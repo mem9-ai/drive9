@@ -148,12 +148,13 @@ func TestUploadSyncReportsPrunedStagedImage(t *testing.T) {
 	}
 }
 
-// TestRetainedShadowIsFencedByAConflictMarker pins the retained-shadow branch of
-// the commit-marker failure path: when the marker cannot be made durable and
-// this landing deliberately kept the shadow, the pending entry must stay on
-// disk and carry PendingConflict so recovery skips it instead of re-uploading
-// the landed image from the surviving shadow.
-func TestRetainedShadowIsFencedByAConflictMarker(t *testing.T) {
+// TestRetainedShadowIsFencedAsCommitted pins the retained-shadow branch of the
+// commit-marker failure path: when the marker cannot be made durable and this
+// landing deliberately kept the shadow, the pending entry must stay on disk
+// with a PendingCommitted fence. Recovery skips it instead of re-uploading the
+// landed image, and the fence is not a failure — a later staging overwrites it
+// and the path's barriers keep reporting success.
+func TestRetainedShadowIsFencedAsCommitted(t *testing.T) {
 	const path = "/retained.txt"
 	payload := []byte("retained image")
 
@@ -201,8 +202,11 @@ func TestRetainedShadowIsFencedByAConflictMarker(t *testing.T) {
 	if !ok || meta == nil {
 		t.Fatal("pending entry was deleted: the retained shadow is now an unfenced replay source")
 	}
-	if meta.Kind != staging.PendingConflict {
-		t.Fatalf("pending kind = %v, want PendingConflict", meta.Kind)
+	if meta.Kind != staging.PendingCommitted {
+		t.Fatalf("pending kind = %v, want PendingCommitted", meta.Kind)
+	}
+	if err := cq.PathTerminalFailure(path); err != nil {
+		t.Fatalf("PathTerminalFailure after a landed commit = %v, want nil", err)
 	}
 	// The marker must be on disk, not only in memory: recovery reads the .meta
 	// file, not this process's map.
@@ -214,7 +218,7 @@ func TestRetainedShadowIsFencedByAConflictMarker(t *testing.T) {
 	if err := json.Unmarshal(raw, &diskMeta); err != nil {
 		t.Fatalf("decode persisted pending meta: %v", err)
 	}
-	if diskMeta.Kind != staging.PendingConflict {
-		t.Fatalf("persisted pending kind = %v, want PendingConflict", diskMeta.Kind)
+	if diskMeta.Kind != staging.PendingCommitted {
+		t.Fatalf("persisted pending kind = %v, want PendingCommitted", diskMeta.Kind)
 	}
 }

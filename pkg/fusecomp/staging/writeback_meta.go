@@ -43,6 +43,12 @@ const (
 	// PendingChmod means file data has already been uploaded remotely, but
 	// the post-upload chmod step still needs to be retried.
 	PendingChmod
+	// PendingCommitted fences a landed image whose WAL commit marker could not
+	// be made durable while its shadow survived: replay must not resurrect the
+	// pre-commit image from that shadow. Unlike PendingConflict this is NOT a
+	// failure — the upload landed, later staging overwrites it freely, and
+	// barriers report success.
+	PendingCommitted
 )
 
 // writeBackInMemoryDataThreshold is the maximum cached write-back payload size
@@ -1211,7 +1217,10 @@ func (c *WriteBackCache) ListPending() []PendingEntry {
 
 	result := make([]PendingEntry, 0, len(c.metas))
 	for path, meta := range c.metas {
-		if meta.Kind == PendingConflict {
+		if meta.Kind == PendingConflict || meta.Kind == PendingChmod || meta.Kind == PendingCommitted {
+			// Not recoverable upload work: a conflict is preserved for manual
+			// recovery, a chmod has no payload, and a committed fence describes
+			// an image that already landed.
 			continue
 		}
 		datPath := c.DatFile(path)
@@ -1555,6 +1564,11 @@ func (c *WriteBackCache) getViewStateLocked(remotePath string) ([]byte, StagedVi
 	meta, ok := c.metas[remotePath]
 	if !ok {
 		return nil, StagedViewNoMeta, nil
+	}
+	if meta.Kind == PendingChmod {
+		// Data already landed; only the mode is outstanding, so the .dat is
+		// absent by design. Reading it here would prune a healthy record.
+		return nil, StagedViewPendingChmod, nil
 	}
 	data, err := os.ReadFile(c.DatFile(remotePath))
 	if err != nil {

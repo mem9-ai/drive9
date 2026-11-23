@@ -165,6 +165,13 @@ func ReplayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStor
 			}
 		}
 		if current, ok := idx.GetMeta(path); ok {
+			// A fence record is terminal for replay: PendingCommitted means the
+			// image landed and only the marker was not durable, PendingConflict
+			// means the image must not be published at all. Neither may be
+			// displaced by an older WAL frame, whatever its timestamp.
+			if current.Kind == PendingCommitted || current.Kind == PendingConflict {
+				return nil
+			}
 			// .meta and .dat may be an older best-effort snapshot even though
 			// a later Flush durably published shadow + full WAL metadata.
 			// Legacy fsync frames have no full publication timestamp, so they

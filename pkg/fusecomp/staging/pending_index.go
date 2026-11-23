@@ -202,8 +202,11 @@ func (idx *PendingIndex) GetMeta(remotePath string) (*WriteBackMeta, bool) {
 func (idx *PendingIndex) HasPending(remotePath string) bool {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	_, ok := idx.items[remotePath]
-	return ok
+	meta, ok := idx.items[remotePath]
+	// A landed image fenced only for replay is not a pending upload: readers
+	// and preload paths must treat the path as clean, and the next staging
+	// overwrites the fence.
+	return ok && meta.Kind != PendingCommitted
 }
 
 // Remove deletes metadata for the given path from memory and disk.
@@ -1019,6 +1022,51 @@ func (idx *PendingIndex) MarkConflictIfGeneration(remotePath string, expectedGen
 	idx.mu.Lock()
 	if m, exists := idx.items[remotePath]; exists && m.Generation == expectedGen {
 		m.Kind = PendingConflict
+		idx.mu.Unlock()
+		return true, nil
+	}
+	idx.mu.Unlock()
+	return false, nil
+}
+
+// MarkCommittedIfGeneration records the non-failure replay fence for a landed
+// image whose commit marker was not durable: it tells journal replay to reject
+// the older frames for this path without marking the entry conflicted (which
+// would surface EIO for a commit that succeeded and would be re-applied to the
+// handle's next staging).
+func (idx *PendingIndex) MarkCommittedIfGeneration(remotePath string, expectedGen uint64) (bool, error) {
+	if expectedGen == 0 {
+		return false, nil
+	}
+	pl := idx.acquirePathLock(remotePath)
+	defer idx.releasePathLock(remotePath, pl)
+
+	idx.mu.RLock()
+	meta, ok := idx.items[remotePath]
+	if !ok {
+		idx.mu.RUnlock()
+		return false, nil
+	}
+	if meta.Generation != expectedGen {
+		idx.mu.RUnlock()
+		return false, nil
+	}
+	committed := *meta
+	committed.Kind = PendingCommitted
+	idx.mu.RUnlock()
+
+	metaBytes, err := json.Marshal(&committed)
+	if err != nil {
+		return false, fmt.Errorf("pending index marshal committed fence: %w", err)
+	}
+	metaPath := filepath.Join(idx.dir, HashPath(remotePath)+".meta")
+	if err := atomicWrite(metaPath, metaBytes); err != nil {
+		return false, fmt.Errorf("pending index write committed fence: %w", err)
+	}
+
+	idx.mu.Lock()
+	if m, exists := idx.items[remotePath]; exists && m.Generation == expectedGen {
+		m.Kind = PendingCommitted
 		idx.mu.Unlock()
 		return true, nil
 	}

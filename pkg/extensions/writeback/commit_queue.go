@@ -1346,6 +1346,13 @@ func (cq *CommitQueue) recoveredEntry(path string) *CommitEntry {
 	if !ok || meta.LayerClean {
 		return nil
 	}
+	if meta.Kind == staging.PendingCommitted {
+		// The image landed; this record only fences replay against the shadow
+		// that outlived a non-durable commit marker. Nothing to re-upload.
+		safeLogPrintf("commit queue: dropping landed replay fence for %s", path)
+		cq.index.RemoveIfGeneration(path, meta.Generation)
+		return nil
+	}
 	if meta.Kind == staging.PendingConflict {
 		// A conflict marker is preserved even without a shadow: the
 		// transfer transaction stages one at the destination deliberately
@@ -2832,11 +2839,13 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 			retained = true
 		}
 		if !retained && entry.ShadowGen != 0 {
-			cq.shadows.RemoveIfGeneration(entry.Path, entry.ShadowGen)
 			// Best effort by design (ShadowStore.remove discards its unlink
-			// error): verify instead of assuming, and remember the failure so
-			// the pending entry is not deleted below.
-			if markerErr != nil && cq.shadows.VerifyRemoved(entry.Path) != nil {
+			// error): verify instead of assuming. Only a removal this entry
+			// actually performed can be verified — if a newer generation
+			// already replaced entry.ShadowGen the shadow belongs to it, not to
+			// this landing.
+			if removed := cq.shadows.RemoveIfGeneration(entry.Path, entry.ShadowGen); removed &&
+				markerErr != nil && cq.shadows.VerifyRemoved(entry.Path) != nil {
 				removalFailed = true
 			}
 		}
@@ -2849,19 +2858,16 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 		// re-uploaded and the surviving shadow cannot resurrect it. The
 		// generation-scoped form is required: an unscoped MarkConflict would
 		// poison a newer generation that already replaced this one.
-		marked, err := cq.index.MarkConflictIfGeneration(entry.Path, entry.PendingIndexGen)
+		marked, err := cq.index.MarkCommittedIfGeneration(entry.Path, entry.PendingIndexGen)
 		switch {
 		case err != nil:
 			// No durable fence was established, so the pending entry must not be
-			// deleted either: keep it for retry and make the failure visible to
-			// this path's barriers, which must not answer a durable success for
-			// an image whose replay source is still on disk.
+			// deleted while its shadow can still replay: keep it for retry.
 			keepPending = true
-			safeLogPrintf("commit queue: conflict marker for %s failed: %v (pending entry kept)", entry.Path, err)
-			cq.RecordTerminalFailureForPath(entry.Path, err)
+			safeLogPrintf("commit queue: replay fence for %s failed: %v (pending entry kept)", entry.Path, err)
 		case marked:
 			keepPending = true
-			safeLogPrintf("commit queue: shadow survived the cleanup for %s after a non-durable commit marker; pending entry kept conflicted", entry.Path)
+			safeLogPrintf("commit queue: shadow survived the cleanup for %s after a non-durable commit marker; replay fenced as committed", entry.Path)
 		}
 	}
 	if cq.index != nil && cq.layerRefSnapshot() == "" && !keepPending {
@@ -3977,6 +3983,8 @@ func (cq *CommitQueue) PathTerminalFailure(path string) error {
 		if meta, found := cq.index.GetMeta(path); found && meta != nil && meta.Kind == staging.PendingConflict {
 			return errCommitTerminalRecovered
 		}
+		// A PendingCommitted fence describes a landed image; its barrier
+		// success is not a failure.
 	}
 	return nil
 }

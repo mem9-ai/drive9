@@ -453,6 +453,12 @@ var errLedgerOwned = errors.New("writeback: path owned by the staging ledger")
 // errStagedViewUnavailable backs a lost staged image that carried no read error.
 var errStagedViewUnavailable = errors.New("staged image is unavailable")
 
+// errStagedViewLost marks a recorded failure as a write-cache view loss. Only
+// these may fail a barrier from the "nothing staged" exit: a standalone commit
+// queue record (a transfer that never had a cache entry) is moved by
+// RenameTerminalFailure and must not abort an OpRename's pre-rename landing.
+var errStagedViewLost = errors.New("staged image was lost")
+
 // IsLedgerOwnedError reports whether err is the ledger-ownership refusal.
 func IsLedgerOwnedError(err error) bool { return errors.Is(err, errLedgerOwned) }
 
@@ -495,16 +501,23 @@ func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPat
 	release := u.acquirePath(localPath)
 	defer release()
 
-	// One atomic lookup: the state carries the reason, so a PendingChmod record
-	// (no .dat by design) is not mistaken for a pruned pair, and a pruned pair
-	// is not mistaken for an entry another upload consumed.
-	meta, data, viewState, viewErr := u.cache.GetMetaAndViewState(localPath)
+	// One atomic lookup under the path lock: the state carries the reason, so a
+	// PendingChmod record (no .dat by design) is not mistaken for a pruned pair,
+	// and a pruned pair is not mistaken for an entry another upload consumed.
+	// The callback captures the staging generations — including the
+	// terminal-failure stamp OnSuccess is allowed to clear.
+	var syncGens StagingGens
+	meta, data, viewState, viewErr := u.cache.GetMetaAndViewStateWithCallback(localPath, func() {
+		if u.SnapshotStagingGens != nil {
+			syncGens = u.SnapshotStagingGens(localPath)
+		}
+	})
 	switch viewState {
 	case staging.StagedViewNoMeta:
 		// Nothing staged. Either the background upload we waited for consumed
 		// it, or its only copy was pruned earlier: the terminal-failure record
 		// tells the two apart.
-		if ferr := u.pendingTerminalFailure(localPath); ferr != nil {
+		if ferr := u.pendingStagedViewLoss(localPath); ferr != nil {
 			return 0, nil, fmt.Errorf("staged image for %s was lost after an earlier failure: %w", localPath, ferr)
 		}
 		return 0, nil, nil
@@ -537,13 +550,15 @@ func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPat
 		}
 	}
 
-	// Snapshot the terminal-failure stamp BEFORE the remote write: OnSuccess
-	// clears a failure recorded before this landing, and must never clear one
-	// recorded after it started (a concurrent loss of a newer generation).
-	var failureSeq uint64
-	if u.TerminalFailureSeq != nil {
+	// The stamp must predate the remote write: OnSuccess clears a failure
+	// recorded before this landing, never one recorded after it started.
+	failureSeq := syncGens.TerminalFailureSeq
+	if failureSeq == 0 && u.TerminalFailureSeq != nil {
 		failureSeq = u.TerminalFailureSeq(localPath)
 	}
+	successGens := syncGens
+	successGens.WriteBackGen = gen
+	successGens.TerminalFailureSeq = failureSeq
 	var committedRev int64
 	threshold := u.directPutThreshold()
 	useDirectPUT := meta.Size == 0 || (threshold > 0 && meta.Size < threshold)
@@ -594,7 +609,7 @@ func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPat
 			return 0, nil, fmt.Errorf("%w; mark chmod pending: %v", err, markErr)
 		}
 		if u.OnSuccess != nil {
-			u.OnSuccess(*meta, committedRev, StagingGens{WriteBackGen: gen, TerminalFailureSeq: failureSeq})
+			u.OnSuccess(*meta, committedRev, successGens)
 		}
 		return 0, nil, err
 	}
@@ -606,7 +621,7 @@ func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPat
 		u.perf.uploaderSuccess.add(1)
 	}
 	if u.OnSuccess != nil {
-		u.OnSuccess(*meta, committedRev, StagingGens{WriteBackGen: gen, TerminalFailureSeq: failureSeq})
+		u.OnSuccess(*meta, committedRev, successGens)
 	}
 	return committedRev, meta, nil
 }
@@ -1200,6 +1215,7 @@ func (u *WriteBackUploader) stagedViewLost(localPath string, err error) error {
 	if err == nil {
 		err = errStagedViewUnavailable
 	}
+	err = fmt.Errorf("%w: %w", errStagedViewLost, err)
 	if u.OnStagedViewLost != nil {
 		u.OnStagedViewLost(localPath, err)
 	}
@@ -1207,11 +1223,16 @@ func (u *WriteBackUploader) stagedViewLost(localPath string, err error) error {
 	return err
 }
 
-// pendingTerminalFailure returns a terminal failure already recorded for the
-// path, if any.
-func (u *WriteBackUploader) pendingTerminalFailure(localPath string) error {
+// pendingStagedViewLoss returns the recorded write-cache view loss for a path,
+// if there is one. A terminal failure of another kind (a standalone commit
+// queue transfer record) is not this barrier's business.
+func (u *WriteBackUploader) pendingStagedViewLoss(localPath string) error {
 	if u.TerminalFailureForPath == nil {
 		return nil
 	}
-	return u.TerminalFailureForPath(localPath)
+	ferr := u.TerminalFailureForPath(localPath)
+	if ferr != nil && errors.Is(ferr, errStagedViewLost) {
+		return ferr
+	}
+	return nil
 }

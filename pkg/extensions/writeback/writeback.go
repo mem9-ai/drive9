@@ -3399,11 +3399,14 @@ func (h *bufferingHandle) DrainFlush(ctx context.Context) (err error) {
 		// A failed drain keeps the staged image available to Release or retry.
 		defer func() {
 			if err != nil {
-				if _, ok := h.w.wbCache.GetMeta(h.path); ok {
-					h.mu.Lock()
-					h.stagedToCache = !h.unlinked
-					h.mu.Unlock()
-				}
+				// Keep the staged image available to Release or a retry. No
+				// GetMeta gate: a pair pruned as damaged would otherwise leave
+				// stagedToCache false, and the next DrainFlush would wait on the
+				// path without checking the recorded failure and report a
+				// durable drain.
+				h.mu.Lock()
+				h.stagedToCache = !h.unlinked
+				h.mu.Unlock()
 			}
 		}()
 		useCache := true

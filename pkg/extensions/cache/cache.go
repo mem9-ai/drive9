@@ -339,7 +339,11 @@ func (c *Cache) invalidatePathTiers(path string) {
 			if _, aliased := aliases[p]; aliased || p == path || strings.HasPrefix(p, prefix) {
 				h.mu.Lock()
 				if h.prefetch != nil {
-					h.prefetch.Invalidate()
+					// Reset without a size (h.size/h.rev are zeroed below): an
+					// in-flight Read that already passed revalidationDue can
+					// still call OnRead/Get against the old smaller fileSize
+					// and serve a short block as EOF.
+					h.prefetch.InvalidateUnknownSize()
 				}
 				// The SSE change replaced this file's remote image: the
 				// handle's open-time size/rev describe the OLD one, and a
