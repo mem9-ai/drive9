@@ -497,18 +497,20 @@ func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPat
 
 	// Atomically read meta + data under one path lock so they are guaranteed
 	// to be from the same generation.
-	meta, data, viewState := u.cache.GetMetaAndViewState(localPath)
+	meta, data, viewState, viewErr := u.cache.GetMetaAndViewState(localPath)
 	switch viewState {
 	case staging.StagedViewNoMeta:
 		// Not in cache: removed between GetMeta and GetMetaAndView by the
 		// background upload we just waited for. Nothing left to publish.
 		return 0, nil, nil
-	case staging.StagedViewTornPair:
-		// The image failed its meta/data binding and was pruned: the bytes
-		// this call was asked to make durable no longer exist. Reporting
-		// success would tell fsync(2) that a file is safe when its only copy
-		// is gone.
-		return 0, nil, fmt.Errorf("staged image for %s failed its meta/data binding and was pruned", localPath)
+	case staging.StagedViewNoData:
+		// A record exists but its payload is not available. Reporting success
+		// would tell fsync(2) that a file is safe when the only copy this call
+		// could publish is gone (torn or missing pair, pruned) or unreadable.
+		if viewErr != nil {
+			return 0, nil, fmt.Errorf("staged image for %s is unreadable: %w", localPath, viewErr)
+		}
+		return 0, nil, fmt.Errorf("staged image for %s has no usable payload (its pair was torn or missing and was pruned)", localPath)
 	}
 	gen := meta.Generation
 
@@ -828,12 +830,13 @@ func (u *WriteBackUploader) tryUploadBatch(firstPath string) bool {
 			continue
 		}
 		var stagingGens StagingGens
-		meta, data, ok := u.cache.GetMetaAndViewWithCallback(localPath, func() {
+		meta, data, state, viewErr := u.cache.GetMetaAndViewStateWithCallback(localPath, func() {
 			if u.SnapshotStagingGens != nil {
 				stagingGens = u.SnapshotStagingGens(localPath)
 			}
 		})
-		if !ok {
+		if state != staging.StagedViewOK {
+			logStagedViewLoss("upload-batch", localPath, state, viewErr)
 			rel()
 			continue
 		}
@@ -1030,13 +1033,14 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 	// same-path write cannot race the snapshot and leave a stale upload holding
 	// newer generations it is not responsible for.
 	var stagingGens StagingGens
-	meta, data, ok := u.cache.GetMetaAndViewWithCallback(localPath, func() {
+	meta, data, state, viewErr := u.cache.GetMetaAndViewStateWithCallback(localPath, func() {
 		if u.SnapshotStagingGens != nil {
 			stagingGens = u.SnapshotStagingGens(localPath)
 		}
 	})
-	if !ok {
-		return // Already uploaded or removed.
+	if state != staging.StagedViewOK {
+		logStagedViewLoss("upload", localPath, state, viewErr)
+		return
 	}
 	gen := meta.Generation
 	// Use the writeBack generation we just read (authoritative) rather than
@@ -1183,4 +1187,18 @@ func (u *WriteBackUploader) applyPendingChmod(ctx context.Context, localPath str
 		u.OnSuccess(*meta, 0, StagingGens{WriteBackGen: gen})
 	}
 	return nil
+}
+
+// logStagedViewLoss names why a staged image was not uploaded. A consumed entry
+// is routine; a pruned or unreadable payload means the image the barrier was
+// asked to publish no longer exists and must not be reported as success.
+func logStagedViewLoss(site, path string, state staging.StagedViewState, err error) {
+	if state == staging.StagedViewNoMeta {
+		return
+	}
+	if err != nil {
+		safeLogPrintf("writeback %s: staged image for %s is unreadable: %v", site, path, err)
+		return
+	}
+	safeLogPrintf("writeback %s: staged image for %s has no usable payload (torn or missing pair pruned)", site, path)
 }

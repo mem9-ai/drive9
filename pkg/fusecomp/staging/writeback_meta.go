@@ -664,28 +664,8 @@ func viewMatchesMeta(meta *WriteBackMeta, data []byte) bool {
 // The view load itself enforces the metadata binding: a torn pair is pruned
 // by getViewLocked, never returned.
 func (c *WriteBackCache) GetMetaAndView(remotePath string) (*WriteBackMeta, []byte, bool) {
-	pl := c.AcquirePathLock(remotePath)
-	c.mu.Lock()
-
-	meta, ok := c.metas[remotePath]
-	if !ok {
-		c.mu.Unlock()
-		c.ReleasePathLock(remotePath, pl)
-		return nil, nil, false
-	}
-	cp := cloneWriteBackMeta(meta)
-
-	data, dataOK := c.getViewLocked(remotePath)
-	c.mu.Unlock()
-	c.ReleasePathLock(remotePath, pl)
-
-	if !dataOK {
-		return nil, nil, false
-	}
-	// Return a copy so callers can use it after locks are released.
-	dataCopy := make([]byte, len(data))
-	copy(dataCopy, data)
-	return &cp, dataCopy, true
+	meta, data, state, _ := c.getMetaAndView(remotePath, nil)
+	return meta, data, state == StagedViewOK
 }
 
 // StagedViewState explains why a staged meta+data read did not produce a pair.
@@ -697,45 +677,34 @@ const (
 	// StagedViewNoMeta means nothing is staged for the path: it was consumed
 	// by an upload, or never staged. Callers may treat it as "nothing to do".
 	StagedViewNoMeta
-	// StagedViewTornPair means a metadata record existed but its data did not
-	// match it, so getViewLocked pruned the pair. The image is gone, and a
-	// caller that reports success here would claim durability for bytes that
-	// no longer exist anywhere.
-	StagedViewTornPair
+	// StagedViewNoData means a metadata record exists but its payload is not
+	// available: the pair was torn or its .dat file was gone (both pruned), or
+	// the read failed for another reason (entry kept, error returned). A caller
+	// that reports success here would claim durability for bytes it never saw.
+	StagedViewNoData
 )
 
-// GetMetaAndViewState is GetMetaAndView with the miss reason. Callers that
-// treat a miss as success (a durability barrier) need the distinction: only
-// StagedViewNoMeta means another upload already consumed the image.
-func (c *WriteBackCache) GetMetaAndViewState(remotePath string) (*WriteBackMeta, []byte, StagedViewState) {
-	pl := c.AcquirePathLock(remotePath)
-	c.mu.Lock()
-	meta, ok := c.metas[remotePath]
-	if !ok {
-		c.mu.Unlock()
-		c.ReleasePathLock(remotePath, pl)
-		return nil, nil, StagedViewNoMeta
-	}
-	cp := cloneWriteBackMeta(meta)
-	data, dataOK := c.getViewLocked(remotePath)
-	c.mu.Unlock()
-	c.ReleasePathLock(remotePath, pl)
-	if !dataOK {
-		return nil, nil, StagedViewTornPair
-	}
-	dataCopy := make([]byte, len(data))
-	copy(dataCopy, data)
-	return &cp, dataCopy, StagedViewOK
+// GetMetaAndViewState is GetMetaAndView with the miss reason and the read
+// error. Callers that treat a miss as success (a durability barrier) need the
+// distinction: only StagedViewNoMeta means another upload already consumed the
+// image.
+func (c *WriteBackCache) GetMetaAndViewState(remotePath string) (*WriteBackMeta, []byte, StagedViewState, error) {
+	return c.getMetaAndView(remotePath, nil)
 }
 
-// GetMetaAndViewWithCallback is like GetMetaAndView but invokes onLocked while
-// the per-path lock is still held (after the meta+data snapshot is read). This
-// lets callers atomically capture associated staging-store generations (e.g.
-// pendingIndex/shadowStore) under the same serialization window so a concurrent
-// same-path Put cannot race the snapshot and leave a stale upload holding newer
-// generations it is not responsible for. The view load itself enforces the
-// metadata binding: a torn pair is pruned by getViewLocked, never returned.
-func (c *WriteBackCache) GetMetaAndViewWithCallback(remotePath string, onLocked func()) (*WriteBackMeta, []byte, bool) {
+// GetMetaAndViewStateWithCallback is GetMetaAndViewState with the path lock
+// held across onLocked, for callers that capture staging generations with the
+// snapshot. A background upload uses the state to tell "another upload took it"
+// from "the pair was pruned", which is worth a log line rather than a silent
+// skip.
+func (c *WriteBackCache) GetMetaAndViewStateWithCallback(remotePath string, onLocked func()) (*WriteBackMeta, []byte, StagedViewState, error) {
+	return c.getMetaAndView(remotePath, onLocked)
+}
+
+// getMetaAndView is the one implementation of the meta+data protocol: the path
+// lock is held across the snapshot and onLocked, so a concurrent same-path Put
+// can neither split the pair nor slip a newer generation past a caller.
+func (c *WriteBackCache) getMetaAndView(remotePath string, onLocked func()) (*WriteBackMeta, []byte, StagedViewState, error) {
 	pl := c.AcquirePathLock(remotePath)
 	defer c.ReleasePathLock(remotePath, pl)
 
@@ -743,15 +712,17 @@ func (c *WriteBackCache) GetMetaAndViewWithCallback(remotePath string, onLocked 
 	meta, ok := c.metas[remotePath]
 	if !ok {
 		c.mu.Unlock()
-		return nil, nil, false
+		return nil, nil, StagedViewNoMeta, nil
 	}
 	cp := cloneWriteBackMeta(meta)
-
-	data, dataOK := c.getViewLocked(remotePath)
+	data, state, viewErr := c.getViewStateLocked(remotePath)
 	c.mu.Unlock()
 
-	if !dataOK {
-		return nil, nil, false
+	if state != StagedViewOK {
+		if onLocked != nil {
+			onLocked()
+		}
+		return nil, nil, state, viewErr
 	}
 
 	// Invoke the callback while the path lock is still held so staging-gen
@@ -762,7 +733,19 @@ func (c *WriteBackCache) GetMetaAndViewWithCallback(remotePath string, onLocked 
 
 	dataCopy := make([]byte, len(data))
 	copy(dataCopy, data)
-	return &cp, dataCopy, true
+	return &cp, dataCopy, StagedViewOK, nil
+}
+
+// GetMetaAndViewWithCallback is like GetMetaAndView but invokes onLocked while
+// the per-path lock is still held (after the meta+data snapshot is read). This
+// lets callers atomically capture associated staging-store generations (e.g.
+// pendingIndex/shadowStore) under the same serialization window so a concurrent
+// same-path Put cannot race the snapshot and leave a stale upload holding newer
+// generations it is not responsible for. The view load itself enforces the
+// metadata binding: a torn pair is pruned by getViewLocked, never returned.
+func (c *WriteBackCache) GetMetaAndViewWithCallback(remotePath string, onLocked func()) (*WriteBackMeta, []byte, bool) {
+	meta, data, state, _ := c.getMetaAndView(remotePath, onLocked)
+	return meta, data, state == StagedViewOK
 }
 
 // Remove deletes the cached data and metadata for remotePath.
@@ -1552,31 +1535,41 @@ func (c *WriteBackCache) pruneEntryLocked(remotePath string, removeDataFile bool
 // writable-open preload — is protected at the one choke point. In-memory
 // payloads skip the check: they were either written by a put (bound by
 // construction) or admitted through this validated load.
-func (c *WriteBackCache) getViewLocked(remotePath string) ([]byte, bool) {
+func (c *WriteBackCache) getViewStateLocked(remotePath string) ([]byte, StagedViewState, error) {
 	if data, ok := c.data[remotePath]; ok {
 		c.touchDataLocked(remotePath)
-		return data, true
+		return data, StagedViewOK, nil
 	}
 	meta, ok := c.metas[remotePath]
 	if !ok {
-		return nil, false
+		return nil, StagedViewNoMeta, nil
 	}
 	data, err := os.ReadFile(c.DatFile(remotePath))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			c.pruneEntryLocked(remotePath, false)
+			return nil, StagedViewNoData, nil
 		}
-		return nil, false
+		// Kept: a transient read error is not evidence the image is gone.
+		return nil, StagedViewNoData, err
 	}
 	if !viewMatchesMeta(meta, data) {
 		// Torn pair: drop it — losing the entry cleanly beats serving or
 		// uploading stale bytes at the new base.
 		c.pruneEntryLocked(remotePath, true)
-		return nil, false
+		return nil, StagedViewNoData, nil
 	}
 	c.cacheDataLocked(remotePath, data, meta.Size)
 	if cached, ok := c.data[remotePath]; ok {
-		return cached, true
+		return cached, StagedViewOK, nil
+	}
+	return data, StagedViewOK, nil
+}
+
+func (c *WriteBackCache) getViewLocked(remotePath string) ([]byte, bool) {
+	data, state, _ := c.getViewStateLocked(remotePath)
+	if state != StagedViewOK {
+		return nil, false
 	}
 	return data, true
 }

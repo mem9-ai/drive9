@@ -1025,20 +1025,20 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 	// One fsync for the whole subtree: the markers are only a fence once they
 	// are on disk, and a cancel usually arrives as one rename/rmdir of a tree.
 	if cq.journal != nil {
-		appendFailed := false
 		for _, p := range cancelled {
 			if err := cq.journal.Append(staging.JournalEntry{
 				Op:   staging.JournalCommit,
 				Path: p,
 			}); err != nil {
-				appendFailed = true
 				safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", p, err)
 			}
 		}
-		if !appendFailed {
-			if err := cq.journal.FsyncShared(); err != nil {
-				safeLogPrintf("commit queue: journal cancel markers not durable: %v", err)
-			}
+		// Unconditional: one failed append must not leave the other subtree
+		// markers in the page cache while their shadows are dropped below. A
+		// crash before the background sync window would then replay the
+		// descendants and bring the deleted names back.
+		if err := cq.journal.FsyncShared(); err != nil {
+			safeLogPrintf("commit queue: journal cancel markers not durable: %v", err)
 		}
 	}
 	for _, p := range cancelled {

@@ -19,7 +19,7 @@ func TestGetMetaAndViewStateDistinguishesMissFromTornPair(t *testing.T) {
 		t.Fatalf("put: %v", err)
 	}
 
-	meta, data, state := c.GetMetaAndViewState(path)
+	meta, data, state, _ := c.GetMetaAndViewState(path)
 	if state != StagedViewOK {
 		t.Fatalf("state = %v, want StagedViewOK", state)
 	}
@@ -34,12 +34,12 @@ func TestGetMetaAndViewStateDistinguishesMissFromTornPair(t *testing.T) {
 	if err := os.WriteFile(c.DatFile(path), []byte("different bytes!"), 0o600); err != nil {
 		t.Fatalf("corrupt data: %v", err)
 	}
-	if _, _, state := c.GetMetaAndViewState(path); state != StagedViewTornPair {
-		t.Fatalf("state after corrupting the data = %v, want StagedViewTornPair", state)
+	if _, _, state, err := c.GetMetaAndViewState(path); state != StagedViewNoData || err != nil {
+		t.Fatalf("state after corrupting the data = %v (err %v), want StagedViewNoData", state, err)
 	}
 
 	// Pruning removed the record: from here on the path is simply not staged.
-	if _, _, state := c.GetMetaAndViewState(path); state != StagedViewNoMeta {
+	if _, _, state, _ := c.GetMetaAndViewState(path); state != StagedViewNoMeta {
 		t.Fatalf("state after the pair was pruned = %v, want StagedViewNoMeta", state)
 	}
 }

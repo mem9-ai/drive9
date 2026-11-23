@@ -422,10 +422,15 @@ func (c *Cache) markUnverified() {
 			if h, ok := key.(*cachingHandle); ok {
 				h.mu.Lock()
 				if h.prefetch != nil {
-					// The invalidated path may have changed length; a block
-					// clipped to the previous size is not an EOF the next read
-					// may trust.
-					h.prefetch.InvalidateUnknownSize()
+					// Keep the open-time size: this reset always pairs with a
+					// revalidation (the flag set below), and revalidateRevision
+					// republishes st.Size only when the identity moved. Dropping
+					// the size here would leave an unchanged file at "unknown"
+					// for good and quietly disable readahead on every open
+					// descriptor after a routine stream disconnect. Sizes that
+					// no revalidation follows use InvalidateUnknownSize instead
+					// (invalidateAllTiers).
+					h.prefetch.Invalidate()
 				}
 				h.revalidate = true
 				h.identityGen++
