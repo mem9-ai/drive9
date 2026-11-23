@@ -296,7 +296,7 @@ def summary(c):
 
     create_s = seconds("create")
     stat_s = seconds("stat")
-    drain_s = seconds("drain")
+    drain_s = drain_seconds()
     report = {
         "schema_version": "drive9-bench/namespace-v1",
         "case": "drive9/fuse/namespace-100k",
