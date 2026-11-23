@@ -37,22 +37,40 @@ func TestGetMetaAndViewStateDistinguishesMissFromTornPair(t *testing.T) {
 	if _, _, state, err := c.GetMetaAndViewState(path); state != StagedViewNoData || err == nil {
 		t.Fatalf("state after corrupting the data = %v (err %v), want StagedViewNoData with a reason", state, err)
 	}
-	if !c.HasViewLoss(path) {
-		t.Fatal("no damage witness after the pair was pruned: a retried barrier would read it as already uploaded")
-	}
 
-	// Pruning removed the record, but the witness keeps the failure visible: a
-	// barrier that retries must not read "nothing staged" as success.
-	if _, _, state, err := c.GetMetaAndViewState(path); state != StagedViewNoData || err == nil {
-		t.Fatalf("state for a pruned pair with a witness = %v (err %v), want StagedViewNoData", state, err)
-	}
-
-	// An explicit removal supersedes the witness.
-	c.Remove(path)
-	if c.HasViewLoss(path) {
-		t.Fatal("damage witness survived an explicit removal")
-	}
+	// The pruned pair is gone: a later lookup reports nothing staged. Reporting
+	// the loss beyond that belongs to the caller that owns a durable failure
+	// record (the commit queue's terminal failures), not to this cache.
 	if _, _, state, _ := c.GetMetaAndViewState(path); state != StagedViewNoMeta {
-		t.Fatalf("state after explicit removal = %v, want StagedViewNoMeta", state)
+		t.Fatalf("state after the pair was pruned = %v, want StagedViewNoMeta", state)
+	}
+}
+
+// TestPendingChmodIsNotPrunedAsATornPair pins the state that keeps a
+// chmod-only record alive: its .dat is absent by design, and reading the view
+// would delete a healthy entry and report the barrier lost.
+func TestPendingChmodIsNotPrunedAsATornPair(t *testing.T) {
+	const path = "/chmod-only.txt"
+	c, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := WriteBackMeta{
+		Path:       path,
+		Size:       7,
+		Kind:       PendingChmod,
+		Generation: 42,
+	}
+	c.PublishMeta(meta)
+
+	got, data, state, err := c.GetMetaAndViewState(path)
+	if err != nil || state != StagedViewPendingChmod {
+		t.Fatalf("state = %v (err %v), want StagedViewPendingChmod", state, err)
+	}
+	if got == nil || got.Kind != PendingChmod || len(data) != 0 {
+		t.Fatalf("meta = %+v data=%q, want the chmod record and no payload", got, data)
+	}
+	if !c.HasMeta(path) {
+		t.Fatal("PendingChmod record was pruned by the meta+view read")
 	}
 }

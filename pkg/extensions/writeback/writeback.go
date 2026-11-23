@@ -644,6 +644,21 @@ func New(opts Options) (*Writeback, error) {
 			workers = defaultUploadConcurrency
 		}
 		up := NewWriteBackUploader(opts.Client, w.wbCache, workers, root)
+		// A staged pair this process cannot publish (pruned or unreadable) is a
+		// failure that must outlive the pair: the commit queue's bounded
+		// terminal-failure map is the existing home for that, and its landings
+		// and cancellations already clear it.
+		up.OnStagedViewLost = func(localPath string, err error) {
+			if w.queue != nil {
+				w.queue.RecordTerminalFailureForPath(localPath, err)
+			}
+		}
+		up.TerminalFailureForPath = func(localPath string) error {
+			if w.queue == nil {
+				return nil
+			}
+			return w.queue.PathTerminalFailure(localPath)
+		}
 		// The snapshot callback runs under the write-back cache's path lock at
 		// upload time: the failure stamp it captures is the one this landing
 		// may clear, and never a failure recorded after the upload started.
@@ -3372,55 +3387,56 @@ func (h *bufferingHandle) DrainFlush(ctx context.Context) (err error) {
 	h.stagedToCache = false
 	h.mu.Unlock()
 	if staged && !unlinked && h.w.uploader != nil && h.w.wbCache != nil {
-		if _, ok := h.w.wbCache.GetMeta(h.path); ok {
-			// A failed drain keeps the staged image available to Release or retry.
-			defer func() {
-				if err != nil {
-					if _, ok := h.w.wbCache.GetMeta(h.path); ok {
-						h.mu.Lock()
-						h.stagedToCache = !h.unlinked
-						h.mu.Unlock()
-					}
-				}
-			}()
-			useCache := true
-			if dirty {
-				snapshot, stageErr := h.stageToWriteCache(ctx, stageFullDurable)
-				if errors.Is(stageErr, errWriteCacheBypass) {
-					useCache = false
-					retainBuffer = true
-				} else if stageErr != nil {
-					return stageErr
-				}
-				if snapshot != nil {
-					uploadGen = snapshot.wgen
-				}
-			}
-			if useCache {
-				// v1 FlushAll over the write-cache track: the Flush snapshot
-				// owns the upload — land it synchronously, exactly once. A
-				// commitLocked here would publish a second image that races
-				// the uploader's CAS on the same base. The landing fence is
-				// captured before the upload so the landing can retire the
-				// failure state of exactly the generations it contains.
-				supersedesGen, failureSeq := h.stagedLandingFence()
-				rev, meta, uploadErr := h.w.uploader.uploadSyncWithMetadata(ctx, h.path)
-				if uploadErr != nil {
-					return uploadErr
-				}
-				if meta != nil {
+		// No GetMeta pre-gate: the uploader's state lookup distinguishes "another
+		// upload consumed it" from "its only copy was pruned", and skipping on
+		// the latter would report a durable drain that never happened.
+		// A failed drain keeps the staged image available to Release or retry.
+		defer func() {
+			if err != nil {
+				if _, ok := h.w.wbCache.GetMeta(h.path); ok {
 					h.mu.Lock()
-					h.retireDirtyLocked(uploadGen)
+					h.stagedToCache = !h.unlinked
 					h.mu.Unlock()
-					h.markLanded(rev)
-					// The landed watermark itself is recorded by the
-					// uploader's RecordLanding callback with byte-exact
-					// identity; this side only retires the failure state of
-					// exactly the generations the landed image contains.
-					h.w.resolveLandedStaging(h.path, rev, supersedesGen, failureSeq)
 				}
-				return nil
 			}
+		}()
+		useCache := true
+		if dirty {
+			snapshot, stageErr := h.stageToWriteCache(ctx, stageFullDurable)
+			if errors.Is(stageErr, errWriteCacheBypass) {
+				useCache = false
+				retainBuffer = true
+			} else if stageErr != nil {
+				return stageErr
+			}
+			if snapshot != nil {
+				uploadGen = snapshot.wgen
+			}
+		}
+		if useCache {
+			// v1 FlushAll over the write-cache track: the Flush snapshot
+			// owns the upload — land it synchronously, exactly once. A
+			// commitLocked here would publish a second image that races
+			// the uploader's CAS on the same base. The landing fence is
+			// captured before the upload so the landing can retire the
+			// failure state of exactly the generations it contains.
+			supersedesGen, failureSeq := h.stagedLandingFence()
+			rev, meta, uploadErr := h.w.uploader.uploadSyncWithMetadata(ctx, h.path)
+			if uploadErr != nil {
+				return uploadErr
+			}
+			if meta != nil {
+				h.mu.Lock()
+				h.retireDirtyLocked(uploadGen)
+				h.mu.Unlock()
+				h.markLanded(rev)
+				// The landed watermark itself is recorded by the
+				// uploader's RecordLanding callback with byte-exact
+				// identity; this side only retires the failure state of
+				// exactly the generations the landed image contains.
+				h.w.resolveLandedStaging(h.path, rev, supersedesGen, failureSeq)
+			}
+			return nil
 		}
 	}
 	if retainBuffer && h.w.queue != nil && h.w.opts.Staging != nil {
@@ -7100,9 +7116,10 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 	// a stale mode. Dropping it entirely (the old behavior) lost every chmod
 	// deferred onto an open writeback handle (chmod/12: 0777 → 0644).
 	mode, hasMode := h.pendingMode, h.hasPendingMode
-	// Kept for the failure path below: a failed fence must not consume an armed
-	// chmod, or a retried fsync/close restages the image with 0644.
-	armedMode, armedHasMode := mode, hasMode
+	// The armed chmod is consumed only once the image is enqueued (below), and
+	// only if no concurrent chmod replaced it meanwhile: a staging attempt that
+	// fails anywhere keeps it armed, and a chmod racing this staging must win.
+	modeSeq := h.modeSeq
 	// Fresh creates that never carried an explicit chmod still need the
 	// POSIX create mode published. The extent session does not take a mode
 	// field, so without this the promoted inode lands mode 000 and even
@@ -7110,7 +7127,6 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 	if isNew && !hasMode {
 		mode, hasMode = 0o644, true
 	}
-	h.pendingMode, h.hasPendingMode = 0, false
 	// Lineage (v1 ensureStagedSnapshotLineageLocked): a fresh snapshot ID
 	// per staging, parented on this handle's current content snapshot.
 	if h.stagedSnapshotID == "" || h.stagedSnapshotSeq != h.stageSeq {
@@ -7202,12 +7218,8 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 			Length:  size,
 			BaseRev: baseRev,
 		}); err != nil {
-			// The staged meta already carries the mode, but the handle must keep
-			// it armed: fsync(2) failed, the caller will retry, and a restage from
-			// a consumed mode would publish 0644 over the requested bits.
-			h.mu.Lock()
-			h.pendingMode, h.hasPendingMode = armedMode, armedHasMode
-			h.mu.Unlock()
+			// The mode stays armed (it is consumed after Enqueue), so the retry
+			// this error provokes restages with the chmod still attached.
 			return fmt.Errorf("journal fsync fence for %s: %w", h.path, err)
 		}
 	}
@@ -7238,6 +7250,12 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 		return err
 	}
 	h.mu.Lock()
+	// Consume the armed chmod only now: every earlier error exit leaves it
+	// armed, and a chmod that bumped modeSeq while this staging ran must not be
+	// cleared or overwritten by this attempt's snapshot.
+	if h.modeSeq == modeSeq {
+		h.pendingMode, h.hasPendingMode = 0, false
+	}
 	h.lastStageSize = size
 	h.stagedHist++
 	h.retireDirtyLocked(stageGen)

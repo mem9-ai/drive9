@@ -1024,7 +1024,7 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 	}
 	// One fsync for the whole subtree: the markers are only a fence once they
 	// are on disk, and a cancel usually arrives as one rename/rmdir of a tree.
-	if cq.journal != nil {
+	if cq.journal != nil && len(cancelled) > 0 {
 		for _, p := range cancelled {
 			if err := cq.journal.Append(staging.JournalEntry{
 				Op:   staging.JournalCommit,
@@ -2817,34 +2817,51 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 	// both until the layer is committed or rolled back: pendingIndex remains
 	// the local metadata source, and shadowStore remains the local data source
 	// for large files that are not admitted to readCache.
+	//
+	// The cleanup is only safe when the local image can no longer be a replay
+	// source. Two cases keep it: a staging handle that retained newer bytes,
+	// and a removal that failed while the commit marker is not durable. Both
+	// must be detected BEFORE the pending entry is deleted, because that
+	// deletion is what makes a later conflict marker a silent no-op.
+	retained := false
+	removalFailed := false
 	if cq.shadows != nil && cq.layerRefSnapshot() == "" {
 		if keep, ok := cq.retainedShadows.LoadAndDelete(entry.Path); ok && keep == entry.ShadowGen {
-			// The staging handle kept newer local bytes: the shadow stays
-			// as the restore source for this landing's evicted parts.
-			cq.index.RemoveIfGeneration(entry.Path, entry.PendingIndexGen)
-			cq.removeFromQueue(entry)
-			return nil
+			// The staging handle kept newer local bytes: the shadow stays as
+			// the restore source for this landing's evicted parts.
+			retained = true
 		}
-		if entry.ShadowGen != 0 {
+		if !retained && entry.ShadowGen != 0 {
 			cq.shadows.RemoveIfGeneration(entry.Path, entry.ShadowGen)
+			// Best effort by design (ShadowStore.remove discards its unlink
+			// error): verify instead of assuming, and remember the failure so
+			// the pending entry is not deleted below.
+			if markerErr != nil && cq.shadows.VerifyRemoved(entry.Path) != nil {
+				removalFailed = true
+			}
 		}
 	}
-	if cq.index != nil && cq.layerRefSnapshot() == "" {
+	keepPending := false
+	if markerErr != nil && (retained || removalFailed) && cq.index != nil && entry.PendingIndexGen != 0 {
+		// The marker is not durable and the local image survived the cleanup:
+		// keep the pending entry, fenced by a conflict marker. Recovery skips a
+		// PendingConflict entry (recoveredEntry), so the landed image is not
+		// re-uploaded and the surviving shadow cannot resurrect it. The
+		// generation-scoped form is required: an unscoped MarkConflict would
+		// poison a newer generation that already replaced this one.
+		marked, err := cq.index.MarkConflictIfGeneration(entry.Path, entry.PendingIndexGen)
+		switch {
+		case err != nil:
+			safeLogPrintf("commit queue: conflict marker for %s failed: %v", entry.Path, err)
+		case marked:
+			keepPending = true
+			safeLogPrintf("commit queue: shadow survived the cleanup for %s after a non-durable commit marker; pending entry kept conflicted", entry.Path)
+		}
+	}
+	if cq.index != nil && cq.layerRefSnapshot() == "" && !keepPending {
 		if entry.PendingIndexGen != 0 {
 			cq.index.RemoveIfGeneration(entry.Path, entry.PendingIndexGen)
 		}
-	}
-	if markerErr != nil && cq.shadows != nil && cq.shadows.VerifyRemoved(entry.Path) != nil {
-		// The marker is not durable AND the shadow survived the removal:
-		// replay could resurrect this image from it. Mark the pending entry
-		// conflicted so recovery re-uploads it at a new revision instead of
-		// blindly recommitting the old one.
-		if cq.index != nil {
-			if _, err := cq.index.MarkConflictIfGeneration(entry.Path, entry.PendingIndexGen); err != nil {
-				safeLogPrintf("commit queue: conflict marker after a failed removal failed for %s: %v", entry.Path, err)
-			}
-		}
-		safeLogPrintf("commit queue: shadow survived the cleanup for %s after a non-durable commit marker; pending entry marked conflicted", entry.Path)
 	}
 	if cq.index != nil && cq.layerRefSnapshot() != "" {
 		if err := cq.index.MarkLayerCommittedIfGeneration(entry.Path, entry.PendingIndexGen, committedRev, entry.Mode, entry.HasMode, entry.LayerEntry); err != nil {

@@ -58,9 +58,9 @@ type SnapshotStagingGensFunc func(remotePath string) StagingGens
 // any time. WaitPath allows Rename/Unlink/Fsync to block until the current
 // upload for a path finishes.
 type WriteBackUploader struct {
-	client     *client.Client
-	cache      *staging.WriteBackCache
-	remoteRoot string
+	client      *client.Client
+	cache       *staging.WriteBackCache
+	remoteRoot  string
 	queueMu     sync.Mutex
 	queueCond   *sync.Cond
 	stateCond   *sync.Cond
@@ -69,9 +69,9 @@ type WriteBackUploader struct {
 	queuedSet   map[string]struct{}
 	activePaths map[string]int
 	wg          sync.WaitGroup
-	stopOnce   sync.Once
-	stopped    atomic.Bool
-	active     atomic.Int64
+	stopOnce    sync.Once
+	stopped     atomic.Bool
+	active      atomic.Int64
 
 	// Per-path in-flight tracking.
 	inflightMu sync.Mutex
@@ -84,8 +84,16 @@ type WriteBackUploader struct {
 	batchDisabled atomic.Bool
 	batchSem      chan struct{}
 
-	perf      *fusePerfCounters
-	OnSuccess WriteBackSuccessFunc
+	perf *fusePerfCounters
+	// OnStagedViewLost records that a staged image could not be published
+	// because its pair was pruned or unreadable. Writeback wires it to the
+	// commit queue's terminal-failure map, so a barrier that retries after the
+	// prune still fails instead of reading "nothing staged" as success.
+	OnStagedViewLost func(localPath string, err error)
+	// TerminalFailureForPath reports a terminal failure already recorded for a
+	// path (nil when there is none).
+	TerminalFailureForPath func(localPath string) error
+	OnSuccess              WriteBackSuccessFunc
 	// SnapshotStagingGens optionally captures the pendingIndex/shadowStore
 	// generations for a path so OnSuccess can do generation-guarded cleanup.
 	SnapshotStagingGens SnapshotStagingGensFunc
@@ -439,6 +447,9 @@ func (u *WriteBackUploader) RecoverPendingFilter(skip func(localPath string) boo
 // ledger owns the path's image (see WriteBackUploader.LedgerOwned).
 var errLedgerOwned = errors.New("writeback: path owned by the staging ledger")
 
+// errStagedViewUnavailable backs a lost staged image that carried no read error.
+var errStagedViewUnavailable = errors.New("staged image is unavailable")
+
 // IsLedgerOwnedError reports whether err is the ledger-ownership refusal.
 func IsLedgerOwnedError(err error) bool { return errors.Is(err, errLedgerOwned) }
 
@@ -481,42 +492,32 @@ func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPat
 	release := u.acquirePath(localPath)
 	defer release()
 
-	// staging.PendingChmod entries have no .dat file (data already uploaded, only
-	// chmod remains). Read meta first so we can handle chmod without loading
-	// data — GetMetaAndView would prune the entry when the .dat is missing.
-	chmodMeta, chmodOK := u.cache.GetMeta(localPath)
-	if !chmodOK {
-		if u.cache.HasViewLoss(localPath) {
-			// The record is gone because its pair was pruned as damaged, not
-			// because another upload consumed it. Reporting success here would
-			// answer a durability barrier for bytes this process dropped.
-			return 0, nil, fmt.Errorf("staged image for %s was pruned as damaged and has no replacement", localPath)
-		}
-		return 0, nil, nil // not in cache (may have been uploaded by the background worker we just waited for)
-	}
-	if chmodMeta.Kind == staging.PendingChmod {
-		if err := u.applyPendingChmod(ctx, localPath, chmodMeta, chmodMeta.Generation, true); err != nil {
-			return 0, nil, err
-		}
-		return 0, chmodMeta, nil
-	}
-
-	// Atomically read meta + data under one path lock so they are guaranteed
-	// to be from the same generation.
+	// One atomic lookup: the state carries the reason, so a PendingChmod record
+	// (no .dat by design) is not mistaken for a pruned pair, and a pruned pair
+	// is not mistaken for an entry another upload consumed.
 	meta, data, viewState, viewErr := u.cache.GetMetaAndViewState(localPath)
 	switch viewState {
 	case staging.StagedViewNoMeta:
-		// Not in cache: removed between GetMeta and GetMetaAndView by the
-		// background upload we just waited for. Nothing left to publish.
-		return 0, nil, nil
-	case staging.StagedViewNoData:
-		// A record exists but its payload is not available. Reporting success
-		// would tell fsync(2) that a file is safe when the only copy this call
-		// could publish is gone (torn or missing pair, pruned) or unreadable.
-		if viewErr != nil {
-			return 0, nil, fmt.Errorf("staged image for %s is unreadable: %w", localPath, viewErr)
+		// Nothing staged. Either the background upload we waited for consumed
+		// it, or its only copy was pruned earlier: the terminal-failure record
+		// tells the two apart.
+		if ferr := u.pendingTerminalFailure(localPath); ferr != nil {
+			return 0, nil, fmt.Errorf("staged image for %s was lost after an earlier failure: %w", localPath, ferr)
 		}
-		return 0, nil, fmt.Errorf("staged image for %s has no usable payload (its pair was torn or missing and was pruned)", localPath)
+		return 0, nil, nil
+	case staging.StagedViewPendingChmod:
+		if err := u.applyPendingChmod(ctx, localPath, meta, meta.Generation, true); err != nil {
+			return 0, nil, err
+		}
+		return 0, meta, nil
+	case staging.StagedViewNoData:
+		// The only copy this call could publish is gone (torn or missing pair,
+		// pruned) or unreadable. Reporting success would tell fsync(2) that a
+		// file is safe.
+		if viewErr != nil {
+			return 0, nil, u.stagedViewLost(localPath, fmt.Errorf("staged image for %s is unreadable: %w", localPath, viewErr))
+		}
+		return 0, nil, u.stagedViewLost(localPath, fmt.Errorf("staged image for %s has no usable payload", localPath))
 	}
 	gen := meta.Generation
 
@@ -825,24 +826,22 @@ func (u *WriteBackUploader) tryUploadBatch(firstPath string) bool {
 
 	for i, localPath := range distinct {
 		rel := releases[i]
-		chmodMeta, ok := u.cache.GetMeta(localPath)
-		if !ok {
-			rel()
-			continue
-		}
-		if chmodMeta.Kind == staging.PendingChmod {
-			rel()
-			fallback = append(fallback, localPath)
-			continue
-		}
 		var stagingGens StagingGens
 		meta, data, state, viewErr := u.cache.GetMetaAndViewStateWithCallback(localPath, func() {
 			if u.SnapshotStagingGens != nil {
 				stagingGens = u.SnapshotStagingGens(localPath)
 			}
 		})
-		if state != staging.StagedViewOK {
-			logStagedViewLoss("upload-batch", localPath, state, viewErr)
+		switch state {
+		case staging.StagedViewNoMeta:
+			rel()
+			continue
+		case staging.StagedViewPendingChmod:
+			rel()
+			fallback = append(fallback, localPath)
+			continue
+		case staging.StagedViewNoData:
+			_ = u.stagedViewLost(localPath, viewErr)
 			rel()
 			continue
 		}
@@ -1018,34 +1017,23 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 	release := u.acquirePath(localPath)
 	defer release()
 
-	// staging.PendingChmod entries have no .dat file (data already uploaded, only
-	// chmod remains). Read meta first so we can handle chmod without loading
-	// data — GetMetaAndView would prune the entry when the .dat is missing.
-	chmodMeta, chmodOK := u.cache.GetMeta(localPath)
-	if !chmodOK {
-		return // Already uploaded or removed.
-	}
-	if chmodMeta.Kind == staging.PendingChmod {
-		_ = u.applyPendingChmod(context.Background(), localPath, chmodMeta, chmodMeta.Generation, false)
-		return
-	}
-
-	// Atomically read meta + data under one path lock so they are guaranteed
-	// to be from the same generation. Without this, a concurrent Put could
-	// replace the data between GetMeta and getView, causing the uploader to
-	// upload new data with old baseRev/generation. The onLocked callback
-	// captures the staging-store generations under the same path-lock window so
-	// the OnSuccess cleanup is generation-guarded consistently — a concurrent
-	// same-path write cannot race the snapshot and leave a stale upload holding
-	// newer generations it is not responsible for.
+	// One atomic lookup: the callback captures the staging-store generations
+	// under the same path lock, so a concurrent same-path write cannot leave a
+	// stale upload holding newer generations it is not responsible for.
 	var stagingGens StagingGens
 	meta, data, state, viewErr := u.cache.GetMetaAndViewStateWithCallback(localPath, func() {
 		if u.SnapshotStagingGens != nil {
 			stagingGens = u.SnapshotStagingGens(localPath)
 		}
 	})
-	if state != staging.StagedViewOK {
-		logStagedViewLoss("upload", localPath, state, viewErr)
+	switch state {
+	case staging.StagedViewNoMeta:
+		return // Already uploaded or removed.
+	case staging.StagedViewPendingChmod:
+		_ = u.applyPendingChmod(context.Background(), localPath, meta, meta.Generation, false)
+		return
+	case staging.StagedViewNoData:
+		_ = u.stagedViewLost(localPath, viewErr)
 		return
 	}
 	gen := meta.Generation
@@ -1195,16 +1183,25 @@ func (u *WriteBackUploader) applyPendingChmod(ctx context.Context, localPath str
 	return nil
 }
 
-// logStagedViewLoss names why a staged image was not uploaded. A consumed entry
-// is routine; a pruned or unreadable payload means the image the barrier was
-// asked to publish no longer exists and must not be reported as success.
-func logStagedViewLoss(site, path string, state staging.StagedViewState, err error) {
-	if state == staging.StagedViewNoMeta {
-		return
+// stagedViewLost records a staged image this process could not publish and
+// returns the error the caller should report. The record is what makes the
+// failure outlive the pruned pair: a retried barrier consults it.
+func (u *WriteBackUploader) stagedViewLost(localPath string, err error) error {
+	if err == nil {
+		err = errStagedViewUnavailable
 	}
-	if err != nil {
-		safeLogPrintf("writeback %s: staged image for %s is unreadable: %v", site, path, err)
-		return
+	if u.OnStagedViewLost != nil {
+		u.OnStagedViewLost(localPath, err)
 	}
-	safeLogPrintf("writeback %s: staged image for %s has no usable payload (torn or missing pair pruned)", site, path)
+	safeLogPrintf("writeback upload: staged image for %s is unavailable: %v", localPath, err)
+	return err
+}
+
+// pendingTerminalFailure returns a terminal failure already recorded for the
+// path, if any.
+func (u *WriteBackUploader) pendingTerminalFailure(localPath string) error {
+	if u.TerminalFailureForPath == nil {
+		return nil
+	}
+	return u.TerminalFailureForPath(localPath)
 }
