@@ -2852,7 +2852,13 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 		marked, err := cq.index.MarkConflictIfGeneration(entry.Path, entry.PendingIndexGen)
 		switch {
 		case err != nil:
-			safeLogPrintf("commit queue: conflict marker for %s failed: %v", entry.Path, err)
+			// No durable fence was established, so the pending entry must not be
+			// deleted either: keep it for retry and make the failure visible to
+			// this path's barriers, which must not answer a durable success for
+			// an image whose replay source is still on disk.
+			keepPending = true
+			safeLogPrintf("commit queue: conflict marker for %s failed: %v (pending entry kept)", entry.Path, err)
+			cq.RecordTerminalFailureForPath(entry.Path, err)
 		case marked:
 			keepPending = true
 			safeLogPrintf("commit queue: shadow survived the cleanup for %s after a non-durable commit marker; pending entry kept conflicted", entry.Path)

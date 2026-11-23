@@ -659,6 +659,12 @@ func New(opts Options) (*Writeback, error) {
 			}
 			return w.queue.PathTerminalFailure(localPath)
 		}
+		up.TerminalFailureSeq = func(localPath string) uint64 {
+			if w.queue == nil {
+				return 0
+			}
+			return w.queue.PathTerminalFailureSeq(localPath)
+		}
 		// The snapshot callback runs under the write-back cache's path lock at
 		// upload time: the failure stamp it captures is the one this landing
 		// may clear, and never a failure recorded after the upload started.

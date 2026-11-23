@@ -93,7 +93,10 @@ type WriteBackUploader struct {
 	// TerminalFailureForPath reports a terminal failure already recorded for a
 	// path (nil when there is none).
 	TerminalFailureForPath func(localPath string) error
-	OnSuccess              WriteBackSuccessFunc
+	// TerminalFailureSeq reports the sequence of that failure record, so a
+	// landing can clear exactly the failures it predates.
+	TerminalFailureSeq func(localPath string) uint64
+	OnSuccess          WriteBackSuccessFunc
 	// SnapshotStagingGens optionally captures the pendingIndex/shadowStore
 	// generations for a path so OnSuccess can do generation-guarded cleanup.
 	SnapshotStagingGens SnapshotStagingGensFunc
@@ -534,6 +537,13 @@ func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPat
 		}
 	}
 
+	// Snapshot the terminal-failure stamp BEFORE the remote write: OnSuccess
+	// clears a failure recorded before this landing, and must never clear one
+	// recorded after it started (a concurrent loss of a newer generation).
+	var failureSeq uint64
+	if u.TerminalFailureSeq != nil {
+		failureSeq = u.TerminalFailureSeq(localPath)
+	}
 	var committedRev int64
 	threshold := u.directPutThreshold()
 	useDirectPUT := meta.Size == 0 || (threshold > 0 && meta.Size < threshold)
@@ -584,7 +594,7 @@ func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPat
 			return 0, nil, fmt.Errorf("%w; mark chmod pending: %v", err, markErr)
 		}
 		if u.OnSuccess != nil {
-			u.OnSuccess(*meta, committedRev, StagingGens{WriteBackGen: gen})
+			u.OnSuccess(*meta, committedRev, StagingGens{WriteBackGen: gen, TerminalFailureSeq: failureSeq})
 		}
 		return 0, nil, err
 	}
@@ -596,7 +606,7 @@ func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPat
 		u.perf.uploaderSuccess.add(1)
 	}
 	if u.OnSuccess != nil {
-		u.OnSuccess(*meta, committedRev, StagingGens{WriteBackGen: gen})
+		u.OnSuccess(*meta, committedRev, StagingGens{WriteBackGen: gen, TerminalFailureSeq: failureSeq})
 	}
 	return committedRev, meta, nil
 }
