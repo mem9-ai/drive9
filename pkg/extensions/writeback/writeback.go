@@ -218,6 +218,13 @@ type Writeback struct {
 	uploader        *WriteBackUploader
 	// pathLocks serializes queue callbacks against same-path staging.
 	pathLocks stripedLocks
+	// viewLossMu/viewLossWitness keeps a bounded record of pruned staged pairs
+	// for stacks WITHOUT a commit queue (write-sync), whose barriers would
+	// otherwise read the loss as a completed upload. With a queue the record
+	// lives in its terminal-failure map instead.
+	viewLossMu      sync.Mutex
+	viewLossWitness map[string]error
+	viewLossOrder   []string
 	// live maps path → *bufferingHandle for open writers (Setattr deferral
 	// looks the current writer up by path).
 	live sync.Map
@@ -640,32 +647,22 @@ func New(opts Options) (*Writeback, error) {
 	}
 	if w.wbCache != nil {
 		// A staged pair dropped by a plain read (Get/GetView/ListPending) is the
-		// same loss a barrier must not report as success; route it into the
-		// commit queue's bounded terminal-failure map, which landings and
-		// cancellations already clear.
+		// same loss a barrier must not report as success. This is the SINGLE
+		// recorder for pruned pairs: it runs under the cache's path lock, before
+		// any same-path operation can read the pair as "nothing staged".
+		// Without a commit queue (write-sync stacks) the loss goes to a bounded
+		// in-process witness instead, so a retried barrier still fails.
 		w.wbCache.OnViewLost = func(remotePath string, err error) {
-			if w.queue == nil {
-				return
-			}
-			w.queue.RecordTerminalFailureForPath(remotePath, fmt.Errorf("%w: %w", errStagedViewLost, err))
+			w.recordViewLoss(remotePath, fmt.Errorf("%w: %w", errStagedViewLost, err))
 		}
 		workers := opts.UploadConcurrency
 		if workers <= 0 {
 			workers = defaultUploadConcurrency
 		}
 		up := NewWriteBackUploader(opts.Client, w.wbCache, workers, root)
-		// A staged pair this process cannot publish (pruned or unreadable) is a
-		// failure that must outlive the pair: the commit queue's bounded
-		// terminal-failure map is the existing home for that, and its landings
-		// and cancellations already clear it.
-		up.OnStagedViewLost = func(localPath string, err error) {
-			if w.queue != nil {
-				w.queue.RecordTerminalFailureForPath(localPath, err)
-			}
-		}
 		up.TerminalFailureForPath = func(localPath string) error {
 			if w.queue == nil {
-				return nil
+				return w.viewLoss(localPath)
 			}
 			return w.queue.PathTerminalFailure(localPath)
 		}
@@ -780,6 +777,9 @@ func New(opts Options) (*Writeback, error) {
 				w.queue.ClearTerminalFailureIfSeq(meta.Path, gens.TerminalFailureSeq)
 				w.queue.ResolveSupersededConflict(meta.Path, meta.SupersedesPendingGen)
 			}
+			// A landing supersedes a fallback witness for the path: the image
+			// the barrier needed is on the server.
+			w.clearViewLoss(meta.Path)
 		}
 		w.uploader = up
 		up.SetPerfCounters(w.perfShim)
@@ -3397,6 +3397,7 @@ func (h *bufferingHandle) Write(ctx context.Context, off int64, data []byte) err
 // facade's chain drain waits for the landing.
 func (h *bufferingHandle) DrainFlush(ctx context.Context) (err error) {
 	retainBuffer := false
+	useCache := true
 	h.mu.Lock()
 	staged, unlinked := h.stagedToCache, h.unlinked
 	dirty, uploadGen := h.dirty, h.wgen
@@ -3408,18 +3409,21 @@ func (h *bufferingHandle) DrainFlush(ctx context.Context) (err error) {
 		// the latter would report a durable drain that never happened.
 		// A failed drain keeps the staged image available to Release or retry.
 		defer func() {
-			if err != nil {
+			if err != nil && useCache {
 				// Keep the staged image available to Release or a retry. No
 				// GetMeta gate: a pair pruned as damaged would otherwise leave
 				// stagedToCache false, and the next DrainFlush would wait on the
 				// path without checking the recorded failure and report a
 				// durable drain.
+				// Only for the write-cache track: a bypassed image was handed to
+				// the commit queue (which owns it), so restoring the flag here
+				// would make every retry re-enter the cache path and fail with
+				// errLedgerOwned instead of waiting on the queue.
 				h.mu.Lock()
 				h.stagedToCache = !h.unlinked
 				h.mu.Unlock()
 			}
 		}()
-		useCache := true
 		if dirty {
 			snapshot, stageErr := h.stageToWriteCache(ctx, stageFullDurable)
 			if errors.Is(stageErr, errWriteCacheBypass) {
@@ -3468,6 +3472,13 @@ func (h *bufferingHandle) DrainFlush(ctx context.Context) (err error) {
 	}
 	if !h.w.waitPathCommit(h.path) {
 		return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
+	}
+	// The queue finished the path, but "finished" includes a terminal failure:
+	// reporting success here would certify a file whose image never landed.
+	if h.w.queue != nil {
+		if ferr := h.w.queue.PathTerminalFailure(h.path); ferr != nil {
+			return ferr
+		}
 	}
 	return nil
 }

@@ -85,11 +85,6 @@ type WriteBackUploader struct {
 	batchSem      chan struct{}
 
 	perf *fusePerfCounters
-	// OnStagedViewLost records that a staged image could not be published
-	// because its pair was pruned or unreadable. Writeback wires it to the
-	// commit queue's terminal-failure map, so a barrier that retries after the
-	// prune still fails instead of reading "nothing staged" as success.
-	OnStagedViewLost func(localPath string, err error)
 	// TerminalFailureForPath reports a terminal failure already recorded for a
 	// path (nil when there is none).
 	TerminalFailureForPath func(localPath string) error
@@ -551,9 +546,13 @@ func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPat
 	}
 
 	// The stamp must predate the remote write: OnSuccess clears a failure
-	// recorded before this landing, never one recorded after it started.
+	// recorded before this landing, never one recorded after it started. It is
+	// read inside the snapshot callback (under the cache path lock) only; the
+	// unlocked fallback that used to run here could capture a failure a
+	// concurrent newer write recorded after this snapshot was taken, and clear
+	// it when this older image landed.
 	failureSeq := syncGens.TerminalFailureSeq
-	if failureSeq == 0 && u.TerminalFailureSeq != nil {
+	if failureSeq == 0 && u.SnapshotStagingGens == nil && u.TerminalFailureSeq != nil {
 		failureSeq = u.TerminalFailureSeq(localPath)
 	}
 	successGens := syncGens
@@ -1208,17 +1207,16 @@ func (u *WriteBackUploader) applyPendingChmod(ctx context.Context, localPath str
 	return nil
 }
 
-// stagedViewLost records a staged image this process could not publish and
-// returns the error the caller should report. The record is what makes the
-// failure outlive the pruned pair: a retried barrier consults it.
+// stagedViewLost reports a staged image this process could not publish and
+// returns the error the caller should report. Recording is NOT done here: the
+// write cache is the single recorder for pruned pairs (WriteBackCache.OnViewLost
+// fires under the path lock), and recording again would double the event and
+// stamp a permanent failure on transient read errors it kept the entry for.
 func (u *WriteBackUploader) stagedViewLost(localPath string, err error) error {
 	if err == nil {
 		err = errStagedViewUnavailable
 	}
 	err = fmt.Errorf("%w: %w", errStagedViewLost, err)
-	if u.OnStagedViewLost != nil {
-		u.OnStagedViewLost(localPath, err)
-	}
 	safeLogPrintf("writeback upload: staged image for %s is unavailable: %v", localPath, err)
 	return err
 }

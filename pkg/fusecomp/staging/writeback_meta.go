@@ -43,12 +43,6 @@ const (
 	// PendingChmod means file data has already been uploaded remotely, but
 	// the post-upload chmod step still needs to be retried.
 	PendingChmod
-	// PendingCommitted fences a landed image whose WAL commit marker could not
-	// be made durable while its shadow survived: replay must not resurrect the
-	// pre-commit image from that shadow. Unlike PendingConflict this is NOT a
-	// failure — the upload landed, later staging overwrites it freely, and
-	// barriers report success.
-	PendingCommitted
 )
 
 // writeBackInMemoryDataThreshold is the maximum cached write-back payload size
@@ -93,16 +87,15 @@ type WriteBackCache struct {
 	// unsynced tracks entries written with wbSyncNone whose .dat/.meta files
 	// have not yet been covered by SyncPending.
 	unsynced map[string]uint64
-	// viewLossEvents records prunes that dropped a staged pair, so the caller
-	// can report them after releasing c.mu. PendingChmod entries never land
-	// here: their missing .dat is by design.
-	viewLossEvents []stagedViewLoss
 	// OnViewLost reports a pruned staged pair to the owner (the write-back
 	// engine records it as a terminal failure so a barrier on the path fails
-	// instead of reading "nothing staged" as success). It is invoked with c.mu
-	// released but the per-path lock still held, and it must stay non-blocking:
-	// the record has to be visible before another same-path operation can
-	// observe the pruned pair as "nothing staged".
+	// instead of reading "nothing staged" as success). It is the ONLY recorder
+	// for pruned pairs: callers invoke it with c.mu released but the per-path
+	// lock still held, so the record exists before another same-path operation
+	// can observe the pruned pair as "nothing staged". It must stay
+	// non-blocking, and it is never invoked for a transient read error (the
+	// entry is kept, so a retry can still succeed). PendingChmod entries never
+	// reach it: their missing .dat is by design.
 	OnViewLost func(remotePath string, err error)
 	syncMu     sync.Mutex
 	durableGen atomic.Uint64
@@ -612,19 +605,18 @@ func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimingsNoSyncCacheLineag
 func (c *WriteBackCache) Get(remotePath string) ([]byte, bool) {
 	pl := c.AcquirePathLock(remotePath)
 	c.mu.Lock()
-	data, ok := c.getViewLocked(remotePath)
-	if !ok {
-		c.mu.Unlock()
-		// Report under the path lock: a same-path barrier that took the lock
-		// after this point must already see the loss record, or it would read
-		// the pruned pair as "another upload consumed it" and report success.
-		c.flushViewLoss()
+	data, state, viewErr, pruned := c.getViewStateLocked(remotePath)
+	c.mu.Unlock()
+	if state != StagedViewOK {
+		// Report while the path lock is still held: a same-path barrier that
+		// takes the lock after this point must already see the loss record, or
+		// it would read the pruned pair as "another upload consumed it".
+		c.reportViewLoss(remotePath, pruned, viewErr)
 		c.ReleasePathLock(remotePath, pl)
 		return nil, false
 	}
 	copyData := make([]byte, len(data))
 	copy(copyData, data)
-	c.mu.Unlock()
 	c.ReleasePathLock(remotePath, pl)
 	return copyData, true
 }
@@ -636,14 +628,15 @@ func (c *WriteBackCache) Get(remotePath string) ([]byte, bool) {
 func (c *WriteBackCache) GetView(remotePath string) ([]byte, bool) {
 	pl := c.AcquirePathLock(remotePath)
 	c.mu.Lock()
-	data, ok := c.getViewLocked(remotePath)
+	data, state, viewErr, pruned := c.getViewStateLocked(remotePath)
 	c.mu.Unlock()
-	// Same rule as Get: a prune this read performed is reported before the
-	// path lock is released, so a concurrent barrier cannot treat the missing
-	// record as a completed upload.
-	c.flushViewLoss()
+	if state != StagedViewOK {
+		c.reportViewLoss(remotePath, pruned, viewErr)
+		c.ReleasePathLock(remotePath, pl)
+		return nil, false
+	}
 	c.ReleasePathLock(remotePath, pl)
-	return data, ok
+	return data, true
 }
 
 // GetMeta reads the metadata for remotePath. Returns nil, false if not cached.
@@ -694,8 +687,8 @@ func (c *WriteBackCache) GetMetaAndView(remotePath string) (*WriteBackMeta, []by
 }
 
 // errStagedViewTorn reports a staged pair whose data no longer matches its
-// metadata binding; it is pruned and remembered so a retried barrier cannot
-// treat the missing record as success.
+// metadata binding. The pair is pruned and reported to the owner, so a retried
+// barrier cannot treat the missing record as a successful landing.
 var errStagedViewTorn = errors.New("staged image failed its meta/data binding")
 
 // StagedViewState explains why a staged meta+data read did not produce a pair.
@@ -755,23 +748,24 @@ func (c *WriteBackCache) getMetaAndView(remotePath string, onLocked func()) (*Wr
 		c.mu.Unlock()
 		return &cp, nil, StagedViewPendingChmod, nil
 	}
-	data, state, viewErr := c.getViewStateLocked(remotePath)
+	data, state, viewErr, pruned := c.getViewStateLocked(remotePath)
 	c.mu.Unlock()
 
 	if state != StagedViewOK {
-		c.flushViewLoss()
+		c.reportViewLoss(remotePath, pruned, viewErr)
 		return nil, nil, state, viewErr
 	}
 
 	// Invoke the callback while the path lock is still held so staging-gen
-	// snapshots are consistent with this meta+data read.
+	// snapshots are consistent with this meta+data read. Any loss report has
+	// already run by now, so the snapshot cannot capture a sequence number
+	// that a later drain would then exceed.
 	if onLocked != nil {
 		onLocked()
 	}
 
 	dataCopy := make([]byte, len(data))
 	copy(dataCopy, data)
-	c.flushViewLoss()
 	return &cp, dataCopy, StagedViewOK, nil
 }
 
@@ -1198,10 +1192,21 @@ func (c *WriteBackCache) ListByPrefix(prefix string) []*WriteBackMeta {
 // It also reconciles any on-disk .meta files not yet in memory so crash
 // recovery and corruption cleanup keep the legacy behavior on this cold path.
 func (c *WriteBackCache) ListPending() []PendingEntry {
+	type prunedView struct {
+		path string
+		err  error
+	}
+	var pruned []prunedView
 	c.mu.Lock()
 	defer func() {
 		c.mu.Unlock()
-		c.flushViewLoss()
+		// Report each prune under its own path lock, so a barrier that races
+		// recovery cannot read the dropped pair as a consumed one.
+		for _, p := range pruned {
+			pl := c.AcquirePathLock(p.path)
+			c.reportViewLoss(p.path, true, p.err)
+			c.ReleasePathLock(p.path, pl)
+		}
 	}()
 
 	entries, err := os.ReadDir(c.dir)
@@ -1241,10 +1246,9 @@ func (c *WriteBackCache) ListPending() []PendingEntry {
 
 	result := make([]PendingEntry, 0, len(c.metas))
 	for path, meta := range c.metas {
-		if meta.Kind == PendingConflict || meta.Kind == PendingChmod || meta.Kind == PendingCommitted {
+		if meta.Kind == PendingConflict || meta.Kind == PendingChmod {
 			// Not recoverable upload work: a conflict is preserved for manual
-			// recovery, a chmod has no payload, and a committed fence describes
-			// an image that already landed.
+			// recovery and a chmod has no payload.
 			continue
 		}
 		datPath := c.DatFile(path)
@@ -1254,7 +1258,7 @@ func (c *WriteBackCache) ListPending() []PendingEntry {
 			// loss so a barrier that later finds nothing staged does not read
 			// it as success.
 			c.pruneEntryLocked(path, false)
-			c.recordViewLossLocked(path, os.ErrNotExist)
+			pruned = append(pruned, prunedView{path: path, err: os.ErrNotExist})
 			continue
 		}
 		// Recovery admits the payload through the same binding check as
@@ -1264,7 +1268,7 @@ func (c *WriteBackCache) ListPending() []PendingEntry {
 		// new base revision instead of pruning the pair.
 		if !viewMatchesMeta(meta, data) {
 			c.pruneEntryLocked(path, true)
-			c.recordViewLossLocked(path, errStagedViewTorn)
+			pruned = append(pruned, prunedView{path: path, err: errStagedViewTorn})
 			continue
 		}
 
@@ -1584,77 +1588,61 @@ func (c *WriteBackCache) pruneEntryLocked(remotePath string, removeDataFile bool
 // writable-open preload — is protected at the one choke point. In-memory
 // payloads skip the check: they were either written by a put (bound by
 // construction) or admitted through this validated load.
-// stagedViewLoss is one prune that dropped a staged pair.
-type stagedViewLoss struct {
-	path string
-	err  error
-}
-
-// recordViewLossLocked queues a loss report for the caller to flush after it
-// releases c.mu (the hook may take other locks). Callers hold c.mu.
-func (c *WriteBackCache) recordViewLossLocked(remotePath string, err error) {
-	c.viewLossEvents = append(c.viewLossEvents, stagedViewLoss{path: remotePath, err: err})
-}
-
-// flushViewLoss invokes OnViewLost for every loss recorded since the last
-// flush. Callers MUST hold no cache lock — c.mu is taken here and the hook
-// runs unlocked — but a caller that can race a same-path barrier must still
-// hold the affected path lock while flushing, so the record exists before
-// another operation can read the pruned pair as "nothing staged".
-func (c *WriteBackCache) flushViewLoss() {
-	c.mu.Lock()
-	events := c.viewLossEvents
-	c.viewLossEvents = nil
-	hook := c.OnViewLost
-	c.mu.Unlock()
-	if hook == nil {
+// reportViewLoss forwards a prune to the owner. The caller holds the path
+// lock (c.mu released), so the record is visible to any same-path barrier that
+// follows. A transient read error never reports: the entry is kept and a retry
+// can still publish it.
+func (c *WriteBackCache) reportViewLoss(remotePath string, pruned bool, err error) {
+	if !pruned || c.OnViewLost == nil {
 		return
 	}
-	for _, e := range events {
-		hook(e.path, e.err)
+	if err == nil {
+		err = errStagedViewTorn
 	}
+	c.OnViewLost(remotePath, err)
 }
 
-func (c *WriteBackCache) getViewStateLocked(remotePath string) ([]byte, StagedViewState, error) {
+// getViewStateLocked reports the payload state for a path. pruned says the
+// record was dropped by this read (torn pair or missing .dat): a transient
+// read error keeps the entry and reports false.
+func (c *WriteBackCache) getViewStateLocked(remotePath string) ([]byte, StagedViewState, error, bool) {
 	if data, ok := c.data[remotePath]; ok {
 		c.touchDataLocked(remotePath)
-		return data, StagedViewOK, nil
+		return data, StagedViewOK, nil, false
 	}
 	meta, ok := c.metas[remotePath]
 	if !ok {
-		return nil, StagedViewNoMeta, nil
+		return nil, StagedViewNoMeta, nil, false
 	}
 	if meta.Kind == PendingChmod {
 		// Data already landed; only the mode is outstanding, so the .dat is
 		// absent by design. Reading it here would prune a healthy record.
-		return nil, StagedViewPendingChmod, nil
+		return nil, StagedViewPendingChmod, nil, false
 	}
 	data, err := os.ReadFile(c.DatFile(remotePath))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			c.pruneEntryLocked(remotePath, false)
-			c.recordViewLossLocked(remotePath, os.ErrNotExist)
-			return nil, StagedViewNoData, os.ErrNotExist
+			return nil, StagedViewNoData, os.ErrNotExist, true
 		}
 		// Kept: a transient read error is not evidence the image is gone.
-		return nil, StagedViewNoData, err
+		return nil, StagedViewNoData, err, false
 	}
 	if !viewMatchesMeta(meta, data) {
 		// Torn pair: drop it — losing the entry cleanly beats serving or
 		// uploading stale bytes at the new base.
 		c.pruneEntryLocked(remotePath, true)
-		c.recordViewLossLocked(remotePath, errStagedViewTorn)
-		return nil, StagedViewNoData, errStagedViewTorn
+		return nil, StagedViewNoData, errStagedViewTorn, true
 	}
 	c.cacheDataLocked(remotePath, data, meta.Size)
 	if cached, ok := c.data[remotePath]; ok {
-		return cached, StagedViewOK, nil
+		return cached, StagedViewOK, nil, false
 	}
-	return data, StagedViewOK, nil
+	return data, StagedViewOK, nil, false
 }
 
 func (c *WriteBackCache) getViewLocked(remotePath string) ([]byte, bool) {
-	data, state, _ := c.getViewStateLocked(remotePath)
+	data, state, _, _ := c.getViewStateLocked(remotePath)
 	if state != StagedViewOK {
 		return nil, false
 	}

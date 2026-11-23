@@ -24,7 +24,9 @@ type PendingIndex struct {
 	layerPublicationMu sync.RWMutex // rollback waits for publishers before dropping caches
 	mu                 sync.RWMutex
 	items              map[string]*WriteBackMeta // path → metadata
-	dir                string                    // directory for .meta persistence
+	fences             map[string]CommittedFence // path → landed replay fence (never a pending entry)
+	fencesLoaded       bool
+	dir                string // directory for .meta persistence
 	nextGen            atomic.Uint64
 	pathLocks          map[string]*pendingPathLock
 	// journal, when set, is the durable publication channel for new pending
@@ -57,6 +59,7 @@ func NewPendingIndex(dir string) (*PendingIndex, error) {
 	}
 	idx := &PendingIndex{
 		items:     make(map[string]*WriteBackMeta),
+		fences:    make(map[string]CommittedFence),
 		dir:       dir,
 		pathLocks: make(map[string]*pendingPathLock),
 	}
@@ -99,6 +102,10 @@ func (idx *PendingIndex) SetJournalSyncOnPut(on bool) {
 // RecoverFromDisk scans .meta files in the directory and rebuilds in-memory
 // state. Called once at startup for crash recovery.
 func (idx *PendingIndex) RecoverFromDisk() error {
+	// Fences first: a fence from a crashed process must be honored by replay
+	// (which may already have run), and it must never be turned back into a
+	// pending entry by a surviving .meta file.
+	idx.ensureCommittedFencesLoaded()
 	entries, err := os.ReadDir(idx.dir)
 	if err != nil {
 		return fmt.Errorf("pending index recovery: %w", err)
@@ -124,6 +131,14 @@ func (idx *PendingIndex) RecoverFromDisk() error {
 			continue
 		}
 		cp := meta
+		// A WAL-replayed entry may be newer than this .meta (replay can run
+		// before disk recovery): never downgrade it to the surviving file.
+		if current, ok := idx.items[meta.Path]; ok && current.Generation > meta.Generation {
+			if current.Generation > maxGen {
+				maxGen = current.Generation
+			}
+			continue
+		}
 		idx.items[meta.Path] = &cp
 		if meta.Generation > maxGen {
 			maxGen = meta.Generation
@@ -198,15 +213,14 @@ func (idx *PendingIndex) GetMeta(remotePath string) (*WriteBackMeta, bool) {
 	return &cp, true
 }
 
-// HasPending reports whether a pending entry exists for the path.
+// HasPending reports whether a pending entry exists for the path. A landed
+// replay fence is not an entry: it lives in the committed-fence map, so every
+// reader of items sees the path as clean.
 func (idx *PendingIndex) HasPending(remotePath string) bool {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	meta, ok := idx.items[remotePath]
-	// A landed image fenced only for replay is not a pending upload: readers
-	// and preload paths must treat the path as clean, and the next staging
-	// overwrites the fence.
-	return ok && meta.Kind != PendingCommitted
+	_, ok := idx.items[remotePath]
+	return ok
 }
 
 // Remove deletes metadata for the given path from memory and disk.
@@ -214,6 +228,10 @@ func (idx *PendingIndex) Remove(remotePath string) {
 	pl := idx.acquirePathLock(remotePath)
 	idx.mu.Lock()
 	delete(idx.items, remotePath)
+	// The name's incarnation ended: a landed-replay fence would otherwise keep
+	// a later re-creation of this path from being recovered.
+	idx.ensureCommittedFencesLoadedLocked()
+	idx.clearCommittedFenceLocked(remotePath)
 	idx.mu.Unlock()
 
 	metaPath := filepath.Join(idx.dir, HashPath(remotePath)+".meta")
@@ -239,6 +257,7 @@ func (idx *PendingIndex) RemoveIfGeneration(remotePath string, expectedGen uint6
 		return false
 	}
 	delete(idx.items, remotePath)
+	idx.clearCommittedFenceLocked(remotePath)
 	idx.mu.Unlock()
 
 	metaPath := filepath.Join(idx.dir, HashPath(remotePath)+".meta")
@@ -1029,45 +1048,52 @@ func (idx *PendingIndex) MarkConflictIfGeneration(remotePath string, expectedGen
 	return false, nil
 }
 
-// MarkCommittedIfGeneration records the non-failure replay fence for a landed
-// image whose commit marker was not durable: it tells journal replay to reject
-// the older frames for this path without marking the entry conflicted (which
-// would surface EIO for a commit that succeeded and would be re-applied to the
-// handle's next staging).
-func (idx *PendingIndex) MarkCommittedIfGeneration(remotePath string, expectedGen uint64) (bool, error) {
+// MarkCommittedIfGeneration records the landed-image replay fence for a path
+// whose commit marker could not be made durable. It writes a dedicated fence
+// record and then deletes the pending entry, so no live reader can observe the
+// landed image as pending work, and the fence cannot be clobbered by, or
+// clobber, a newer WAL publication on the next recovery.
+//
+// The fence is durable before the entry is dropped: if the write fails the
+// entry stays pending for a retry, which is what keeps a crash from losing the
+// local image without a fence.
+func (idx *PendingIndex) MarkCommittedIfGeneration(remotePath string, expectedGen uint64, shadowGen ContentGen) (bool, error) {
 	if expectedGen == 0 {
 		return false, nil
 	}
 	pl := idx.acquirePathLock(remotePath)
 	defer idx.releasePathLock(remotePath, pl)
 
-	idx.mu.RLock()
+	idx.mu.Lock()
+	idx.ensureCommittedFencesLoadedLocked()
 	meta, ok := idx.items[remotePath]
-	if !ok {
-		idx.mu.RUnlock()
+	if !ok || meta.Generation != expectedGen {
+		idx.mu.Unlock()
 		return false, nil
 	}
-	if meta.Generation != expectedGen {
-		idx.mu.RUnlock()
-		return false, nil
-	}
-	committed := *meta
-	committed.Kind = PendingCommitted
-	idx.mu.RUnlock()
+	fence := CommittedFence{Path: remotePath, Generation: expectedGen, ShadowGen: shadowGen}
+	journal := idx.journal
+	idx.mu.Unlock()
 
-	metaBytes, err := json.Marshal(&committed)
+	if journal != nil {
+		fence.JournalSeq = journal.CurrentSeq()
+	}
+	raw, err := json.Marshal(&fence)
 	if err != nil {
 		return false, fmt.Errorf("pending index marshal committed fence: %w", err)
 	}
-	metaPath := filepath.Join(idx.dir, HashPath(remotePath)+".meta")
-	if err := atomicWrite(metaPath, metaBytes); err != nil {
+	if err := atomicWrite(idx.fenceFile(remotePath), raw); err != nil {
 		return false, fmt.Errorf("pending index write committed fence: %w", err)
 	}
 
 	idx.mu.Lock()
 	if m, exists := idx.items[remotePath]; exists && m.Generation == expectedGen {
-		m.Kind = PendingCommitted
+		delete(idx.items, remotePath)
+		idx.fences[remotePath] = fence
 		idx.mu.Unlock()
+		// The entry is gone from memory under the same path lock the fence
+		// write took, so this disk removal cannot race a newer .meta.
+		_ = os.Remove(filepath.Join(idx.dir, HashPath(remotePath)+".meta"))
 		return true, nil
 	}
 	idx.mu.Unlock()
@@ -1222,6 +1248,12 @@ func (idx *PendingIndex) publishMeta(meta *WriteBackMeta, onlyIfAbsent bool) (ui
 
 	idx.mu.Lock()
 	idx.items[remotePath] = meta
+	// A newer staging supersedes a landed-replay fence for the path: the fence
+	// only masks frames at or below its own generation, and leaving it would
+	// keep suppressing nothing while still pinning a stale shadow at settle.
+	// Fences are loaded by recovery before any staging publication, so an
+	// unloaded map here means nothing to clear.
+	idx.clearCommittedFenceLocked(remotePath)
 	idx.mu.Unlock()
 
 	return gen, nil
@@ -1243,6 +1275,13 @@ func (idx *PendingIndex) publishRecoveredMeta(metaBytes []byte) error {
 		return fmt.Errorf("recovered meta has empty path")
 	}
 	idx.mu.Lock()
+	idx.ensureCommittedFencesLoadedLocked()
+	if fence, fenced := idx.fences[meta.Path]; fenced && meta.Generation != 0 && meta.Generation <= fence.Generation {
+		// The image landed and the fence outranks this frame: never reinstall
+		// it as pending work, whatever order replay and disk recovery ran in.
+		idx.mu.Unlock()
+		return nil
+	}
 	idx.items[meta.Path] = &meta
 	// Future publication must not reuse a generation restored from the WAL.
 	for previous := idx.nextGen.Load(); previous < meta.Generation; previous = idx.nextGen.Load() {

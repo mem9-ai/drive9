@@ -59,13 +59,20 @@ func NewStagingWithQuota(dir string, freeRatio float64, sizeMB int64) (*Staging,
 	return &Staging{Shadow: shadow, Pending: pending, Journal: journal}, nil
 }
 
-// Recover replays the journal into the pending index. Call once at mount,
-// before any plugin stages.
+// Recover replays the journal into the pending index and then retires the
+// landed-image fences the replay honored. Call once at mount, before any plugin
+// stages.
 func (s *Staging) Recover() error {
 	if s == nil || s.Journal == nil || s.Pending == nil {
 		return nil
 	}
-	return ReplayJournalIntoPending(s.Journal, s.Pending, s.Shadow)
+	if err := ReplayJournalIntoPending(s.Journal, s.Pending, s.Shadow); err != nil {
+		return err
+	}
+	// Fences must outlive the replay that consulted them: settling appends the
+	// durable commit marker and drops the shadow first, so a crash here leaves
+	// the fence for the next start instead of resurrecting the landed image.
+	return s.Pending.SettleCommittedFences(s.Journal, s.Shadow)
 }
 
 // Compact drops journal frames already covered by commit markers.

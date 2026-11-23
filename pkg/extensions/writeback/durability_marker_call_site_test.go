@@ -2,7 +2,7 @@ package writeback
 
 import (
 	"context"
-	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -102,7 +102,8 @@ func TestOnCommitSuccessCleansUpWhenTheMarkerCannotSync(t *testing.T) {
 
 // TestUploadSyncReportsPrunedStagedImage pins the barrier: a staged pair that
 // was torn and pruned means the only copy is gone, so the synchronous upload
-// must fail — and record the loss where a retried barrier can still see it.
+// must fail — and the cache must have recorded the loss (under its path lock,
+// before the read returns) where a retried barrier can still see it.
 func TestUploadSyncReportsPrunedStagedImage(t *testing.T) {
 	const path = "/torn.txt"
 	cache, err := staging.NewWriteBackCache(t.TempDir())
@@ -113,33 +114,25 @@ func TestUploadSyncReportsPrunedStagedImage(t *testing.T) {
 	if err := cache.Put(path, payload, int64(len(payload)), staging.PendingNew); err != nil {
 		t.Fatal(err)
 	}
+	// The cache is the single recorder: mirror what Writeback wires.
+	recorded := make(map[string]error)
+	cache.OnViewLost = func(p string, err error) {
+		recorded[p] = fmt.Errorf("%w: %w", errStagedViewLost, err)
+	}
 	// Drop the in-memory copy so the next view load reads the .dat file, then
 	// rewrite it so its checksum no longer matches the metadata binding.
 	cache.DropInMemoryPayload(path)
 	if err := os.WriteFile(cache.DatFile(path), []byte("different bytes!"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	type loss struct {
-		path string
-		err  error
-	}
-	var lost []loss
 	u := NewWriteBackUploader(nil, cache, 1)
-	u.OnStagedViewLost = func(p string, err error) { lost = append(lost, loss{p, err}) }
-	u.TerminalFailureForPath = func(p string) error {
-		for _, l := range lost {
-			if l.path == p {
-				return l.err
-			}
-		}
-		return nil
-	}
+	u.TerminalFailureForPath = func(p string) error { return recorded[p] }
 	ctx := context.Background()
 	if _, err := u.UploadSyncWithRevision(ctx, path); err == nil {
 		t.Fatal("first UploadSyncWithRevision over a torn pair = nil, want an error")
 	}
-	if len(lost) != 1 || lost[0].path != path {
-		t.Fatalf("recorded losses = %+v, want one record for %s", lost, path)
+	if _, ok := recorded[path]; !ok {
+		t.Fatalf("the prune was not recorded: %+v", recorded)
 	}
 	// The retry finds nothing staged, but the recorded loss must keep the
 	// barrier failing instead of reading the prune as "already uploaded".
@@ -150,10 +143,11 @@ func TestUploadSyncReportsPrunedStagedImage(t *testing.T) {
 
 // TestRetainedShadowIsFencedAsCommitted pins the retained-shadow branch of the
 // commit-marker failure path: when the marker cannot be made durable and this
-// landing deliberately kept the shadow, the pending entry must stay on disk
-// with a PendingCommitted fence. Recovery skips it instead of re-uploading the
-// landed image, and the fence is not a failure — a later staging overwrites it
-// and the path's barriers keep reporting success.
+// landing deliberately kept the shadow, the path gets a durable landed fence
+// and its pending entry is retired. Recovery skips the landed image instead of
+// re-uploading it from the surviving shadow, every live reader sees the path as
+// clean, and the fence is not a failure — the path's barriers keep reporting
+// success.
 func TestRetainedShadowIsFencedAsCommitted(t *testing.T) {
 	const path = "/retained.txt"
 	payload := []byte("retained image")
@@ -167,8 +161,7 @@ func TestRetainedShadowIsFencedAsCommitted(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { shadow.Close() })
-	pendingDir := t.TempDir()
-	pending, err := staging.NewPendingIndex(pendingDir)
+	pending, err := staging.NewPendingIndex(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,6 +176,8 @@ func TestRetainedShadowIsFencedAsCommitted(t *testing.T) {
 	cq := NewCommitQueue(nil, shadow, pending, j, 1, 8)
 	// The staging handle kept newer bytes for this landing.
 	cq.retainedShadows.Store(path, shadowGen)
+	// The fence must capture the newest journal sequence it was written after.
+	seqAtFence := j.CurrentSeq()
 	// A closed journal makes the commit marker non-durable deterministically.
 	if err := j.Close(); err != nil {
 		t.Fatal(err)
@@ -195,30 +190,34 @@ func TestRetainedShadowIsFencedAsCommitted(t *testing.T) {
 		PendingIndexGen: pendingGen,
 	}
 	if err := cq.onCommitSuccess(entry, 0, 1); err != nil {
-		t.Fatalf("onCommitSuccess = %v, want nil (the fault is logged, the fence is a conflict marker)", err)
+		t.Fatalf("onCommitSuccess = %v, want nil (the fault is logged, the landing is fenced)", err)
 	}
 
-	meta, ok := pending.GetMeta(path)
-	if !ok || meta == nil {
-		t.Fatal("pending entry was deleted: the retained shadow is now an unfenced replay source")
+	// The landed image is not pending work: every live reader must see a clean
+	// path, or rename/unlink/overlay paths would treat it as an upload to
+	// settle.
+	if meta, ok := pending.GetMeta(path); ok {
+		t.Fatalf("pending entry survived the fence: %+v", meta)
 	}
-	if meta.Kind != staging.PendingCommitted {
-		t.Fatalf("pending kind = %v, want PendingCommitted", meta.Kind)
+	if pending.HasPending(path) {
+		t.Fatal("HasPending reports the landed image as pending work")
+	}
+	if n := pending.Count(); n != 0 {
+		t.Fatalf("pending count = %d after the fence, want 0", n)
+	}
+	// The fence itself must be durable and generation-scoped, and it must not
+	// read as a terminal failure: the upload landed.
+	fence, ok := pending.CommittedFence(path)
+	if !ok {
+		t.Fatal("no landed fence was recorded for the path")
+	}
+	if fence.Generation != pendingGen || fence.ShadowGen != shadowGen {
+		t.Fatalf("fence = %+v, want generation %d and shadow %d", fence, pendingGen, shadowGen)
+	}
+	if fence.JournalSeq != seqAtFence {
+		t.Fatalf("fence journal seq = %d, want %d (the frames it masks)", fence.JournalSeq, seqAtFence)
 	}
 	if err := cq.PathTerminalFailure(path); err != nil {
 		t.Fatalf("PathTerminalFailure after a landed commit = %v, want nil", err)
-	}
-	// The marker must be on disk, not only in memory: recovery reads the .meta
-	// file, not this process's map.
-	raw, err := os.ReadFile(filepath.Join(pendingDir, staging.HashPath(path)+".meta"))
-	if err != nil {
-		t.Fatalf("read persisted pending meta: %v", err)
-	}
-	var diskMeta staging.WriteBackMeta
-	if err := json.Unmarshal(raw, &diskMeta); err != nil {
-		t.Fatalf("decode persisted pending meta: %v", err)
-	}
-	if diskMeta.Kind != staging.PendingCommitted {
-		t.Fatalf("persisted pending kind = %v, want PendingCommitted", diskMeta.Kind)
 	}
 }

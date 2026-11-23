@@ -77,6 +77,16 @@ type Journal struct {
 	doneGen uint64
 }
 
+// CurrentSeq reports the highest sequence number this journal has appended.
+// A committed fence captures it so recovery can tell the frames the fence
+// masks (at or below it) from writes that happened after the landing.
+func (j *Journal) CurrentSeq() uint64 {
+	if j == nil {
+		return 0
+	}
+	return j.seq.Load()
+}
+
 // NewJournal opens or creates a journal WAL file at the given path. The
 // sequence counter resumes from the highest Seq already on disk so that
 // appends before any Replay never reuse sequence numbers.
@@ -164,12 +174,26 @@ func ReplayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStor
 				return fmt.Errorf("journal replay resurrect %s: %w", path, err)
 			}
 		}
+		// A landed-image fence masks exactly the frames it was written after:
+		// a pending-meta frame at or below the fenced generation, and a data
+		// frame at or below the journal sequence current at fence time. Newer
+		// frames are a later write that was acknowledged before the crash, so
+		// they must replay — dropping them would lose fsync'd data.
+		if fence, ok := idx.CommittedFence(path); ok {
+			masked := false
+			if fromMeta {
+				masked = meta.Generation != 0 && meta.Generation <= fence.Generation
+			} else {
+				masked = fence.JournalSeq != 0 && e.Seq <= fence.JournalSeq
+			}
+			if masked {
+				return nil
+			}
+		}
 		if current, ok := idx.GetMeta(path); ok {
-			// A fence record is terminal for replay: PendingCommitted means the
-			// image landed and only the marker was not durable, PendingConflict
-			// means the image must not be published at all. Neither may be
-			// displaced by an older WAL frame, whatever its timestamp.
-			if current.Kind == PendingCommitted || current.Kind == PendingConflict {
+			// A conflict record is terminal for replay: the image must not be
+			// published at all, and no older WAL frame may displace it.
+			if current.Kind == PendingConflict {
 				return nil
 			}
 			// .meta and .dat may be an older best-effort snapshot even though

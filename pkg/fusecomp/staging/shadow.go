@@ -1139,7 +1139,12 @@ func (s *ShadowStore) RemoveIfGenerationDurable(remotePath string, expectedGen C
 	if !ok {
 		return false, nil
 	}
-	s.runRemoveCleanup(cleanup)
+	// The unlink/retire verdict comes back under the path lock the removal
+	// took: checking for the file afterwards would race a concurrent spill that
+	// legitimately created a fresher shadow.
+	if rerr := s.runRemoveCleanupChecked(cleanup); rerr != nil {
+		return true, fmt.Errorf("remove shadow %s: %w", remotePath, rerr)
+	}
 	if derr := fsyncDir(s.dir); derr != nil {
 		return true, fmt.Errorf("shadow dir sync after removing %s: %w", remotePath, derr)
 	}
@@ -2068,6 +2073,35 @@ func (s *ShadowStore) runRemoveCleanup(cleanup shadowRemoveCleanup) {
 		// Has()/ReadAt()/ReadAll() fallback paths.
 		_ = os.Remove(cleanup.immediatePath)
 	}
+}
+
+// runRemoveCleanupChecked is runRemoveCleanup with the on-disk verdict: it
+// reports why the bytes may still be there, for callers whose crash reasoning
+// depends on the removal actually having happened.
+func (s *ShadowStore) runRemoveCleanupChecked(cleanup shadowRemoveCleanup) error {
+	if cleanup.removedSize > 0 {
+		s.pendingBytes.Add(-cleanup.removedSize)
+	}
+	if cleanup.retire {
+		if err := os.Rename(cleanup.srcDiskPath, cleanup.retiredPath); err != nil {
+			if rerr := os.Remove(cleanup.srcDiskPath); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+				if cleanup.retired != nil {
+					close(cleanup.retired.cleanupDone)
+				}
+				return rerr
+			}
+		}
+		if cleanup.retired != nil {
+			close(cleanup.retired.cleanupDone)
+		}
+		return nil
+	}
+	if cleanup.immediatePath != "" {
+		if err := os.Remove(cleanup.immediatePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *ShadowStore) remove(remotePath string, expectedGen ContentGen, reason shadowRetirementReason) bool {

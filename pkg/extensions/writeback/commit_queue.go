@@ -1346,13 +1346,6 @@ func (cq *CommitQueue) recoveredEntry(path string) *CommitEntry {
 	if !ok || meta.LayerClean {
 		return nil
 	}
-	if meta.Kind == staging.PendingCommitted {
-		// The image landed; this record only fences replay against the shadow
-		// that outlived a non-durable commit marker. Nothing to re-upload.
-		safeLogPrintf("commit queue: dropping landed replay fence for %s", path)
-		cq.index.RemoveIfGeneration(path, meta.Generation)
-		return nil
-	}
 	if meta.Kind == staging.PendingConflict {
 		// A conflict marker is preserved even without a shadow: the
 		// transfer transaction stages one at the destination deliberately
@@ -2829,7 +2822,7 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 	// source. Two cases keep it: a staging handle that retained newer bytes,
 	// and a removal that failed while the commit marker is not durable. Both
 	// must be detected BEFORE the pending entry is deleted, because that
-	// deletion is what makes a later conflict marker a silent no-op.
+	// deletion is what makes a later landed fence a silent no-op.
 	retained := false
 	removalFailed := false
 	if cq.shadows != nil && cq.layerRefSnapshot() == "" {
@@ -2846,12 +2839,13 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 				// whose pending entry is about to be deleted. Only a removal
 				// this entry performed counts — a newer generation that already
 				// replaced entry.ShadowGen owns the file.
+				// The durable removal reports its own verdict (under the shadow
+				// path lock). VerifyRemoved used to check from outside that lock
+				// and raced a concurrent spill, reporting a false failure.
 				removed, derr := cq.shadows.RemoveIfGenerationDurable(entry.Path, entry.ShadowGen)
-				if removed && (derr != nil || cq.shadows.VerifyRemoved(entry.Path) != nil) {
+				if removed && derr != nil {
 					removalFailed = true
-					if derr != nil {
-						safeLogPrintf("commit queue: shadow removal for %s was not made durable: %v", entry.Path, derr)
-					}
+					safeLogPrintf("commit queue: shadow removal for %s was not made durable: %v", entry.Path, derr)
 				}
 			} else {
 				cq.shadows.RemoveIfGeneration(entry.Path, entry.ShadowGen)
@@ -2861,12 +2855,12 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 	keepPending := false
 	if markerErr != nil && (retained || removalFailed) && cq.index != nil && entry.PendingIndexGen != 0 {
 		// The marker is not durable and the local image survived the cleanup:
-		// keep the pending entry, fenced by a committed marker. Recovery skips a
-		// PendingCommitted entry (recoveredEntry), so the landed image is not
-		// re-uploaded and the surviving shadow cannot resurrect it. The
-		// generation-scoped form is required: an unscoped MarkConflict would
-		// poison a newer generation that already replaced this one.
-		marked, err := cq.index.MarkCommittedIfGeneration(entry.Path, entry.PendingIndexGen)
+		// record a landed replay fence. The fence is a separate durable record,
+		// so the pending entry is retired (readers see the path as clean) while
+		// recovery still refuses to re-upload the landed image from the
+		// surviving shadow. Generation-scoped on both sides: a newer staging
+		// that already replaced this one is never suppressed by it.
+		marked, err := cq.index.MarkCommittedIfGeneration(entry.Path, entry.PendingIndexGen, entry.ShadowGen)
 		switch {
 		case err != nil:
 			// No durable fence was established, so the pending entry must not be
@@ -2874,7 +2868,6 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 			keepPending = true
 			safeLogPrintf("commit queue: replay fence for %s failed: %v (pending entry kept)", entry.Path, err)
 		case marked:
-			keepPending = true
 			safeLogPrintf("commit queue: shadow survived the cleanup for %s after a non-durable commit marker; replay fenced as committed", entry.Path)
 		}
 	}
@@ -3991,8 +3984,6 @@ func (cq *CommitQueue) PathTerminalFailure(path string) error {
 		if meta, found := cq.index.GetMeta(path); found && meta != nil && meta.Kind == staging.PendingConflict {
 			return errCommitTerminalRecovered
 		}
-		// A PendingCommitted fence describes a landed image; its barrier
-		// success is not a failure.
 	}
 	return nil
 }
