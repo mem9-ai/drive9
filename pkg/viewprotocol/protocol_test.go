@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -133,86 +135,24 @@ func TestParseFenceHeaderAndViewRoute(t *testing.T) {
 }
 
 func TestClassifyClientAndViewDataRoutes(t *testing.T) {
-	layerID := "layer_01j8z4r9w3m5n7p9q2s4t6v8xz"
-
-	// Set A: pass-through on client, rejected inside /v1/views/{id}.
-	passThroughCases := []struct {
-		method string
-		path   string
-	}{
-		{http.MethodGet, "/v1/status"},
-		{http.MethodGet, "/v1/layers"},
-		{http.MethodPost, "/v1/layers"},
-		{http.MethodGet, "/v1/layers/" + layerID},
-		{http.MethodDelete, "/v1/layers/" + layerID},
-		{http.MethodPost, "/v1/layers/" + layerID + "/fork"},
-		{http.MethodPost, "/v1/layers/" + layerID + "/merge"},
-		{http.MethodPost, "/v1/layers/" + layerID + "/bind-mount"},
-		{http.MethodPost, "/v1/layers/" + layerID + "/renew-mount"},
-		{http.MethodPost, "/v1/layers/" + layerID + "/unbind-mount"},
-		{http.MethodPost, "/v1/mounts"},
-		{http.MethodPost, "/v1/mounts/mnt_123/heartbeat"},
-		{http.MethodDelete, "/v1/mounts/mnt_123"},
+	data, err := os.ReadFile("testdata/client_routes.json")
+	require.NoError(t, err)
+	var cases []struct{ Method, Target, Action string }
+	require.NoError(t, json.Unmarshal(data, &cases))
+	require.NotEmpty(t, cases)
+	actions := map[string]RouteAction{"pass": RoutePassThrough, "rewrite": RouteRewriteView, "unsupported": RouteRejectUnsupported, "invalid": RouteRejectInvalid}
+	for _, tc := range cases {
+		t.Run(tc.Method+" "+tc.Target, func(t *testing.T) {
+			uri, err := url.ParseRequestURI(tc.Target)
+			require.NoError(t, err)
+			want, ok := actions[tc.Action]
+			require.True(t, ok, "unknown route action %q", tc.Action)
+			require.Equal(t, want, ClassifyClientRoute(tc.Method, uri.EscapedPath(), uri.Query()))
+			if want == RoutePassThrough {
+				require.Equal(t, RouteRejectUnsupported, ClassifyViewDataRoute(tc.Method, uri.EscapedPath(), uri.Query()))
+			}
+		})
 	}
-	for _, tc := range passThroughCases {
-		require.Equal(t, RoutePassThrough, ClassifyClientRoute(tc.method, tc.path, nil), "%s %s", tc.method, tc.path)
-		require.Equal(t, RouteRejectUnsupported, ClassifyViewDataRoute(tc.method, tc.path, nil), "%s %s", tc.method, tc.path)
-	}
-	require.Equal(t, RoutePassThrough, ClassifyClientRoute(http.MethodGet, "/v1/layers", url.Values{"limit": {"50"}, "after": {layerID}}))
-	require.Equal(t, RouteRejectUnsupported, ClassifyViewDataRoute(http.MethodGet, "/v1/layers", url.Values{"limit": {"50"}, "after": {layerID}}))
-	require.Equal(t, RoutePassThrough, ClassifyClientRoute(http.MethodDelete, "/v1/layers/"+layerID, url.Values{"force": {"true"}}))
-
-	// Set B: literal filenames /grep and /find MUST rewrite, while ?grep and ?find MUST reject!
-	require.Equal(t, RouteRewriteView, ClassifyClientRoute(http.MethodGet, "/v1/fs/grep", nil))
-	require.Equal(t, RouteRewriteView, ClassifyClientRoute(http.MethodGet, "/v1/fs/sub/find", url.Values{"stat": {"1"}}))
-	require.Equal(t, RouteRewriteView, ClassifyClientRoute(http.MethodPut, "/v1/fs/grep", nil))
-	require.Equal(t, RouteRewriteView, ClassifyClientRoute(http.MethodGet, "/v1/fs/dir", url.Values{"list": {"1"}, "limit": {"100"}, "cursor": {"abc"}}))
-	require.Equal(t, RouteRewriteView, ClassifyClientRoute(http.MethodPost, "/v1/fs/dir", url.Values{"mkdir": {"1"}, "mode": {"448"}}))
-	require.Equal(t, RouteRewriteView, ClassifyClientRoute(http.MethodPost, "/v1/fs/ext", url.Values{"create": {"1"}, "layout": {"extent"}}))
-	require.Equal(t, RouteRewriteView, ClassifyClientRoute(http.MethodGet, "/v1/uploads", url.Values{"path": {"/a"}, "status": {"UPLOADING"}}))
-	require.Equal(t, RouteRewriteView, ClassifyClientRoute(http.MethodDelete, "/v1/uploads/up_v1", nil))
-	require.Equal(t, RouteRewriteView, ClassifyClientRoute(http.MethodPost, "/v1/fs:batch-stat", nil))
-	require.Equal(t, RouteRewriteView, ClassifyClientRoute(http.MethodPost, "/v1/fs:batch-read-small", nil))
-	require.Equal(t, RouteRewriteView, ClassifyClientRoute(http.MethodPost, "/v1/fs:batch-write", nil))
-	require.Equal(t, RouteRewriteView, ClassifyClientRoute(http.MethodPost, "/v2/uploads/initiate", nil))
-	require.Equal(t, RouteRewriteView, ClassifyClientRoute(http.MethodPost, "/v2/uploads/up_1/presign-batch", nil))
-	require.Equal(t, RouteRewriteView, ClassifyClientRoute(http.MethodPost, "/v2/uploads/up_1/complete", nil))
-
-	// Set C: query selectors ?grep, ?find, ?tasks, ?append, ?append-log, SSE, SQL, batch-upload, runtime,
-	// plus deleted legacy /v1/layers/* sub-routes and invalid HTTP methods on control actions.
-	rejectUnsupported := []struct {
-		method string
-		path   string
-		query  url.Values
-	}{
-		{http.MethodGet, "/v1/fs/dir", url.Values{"grep": {"needle"}}},
-		{http.MethodGet, "/v1/fs/dir", url.Values{"stat": {"1"}, "grep": {"needle"}}},
-		{http.MethodGet, "/v1/fs/dir", url.Values{"find": {"1"}}},
-		{http.MethodGet, "/v1/fs/file", url.Values{"tasks": {"1"}}},
-		{http.MethodPost, "/v1/fs/file", url.Values{"append": {"1"}}},
-		{http.MethodPost, "/v1/fs/file", url.Values{"append-log": {"1"}}},
-		{http.MethodGet, "/v1/events", nil},
-		{http.MethodPost, "/v1/sql", nil},
-		{http.MethodPost, "/v1/fs:batch-upload", nil},
-		{http.MethodPost, "/v1/runtime/exec", nil},
-		{http.MethodGet, "/v1/layers", url.Values{"cursor": {"abc"}}},
-		{http.MethodGet, "/v1/layers", url.Values{"state": {"active"}}},
-		{http.MethodGet, "/v1/layers", url.Values{"parent_layer_id": {layerID}}},
-		{http.MethodGet, "/v1/layers", url.Values{"tag": {"env=prod"}}},
-		{http.MethodPost, "/v1/layers/" + layerID, nil},
-		{http.MethodGet, "/v1/layers/" + layerID + "/entries", nil},
-		{http.MethodPost, "/v1/layers/" + layerID + "/commit", nil},
-		{http.MethodPost, "/v1/layers/" + layerID + "/rollback", nil},
-		{http.MethodGet, "/v1/layers/" + layerID + "/checkpoints", nil},
-		{http.MethodDelete, "/v1/layers/" + layerID + "/merge", nil},
-		{http.MethodPost, "/v1/layers/" + layerID + "/merge/extra", nil},
-	}
-	for _, tc := range rejectUnsupported {
-		require.Equal(t, RouteRejectUnsupported, ClassifyClientRoute(tc.method, tc.path, tc.query), "%s %s?%v", tc.method, tc.path, tc.query)
-	}
-
-	require.Equal(t, RouteRejectInvalid, ClassifyClientRoute(http.MethodGet, "/v1/views/"+layerID+"/v1/fs/a", nil))
-	require.Equal(t, RouteRejectInvalid, ClassifyClientRoute(http.MethodPost, "/v1/fs/a", url.Values{"mkdir": {"1"}, "rename": {"1"}}))
 }
 
 func TestPathWithinBaseRootAndRedirectConfinement(t *testing.T) {
@@ -763,7 +703,7 @@ func TestViewDownloadHTTPS307ScrubsMTLSClientCertAndProxyAuth(t *testing.T) {
 		DialTLS: func(string, string) (net.Conn, error) { return nil, errors.New("legacy DialTLS") }, //nolint:staticcheck // deliberately verifies deprecated DialTLS is scrubbed
 	}
 	scrubbedLegacy := sanitizeRedirectHTTPTransport(legacyDialTLSTransport)
-	require.Nil(t, scrubbedLegacy.DialTLS)         //nolint:staticcheck // deliberately verifies deprecated DialTLS is scrubbed
+	require.Nil(t, scrubbedLegacy.DialTLS)            //nolint:staticcheck // deliberately verifies deprecated DialTLS is scrubbed
 	require.NotNil(t, legacyDialTLSTransport.DialTLS) //nolint:staticcheck // caller transport must remain untouched
 	// Caller's original mtlsTransport MUST NOT be mutated.
 	require.Equal(t, "api.example", mtlsTransport.TLSClientConfig.ServerName)
