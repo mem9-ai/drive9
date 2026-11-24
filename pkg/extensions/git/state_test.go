@@ -8,13 +8,17 @@ package git
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/mem9-ai/drive9/internal/testbackend"
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -161,4 +165,62 @@ func TestPortGitStateRestoreOnStart(t *testing.T) {
 	if out := run(t, overlayRepo, "cat-file", "-p", "HEAD^{commit}"); !strings.Contains(out, "one") {
 		t.Fatalf("restored commit content missing: %q", out)
 	}
+}
+
+// The final upload must acknowledge durable state. A failed attempt can be
+// retried on the same runtime, even after admission to new work is closed.
+func TestCheckpointReportsFailureAndRetries(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedGitWorkspace("ws", "/repo")
+	var fail atomic.Bool
+	fail.Store(true)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if fail.Load() && r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/git-state") {
+			http.Error(w, "fixture storage unavailable", http.StatusBadRequest)
+			return
+		}
+		b.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	g, err := New(Options{Client: client.New(ts.URL, ""), LocalRoot: t.TempDir()})
+	require.NoError(t, err)
+	dir := filepath.Dir(g.gitDirFor("/repo"))
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+	run(t, dir, "init", "-q", "-b", "main")
+	run(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "seed")
+	g.workspaces = []*workspace{{root: "/repo", id: "ws", headCommit: run(t, dir, "rev-parse", "HEAD")}}
+	require.ErrorContains(t, g.Drain(t.Context()), "fixture storage unavailable")
+	require.ErrorContains(t, g.Stop(t.Context()), "fixture storage unavailable")
+	_, ok := b.GitState("ws")
+	require.False(t, ok)
+	fail.Store(false)
+	require.NoError(t, g.Stop(t.Context()))
+	_, ok = b.GitState("ws")
+	require.True(t, ok)
+	require.Empty(t, b.GitPacks("ws"), "a clean base commit needs no uploaded object pack")
+}
+
+func TestLinkedCheckpointDetectsCommonRefChangeWithIdenticalAdmin(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedGitWorkspace("ws", "/linked")
+	g, _, _ := newGitExt(t, b, t.TempDir())
+	dir := t.TempDir()
+	run(t, dir, "init", "-q", "-b", "main")
+	run(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base")
+	base := run(t, dir, "rev-parse", "HEAD")
+	linked := filepath.Join(t.TempDir(), "linked")
+	run(t, dir, "worktree", "add", "-q", "-b", "linked", linked)
+	ws := &workspace{root: "/linked", id: "ws", headCommit: base}
+	admin := run(t, linked, "rev-parse", "--absolute-git-dir")
+	require.NoError(t, g.checkpointWorkspace(t.Context(), ws, admin))
+	require.Empty(t, b.GitPacks("ws"))
+	before, err := archiveLocalGitStateDir(admin)
+	require.NoError(t, err)
+	// A local branch can advance without writing anything under worktrees/linked.
+	run(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "local change")
+	after, err := archiveLocalGitStateDir(admin)
+	require.NoError(t, err)
+	require.Equal(t, before, after)
+	require.NoError(t, g.checkpointWorkspace(t.Context(), ws, admin))
+	require.NotEmpty(t, b.GitPacks("ws"))
 }

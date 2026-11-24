@@ -383,7 +383,7 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 		if op.HasMode || op.Size >= 0 {
 			if _, hit := w.lookup(rel); !hit {
 				if n, tok := w.treeLookup(rel); tok && n.Kind == "file" && n.ObjectSHA != "" {
-					if data, merr := g.materializeBlob(w, n.ObjectSHA); merr == nil {
+					if data, merr := g.materializeTreeEntry(ctx, w, rel, n.ObjectSHA); merr == nil {
 						mode := strings.TrimSpace(n.Mode)
 						if mode == "" {
 							mode = "100644"
@@ -517,7 +517,7 @@ func (g *Git) renameOverlay(ctx context.Context, oldPath, newPath string) error 
 	// materialize the blob through the Git content path — a plain
 	// namespace stat/read 404s for fast-clone files (v1 copyGitFileOverlay).
 	if n, tok := wOld.treeLookup(relOld); tok && n.Kind == "file" && n.ObjectSHA != "" {
-		if data, merr := g.materializeBlob(wOld, n.ObjectSHA); merr == nil {
+		if data, merr := g.materializeTreeEntry(ctx, wOld, relOld, n.ObjectSHA); merr == nil {
 			mode := strings.TrimSpace(n.Mode)
 			if mode == "" {
 				mode = "100644"
@@ -644,7 +644,7 @@ func (g *Git) listMerged(ctx context.Context, w *workspace, dir string, next fs.
 	}
 	w.mu.RUnlock()
 	for _, u := range pending {
-		size := g.blobSize(w, u.sha)
+		size := g.resolveTreeNodeSize(ctx, w, u.rel, u.sha)
 		w.noteTreeSize(u.rel, size)
 		if e, ok := out[u.name]; ok && size > 0 {
 			e.Attr.Size = size

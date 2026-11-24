@@ -39,23 +39,8 @@ const (
 
 func newGitCommandContext(ctx context.Context, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "git", args...)
-	configureGitCommandGroup(cmd, true)
+	configureGitCommandGroup(cmd)
 	return cmd
-}
-
-func gitCommandOutput(ctx context.Context, args ...string) ([]byte, error) {
-	cmd := newGitCommandContext(ctx, args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		msg := strings.TrimSpace(stderr.String())
-		if msg != "" {
-			return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, msg)
-		}
-		return nil, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
-	}
-	return out, nil
 }
 
 func gitCommandOutputNoLazy(ctx context.Context, args ...string) ([]byte, error) {
@@ -411,12 +396,12 @@ func gitObjectInfoBatch(ctx context.Context, gitDir string, ids []string) (map[s
 // it into the returned pack: a checkpoint that archives the index/refs while
 // some of their objects were dropped publishes an unrestorable state (git
 // diff --cached then reports missing objects).
-func (g *Git) buildLocalGitObjectPack(ctx context.Context, gitDir, baseCommit string) (pack []byte, complete bool, err error) {
+func (g *Git) buildLocalGitObjectPack(ctx context.Context, gitDir, baseCommit string, tips []string) (pack []byte, complete bool, err error) {
 	baseObjects, baseTrees, err := collectBaseCommitObjectsNoLazy(ctx, gitDir, baseCommit)
 	if err != nil {
 		return nil, false, err
 	}
-	refObjects, refsOversize, err := collectLocalRefObjectSet(ctx, gitDir, baseCommit, baseObjects, baseTrees)
+	refObjects, refsOversize, err := collectLocalRefObjectSet(ctx, gitDir, baseCommit, tips, baseObjects, baseTrees)
 	if err != nil {
 		return nil, false, err
 	}
@@ -463,11 +448,7 @@ func (g *Git) buildLocalGitObjectPack(ctx context.Context, gitDir, baseCommit st
 	return pack, refsCovered && stagedCovered, nil
 }
 
-func collectLocalRefObjectSet(ctx context.Context, gitDir, baseCommit string, baseObjects, baseTrees map[string]struct{}) (map[string]struct{}, bool, error) {
-	tips, err := collectLocalRefTips(ctx, gitDir)
-	if err != nil {
-		return nil, false, err
-	}
+func collectLocalRefObjectSet(ctx context.Context, gitDir, baseCommit string, tips []string, baseObjects, baseTrees map[string]struct{}) (map[string]struct{}, bool, error) {
 	if len(tips) == 0 {
 		return nil, false, nil
 	}
@@ -505,7 +486,7 @@ func collectStagedObjectSet(ctx context.Context, gitDir string, baseObjects map[
 			continue
 		}
 		meta := strings.Fields(string(rec[:tab]))
-		if len(meta) < 3 || meta[2] != "0" {
+		if len(meta) < 3 || meta[0] == "160000" {
 			continue
 		}
 		oid := strings.ToLower(meta[1])
@@ -530,9 +511,10 @@ func collectStagedObjectSet(ctx context.Context, gitDir string, baseObjects map[
 	}
 	objects := make(map[string]struct{})
 	for _, oid := range staged {
-		if object, ok := info[oid]; ok && object.typ != "" && object.typ != "missing" {
-			objects[oid] = struct{}{}
+		if object, ok := info[oid]; !ok || object.typ != "blob" {
+			return nil, fmt.Errorf("index object %s is unavailable", oid)
 		}
+		objects[oid] = struct{}{}
 	}
 	return objects, nil
 }
@@ -548,7 +530,8 @@ func shouldSkipGitObjectStatePath(rel string, _ fs.DirEntry) bool {
 	}
 	// objects/ and hooks/ are top-level .git directories. Matching the name at
 	// any depth used to drop legitimate content such as refs/heads/hooks.
-	return parts[0] == "objects" || parts[0] == "hooks"
+	return parts[0] == "objects" || parts[0] == "hooks" ||
+		(len(parts) == 2 && parts[0] == "worktrees" && strings.HasPrefix(parts[1], ".drive9-git-state-restore-"))
 }
 
 // archiveLocalGitStateDir tars+gzips the .git tree without objects/.
@@ -757,6 +740,11 @@ func (g *Git) scheduleGitStateCheckpoint(path string) {
 	if relSlash != ".git" && !strings.HasPrefix(relSlash, ".git/") {
 		return
 	}
+	g.backgroundMu.Lock()
+	defer g.backgroundMu.Unlock()
+	if g.stopping {
+		return
+	}
 	g.checkpoints.Schedule(gitDir, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), gitCheckpointTimeout)
 		defer cancel()
@@ -784,17 +772,27 @@ func (g *Git) checkpointWorkspace(ctx context.Context, w *workspace, gitDir stri
 	}
 	g.ckptMu.Lock()
 	defer g.ckptMu.Unlock()
+	if g.wasFreshRestored(gitDir) {
+		return nil
+	}
 	content, err := archiveLocalGitStateDir(gitDir)
 	if err != nil {
 		return err
 	}
 	sum := sha256.Sum256(content)
 	sumHex := hex.EncodeToString(sum[:])
-	if sumHex != "" && sumHex == w.baselineStateSHA256() {
+	baseCommit := strings.ToLower(strings.TrimSpace(w.head()))
+	tips, err := collectLocalRefTips(ctx, gitDir)
+	if err != nil {
+		return err
+	}
+	// A linked worktree's refs live outside its admin archive. The inputs
+	// to its object pack include those tips, its base, and the archived index.
+	checkpoint := strings.Join(append([]string{sumHex, baseCommit}, tips...), ":")
+	if checkpoint == w.lastCheckpoint {
 		return nil
 	}
-	baseCommit := strings.ToLower(strings.TrimSpace(w.head()))
-	pack, complete, err := g.buildLocalGitObjectPack(ctx, gitDir, baseCommit)
+	pack, complete, err := g.buildLocalGitObjectPack(ctx, gitDir, baseCommit, tips)
 	if err != nil {
 		return err
 	}
@@ -817,32 +815,38 @@ func (g *Git) checkpointWorkspace(ctx context.Context, w *workspace, gitDir stri
 		Content:          content,
 	})
 	if err == nil {
-		w.setBaselineStateSHA256(sumHex)
+		w.lastCheckpoint = checkpoint
 	}
 	return err
 }
 
 // checkpointAllGitWorkspaces flushes every workspace's state (the shutdown
 // boundary).
-func (g *Git) checkpointAllGitWorkspaces() {
+func (g *Git) checkpointAllGitWorkspaces(ctx context.Context) error {
 	if g == nil || g.localRoot == "" {
-		return
+		return nil
 	}
 	g.mu.RLock()
 	workspaces := make([]*workspace, 0, len(g.workspaces))
 	workspaces = append(workspaces, g.workspaces...)
 	g.mu.RUnlock()
-	ctx, cancel := context.WithTimeout(context.Background(), gitCheckpointTimeout)
-	defer cancel()
+	var errs []error
 	for _, w := range workspaces {
 		gitDir, ok := g.checkpointGitDir(w)
-		if !ok {
+		if !ok || g.wasFreshRestored(gitDir) {
 			continue
 		}
-		if err := g.checkpointWorkspace(ctx, w, gitDir); err != nil {
-			fmt.Fprintf(os.Stderr, "drive9: git state final checkpoint failed for workspace %s: %v\n", w.id, err)
+		if ctx.Err() != nil {
+			return errors.Join(ctx.Err(), errors.Join(errs...))
+		}
+		checkpointCtx, cancel := context.WithTimeout(ctx, gitCheckpointTimeout)
+		err := g.checkpointWorkspace(checkpointCtx, w, gitDir)
+		cancel()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("checkpoint workspace %s: %w", w.id, err))
 		}
 	}
+	return errors.Join(errs...)
 }
 
 // restoreWorkspaceState restores objects from the remote clone, then the
@@ -966,6 +970,8 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 	if !gitDirLooksUsable(ctx, tmpGitDir) {
 		return fmt.Errorf("restored git state is missing a usable HEAD")
 	}
+	g.ckptMu.Lock()
+	defer g.ckptMu.Unlock()
 	g.evictBatchReader(gitDir)
 	if err := os.RemoveAll(gitDir); err != nil {
 		return err
@@ -973,11 +979,10 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 	if err := os.Rename(tmpGitDir, gitDir); err != nil {
 		return err
 	}
-	if archived, aerr := archiveLocalGitStateDir(gitDir); aerr == nil {
-		sum := sha256.Sum256(archived)
-		w.setBaselineStateSHA256(hex.EncodeToString(sum[:]))
-	}
 	if linkedCommonGitDir != "" {
+		g.mu.Lock()
+		delete(g.freshRestored, filepath.Clean(gitDir))
+		g.mu.Unlock()
 		return writeWorktreeGitPointer(g, w.rootPath(), gitDir)
 	}
 	g.markFreshRestored(gitDir)
@@ -1244,6 +1249,7 @@ func (g *Git) MaterializeHeadTree(ctx context.Context, gitDir string) error {
 	)
 	cmd.Stdin = strings.NewReader(strings.Join(missing, "\n") + "\n")
 	cmd.Env = append(gitSafeEnv(os.Environ()),
+		"GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_ALLOW_PROTOCOL="+allowProtocols,
 	)
@@ -1348,6 +1354,7 @@ func resolvePromisorRemote(ctx context.Context, gitDir string, missingCount int)
 	}
 	var partialCloneRemote string
 	var promisorRemotes []string
+	enabled := make(map[string]bool)
 	remoteURLs := make(map[string][]string)
 	unsafeRemoteKey := make(map[string]string)
 
@@ -1373,11 +1380,14 @@ func resolvePromisorRemote(ctx context.Context, gitDir string, missingCount int)
 		remoteName := rest[:dot]
 		subKey := strings.ToLower(rest[dot+1:])
 		switch {
-		case subKey == "promisor" && isGitConfigTruthy(e.value, e.hasValue):
+		case subKey == "promisor":
 			if err := validateGitRemoteName(remoteName); err != nil {
 				return "", err
 			}
-			promisorRemotes = append(promisorRemotes, remoteName)
+			if _, seen := enabled[remoteName]; !seen {
+				promisorRemotes = append(promisorRemotes, remoteName)
+			}
+			enabled[remoteName] = isGitConfigTruthy(e.value, e.hasValue)
 		case gitCheckpointUnsafeRemoteKeys[subKey]:
 			if _, exists := unsafeRemoteKey[remoteName]; !exists {
 				unsafeRemoteKey[remoteName] = subKey
@@ -1392,8 +1402,13 @@ func resolvePromisorRemote(ctx context.Context, gitDir string, missingCount int)
 	}
 
 	chosen := partialCloneRemote
-	if chosen == "" && len(promisorRemotes) > 0 {
-		chosen = promisorRemotes[0]
+	if chosen == "" {
+		for _, name := range promisorRemotes {
+			if enabled[name] {
+				chosen = name
+				break
+			}
+		}
 	}
 	if chosen == "" {
 		return "", fmt.Errorf("materialize head tree: %d missing blob(s) but no promisor remote is configured", missingCount)

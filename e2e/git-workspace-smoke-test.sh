@@ -309,7 +309,21 @@ stop_mount() {
     if [ "$rc" -ne 0 ] || [ "$forced" -ne 0 ]; then
       kill "$MOUNT_PID" >/dev/null 2>&1 || true
     fi
-    wait "$MOUNT_PID" || worker_rc=$?
+    local deadline=$((SECONDS + POLL_TIMEOUT_S))
+    while kill -0 "$MOUNT_PID" 2>/dev/null; do
+      if [ "$SECONDS" -ge "$deadline" ]; then
+        echo "mount worker did not exit within ${POLL_TIMEOUT_S}s" >&2
+        forced=1
+        kill -KILL "$MOUNT_PID" 2>/dev/null || true
+        break
+      fi
+      sleep 0.2
+    done
+    if kill -0 "$MOUNT_PID" 2>/dev/null; then
+      worker_rc=124
+    else
+      wait "$MOUNT_PID" || worker_rc=$?
+    fi
     echo "umount: rc=$rc forced=$forced worker_rc=$worker_rc"
   fi
   MOUNT_PID=""
@@ -553,6 +567,36 @@ run_agent_patch_apply() {
   stop_mount
 }
 
+# Compare the checkpoint served after a normal worker exit with the index and
+# HEAD the worker had on disk. Keep archive contents out of the CI log.
+check_saved_git_state() {
+  local root="$1" admin="$2" json="$3" id
+  id=$(curl -fsS --max-time "$POLL_TIMEOUT_S" -H "Authorization: Bearer $API_KEY" "$BASE/v1/git-workspaces" |
+    jq -er --arg root "$root" '.workspaces[] | select(.root_path == $root) | .workspace_id') || return 1
+  curl -fsS --max-time "$POLL_TIMEOUT_S" -H "Authorization: Bearer $API_KEY" "$BASE/v1/git-workspaces/$id/git-state" -o "$json" || return 1
+  python3 - "$json" "$admin" <<'CHECKPOINT'
+import base64, hashlib, io, json, pathlib, sys, tarfile
+
+state = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
+data = base64.b64decode(state["content"], validate=True)
+if len(data) != state["size_bytes"] or hashlib.sha256(data).hexdigest() != state["checksum_sha256"]:
+    sys.exit("checkpoint checksum or length mismatch")
+with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+    for name in ("HEAD", "index"):
+        entry = archive.getmember(name)
+        if not entry.isfile() or archive.extractfile(entry).read() != (pathlib.Path(sys.argv[2]) / name).read_bytes():
+            sys.exit(f"server checkpoint {name} differs from the final local {name}")
+print("checkpoint checksum, HEAD and index verified")
+CHECKPOINT
+}
+
+timed_lookup() {
+  local start=$SECONDS rc=0
+  run_with_timeout "$GIT_WORKSPACE_GIT_TIMEOUT_S" test "$@" || rc=$?
+  echo "cold lookup $2 elapsed=$((SECONDS-start))s rc=$rc"
+  return "$rc"
+}
+
 run_sandbox_restore() {
   local slug="$1" repo_url="$2"
   local scenario="sandbox_restore"
@@ -581,10 +625,11 @@ run_sandbox_restore() {
   check_cmd "$slug $scenario dirty status before remount" test -s "$status_before"
   check_cmd "$slug $scenario first mount log audit" audit_mount_log "$log_a"
   stop_mount
+  check_cmd "$slug $scenario saved checkpoint" check_saved_git_state "/${repo##*/}" "$local_root_a/overlay/${repo##*/}/.git" "$case_root/state.json"
 
   echo "[repo=$slug scenario=$scenario] remount with fresh local root"
   check_cmd "$slug $scenario second mount starts" start_mount "$mount_point" "$local_root_b" "$log_b"
-  check_cmd "$slug $scenario .git restored" test -d "$repo/.git"
+  check_cmd "$slug $scenario .git restored" timed_lookup -d "$repo/.git"
   git_cmd -C "$repo" status --porcelain=v1 > "$status_after"
   check_cmd "$slug $scenario status restored after remount" cmp -s "$status_before" "$status_after"
   check_cmd "$slug $scenario restored status contains generated files" grep -q "agent-bench/generated/file-0000.md" "$status_after"
@@ -645,12 +690,20 @@ run_fast_worktree() {
   check_cmd "$slug $scenario cached diff before remount" grep -Fxq "$staged_rel" "$cached_before"
   check_cmd "$slug $scenario dirty status before remount" test -s "$status_before"
   check_cmd "$slug $scenario first mount log audit" audit_mount_log "$log_a"
+  local linked_admin
+  linked_admin=$(git_cmd -C "$worktree" rev-parse --absolute-git-dir)
+  case "$linked_admin" in
+    "$mount_point"/*) linked_admin="$local_root_a/overlay/${linked_admin#"$mount_point"/}" ;;
+    "$local_root_a/overlay/"*) ;;
+    *) echo "unexpected linked gitdir $linked_admin" >&2; return 1 ;;
+  esac
   stop_mount
+  check_cmd "$slug $scenario saved linked checkpoint" check_saved_git_state "/${worktree##*/}" "$linked_admin" "$case_root/state.json"
 
   echo "[repo=$slug scenario=$scenario] remount with fresh local root"
   check_cmd "$slug $scenario second mount starts" start_mount "$mount_point" "$local_root_b" "$log_b"
-  check_cmd "$slug $scenario linked .git restored as file" test -f "$worktree/.git"
-  check_cmd "$slug $scenario base .git restored" test -d "$base_repo/.git"
+  check_cmd "$slug $scenario linked .git restored as file" timed_lookup -f "$worktree/.git"
+  check_cmd "$slug $scenario base .git restored" timed_lookup -d "$base_repo/.git"
   check_cmd "$slug $scenario base worktree list restored" bash -c 'git -C "$1" worktree list --porcelain | grep -q "^worktree $2$"' _ "$base_repo" "$worktree"
   check_cmd "$slug $scenario linked worktree ready after remount" assert_repo_ready "$worktree"
   check_eq "$slug $scenario commit subject after remount" "$(git -C "$worktree" log -1 --pretty=%s)" "$commit_subject"
@@ -685,6 +738,13 @@ cleanup() {
     rm -f "$CLI_BIN"
   fi
   if [ -n "${RUN_ROOT:-}" ] && [ -d "$RUN_ROOT" ]; then
+    local mp
+    for mp in "$RUN_ROOT"/*/mount; do
+      if is_mounted "$mp"; then
+        echo "retaining $RUN_ROOT while $mp is mounted" >&2
+        return
+      fi
+    done
     rm -rf "$RUN_ROOT"
   fi
 }

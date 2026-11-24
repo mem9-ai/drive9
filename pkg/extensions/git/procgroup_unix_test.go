@@ -80,3 +80,74 @@ func TestNewGitCommandContextCancelReapsGrandchildHoldingPipes(t *testing.T) {
 
 	waitForPIDGone(t, grandchildPID, 2*time.Second)
 }
+
+func TestStopInterruptsBlockedCatFileAndClosesAdmission(t *testing.T) {
+	for _, mode := range []string{"content", "size"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			gitPath := filepath.Join(dir, "git")
+			require.NoError(t, os.WriteFile(gitPath, []byte("#!/bin/sh\nread -r oid || exit 1\necho $$ > \"$READER_PID\"\nexec sleep 60\n"), 0o755))
+			pidFile := filepath.Join(dir, "reader.pid")
+			t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+			t.Setenv("READER_PID", pidFile)
+			g := &Git{}
+			b := g.batchReaderFor(dir)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				oid := strings.Repeat("1", 40)
+				if mode == "size" {
+					b.sizeBlob(oid)
+				} else {
+					_, _, _ = b.readBlob(oid)
+				}
+			}()
+			require.Eventually(t, func() bool { data, _ := os.ReadFile(pidFile); return len(data) > 1 }, 3*time.Second, time.Millisecond*10)
+			raw, err := os.ReadFile(pidFile)
+			require.NoError(t, err)
+			pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+			require.NoError(t, err)
+			t.Cleanup(b.close)
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+			stop := make(chan error, 1)
+			go func() { stop <- g.Stop(ctx) }()
+			select {
+			case err := <-stop:
+				require.NoError(t, err)
+			case <-ctx.Done():
+				t.Fatal("Stop blocked on cat-file I/O")
+			}
+			<-done
+			waitForPIDGone(t, pid, time.Second)
+			require.Nil(t, g.batchReaderFor(dir))
+			require.Empty(t, g.batchReaders)
+		})
+	}
+}
+
+func TestBatchReaderRejectsInvalidAndNonBlobObjects(t *testing.T) {
+	dir := t.TempDir()
+	run(t, dir, "init", "-q")
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "f"), []byte("blob"), 0o644))
+	run(t, dir, "add", "f")
+	tree := run(t, dir, "write-tree")
+	blob := run(t, dir, "rev-parse", ":f")
+	g := &Git{}
+	t.Cleanup(func() { _ = g.Stop(context.Background()) })
+	b := g.batchReaderFor(filepath.Join(dir, ".git"))
+	for _, invalid := range []string{"", blob + "\n" + blob, tree} {
+		_, found, err := b.readBlob(invalid)
+		require.Error(t, err)
+		require.False(t, found)
+		_, ok := b.sizeBlob(invalid)
+		require.False(t, ok)
+		data, found, err := b.readBlob(blob)
+		require.NoError(t, err)
+		require.True(t, found)
+		require.Equal(t, "blob", string(data))
+		size, ok := b.sizeBlob(blob)
+		require.True(t, ok)
+		require.EqualValues(t, 4, size)
+	}
+}

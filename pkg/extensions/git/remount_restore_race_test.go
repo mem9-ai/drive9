@@ -204,6 +204,12 @@ func TestFreshLocalRootLinkedWorktreeDotGitLookupWaitsForRestore(t *testing.T) {
 	run(t, filepath.Dir(baseRepoA), "clone", "-q", "--filter=blob:none", "file://"+bare, baseRepoA)
 	run(t, baseRepoA, "worktree", "add", "-q", linkedRepoA, "-b", "wt-branch")
 	wtAdminA := filepath.Join(baseRepoA, ".git", "worktrees", "linked")
+	require.NoError(t, os.WriteFile(filepath.Join(linkedRepoA, "f.txt"), []byte("linked commit\n"), 0o644))
+	run(t, linkedRepoA, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "linked commit")
+	linkedHead := run(t, linkedRepoA, "rev-parse", "HEAD")
+	require.NoError(t, os.WriteFile(filepath.Join(linkedRepoA, "staged.txt"), []byte("staged payload\n"), 0o644))
+	run(t, linkedRepoA, "add", "staged.txt")
+	indexEntries := run(t, linkedRepoA, "ls-files", "--stage")
 
 	b.SeedGitWorkspaceFull("ws-main", "/base", "file://"+bare, head)
 	b.SeedGitWorktree("ws-linked", "/linked", "file://"+bare, head, "ws-main", ".git/worktrees/linked")
@@ -228,7 +234,7 @@ func TestFreshLocalRootLinkedWorktreeDotGitLookupWaitsForRestore(t *testing.T) {
 
 	// Cold Mount B probes /linked/.git BEFORE Start() even runs.
 	localRootB := t.TempDir()
-	_, chB := buildLocalizeGitStack(t, cl, localRootB, nil)
+	gB, chB := buildLocalizeGitStack(t, cl, localRootB, nil)
 
 	linkedAttr, err := chB.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: "/linked/.git"})
 	require.NoError(t, err)
@@ -239,6 +245,16 @@ func TestFreshLocalRootLinkedWorktreeDotGitLookupWaitsForRestore(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, baseAttr.Attr)
 	require.Equal(t, fs.KindDir, baseAttr.Attr.Kind)
+	linkedRepoB := filepath.Join(localRootB, "overlay", "linked")
+	require.Equal(t, linkedHead, run(t, linkedRepoB, "rev-parse", "HEAD"))
+	require.Equal(t, indexEntries, run(t, linkedRepoB, "ls-files", "--stage"))
+	require.Equal(t, "staged payload", run(t, linkedRepoB, "show", ":staged.txt"))
+	// Retrying hydration after the admin directory was installed must retain
+	// any new local index content, even if the completion latch is still open.
+	run(t, linkedRepoB, "rm", "--cached", "staged.txt")
+	require.NoError(t, gB.restoreWorkspaceState(ctx, gB.workspaceByID("ws-linked")))
+	require.NotContains(t, run(t, linkedRepoB, "ls-files"), "staged.txt")
+
 }
 
 // Dormant G0 invariant: .git-segment probes on a workspace-free root confirm

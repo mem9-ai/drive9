@@ -227,6 +227,25 @@ func TestMaterializeHeadTreeRejectsMissingOrUnsafePromisorConfig(t *testing.T) {
 		require.Equal(t, int32(0), remote.UploadPackPOSTs.Load())
 	})
 
+	t.Run("last_promisor_value_disables_remote", func(t *testing.T) {
+		gitDir := newPartial(t)
+		_ = exec.Command("git", "--git-dir", gitDir, "config", "--unset-all", "extensions.partialClone").Run()
+		run(t, gitDir, "config", "--add", "remote.origin.promisor", "false")
+		require.ErrorContains(t, g.MaterializeHeadTree(ctx, gitDir), "no promisor remote")
+		require.Zero(t, remote.UploadPackPOSTs.Load())
+	})
+
+	t.Run("fetch_uses_same_config_as_remote_selection", func(t *testing.T) {
+		gitDir := newPartial(t)
+		global := filepath.Join(t.TempDir(), "gitconfig")
+		run(t, gitDir, "config", "--file", global, "http.proxy", "http://127.0.0.1:1")
+		// A global URL rewrite to an empty local repository would lose the objects.
+		run(t, gitDir, "config", "--file", global, "url.file:///missing-test-repository.insteadOf", remote.URL)
+		t.Setenv("GIT_CONFIG_GLOBAL", global)
+		require.NoError(t, g.MaterializeHeadTree(ctx, gitDir))
+		require.Equal(t, int32(1), remote.UploadPackPOSTs.Load())
+	})
+
 	t.Run("dash_prefixed_partial_clone_remote", func(t *testing.T) {
 		gitDir := newPartial(t)
 		run(t, gitDir, "--git-dir", gitDir, "config", "extensions.partialClone", "--upload-pack=/bin/false")

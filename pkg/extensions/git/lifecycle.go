@@ -83,6 +83,11 @@ func (g *Git) runForeground(ctx context.Context, run func(context.Context) error
 	return run(runCtx)
 }
 
+type gitStopAttempt struct {
+	done chan struct{}
+	err  error
+}
+
 // Stop closes task admission, cancels and joins all discovery/restore tasks,
 // then joins pending checkpoints and makes the final checkpoint. A caller
 // timeout does not relinquish directory ownership: retry waits on the same
@@ -91,26 +96,33 @@ func (g *Git) Stop(ctx context.Context) error {
 	g.backgroundMu.Lock()
 	if !g.stopping {
 		g.stopping = true
-		g.stopDone = make(chan struct{})
 		for task := range g.background {
 			task.cancel()
 		}
-		g.closeBatchReaders()
+	}
+	attempt := g.stopAttempt
+	if attempt == nil {
+		attempt = &gitStopAttempt{done: make(chan struct{})}
+		g.stopAttempt = attempt
 		go func() {
-			g.backgroundWG.Wait()
 			g.closeBatchReaders()
+			g.backgroundWG.Wait()
 			if g.checkpoints != nil {
 				g.checkpoints.FlushAll()
 			}
-			g.checkpointAllGitWorkspaces()
-			close(g.stopDone)
+			attempt.err = g.checkpointAllGitWorkspaces(context.Background())
+			g.backgroundMu.Lock()
+			if attempt.err != nil {
+				g.stopAttempt = nil // A subsequent Stop retries the final upload.
+			}
+			close(attempt.done)
+			g.backgroundMu.Unlock()
 		}()
 	}
-	done := g.stopDone
 	g.backgroundMu.Unlock()
 	select {
-	case <-done:
-		return nil
+	case <-attempt.done:
+		return attempt.err
 	case <-ctx.Done():
 		return ctx.Err()
 	}

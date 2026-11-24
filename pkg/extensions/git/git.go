@@ -88,21 +88,10 @@ type workspace struct {
 	// cancelable by caller/Stop contexts. An attempt that fails (or finds
 	// the checkpoint not uploaded yet) leaves restoreLatched false so the
 	// next entry point retries; once latched, later calls no-op.
-	restoreWait      chan struct{}
-	restoreLatched   bool
-	baselineStateSum string
-}
-
-func (w *workspace) baselineStateSHA256() string {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	return w.baselineStateSum
-}
-
-func (w *workspace) setBaselineStateSHA256(sum string) {
-	w.mu.Lock()
-	w.baselineStateSum = sum
-	w.mu.Unlock()
+	restoreWait    chan struct{}
+	restoreLatched bool
+	// Accessed under Git.ckptMu. Only a successful pack + state upload sets it.
+	lastCheckpoint string
 }
 
 func (w *workspace) isRestoreLatched() bool {
@@ -409,7 +398,7 @@ type Git struct {
 	background   map[*gitBackgroundTask]struct{}
 	started      bool
 	stopping     bool
-	stopDone     chan struct{}
+	stopAttempt  *gitStopAttempt
 
 	// live indexes claimed workspace handles by path (SetAttr
 	// interception, unlink/rename retargeting).
@@ -902,7 +891,6 @@ func (g *Git) ensure(ctx context.Context) {
 		// checkpoint raced the discovery) retries on the next reload —
 		// the success latch makes repeat attempts a no-op.
 		if g.localRoot != "" {
-			w := w
 			g.runBackground(func(restoreCtx context.Context) {
 				if g.bgRestoreSem != nil {
 					select {
@@ -1033,10 +1021,10 @@ func (g *Git) Start(ctx context.Context) error {
 	return nil
 }
 
-// Drain flushes pending debounced checkpoints.
+// Drain finishes pending uploads and confirms the on-disk Git state has been saved.
 func (g *Git) Drain(ctx context.Context) error {
 	if g.checkpoints != nil {
 		g.checkpoints.FlushAll()
 	}
-	return nil
+	return g.checkpointAllGitWorkspaces(ctx)
 }

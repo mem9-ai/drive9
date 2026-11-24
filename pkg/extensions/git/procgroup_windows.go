@@ -8,16 +8,12 @@ import (
 	"os/exec"
 )
 
-func configureGitCommandGroup(cmd *exec.Cmd, withContextCancel bool) {
+func configureGitCommandGroup(cmd *exec.Cmd) {
 	if cmd == nil {
 		return
 	}
 	cmd.WaitDelay = gitSubprocessWaitDelay
-	if withContextCancel {
-		cmd.Cancel = func() error {
-			return killGitCommandGroup(cmd)
-		}
-	}
+	cmd.Cancel = func() error { return killGitCommandGroup(cmd) }
 }
 
 func killGitCommandGroup(cmd *exec.Cmd) error {
