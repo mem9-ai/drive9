@@ -572,7 +572,7 @@ run_agent_patch_apply() {
 check_saved_git_state() {
   local root="$1" admin="$2" json="$3" id
   id=$(curl -fsS --max-time "$POLL_TIMEOUT_S" -H "Authorization: Bearer $API_KEY" "$BASE/v1/git-workspaces" |
-    jq -er --arg root "$root" '.workspaces[] | select(.root_path == $root) | .workspace_id') || return 1
+    jq -er --arg root "$root" '[.workspaces[] | select((.root_path | rtrimstr("/")) == $root) | .workspace_id] | if length == 1 then .[0] else error("expected one workspace for " + $root) end') || return 1
   curl -fsS --max-time "$POLL_TIMEOUT_S" -H "Authorization: Bearer $API_KEY" "$BASE/v1/git-workspaces/$id/git-state" -o "$json" || return 1
   python3 - "$json" "$admin" <<'CHECKPOINT'
 import base64, hashlib, io, json, pathlib, sys, tarfile
