@@ -77,6 +77,16 @@ type Journal struct {
 	doneGen uint64
 }
 
+// CurrentSeq reports the highest sequence number this journal has appended.
+// A committed fence captures it so recovery can tell the frames the fence
+// masks (at or below it) from writes that happened after the landing.
+func (j *Journal) CurrentSeq() uint64 {
+	if j == nil {
+		return 0
+	}
+	return j.seq.Load()
+}
+
 // NewJournal opens or creates a journal WAL file at the given path. The
 // sequence counter resumes from the highest Seq already on disk so that
 // appends before any Replay never reuse sequence numbers.
@@ -84,6 +94,16 @@ func NewJournal(path string) (*Journal, error) {
 	fd, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("journal open: %w", err)
+	}
+	// Sync the parent directory on every open, not only when this call created
+	// the file: a previous open may have crashed between O_CREATE and its own
+	// directory sync, and compact() renames the WAL (journal.go compact) after
+	// which the name is only durable once the directory is synced. Fsyncing
+	// frames is pointless while the name that finds them is not durable —
+	// recovery reads that as an empty WAL.
+	if derr := fsyncDir(filepath.Dir(path)); derr != nil {
+		_ = fd.Close()
+		return nil, fmt.Errorf("journal dir sync: %w", derr)
 	}
 	j := &Journal{
 		fd:                fd,
@@ -116,6 +136,11 @@ func NewJournal(path string) (*Journal, error) {
 func ReplayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStore) error {
 	if j == nil || idx == nil {
 		return nil
+	}
+	// Fences gate the replay below, so an unreadable one is a durability hole:
+	// abort rather than replay a path whose landed image we cannot rule out.
+	if err := idx.loadCommittedFences(); err != nil {
+		return err
 	}
 
 	latestData := make(map[string]JournalEntry) // path → latest fsync entry
@@ -154,7 +179,28 @@ func ReplayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStor
 				return fmt.Errorf("journal replay resurrect %s: %w", path, err)
 			}
 		}
+		// A landed-image fence masks exactly the frames it was written after:
+		// a pending-meta frame at or below the fenced generation, and a data
+		// frame at or below the journal sequence current at fence time. Newer
+		// frames are a later write that was acknowledged before the crash, so
+		// they must replay — dropping them would lose fsync'd data.
+		if fence, ok := idx.CommittedFence(path); ok {
+			masked := false
+			if fromMeta {
+				masked = meta.Generation != 0 && meta.Generation <= fence.Generation
+			} else {
+				masked = fence.JournalSeq != 0 && e.Seq <= fence.JournalSeq
+			}
+			if masked {
+				return nil
+			}
+		}
 		if current, ok := idx.GetMeta(path); ok {
+			// A conflict record is terminal for replay: the image must not be
+			// published at all, and no older WAL frame may displace it.
+			if current.Kind == PendingConflict {
+				return nil
+			}
 			// .meta and .dat may be an older best-effort snapshot even though
 			// a later Flush durably published shadow + full WAL metadata.
 			// Legacy fsync frames have no full publication timestamp, so they
@@ -263,6 +309,20 @@ func (j *Journal) Append(entry JournalEntry) error {
 		return fmt.Errorf("journal write: %w", err)
 	}
 	return nil
+}
+
+// AppendSync appends entry and makes it durable before returning.
+//
+// Append only hands the frame to the page cache. A marker frame is a fence: it
+// is what stops replay from resurrecting the frames it was written after, so a
+// caller that drops the local state that fence protects must use AppendSync.
+// Crash recovery takes the WAL as written, and an unsynced marker simply is not
+// there.
+func (j *Journal) AppendSync(entry JournalEntry) error {
+	if err := j.Append(entry); err != nil {
+		return err
+	}
+	return j.FsyncShared()
 }
 
 // Fsync ensures all journal entries are durable on disk.
