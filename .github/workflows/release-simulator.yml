@@ -1,6 +1,12 @@
-name: Release Simulator Binary
+name: Release simulator binaries
 
 on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "tests/simulator/**"
+      - ".github/workflows/release-simulator.yml"
   push:
     branches:
       - main
@@ -9,20 +15,23 @@ on:
       - ".github/workflows/release-simulator.yml"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
-  group: release-simulator
-  cancel-in-progress: true
+  group: release-simulator-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
-    name: Build ${{ matrix.artifact }}
+    name: Build (${{ matrix.artifact }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             rust_target: x86_64-unknown-linux-musl
             artifact: drive9-simulator-linux-amd64
             musl: true
@@ -30,7 +39,7 @@ jobs:
             rust_target: aarch64-unknown-linux-musl
             artifact: drive9-simulator-linux-arm64
             musl: true
-          - os: macos-14
+          - os: macos-15
             rust_target: aarch64-apple-darwin
             artifact: drive9-simulator-darwin-arm64
             musl: false
@@ -38,12 +47,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install build dependencies (Linux static musl + embedded C suites)
         if: matrix.musl
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools build-essential pkgconf bison flex m4 xz-utils \
+          sudo apt-get install -y musl-tools build-essential pkgconf bison flex m4 xz-utils perl \
             zlib1g-dev libaio-dev libacl1-dev libcap-dev libkeyutils-dev libnuma-dev uuid-dev libssl-dev attr
 
       - name: Setup Rust
@@ -56,9 +67,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/fstest
-          key: fstest-bundle-v3-${{ matrix.rust_target }}-${{ hashFiles('tests/simulator/Cargo.lock') }}
+          key: fstest-bundle-v5-${{ matrix.rust_target }}-${{ hashFiles('tests/simulator/Cargo.lock') }}
           restore-keys: |
-            fstest-bundle-v3-${{ matrix.rust_target }}-
+            fstest-bundle-v5-${{ matrix.rust_target }}-
 
       - name: Run simulator unit & manifest completeness tests
         env:
@@ -102,12 +113,14 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: dist/${{ matrix.artifact }}
+          if-no-files-found: error
           retention-days: 7
 
   publish:
     name: Publish Simulator Binaries
     needs: build
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
@@ -148,23 +161,31 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release edit "$TAG" --notes "$NOTES" --latest=false
           else
-            gh release create "$TAG" --title "drive9-simulator (latest)" --notes "$NOTES" --prerelease --latest=false
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "drive9-simulator (latest)" --notes "$NOTES" --prerelease --latest=false
           fi
-          gh release upload "$TAG" \
-            dist/drive9-simulator-* \
-            dist/simulator-checksums.txt \
-            dist/simulator-version \
-            --clobber
+          gh release upload "$TAG" dist/drive9-simulator-* --clobber
+          gh release upload "$TAG" dist/simulator-checksums.txt dist/simulator-version --clobber
 
-      - name: Upload to S3 releases bucket (when AWS_ROLE_ARN is configured)
-        if: ${{ secrets.AWS_ROLE_ARN != '' }}
+      - name: Check optional S3 release role
+        id: s3_role
+        env:
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          if [ -n "$AWS_ROLE_ARN" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure AWS credentials
+        if: steps.s3_role.outputs.configured == 'true'
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: us-west-2
 
-      - name: Sync simulator binaries to S3 (when AWS_ROLE_ARN is configured)
-        if: ${{ secrets.AWS_ROLE_ARN != '' }}
+      - name: Sync simulator binaries to S3
+        if: steps.s3_role.outputs.configured == 'true'
         run: |
           aws s3 sync dist/ s3://drive9-releases/simulator/latest/ \
             --exclude "*" \

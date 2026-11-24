@@ -31,7 +31,7 @@ webpki-roots = "0.26"
 chrono = "0.4"
 regex = "1"
 xattr = "1"
-fstest = { git = "https://github.com/mornyx/fstest.git", rev = "1d4171e55724aea5c1271d04a0ec5f074c8234df" }
+fstest = { git = "https://github.com/mornyx/fstest.git", rev = "45ecdd80b3ab71a513268772836c110d9f34401b" }
 rusqlite = { version = "0.40.2", features = ["bundled", "backup"], optional = true }
 tokio = { version = "1", features = ["net", "time", "sync", "io-util", "macros"], optional = true }
 axum = { version = "0.8", optional = true }

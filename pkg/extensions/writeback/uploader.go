@@ -58,9 +58,9 @@ type SnapshotStagingGensFunc func(remotePath string) StagingGens
 // any time. WaitPath allows Rename/Unlink/Fsync to block until the current
 // upload for a path finishes.
 type WriteBackUploader struct {
-	client     *client.Client
-	cache      *staging.WriteBackCache
-	remoteRoot string
+	client      *client.Client
+	cache       *staging.WriteBackCache
+	remoteRoot  string
 	queueMu     sync.Mutex
 	queueCond   *sync.Cond
 	stateCond   *sync.Cond
@@ -69,9 +69,9 @@ type WriteBackUploader struct {
 	queuedSet   map[string]struct{}
 	activePaths map[string]int
 	wg          sync.WaitGroup
-	stopOnce   sync.Once
-	stopped    atomic.Bool
-	active     atomic.Int64
+	stopOnce    sync.Once
+	stopped     atomic.Bool
+	active      atomic.Int64
 
 	// Per-path in-flight tracking.
 	inflightMu sync.Mutex
@@ -354,6 +354,22 @@ func (u *WriteBackUploader) WaitPath(localPath string) {
 	if ok {
 		<-ps.done
 	}
+}
+
+// IsQueuedOrActive reports whether localPath is currently queued, held by an
+// active worker/path gate, or in flight in the background uploader.
+func (u *WriteBackUploader) IsQueuedOrActive(localPath string) bool {
+	if u == nil {
+		return false
+	}
+	u.queueMu.Lock()
+	_, queued := u.queuedSet[localPath]
+	active := u.activePaths[localPath] > 0
+	u.queueMu.Unlock()
+	if queued || active {
+		return true
+	}
+	return u.InFlight(localPath)
 }
 
 // WaitQueuedOrActive blocks until localPath is neither queued in the
