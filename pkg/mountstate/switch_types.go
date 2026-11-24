@@ -75,12 +75,14 @@ func (u PendingUnbind) Validate() error {
 
 // SwitchReceipt describes a durable binding decision in SwitchJournal.
 type SwitchReceipt struct {
-	OperationID    string                     `json:"operation_id"`
-	FromGeneration uint64                     `json:"from_generation"`
-	Generation     uint64                     `json:"generation"`
-	From           viewprotocol.SwitchBinding `json:"from"`
-	Target         viewprotocol.SwitchBinding `json:"target"`
-	State          string                     `json:"state"`
+	// RequestedLayerRef records the original selector locally for retries after a layer is deleted.
+	RequestedLayerRef string                     `json:"-"`
+	OperationID       string                     `json:"operation_id"`
+	FromGeneration    uint64                     `json:"from_generation"`
+	Generation        uint64                     `json:"generation"`
+	From              viewprotocol.SwitchBinding `json:"from"`
+	Target            viewprotocol.SwitchBinding `json:"target"`
+	State             string                     `json:"state"`
 }
 
 // SwitchSnapshot reports the durable state of a SwitchJournal.

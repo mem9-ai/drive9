@@ -3,12 +3,9 @@
 package cli
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -26,35 +23,6 @@ import (
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
-
-func startFakeMountStatusSocket(t *testing.T, getStatus func() mountcontrol.StatusResponse) string {
-	t.Helper()
-	shortDir, err := os.MkdirTemp("/tmp", "d9cli")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = os.RemoveAll(shortDir) })
-	sockPath := filepath.Join(shortDir, "ctrl.sock")
-	ln, err := net.Listen("unix", sockPath)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = ln.Close() })
-
-	go func() {
-		for {
-			conn, aerr := ln.Accept()
-			if aerr != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer func() { _ = c.Close() }()
-				var req mountcontrol.DrainRequest
-				if json.NewDecoder(bufio.NewReader(c)).Decode(&req) != nil {
-					return
-				}
-				_ = json.NewEncoder(c).Encode(getStatus())
-			}(conn)
-		}
-	}()
-	return sockPath
-}
 
 func TestUmountAndPackUnpackFollowPostSwitchControlStatus(t *testing.T) {
 	shortDir, err := os.MkdirTemp("/tmp", "d9swp")
@@ -255,15 +223,19 @@ func TestArchiveCommandsRequireAConfirmedMountView(t *testing.T) {
 		{"uncertain", mountcontrol.StatusResponse{Error: "journal uncertain"}, "journal uncertain"},
 		{"recovering", mountcontrol.StatusResponse{OK: true, Recovering: true}, "recovering"},
 		{"missing_binding", mountcontrol.StatusResponse{OK: true, ViewSwitch: true}, "cannot identify"},
+		{"empty_status", mountcontrol.StatusResponse{OK: true}, "cannot identify"},
+		{"missing_socket", mountcontrol.StatusResponse{}, "control socket"},
 		{"unavailable", mountcontrol.StatusResponse{}, "read mount view"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mp := t.TempDir()
 			socket := filepath.Join(root, "missing.sock")
-			if tc.name != "unavailable" {
+			if tc.name == "missing_socket" {
+				socket = ""
+			} else if tc.name != "unavailable" {
 				socket = startFakeMountStatusSocket(t, func() mountcontrol.StatusResponse { return tc.status })
 			}
-			state := mountstate.ProcessState{PID: os.Getpid(), MountKind: mountstate.MountKindFUSE, MountPoint: mp, RemoteRoot: "/", LocalRoot: root, ControlSocket: socket, PackPaths: []string{"dist"}}
+			state := mountstate.ProcessState{PID: os.Getpid(), MountKind: mountstate.MountKindFUSE, MountPoint: mp, LayerID: "layer_01j00000000000000000000001", RemoteRoot: "/", LocalRoot: root, ControlSocket: socket, PackPaths: []string{"dist"}}
 			_, err := mountstate.WriteProcessState(mp, state)
 			require.NoError(t, err)
 			c := client.New("http://127.0.0.1:1", "unused")

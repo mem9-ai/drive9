@@ -396,24 +396,21 @@ func (v *mountView) drainShutdownResponse(ctx context.Context) mountcontrol.Drai
 }
 
 func (v *mountView) bindProcessStateUpdater(fn func(string, bool)) {
-	if v == nil || v.switcher == nil || fn == nil {
+	if v == nil || v.switcher == nil {
 		return
 	}
-	v.switcher.mu.Lock()
-	v.switcher.onSwitchDone = func(b viewprotocol.SwitchBinding) {
-		fn(b.LayerID, b.LayerID != "" && b.ReadOnly)
+	sw := v.switcher
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	if fn == nil {
+		sw.onSwitchDone = nil
+		return
 	}
-	var (
-		hasSnap bool
-		snap    mountstate.SwitchSnapshot
-	)
-	if v.switcher.journal != nil && !v.switcher.journal.Uncertain() {
-		snap = v.switcher.journal.Snapshot()
-		hasSnap = true
+	sw.onSwitchDone = func(binding viewprotocol.SwitchBinding) {
+		fn(binding.LayerID, binding.LayerID != "" && binding.ReadOnly)
 	}
-	v.switcher.mu.Unlock()
-	if hasSnap {
-		fn(snap.Binding.LayerID, snap.Binding.LayerID != "" && snap.Binding.ReadOnly)
+	if sw.journal != nil && !sw.journal.Uncertain() {
+		sw.onSwitchDone(sw.journal.Snapshot().Binding)
 	}
 }
 

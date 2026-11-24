@@ -21,14 +21,19 @@ func OpenExistingSwitchJournal(string) (*SwitchJournal, error) {
 	return nil, errSwitchJournalUnsupported
 }
 
-func (j *SwitchJournal) Close() error                                         { return nil }
-func (j *SwitchJournal) Uncertain() bool                                      { return false }
-func (j *SwitchJournal) Snapshot() SwitchSnapshot                             { return SwitchSnapshot{} }
-func (j *SwitchJournal) Operation(string) (SwitchReceipt, bool)               { return SwitchReceipt{}, false }
-func (j *SwitchJournal) AppendBindIntent(PendingUnbind) error                 { return errSwitchJournalUnsupported }
-func (j *SwitchJournal) AppendUnbindDone(PendingUnbind) error                 { return errSwitchJournalUnsupported }
-func (j *SwitchJournal) BindInitial(viewprotocol.SwitchBinding, string) error { return errSwitchJournalUnsupported }
+func (j *SwitchJournal) Close() error                           { return nil }
+func (j *SwitchJournal) Uncertain() bool                        { return false }
+func (j *SwitchJournal) Snapshot() SwitchSnapshot               { return SwitchSnapshot{} }
+func (j *SwitchJournal) Operation(string) (SwitchReceipt, bool) { return SwitchReceipt{}, false }
+func (j *SwitchJournal) AppendBindIntent(PendingUnbind) error   { return errSwitchJournalUnsupported }
+func (j *SwitchJournal) AppendUnbindDone(PendingUnbind) error   { return errSwitchJournalUnsupported }
+func (j *SwitchJournal) BindInitial(viewprotocol.SwitchBinding, string) error {
+	return errSwitchJournalUnsupported
+}
 func (j *SwitchJournal) Decide(string, uint64, viewprotocol.SwitchBinding) (SwitchReceipt, bool, error) {
+	return SwitchReceipt{}, false, errSwitchJournalUnsupported
+}
+func (j *SwitchJournal) DecideWithLayerRef(string, uint64, viewprotocol.SwitchBinding, string) (SwitchReceipt, bool, error) {
 	return SwitchReceipt{}, false, errSwitchJournalUnsupported
 }
 func (j *SwitchJournal) MarkTargetRevoked(string) (SwitchReceipt, error) {

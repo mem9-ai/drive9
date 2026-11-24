@@ -41,7 +41,9 @@ func TestSwitchJournalLifecycleReplayAndPendingUnbinds(t *testing.T) {
 		LayerID: testLayerA, MountID: "mnt-1", Kind: UnbindKindOp, OperationID: "op-1", Fence: 0,
 	}))
 	targetA := viewprotocol.SwitchBinding{LayerID: testLayerA, Fence: 1, BaseRootPath: "/workspace"}
-	rcpt1, replayed, err := j.Decide("op-1", 1, targetA)
+	_, _, err = j.DecideWithLayerRef("op-1", 1, targetA, testLayerB)
+	require.ErrorIs(t, err, ErrSwitchInvalid)
+	rcpt1, replayed, err := j.DecideWithLayerRef("op-1", 1, targetA, "work")
 	require.NoError(t, err)
 	require.False(t, replayed)
 	require.Equal(t, SwitchRecovering, rcpt1.State)
@@ -57,6 +59,7 @@ func TestSwitchJournalLifecycleReplayAndPendingUnbinds(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, replayed)
 	require.Equal(t, rcpt1, rcpt1Replay)
+	require.Equal(t, "work", rcpt1Replay.RequestedLayerRef)
 
 	done1, err := j.Complete("op-1")
 	require.NoError(t, err)

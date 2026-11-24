@@ -567,10 +567,11 @@ func TestReadOnlyLayerUmountPack(t *testing.T) {
 			mp := t.TempDir()
 			detached := false
 			deps := umountDeps{
-				goos: "linux", lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
+				requestStatus: fixedArchiveStatus("layer-42"),
+				goos:          "linux", lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
 				run: func([]string) error { detached = true; return nil },
 				readProcessState: func(string) (mountstate.ProcessState, string, error) {
-					return mountstate.ProcessState{LayerID: "layer-42", LayerReadOnly: true, PackPaths: []string{"build"}}, "", nil
+					return mountstate.ProcessState{ControlSocket: "fixture.sock", LayerID: "layer-42", LayerReadOnly: true, PackPaths: []string{"build"}}, "", nil
 				},
 				packAfterUnmount: func(context.Context, mountstate.ProcessState, []string, []string) error {
 					t.Fatal("packed read-only layer")

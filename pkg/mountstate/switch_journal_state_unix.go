@@ -144,6 +144,9 @@ func (j *SwitchJournal) applyRecordLocked(rec switchJournalRecord, first bool) e
 		if err := rec.Target.Validate(); err != nil {
 			return err
 		}
+		if err := validateDecisionLayerRef(rec.Target.LayerID, rec.RequestedLayerRef); err != nil {
+			return err
+		}
 		nextUnbinds := append([]PendingUnbind(nil), j.pendingUnbinds...)
 		if rec.Target.LayerID != "" && !rec.Target.ReadOnly {
 			filtered := make([]PendingUnbind, 0, len(nextUnbinds))
@@ -164,12 +167,13 @@ func (j *SwitchJournal) applyRecordLocked(rec switchJournalRecord, first bool) e
 			return fmt.Errorf("decide while pending_unbinds non-empty")
 		}
 		rcpt := SwitchReceipt{
-			OperationID:    rec.OperationID,
-			FromGeneration: rec.FromGeneration,
-			Generation:     rec.Generation,
-			From:           j.binding,
-			Target:         rec.Target,
-			State:          SwitchRecovering,
+			RequestedLayerRef: rec.RequestedLayerRef,
+			OperationID:       rec.OperationID,
+			FromGeneration:    rec.FromGeneration,
+			Generation:        rec.Generation,
+			From:              j.binding,
+			Target:            rec.Target,
+			State:             SwitchRecovering,
 		}
 		j.pendingUnbinds = nil
 		j.generation = rec.Generation
@@ -256,4 +260,15 @@ func (j *SwitchJournal) applyRecordLocked(rec switchJournalRecord, first bool) e
 	default:
 		return fmt.Errorf("unknown switch journal record %q", rec.Type)
 	}
+}
+
+func validateDecisionLayerRef(layerID, ref string) error {
+	if ref == "" {
+		return nil
+	} // Older records only contain the resolved layer ID.
+	norm, err := viewprotocol.NormalizeLayerRef(ref)
+	if err != nil || norm != ref || layerID == "" || (viewprotocol.IsCanonicalLayerID(ref) && ref != layerID) {
+		return fmt.Errorf("%w: invalid requested layer reference", ErrSwitchInvalid)
+	}
+	return nil
 }

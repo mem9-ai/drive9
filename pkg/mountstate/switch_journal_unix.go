@@ -27,15 +27,16 @@ import (
 const maxSwitchRecordLen = 64 << 10
 
 type switchJournalRecord struct {
-	Type           string                     `json:"type"`
-	MountID        string                     `json:"mount_id,omitempty"`
-	Scope          string                     `json:"scope,omitempty"`
-	OperationID    string                     `json:"operation_id,omitempty"`
-	FromGeneration uint64                     `json:"from_generation,omitempty"`
-	Generation     uint64                     `json:"generation,omitempty"`
-	From           viewprotocol.SwitchBinding `json:"from,omitempty"`
-	Target         viewprotocol.SwitchBinding `json:"target,omitempty"`
-	Unbind         *PendingUnbind             `json:"unbind,omitempty"`
+	RequestedLayerRef string                     `json:"requested_layer_ref,omitempty"`
+	Type              string                     `json:"type"`
+	MountID           string                     `json:"mount_id,omitempty"`
+	Scope             string                     `json:"scope,omitempty"`
+	OperationID       string                     `json:"operation_id,omitempty"`
+	FromGeneration    uint64                     `json:"from_generation,omitempty"`
+	Generation        uint64                     `json:"generation,omitempty"`
+	From              viewprotocol.SwitchBinding `json:"from,omitempty"`
+	Target            viewprotocol.SwitchBinding `json:"target,omitempty"`
+	Unbind            *PendingUnbind             `json:"unbind,omitempty"`
 }
 
 // SwitchJournal persists local mount view bindings, pending switch decisions,

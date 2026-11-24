@@ -5,7 +5,11 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
+	"github.com/mem9-ai/drive9/pkg/mountcontrol"
+	"github.com/stretchr/testify/require"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -735,12 +739,13 @@ func TestPackMountProfileOverrideUsesEffectiveProfilePackPaths(t *testing.T) {
 	mustWriteFile(t, filepath.Join(localRoot, "overlay", ".git", "config"), []byte("git\n"), 0o644)
 	mustWriteFile(t, filepath.Join(localRoot, "overlay", "dist", "app.js"), []byte("bundle\n"), 0o644)
 	_, err := mountstate.WriteProcessState(mountPoint, mountstate.ProcessState{
-		PID:        os.Getpid(),
-		MountPoint: mountPoint,
-		RemoteRoot: "/remote",
-		Profile:    "coding-agent",
-		LocalRoot:  localRoot,
-		PackPaths:  []string{".git"},
+		ControlSocket: fixedArchiveSocket(t, ""),
+		PID:           os.Getpid(),
+		MountPoint:    mountPoint,
+		RemoteRoot:    "/remote",
+		Profile:       "coding-agent",
+		LocalRoot:     localRoot,
+		PackPaths:     []string{".git"},
 	})
 	if err != nil {
 		t.Fatalf("WriteProcessState: %v", err)
@@ -792,12 +797,13 @@ func TestPackMountProfileNoneDoesNotUseMountPackPaths(t *testing.T) {
 	localRoot := t.TempDir()
 	mustWriteFile(t, filepath.Join(localRoot, "overlay", ".git", "config"), []byte("git\n"), 0o644)
 	_, err := mountstate.WriteProcessState(mountPoint, mountstate.ProcessState{
-		PID:        os.Getpid(),
-		MountPoint: mountPoint,
-		RemoteRoot: "/remote",
-		Profile:    "coding-agent",
-		LocalRoot:  localRoot,
-		PackPaths:  []string{".git"},
+		ControlSocket: fixedArchiveSocket(t, ""),
+		PID:           os.Getpid(),
+		MountPoint:    mountPoint,
+		RemoteRoot:    "/remote",
+		Profile:       "coding-agent",
+		LocalRoot:     localRoot,
+		PackPaths:     []string{".git"},
 	})
 	if err != nil {
 		t.Fatalf("WriteProcessState: %v", err)
@@ -825,18 +831,20 @@ func TestPackMountProfileNoneDoesNotUseMountPackPaths(t *testing.T) {
 
 func TestRunUmountPacksAfterUnmount(t *testing.T) {
 	state := mountstate.ProcessState{
-		PID:        1234,
-		MountPoint: "/mnt/drive9",
-		RemoteRoot: "/remote",
-		Profile:    "coding-agent",
-		LocalRoot:  filepath.Join(t.TempDir(), "local"),
-		PackPaths:  []string{".git"},
+		ControlSocket: "fixture.sock",
+		PID:           1234,
+		MountPoint:    "/mnt/drive9",
+		RemoteRoot:    "/remote",
+		Profile:       "coding-agent",
+		LocalRoot:     filepath.Join(t.TempDir(), "local"),
+		PackPaths:     []string{".git"},
 	}
 	var calls []string
 	var gotPaths []string
 	deps := umountDeps{
-		goos:     "linux",
-		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
+		requestStatus: fixedArchiveStatus(""),
+		goos:          "linux",
+		lookPath:      fakeLookPath(map[string]bool{"fusermount3": true}),
 		run: func(argv []string) error {
 			calls = append(calls, "run")
 			return nil
@@ -892,18 +900,20 @@ func TestRunUmountPacksAfterUnmount(t *testing.T) {
 
 func TestRunUmountAutoPacksCodingAgentMount(t *testing.T) {
 	state := mountstate.ProcessState{
-		PID:        1234,
-		MountPoint: "/mnt/drive9",
-		RemoteRoot: "/remote",
-		Profile:    "coding-agent",
-		LocalRoot:  filepath.Join(t.TempDir(), "local"),
-		PackPaths:  []string{".git"},
+		ControlSocket: "fixture.sock",
+		PID:           1234,
+		MountPoint:    "/mnt/drive9",
+		RemoteRoot:    "/remote",
+		Profile:       "coding-agent",
+		LocalRoot:     filepath.Join(t.TempDir(), "local"),
+		PackPaths:     []string{".git"},
 	}
 	var gotArchives []string
 	deps := umountDeps{
-		goos:     "linux",
-		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
-		run:      func(argv []string) error { return nil },
+		requestStatus: fixedArchiveStatus(""),
+		goos:          "linux",
+		lookPath:      fakeLookPath(map[string]bool{"fusermount3": true}),
+		run:           func(argv []string) error { return nil },
 		readProcessState: func(string) (mountstate.ProcessState, string, error) {
 			return state, "/tmp/drive9.pid", nil
 		},
@@ -1665,6 +1675,7 @@ func TestLayerMountUnpacksIntoSelectedOverlay(t *testing.T) {
 			assertFileContent(t, filepath.Join(viewLocal, "overlay", file), "layer data")
 			mountPoint := t.TempDir()
 			state := mountstate.ProcessState{PID: os.Getpid(), MountPoint: mountPoint, Server: srv.URL, LocalRoot: local, RemoteRoot: base, Profile: "layer-pack", LayerID: id, LayerReadOnly: true}
+			state.ControlSocket = fixedArchiveSocket(t, id)
 			pidFile, err := mountstate.WriteProcessState(mountPoint, state)
 			if err != nil {
 				t.Fatal(err)
@@ -1806,5 +1817,48 @@ func TestLayerDefaultRootUsesResolvedRemoteRoot(t *testing.T) {
 	}
 	if len(roots) != 2 || roots[0] == "" || roots[0] != roots[1] {
 		t.Fatalf("default roots %v", roots)
+	}
+}
+
+func startFakeMountStatusSocket(t *testing.T, getStatus func() mountcontrol.StatusResponse) string {
+	t.Helper()
+	shortDir, err := os.MkdirTemp("/tmp", "d9cli")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(shortDir) })
+	sockPath := filepath.Join(shortDir, "ctrl.sock")
+	ln, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+
+	go func() {
+		for {
+			conn, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				var req mountcontrol.DrainRequest
+				if json.NewDecoder(c).Decode(&req) != nil {
+					return
+				}
+				_ = json.NewEncoder(c).Encode(getStatus())
+			}(conn)
+		}
+	}()
+	return sockPath
+}
+
+func fixedArchiveSocket(t *testing.T, layer string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		return ""
+	}
+	return startFakeMountStatusSocket(t, func() mountcontrol.StatusResponse { return mountcontrol.StatusResponse{OK: true, Layer: &layer} })
+}
+
+func fixedArchiveStatus(layer string) func(context.Context, string, time.Duration) (*mountcontrol.StatusResponse, error) {
+	return func(context.Context, string, time.Duration) (*mountcontrol.StatusResponse, error) {
+		return &mountcontrol.StatusResponse{OK: true, Layer: &layer}, nil
 	}
 }

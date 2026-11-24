@@ -13,8 +13,14 @@ import (
 )
 
 func refreshMountedPackView(state *mountstate.ProcessState, request func(context.Context, string, time.Duration) (*mountcontrol.StatusResponse, error), timeout time.Duration) error {
-	if state.MountKind != "" && state.MountKind != mountstate.MountKindFUSE || strings.TrimSpace(state.ControlSocket) == "" {
+	if state.MountKind != "" && state.MountKind != mountstate.MountKindFUSE {
 		return nil
+	}
+	if strings.TrimSpace(state.ControlSocket) == "" {
+		return errors.New("mount control socket is missing; cannot confirm archive view")
+	}
+	if request == nil {
+		request = mountcontrol.RequestStatus
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -32,7 +38,7 @@ func refreshMountedPackView(state *mountstate.ProcessState, request func(context
 	if snap != nil {
 		state.LayerID = snap.Binding.LayerID
 		state.LayerReadOnly = snap.Binding.LayerID != "" && snap.Binding.ReadOnly
-	} else if status.ViewSwitch || (status.Layer != nil && *status.Layer != state.LayerID) {
+	} else if status.ViewSwitch || status.Layer == nil || *status.Layer != state.LayerID {
 		return errors.New("cannot identify the active mount view for the archive")
 	}
 	if strings.TrimSpace(status.RemoteRoot) != "" {

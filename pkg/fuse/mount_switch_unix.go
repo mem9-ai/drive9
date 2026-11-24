@@ -274,41 +274,21 @@ func (s *mountViewSwitch) apply(ctx context.Context, req mountcontrol.SwitchRequ
 	isMain, layerRef, _ := req.NormalizedTarget()
 
 	if prior, ok := s.journal.Operation(req.OperationID); ok {
-		if prior.FromGeneration != req.ExpectedGeneration {
+		if prior.FromGeneration != req.ExpectedGeneration || (req.Recover && prior.State == mountstate.SwitchTargetRevoked) {
 			return switchErrResp(req, viewprotocol.CodeConflict, "CONFLICT", mountstate.ErrSwitchConflict)
 		}
-		if prior.State == mountstate.SwitchTargetRevoked {
-			if (isMain && prior.Target.LayerID == "") || (!isMain && prior.Target.LayerID != "") {
-				return mountcontrol.SwitchResponse{
-					MountID: snap.MountID, OperationID: req.OperationID, Receipt: &prior,
-					Code: viewprotocol.CodeSwitchTargetRevoked, ErrorKind: "TARGET_REVOKED", Error: "target layer or lease was revoked",
-				}
-			}
-			return switchErrResp(req, viewprotocol.CodeConflict, "CONFLICT", mountstate.ErrSwitchConflict)
-		}
-		matched, matchErr := s.targetMatchesReplay(ctx, isMain, layerRef, prior.Target)
+		matched, matchErr := s.targetMatchesReplay(ctx, isMain, layerRef, prior)
 		if matchErr != nil {
 			return switchErrResp(req, viewprotocol.CodeSwitchRecovering, "RECOVERING", matchErr)
 		}
-		if prior.State == mountstate.SwitchRecovering && snap.Pending != nil && snap.Pending.OperationID == req.OperationID {
-			if matched {
-				return s.finishPendingLocked(ctx, req.OperationID)
-			}
-			if !isMain && prior.Target.LayerID != "" {
-				callCtx, cancel := context.WithTimeout(ctx, s.leaseCallTimeout())
-				_, gerr := s.baseClient.GetLayer(callCtx, prior.Target.LayerID)
-				cancel()
-				if gerr != nil {
-					if isRevokedTargetError(gerr) {
-						return s.finishPendingLocked(ctx, req.OperationID)
-					}
-					return switchErrResp(req, viewprotocol.CodeSwitchRecovering, "RECOVERING", gerr)
-				}
-			}
-			return switchErrResp(req, viewprotocol.CodeConflict, "CONFLICT", mountstate.ErrSwitchConflict)
-		}
 		if !matched {
 			return switchErrResp(req, viewprotocol.CodeConflict, "CONFLICT", mountstate.ErrSwitchConflict)
+		}
+		if prior.State == mountstate.SwitchTargetRevoked {
+			return mountcontrol.SwitchResponse{MountID: snap.MountID, OperationID: req.OperationID, Receipt: &prior, Code: viewprotocol.CodeSwitchTargetRevoked, ErrorKind: "TARGET_REVOKED", Error: "target layer or lease was revoked"}
+		}
+		if prior.State == mountstate.SwitchRecovering && snap.Pending != nil && snap.Pending.OperationID == req.OperationID {
+			return s.finishPendingLocked(ctx, req.OperationID)
 		}
 		if prior.State == mountstate.SwitchDone {
 			return mountcontrol.SwitchResponse{MountID: snap.MountID, OperationID: req.OperationID, Receipt: &prior}
@@ -384,22 +364,23 @@ func (s *mountViewSwitch) apply(ctx context.Context, req mountcontrol.SwitchRequ
 	return s.executeSwitchPrecheckedLocked(ctx, req, snap, isMain, layerRef, recoveringFromRevoked)
 }
 
-func (s *mountViewSwitch) targetMatchesReplay(ctx context.Context, isMain bool, layerRef string, target viewprotocol.SwitchBinding) (bool, error) {
+func (s *mountViewSwitch) targetMatchesReplay(ctx context.Context, isMain bool, layerRef string, prior mountstate.SwitchReceipt) (bool, error) {
+	target := prior.Target
 	if isMain {
 		return target.LayerID == "", nil
 	}
 	if target.LayerID == "" {
 		return false, nil
 	}
-	if target.LayerID == layerRef {
-		return true, nil
+	if viewprotocol.IsCanonicalLayerID(layerRef) {
+		return target.LayerID == layerRef, nil
 	}
 	callCtx, cancel := context.WithTimeout(ctx, s.leaseCallTimeout())
 	info, err := s.baseClient.GetLayer(callCtx, layerRef)
 	cancel()
 	if err != nil {
-		if isRevokedTargetError(err) {
-			return false, nil
+		if client.IsNotFound(err) {
+			return layerRef == prior.RequestedLayerRef, nil
 		}
 		return false, err
 	}
@@ -589,7 +570,7 @@ func (s *mountViewSwitch) executeSwitchPrecheckedLocked(
 				return cerr
 			}
 		}
-		_, _, decideErr = s.journal.Decide(req.OperationID, snap.Generation, targetBinding)
+		_, _, decideErr = s.journal.DecideWithLayerRef(req.OperationID, snap.Generation, targetBinding, layerRef)
 		return decideErr
 	})
 	if idleErr != nil {

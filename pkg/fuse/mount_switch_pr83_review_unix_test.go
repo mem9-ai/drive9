@@ -250,11 +250,37 @@ func TestMountViewSwitchUncertainStatusAndRecoveringPausedGuard(t *testing.T) {
 		delete(fb.layers, l1)
 		fb.mu.Unlock()
 
+		checkConflicts := func() {
+			t.Helper()
+			for _, ref := range []string{"layer_01j00000000000000000000002", "L2", "missing", "main"} {
+				_, err := mountcontrol.RequestSwitch(ctx, ctrl.SocketPath(), mountcontrol.SwitchRequest{
+					MountID: "mount-1", OperationID: "op_revoked_target", ExpectedGeneration: 1, Layer: ref,
+				})
+				var conflict *mountcontrol.SwitchError
+				require.ErrorAs(t, err, &conflict)
+				require.Equal(t, viewprotocol.CodeConflict, conflict.Code, ref)
+			}
+		}
+		checkConflicts()
+
 		_, err = mountcontrol.RequestSwitch(ctx, ctrl.SocketPath(), mountcontrol.SwitchRequest{
 			MountID: "mount-1", OperationID: "op_revoked_target", ExpectedGeneration: 1, Layer: "L1",
 		})
 		require.ErrorAs(t, err, &swErr)
 		require.Equal(t, viewprotocol.CodeSwitchTargetRevoked, swErr.Code)
+
+		checkConflicts()
+		_, err = mountcontrol.RequestSwitch(ctx, ctrl.SocketPath(), mountcontrol.SwitchRequest{
+			MountID: "mount-1", OperationID: "op_revoked_target", ExpectedGeneration: 1, Layer: l1,
+		})
+		require.ErrorAs(t, err, &swErr)
+		require.Equal(t, viewprotocol.CodeSwitchTargetRevoked, swErr.Code)
+
+		_, err = mountcontrol.RequestSwitch(ctx, ctrl.SocketPath(), mountcontrol.SwitchRequest{
+			MountID: "mount-1", OperationID: "op_revoked_target", ExpectedGeneration: 1, Layer: l1, Recover: true,
+		})
+		require.ErrorAs(t, err, &swErr)
+		require.Equal(t, viewprotocol.CodeConflict, swErr.Code)
 
 		fb.mu.Lock()
 		fb.layers[l1] = &savedL1
@@ -425,4 +451,22 @@ func TestInodeBudgetSymmetryStartupClassificationAndLayerGitGate(t *testing.T) {
 	require.True(t, preLayer.OK)
 	require.Empty(t, preLayer.Refusals)
 	require.NoError(t, rtLayer.stop(context.Background()))
+}
+
+func TestSwitchAfterUnmountLeavesProcessStateRemoved(t *testing.T) {
+	sw, _, _, _ := viewSwitchFixture(t)
+	view := &mountView{switcher: sw}
+	mp := t.TempDir()
+	view.bindProcessStateUpdater(func(layer string, readOnly bool) {
+		_, err := mountstate.WriteProcessState(mp, mountstate.ProcessState{PID: os.Getpid(), MountPoint: mp, LayerID: layer, LayerReadOnly: readOnly})
+		require.NoError(t, err)
+	})
+	view.bindProcessStateUpdater(nil)
+	path := mountstate.PIDFilePath(mp)
+	require.NoError(t, os.Remove(path))
+	resp := sw.apply(context.Background(), mountcontrol.SwitchRequest{MountID: "mount-1", OperationID: "op_after_unregister", ExpectedGeneration: 1, Layer: "L1"})
+	require.NotNil(t, resp.Receipt, resp.Error)
+	require.Equal(t, mountstate.SwitchDone, resp.Receipt.State)
+	_, err := os.Stat(path)
+	require.ErrorIs(t, err, os.ErrNotExist)
 }

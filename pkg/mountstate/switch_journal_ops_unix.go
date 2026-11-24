@@ -78,6 +78,10 @@ func (j *SwitchJournal) BindInitial(target viewprotocol.SwitchBinding, operation
 }
 
 func (j *SwitchJournal) Decide(operationID string, expectedGeneration uint64, target viewprotocol.SwitchBinding) (SwitchReceipt, bool, error) {
+	return j.DecideWithLayerRef(operationID, expectedGeneration, target, target.LayerID)
+}
+
+func (j *SwitchJournal) DecideWithLayerRef(operationID string, expectedGeneration uint64, target viewprotocol.SwitchBinding, layerRef string) (SwitchReceipt, bool, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.uncertain {
@@ -88,6 +92,9 @@ func (j *SwitchJournal) Decide(operationID string, expectedGeneration uint64, ta
 	}
 	if err := target.Validate(); err != nil {
 		return SwitchReceipt{}, false, fmt.Errorf("%w: %v", ErrSwitchInvalid, err)
+	}
+	if err := validateDecisionLayerRef(target.LayerID, layerRef); err != nil {
+		return SwitchReceipt{}, false, err
 	}
 	if prior, ok := j.history[operationID]; ok {
 		if prior.FromGeneration == expectedGeneration && prior.Target.LayerID == target.LayerID && prior.Target.ReadOnly == target.ReadOnly {
@@ -120,12 +127,13 @@ func (j *SwitchJournal) Decide(operationID string, expectedGeneration uint64, ta
 		return SwitchReceipt{}, false, fmt.Errorf("%w: missing persisted bind_intent for %s", ErrSwitchInvalid, target.LayerID)
 	}
 	if err := j.appendAndApplyLocked(switchJournalRecord{
-		Type:           "decide",
-		OperationID:    operationID,
-		FromGeneration: expectedGeneration,
-		Generation:     expectedGeneration + 1,
-		From:           j.binding,
-		Target:         target,
+		Type:              "decide",
+		RequestedLayerRef: layerRef,
+		OperationID:       operationID,
+		FromGeneration:    expectedGeneration,
+		Generation:        expectedGeneration + 1,
+		From:              j.binding,
+		Target:            target,
 	}); err != nil {
 		return SwitchReceipt{}, false, err
 	}
