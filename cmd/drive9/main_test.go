@@ -3,12 +3,15 @@ package main
 import (
 	"bytes"
 	"io"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/server"
 )
 
 func TestVersionStringUsesDrive9Component(t *testing.T) {
@@ -399,6 +402,25 @@ func captureDispatchOutput(t *testing.T, cmd string, args []string) (string, str
 	_ = stdoutW.Close()
 	_ = stderrW.Close()
 	return <-stdoutDone, <-stderrDone, exitCodes
+}
+
+func TestLayerListReportsEmbeddedServerUnsupported(t *testing.T) {
+	embedded := server.New(nil)
+	t.Cleanup(embedded.Close)
+	endpoint := httptest.NewServer(embedded)
+	t.Cleanup(endpoint.Close)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("DRIVE9_SERVER", endpoint.URL)
+	t.Setenv("DRIVE9_API_KEY", "test-key")
+	t.Setenv("DRIVE9_VAULT_TOKEN", "")
+
+	_, stderr, codes := captureDispatchOutput(t, "fs", []string{"layer", "ls"})
+	if len(codes) != 1 || codes[0] != 1 {
+		t.Fatalf("fs layer ls exit codes = %v, want [1]", codes)
+	}
+	if !strings.Contains(stderr, "TiDB server runtime") {
+		t.Fatalf("fs layer ls stderr = %q, want TiDB server requirement", stderr)
+	}
 }
 
 func TestDispatchSubcommandHelpShowsUsageWithoutFatalPrefix(t *testing.T) {

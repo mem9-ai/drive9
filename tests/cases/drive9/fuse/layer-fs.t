@@ -1,5 +1,7 @@
 #!/bin/sh
-# LayerFS uses a real tenant and manages its own fenced mount.
+# The simulator's Rust server implements core operations only. Use an external
+# TiDB server for fenced mounts, or the Go server with DRIVE9_EXPECT_EMBEDDED_LAYER_501=1.
+# Code CI also checks the Go server's HTTP routes and CLI error on every PR to main.
 set -eu
 
 require --req 'drive9-layer-server' --claim 'external-server-selected' -- test "${SIM_BUILTIN_SERVER:-0}" = 0
