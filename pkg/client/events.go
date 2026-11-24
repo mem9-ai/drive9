@@ -62,6 +62,12 @@ func (c *Client) WatchEvents(ctx context.Context, actor string, handler EventHan
 
 // WatchEventsWithLifecycle is WatchEvents with optional lifecycle callbacks.
 func (c *Client) WatchEventsWithLifecycle(ctx context.Context, actor string, handler EventHandler, lifecycle EventLifecycle) {
+	if c.view.LayerID != "" {
+		if lifecycle.OnDisconnected != nil {
+			lifecycle.OnDisconnected(viewprotocol.ErrUnsupportedInLayerView)
+		}
+		return
+	}
 	var lastSeq uint64
 	backoff := sseInitialBackoff
 

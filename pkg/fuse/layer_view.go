@@ -56,8 +56,8 @@ type layerMountBinding struct {
 	Fence        int64
 	ReadOnly     bool
 
-	fenced        atomic.Bool
-	fenceMu       sync.Mutex
+	fenced           atomic.Bool
+	fenceMu          sync.Mutex
 	onFenceCallbacks []func()
 
 	renewCancel context.CancelFunc
@@ -218,9 +218,10 @@ func resolveLayerMountView(
 		ReadOnly:     false,
 	}
 	vc, verr := baseClient.WithView(client.ViewBinding{
-		LayerID:    info.LayerID,
-		Fence:      lease.Fence,
-		WriteGuard: binding.checkWriteAllowed,
+		LayerID:      info.LayerID,
+		Fence:        lease.Fence,
+		WriteGuard:   binding.checkWriteAllowed,
+		ReadUnfenced: binding.fenced.Load,
 	})
 	if verr != nil {
 		binding.Unbind(context.Background())

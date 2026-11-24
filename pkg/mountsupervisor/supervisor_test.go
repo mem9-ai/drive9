@@ -355,3 +355,23 @@ func TestCollectStatusOrphanUsesCreation(t *testing.T) {
 		t.Fatalf("state=%s want orphan_worker when healthy", snap.State)
 	}
 }
+
+func TestSupervisorReplacesStoredLayerMetadata(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	mp := t.TempDir()
+	s := &supervisor{cfg: applyDefaults(Config{MountPoint: mp, LayerID: "layer-42", LayerReadOnly: true, LocalRoot: "/base"})}
+	for _, id := range []string{"layer-42", ""} {
+		s.cfg.LayerID = id
+		s.cfg.LayerReadOnly = id != ""
+		if err := s.writeAuthoritativeProcessState(); err != nil {
+			t.Fatal(err)
+		}
+		st, _, err := mountstate.ReadProcessState(mp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.LayerID != id || st.LayerReadOnly != s.cfg.LayerReadOnly || st.LocalRoot != "/base" {
+			t.Fatalf("stored layer=%q readOnly=%v root=%q", st.LayerID, st.LayerReadOnly, st.LocalRoot)
+		}
+	}
+}

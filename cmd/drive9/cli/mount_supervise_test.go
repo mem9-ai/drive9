@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"reflect"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/mountstate"
+	"github.com/mem9-ai/drive9/pkg/mountsupervisor"
 )
 
 func TestPeelSystemdUnitFlagsPassesMountFlags(t *testing.T) {
@@ -167,7 +169,10 @@ func TestProcessMatchesIdentitySelf(t *testing.T) {
 }
 
 func TestAdoptSupervisorCommandArgsIncludesMountKind(t *testing.T) {
-	args := adoptSupervisorCommandArgs("/mnt/obj", "/tmp/obj.log", "https://s", `["s3://b/","/mnt/obj"]`, 42, 7, mountstate.MountKindObject)
+	args, err := adoptSupervisorCommandArgs("/mnt/obj", "/tmp/obj.log", "https://s", `["s3://b/","/mnt/obj"]`, 42, 7, mountstate.MountKindObject, mountstate.ProcessState{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	kind := ""
 	for i := 0; i < len(args)-1; i++ {
 		if args[i] == "--mount-kind" {
@@ -521,5 +526,65 @@ func TestWaitForSupervisedMountReadyIgnoresStaleState(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "timed out waiting") {
 		t.Fatalf("error = %v, want ready timeout", err)
+	}
+}
+
+func TestSupervisorLayerMetadataRoundTrip(t *testing.T) {
+	mp := t.TempDir()
+	for _, readOnly := range []bool{false, true} {
+		st := mountstate.ProcessState{LayerID: "layer-42", LayerReadOnly: readOnly, LocalRoot: "/base", RemoteRoot: "/repo", Profile: "work", PackPaths: []string{"build"}}
+		fresh, err := superviseCommandArgs(mountSuperviseStartRequest{MountPoint: mp, OriginalArgs: []string{"--layer", st.LayerID, mp}, LayerID: st.LayerID, LayerReadOnly: readOnly, LocalRoot: st.LocalRoot, RemoteRoot: st.RemoteRoot, Profile: st.Profile, PackPaths: st.PackPaths}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		adopted, err := adoptSupervisorCommandArgs(mp, "", "", `["--layer","layer-42","/mnt"]`, 42, 7, mountstate.MountKindFUSE, st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, cmd := range [][]string{fresh, adopted} {
+			err := runMountSuperviseWith(cmd[2:], func(cfg mountsupervisor.Config) error {
+				if cfg.LayerID != st.LayerID || cfg.LayerReadOnly != readOnly || cfg.LocalRoot != st.LocalRoot || cfg.RemoteRoot != st.RemoteRoot || cfg.Profile != st.Profile || !reflect.DeepEqual(cfg.PackPaths, st.PackPaths) {
+					t.Errorf("layer pack metadata changed during supervisor startup (adopt=%v, readOnly=%v)", cfg.Adopt, readOnly)
+				}
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+func TestReadOnlyLayerUmountPack(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	for _, flag := range []string{"--pack", "--pack-path", ""} {
+		t.Run("pack"+flag, func(t *testing.T) {
+			mp := t.TempDir()
+			detached := false
+			deps := umountDeps{
+				goos: "linux", lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
+				run: func([]string) error { detached = true; return nil },
+				readProcessState: func(string) (mountstate.ProcessState, string, error) {
+					return mountstate.ProcessState{LayerID: "layer-42", LayerReadOnly: true, PackPaths: []string{"build"}}, "", nil
+				},
+				packAfterUnmount: func(context.Context, mountstate.ProcessState, []string, []string) error {
+					t.Fatal("packed read-only layer")
+					return nil
+				},
+				now: time.Now, sleep: time.Sleep, printErrf: func(string, ...any) {},
+			}
+			args := []string{"--timeout", "0"}
+			if flag != "" {
+				args = append(args, flag, "archive")
+			}
+			err := runUmount(append(args, mp), deps)
+			if flag != "" {
+				if detached || err == nil || !strings.Contains(err.Error(), "read-only layer") {
+					t.Fatalf("detached=%v error=%v", detached, err)
+				}
+			} else if !detached || err != nil {
+				t.Fatalf("auto-pack detached=%v error=%v", detached, err)
+			}
+		})
 	}
 }

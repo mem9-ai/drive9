@@ -39,7 +39,7 @@ const (
 	CodeConflict               = "CONFLICT"
 	CodeEOverflow              = "EOVERFLOW"
 	CodeMergeTooLarge          = "MERGE_TOO_LARGE"
-	CodeTenantReadOnly         = "TENANT_READ_ONLY"
+	CodeTenantReadOnly         = "A_READ_ONLY"
 	CodeUnsupportedInLayerView  = "UNSUPPORTED_IN_LAYER_VIEW"
 	CodeLayerRequiresTiDBServer = "LAYER_REQUIRES_TIDB_SERVER"
 	CodeLayerCreateDisabled     = "LAYER_CREATE_DISABLED"

@@ -1079,7 +1079,7 @@ func mountWithConfig(cfg MountConfig) error {
 	// .git stays local, v1 gitDirShouldBeLocalOverlay) wires into the
 	// overlay router.
 	var gitExt *git.Git
-	if wantExt["git"] && cfg.EnableGitWorkspaces {
+	if wantExt["git"] && cfg.EnableGitWorkspaces && layerBinding.LayerID == "" {
 		var gerr error
 		gitExt, gerr = git.New(git.Options{Client: cl, Events: bus, LocalRoot: viewLocalRoot, RemoteRoot: remoteRoot, SyncPolicy: string(cfg.WritePolicy),
 			OnWorkspaceRefresh: sharedCounters.RecordGitWorkspaceRefresh})
@@ -1594,7 +1594,6 @@ func mountWithConfig(cfg MountConfig) error {
 			shutdownOutcome.set(err)
 			fmt.Fprintf(os.Stderr, "drive9: shutdown drain failed at %s: %v\n", cfg.MountPoint, err)
 		}
-		layerBinding.Unbind(shutdownCtx)
 		for attempt := 0; attempt < 5; attempt++ {
 			if err := server.Unmount(); err == nil {
 				return

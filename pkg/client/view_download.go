@@ -33,7 +33,8 @@ func (c *Client) rewriteRequestForView(req *http.Request) (*http.Request, error)
 		return out, nil
 
 	case viewprotocol.RouteRewriteView:
-		if viewRouteRequiresWriteGuard(req.Method, innerEscaped) && c.view.WriteGuard != nil {
+		write := viewRouteRequiresWriteGuard(req.Method, innerEscaped)
+		if write && c.view.WriteGuard != nil {
 			if err := c.view.WriteGuard(); err != nil {
 				return nil, err
 			}
@@ -55,7 +56,7 @@ func (c *Client) rewriteRequestForView(req *http.Request) (*http.Request, error)
 		uCopy.Path = fullDecoded
 		uCopy.RawPath = fullEscaped
 		out.URL = &uCopy
-		if c.view.Fence > 0 {
+		if c.view.Fence > 0 && (write || c.view.ReadUnfenced == nil || !c.view.ReadUnfenced()) {
 			out.Header.Set(viewprotocol.FenceHeader, strconv.FormatInt(c.view.Fence, 10))
 		} else {
 			out.Header.Del(viewprotocol.FenceHeader)

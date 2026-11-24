@@ -2052,13 +2052,13 @@ func (c *Client) readObjectRangeStrict(ctx context.Context, objectURL string, of
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	case http.StatusOK:
 		defer func() { _ = resp.Body.Close() }()
-		return nil, fmt.Errorf("range request was not honored for %q at offset=%d length=%d", objectURL, offset, length)
+		return nil, fmt.Errorf("range request was not honored at offset=%d length=%d", offset, length)
 	default:
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode >= 300 {
 			return nil, readError(resp)
 		}
-		return nil, fmt.Errorf("unexpected status %d for range request %q", resp.StatusCode, objectURL)
+		return nil, fmt.Errorf("unexpected status %d for range request", resp.StatusCode)
 	}
 }
 

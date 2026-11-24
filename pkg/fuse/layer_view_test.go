@@ -138,6 +138,10 @@ func TestLayerMountViewExpireBindRenewSelfFenceAndUnbind(t *testing.T) {
 			}
 			_, _ = w.Write([]byte(`{"status":"ok","revision":1}`))
 		case r.Method == http.MethodHead && r.URL.Path == "/v1/views/"+layerID+"/v1/fs/repo/file.txt":
+			if !allowRenew.Load() && r.Header.Get("X-FS-Layer-Fence") != "" {
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
 			w.Header().Set("X-Dat9-Revision", "1")
 			w.WriteHeader(http.StatusOK)
 		default:

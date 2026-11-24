@@ -174,3 +174,49 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
+
+func TestViewDeploymentPrefixAndPageLimits(t *testing.T) {
+	const lid = "layer_01j8z4r9w3m5n7p9q2s4t6v8xz"
+	for _, prefix := range []string{"/deploy%20prod", "/%E6%B5%8B%E8%AF%95"} {
+		t.Run(prefix, func(t *testing.T) {
+			var limits []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.EscapedPath() != prefix+"/v1/views/"+lid+"/v1/fs/dir/" {
+					t.Errorf("wrong deployment path %q", r.URL.EscapedPath())
+				}
+				limits = append(limits, r.URL.Query().Get("limit"))
+				page := struct {
+					Entries []FileInfo `json:"entries"`
+					Cursor  string     `json:"next_cursor,omitempty"`
+				}{Entries: make([]FileInfo, 1)}
+				if r.URL.Query().Get("cursor") == "" {
+					page.Entries = make([]FileInfo, 1000)
+					page.Cursor = "next"
+				}
+				_ = json.NewEncoder(w).Encode(page)
+			}))
+			defer server.Close()
+			v, err := New(server.URL+prefix, "").WithView(ViewBinding{LayerID: lid})
+			require.NoError(t, err)
+			got, err := v.ListWithOptionsCtx(context.Background(), "/dir/", ListOptions{Limit: 1001})
+			require.NoError(t, err)
+			require.Len(t, got.Entries, 1001)
+			require.Equal(t, []string{"1000", "1"}, limits)
+		})
+	}
+}
+
+func TestWatchViewEventsReportsUnsupportedOnce(t *testing.T) {
+	const lid = "layer_01j8z4r9w3m5n7p9q2s4t6v8xz"
+	v, err := New("https://example.test", "").WithView(ViewBinding{LayerID: lid})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := 0
+	v.WatchEventsWithLifecycle(ctx, "", nil, EventLifecycle{OnDisconnected: func(err error) {
+		calls++
+		require.ErrorIs(t, err, viewprotocol.ErrUnsupportedInLayerView)
+		cancel()
+	}})
+	require.Equal(t, 1, calls)
+}
