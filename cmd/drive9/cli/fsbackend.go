@@ -92,6 +92,9 @@ func fsHandleForArgOpts(defaultClient *client.Client, raw string, forCopy bool) 
 	case KindDrive9:
 		c := defaultClient
 		if loc.Context != "" {
+			if err := requireNoLayerWithRemoteContext("", defaultClient, RemotePath{Context: loc.Context, Path: loc.Path}, raw); err != nil {
+				return fsHandle{}, err
+			}
 			c, err = newFSClientForContext(loc.Context)
 			if err != nil {
 				return fsHandle{}, err

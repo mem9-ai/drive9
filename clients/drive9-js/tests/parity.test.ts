@@ -25,6 +25,35 @@ afterAll(() => server.close());
 const text = new TextEncoder();
 
 describe("TypeScript SDK parity surface", () => {
+  it("batch writes preserve explicit modes and reject unsupported tags", async () => {
+    const c = new Client("http://localhost:9009", "key");
+    server.use(http.post("http://localhost:9009/v1/fs\\:batch-write", async ({ request }) => {
+      const body = await request.json() as { items: Array<{ path: string; hasMode?: boolean; mode?: number }> };
+      expect(body.items.map(({ mode, hasMode }) => [mode, hasMode])).toEqual([[0, true], [0o600, true], [undefined, undefined]]);
+      return HttpResponse.json({ results: body.items.map(({ path }) => ({ path, status: 200 })) });
+    }));
+    const data = new Uint8Array(1);
+    expect(await c.batchWrite([
+      { path: "/zero", data, mode: 0 },
+      { path: "/private", data, mode: 0o600 },
+      { path: "/inherit", data },
+    ])).toHaveLength(3);
+    await expect(c.batchWrite([{ path: "/tagged", data, tags: { env: "test" } }])).rejects.toThrow(/does not support tags/);
+  });
+
+  it("resolves relative object locations from the view URL under a deployment prefix", async () => {
+    const layerId = "layer_01j8z6kh2m9q7w3r5t6y8v0p1a";
+    const c = new Client("http://localhost:9009/deploy", "key").withView({ layerId });
+    server.use(
+      http.get(`http://localhost:9009/deploy/v1/views/${layerId}/v1/fs/blob`, () =>
+        new HttpResponse(null, { status: 307, headers: { Location: "../../../../../s3/blob" } })),
+      http.get("http://localhost:9009/deploy/s3/blob", ({ request }) => request.headers.has("range")
+        ? new HttpResponse("b", { status: 206 }) : new HttpResponse("abc"))
+    );
+    expect(new TextDecoder().decode(await c.read("/blob"))).toBe("abc");
+    expect(await new Response(await c.readStreamRange("/blob", 1, 1)).text()).toBe("b");
+  });
+
   it("loads the current context from DRIVE9_CONFIG and treats missing type as owner", () => {
     const dir = mkdtempSync(join(tmpdir(), "drive9-js-config-"));
     const configPath = join(dir, "config.json");
@@ -554,6 +583,13 @@ describe("TypeScript SDK parity surface", () => {
     expect(s3SawFence).toBeNull();
     await expect(vc.read("/workspace/evil.bin")).rejects.toBeInstanceOf(InvalidLayerViewRequestError);
 
+    await expect(vc.exec({ argv: ["pwd"] })).rejects.toBeInstanceOf(UnsupportedInLayerViewError);
+    await expect(vc.runtimeCapabilities()).rejects.toBeInstanceOf(UnsupportedInLayerViewError);
+    await expect(vc.listGitWorkspaces()).rejects.toBeInstanceOf(UnsupportedInLayerViewError);
+    await expect(vc.createJournal({ title: "test" })).rejects.toBeInstanceOf(UnsupportedInLayerViewError);
+    await expect(vc.revokeScopedToken("token")).rejects.toBeInstanceOf(UnsupportedInLayerViewError);
+    await expect(vc.listVaultSecrets()).rejects.toBeInstanceOf(UnsupportedInLayerViewError);
+
     // Set D & local caps reject before hitting network.
     await expect(vc.grep("q", "/workspace")).rejects.toBeInstanceOf(UnsupportedInLayerViewError);
     await expect(vc.find("/workspace")).rejects.toBeInstanceOf(UnsupportedInLayerViewError);
@@ -569,6 +605,13 @@ describe("TypeScript SDK parity surface", () => {
 
     // Local self-fence halts mutating requests while leaving reads intact.
     fencedLocally = true;
+    server.use(...["batch-stat", "batch-read-small"].map((action) =>
+      http.post(`http://localhost:9009/v1/views/${layerId}/v1/fs\\:${action}`, () =>
+        HttpResponse.json({ results: [{ path: "/file", status: 200 }] }))
+    ));
+    expect(await vc.batchStat(["/file"])).toHaveLength(1);
+    expect(await vc.batchReadSmall(["/file"])).toHaveLength(1);
+
     await expect(vc.write("/workspace/a.txt", text.encode("blocked"))).rejects.toThrow("self-fenced");
     expect((await vc.list("/workspace")).length).toBe(2);
 

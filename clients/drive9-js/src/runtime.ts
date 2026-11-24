@@ -1,3 +1,4 @@
+import { clientFetch, UnsupportedInLayerViewError, InvalidLayerViewRequestError } from "./view.js";
 const MAX_RUNTIME_FRAME_BYTES = 1 << 20;
 const RUNTIME_CANCEL_TIMEOUT_MS = 20_000;
 
@@ -168,7 +169,7 @@ export async function exec(client: RuntimeClient, input: ExecRequest, options: E
   const body = { ...rest, argv: resolvedArgv, workspace: rest.workspace ?? {} };
   let response: Response;
   try {
-    response = await fetch(`${client.baseUrl}/v1/runtime/exec`, {
+    response = await clientFetch(client, `${client.baseUrl}/v1/runtime/exec`, {
       method: "POST",
       headers: client.authHeaders({ "Content-Type": "application/json", Accept: "application/x-ndjson" }),
       body: JSON.stringify(body),
@@ -176,6 +177,7 @@ export async function exec(client: RuntimeClient, input: ExecRequest, options: E
       redirect: "error",
     });
   } catch (error) {
+    if (error instanceof UnsupportedInLayerViewError || error instanceof InvalidLayerViewRequestError) throw error;
     throw unknownOutcome("runtime request ended before a terminal frame", "", error);
   }
   if (response.status === 404) throw new RuntimeNotEnabledError();
@@ -255,7 +257,7 @@ export async function exec(client: RuntimeClient, input: ExecRequest, options: E
 }
 
 export async function getRuntimeCapabilities(client: RuntimeClient, signal?: AbortSignal): Promise<RuntimeCapabilities> {
-  const response = await fetch(`${client.baseUrl}/v1/runtime/capabilities`, {
+  const response = await clientFetch(client, `${client.baseUrl}/v1/runtime/capabilities`, {
     headers: client.authHeaders(),
     signal,
     redirect: "error",
@@ -279,13 +281,14 @@ export async function cancelRuntimeExecution(client: RuntimeClient, executionId:
   if (!validExecutionId(executionId)) throw new Error("invalid runtime execution id");
   let response: Response;
   try {
-    response = await fetch(`${client.baseUrl}/v1/runtime/executions/${encodeURIComponent(executionId)}/cancel`, {
+    response = await clientFetch(client, `${client.baseUrl}/v1/runtime/executions/${encodeURIComponent(executionId)}/cancel`, {
       method: "POST",
       headers: client.authHeaders(),
       signal,
       redirect: "error",
     });
   } catch (error) {
+    if (error instanceof UnsupportedInLayerViewError || error instanceof InvalidLayerViewRequestError) throw error;
     throw unknownOutcome("runtime cancellation outcome is unknown", executionId, error);
   }
   if (!response.ok) {

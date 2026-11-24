@@ -140,6 +140,18 @@ func TestWithViewThreeSetRoutingPaginationAndRedirectIsolation(t *testing.T) {
 	_, err = guardedVC.rewriteRequestForView(resumeReq)
 	require.ErrorIs(t, err, guardErr)
 
+	for _, path := range []string{"/v1/fs:batch-stat", "/v1/fs:batch-read-small", "/v1/fs:batch-write"} {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiSrv.URL+path, nil)
+		require.NoError(t, err)
+		out, err := guardedVC.rewriteRequestForView(req)
+		if path == "/v1/fs:batch-write" {
+			require.ErrorIs(t, err, guardErr)
+			continue
+		}
+		require.NoError(t, err)
+		require.Equal(t, "/v1/views/"+lid+path, out.URL.Path)
+	}
+
 	listUpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, apiSrv.URL+"/v1/uploads?path=%2Fdir%2Fa.txt", nil)
 	require.NoError(t, err)
 	rewrittenListUp, err := guardedVC.rewriteRequestForView(listUpReq)
