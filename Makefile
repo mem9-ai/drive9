@@ -85,7 +85,7 @@ BUILDINFO_LDFLAGS = -X github.com/mem9-ai/drive9/pkg/buildinfo.Version=$(if $(VE
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.BuildTime=$(BUILD_TIME)
 
-.PHONY: mod test test-fuse-kernel test-race test-failpoint test-podman fmt lint install-lint gitleaks install-gitleaks test-gitleaks-fail-closed test-gitleaks-scan-coverage build build-server build-cli build-cli-release build-simulator build-simulator-release build-migration build-migration-release build-migration-kube-plugin build-migration-kube-plugin-release test-simulator e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
+.PHONY: mod test test-fuse-kernel test-race test-failpoint test-podman fmt lint install-lint gitleaks install-gitleaks test-gitleaks-fail-closed test-gitleaks-scan-coverage test-publish-agent-archive build build-server build-cli build-cli-release build-simulator build-simulator-release build-migration build-migration-release build-migration-kube-plugin build-migration-kube-plugin-release test-simulator e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
 
 mod:
 	$(GO) mod tidy
@@ -194,6 +194,10 @@ test-gitleaks-fail-closed: install-gitleaks
 # Regression for the scan-coverage guards (`--text`, `-m`).
 test-gitleaks-scan-coverage: install-gitleaks
 	./scripts/test-gitleaks-scan-coverage.sh
+
+# Regression suite for scripts/publish-agent-archive.sh retention and pruning.
+test-publish-agent-archive:
+	./scripts/test-publish-agent-archive.sh
 
 install-gitleaks:
 	@echo "Checking for gitleaks..."

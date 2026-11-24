@@ -11,9 +11,19 @@ on:
         required: true
         default: main
         type: string
+      retain_commits:
+        description: Number of recent complete commits to retain (0 disables pruning).
+        required: false
+        default: '20'
+        type: string
+      break_lock_owner:
+        description: Exact owner ID of a confirmed-dead archive lock to break (leave empty for normal runs).
+        required: false
+        default: ''
+        type: string
 
 concurrency:
-  group: drive9-archive-${{ github.event.inputs.branch || github.ref_name }}
+  group: drive9-archive
   cancel-in-progress: false
 
 jobs:
@@ -28,6 +38,8 @@ jobs:
       DRIVE9_SERVER: https://api.drive9.ai
       DRIVE9_API_KEY: ${{ secrets.DRIVE9_ARCHIVE_API_KEY }}
       DRIVE9_ARCHIVE_BRANCH: ${{ github.event.inputs.branch || 'main' }}
+      DRIVE9_ARCHIVE_RETAIN_COMMITS: ${{ github.event.inputs.retain_commits || '20' }}
+      DRIVE9_ARCHIVE_LOCK_BREAK_OWNER: ${{ github.event.inputs.break_lock_owner || '' }}
 
     steps:
       - name: Checkout
@@ -35,7 +47,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-          ref: ${{ github.event_name == 'push' && github.sha || github.event.inputs.branch || 'main' }}
+          ref: ${{ github.sha }}
 
       - name: Setup Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
