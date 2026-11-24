@@ -325,9 +325,32 @@ func (c *WriteBackCache) RekeyViewLossPrefix(oldPrefix, newPrefix string) {
 // from the markers a previous process left, so a recovered marker is honored and
 // a fresh generation can never be mistaken for an older loss.
 func (c *WriteBackCache) loadViewLossFromDisk() {
-	losses, _ := c.scanViewLosses()
-	for _, loss := range losses {
-		if loss.Generation == 0 {
+	entries, err := os.ReadDir(c.dir)
+	if err != nil {
+		// Nothing can be proven about a directory that cannot be read: fail
+		// closed for the drain's counter.
+		c.mu.Lock()
+		c.lostUnreadable++
+		c.mu.Unlock()
+		return
+	}
+	unreadable := 0
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".lost") {
+			continue
+		}
+		raw, rerr := os.ReadFile(filepath.Join(c.dir, name))
+		if rerr != nil {
+			if !errors.Is(rerr, os.ErrNotExist) {
+				unreadable++
+			}
+			continue
+		}
+		var loss ViewLoss
+		if jerr := json.Unmarshal(raw, &loss); jerr != nil || loss.Path == "" || loss.Generation == 0 {
+			// A marker that cannot be trusted still means "do not certify".
+			unreadable++
 			continue
 		}
 		c.mu.Lock()
@@ -338,58 +361,27 @@ func (c *WriteBackCache) loadViewLossFromDisk() {
 		c.mu.Unlock()
 		c.advanceNextGen(loss.Generation)
 	}
+	if unreadable > 0 {
+		c.mu.Lock()
+		c.lostUnreadable += unreadable
+		c.mu.Unlock()
+	}
 }
 
 // ViewLossCount reports how many unresolved view losses are on record. It is the
 // only signal a drain has for a pruned pair whose path no longer has an open
 // handle (closed, or a fresh process after a restart).
 //
-// It fails closed: a scan error reports at least one loss, and an unreadable or
-// corrupt marker counts as its own, because a drain must not certify a mount it
-// cannot prove clean.
+// It is O(1): the in-process mirror is authoritative after construction (every
+// marker this process writes goes through writeViewLoss, and loadViewLossFromDisk
+// adopts the ones a previous process left), and markers that could not be
+// decoded are counted once at load. A directory scan per call would make
+// syncfs(2) O(staged files) on a write-back mount.
 func (c *WriteBackCache) ViewLossCount() int {
 	if c == nil {
 		return 0
 	}
 	c.mu.Lock()
-	seen := make(map[string]struct{}, len(c.lostGens))
-	for path := range c.lostGens {
-		seen[path] = struct{}{}
-	}
-	c.mu.Unlock()
-
-	entries, err := os.ReadDir(c.dir)
-	if err != nil {
-		// Nothing can be proven: at least one unresolved record is possible.
-		if len(seen) > 0 {
-			return len(seen)
-		}
-		return 1
-	}
-	count := len(seen)
-	for _, e := range entries {
-		name := e.Name()
-		if !strings.HasSuffix(name, ".lost") {
-			continue
-		}
-		raw, rerr := os.ReadFile(filepath.Join(c.dir, name))
-		if rerr != nil {
-			if errors.Is(rerr, os.ErrNotExist) {
-				continue
-			}
-			count++
-			continue
-		}
-		var loss ViewLoss
-		if jerr := json.Unmarshal(raw, &loss); jerr != nil || loss.Path == "" || loss.Generation == 0 {
-			count++
-			continue
-		}
-		if _, ok := seen[loss.Path]; ok {
-			continue
-		}
-		seen[loss.Path] = struct{}{}
-		count++
-	}
-	return count
+	defer c.mu.Unlock()
+	return len(c.lostGens) + c.lostUnreadable
 }

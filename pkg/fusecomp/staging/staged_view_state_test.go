@@ -486,3 +486,33 @@ func TestHasViewLossPrefixFailsClosed(t *testing.T) {
 		t.Fatal("an unreadable marker did not fail closed")
 	}
 }
+
+// TestViewLossCountIsCheapAndFailsClosed pins both halves of the drain counter:
+// it is O(1) (the in-process mirror, no directory scan per syncfs) and it counts
+// a marker that could not be decoded, because a drain must not certify a mount
+// whose records it cannot read.
+func TestViewLossCountIsCheapAndFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	const path = "/counted.txt"
+	first, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.writeViewLoss(path, 3, os.ErrNotExist)
+	if err := os.WriteFile(first.lostFile("/corrupt.txt"), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := restarted.ViewLossCount(); got < 2 {
+		t.Fatalf("ViewLossCount = %d, want the recorded loss and the unreadable marker", got)
+	}
+	// Clearing the recorded loss keeps the unreadable marker counted.
+	restarted.ClearViewLoss(path)
+	if got := restarted.ViewLossCount(); got != 1 {
+		t.Fatalf("ViewLossCount after clearing = %d, want 1 (the unreadable marker)", got)
+	}
+}

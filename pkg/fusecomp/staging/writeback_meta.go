@@ -90,6 +90,9 @@ type WriteBackCache struct {
 	// lostGens mirrors the durable view-loss markers this process wrote, so the
 	// common barrier miss does not need a file read.
 	lostGens map[string]uint64
+	// lostUnreadable counts markers that could not be decoded when the cache was
+	// opened: a drain must not certify a mount whose records it cannot read.
+	lostUnreadable int
 	// OnViewLost reports a pruned staged pair to the owner (the write-back
 	// engine records it as a terminal failure so a barrier on the path fails
 	// instead of reading "nothing staged" as success). It is the ONLY recorder
