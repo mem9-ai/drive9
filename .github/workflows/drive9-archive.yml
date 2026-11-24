@@ -16,6 +16,11 @@ on:
         required: false
         default: '20'
         type: string
+      break_lock_owner:
+        description: Exact owner ID of a confirmed-dead archive lock to break (leave empty for normal runs).
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   group: drive9-archive
@@ -34,6 +39,7 @@ jobs:
       DRIVE9_API_KEY: ${{ secrets.DRIVE9_ARCHIVE_API_KEY }}
       DRIVE9_ARCHIVE_BRANCH: ${{ github.event.inputs.branch || 'main' }}
       DRIVE9_ARCHIVE_RETAIN_COMMITS: ${{ github.event.inputs.retain_commits || '20' }}
+      DRIVE9_ARCHIVE_LOCK_BREAK_OWNER: ${{ github.event.inputs.break_lock_owner || '' }}
 
     steps:
       - name: Checkout

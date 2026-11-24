@@ -28,6 +28,7 @@ archive_root="${DRIVE9_ARCHIVE_ROOT:-/drive9}"
 archive_root="${archive_root%/}"
 latest_index="${archive_root}/latest.json"
 archive_lock_path="${archive_root}/.publish-lock"
+archive_staging_root="${archive_root}/.staging"
 cli_targets="${DRIVE9_ARCHIVE_CLI_TARGETS:-linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64}"
 legacy_agfs_module="github.com/c4pt0r/agfs/agfs-server"
 legacy_agfs_version="${DRIVE9_ARCHIVE_LEGACY_AGFS_VERSION:-v0.0.0-20260410081414-678f51854d2a}"
@@ -36,12 +37,10 @@ work_root=""
 artifact_root=""
 worktree_root=""
 lock_state_dir=""
-lock_state_mutex=""
 lock_lease_file=""
 lock_token_file=""
 lock_token_exp_file=""
-lock_issued_tokens_file=""
-lock_stop_file=""
+lock_token_id=""
 repository="${GITHUB_REPOSITORY:-mem9-ai/drive9}"
 branch="${DRIVE9_ARCHIVE_BRANCH:-main}"
 latest_index_branch="${DRIVE9_ARCHIVE_LATEST_BRANCH:-main}"
@@ -49,20 +48,23 @@ retain_commits="${DRIVE9_ARCHIVE_RETAIN_COMMITS:-20}"
 incomplete_grace_seconds="${DRIVE9_ARCHIVE_INCOMPLETE_GRACE_SECONDS:-3600}"
 quota_retry_attempts="${DRIVE9_ARCHIVE_QUOTA_RETRY_ATTEMPTS:-6}"
 quota_retry_delay="${DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY:-10}"
-lock_ttl_seconds="${DRIVE9_ARCHIVE_LOCK_TTL_SECONDS:-300}"
-lock_skew_margin_seconds="${DRIVE9_ARCHIVE_LOCK_SKEW_SECONDS:-15}"
+lock_token_ttl_seconds="${DRIVE9_ARCHIVE_LOCK_TOKEN_TTL_SECONDS:-3600}"
 lock_wait_seconds="${DRIVE9_ARCHIVE_LOCK_WAIT_SECONDS:-1800}"
 lock_poll_seconds="${DRIVE9_ARCHIVE_LOCK_POLL_SECONDS:-5}"
-lock_renew_seconds="${DRIVE9_ARCHIVE_LOCK_RENEW_SECONDS:-}"
+lock_break_owner="${DRIVE9_ARCHIVE_LOCK_BREAK_OWNER:-}"
+lock_bootstrap_recovery_seconds=60
 remote_auth_status=41
 remote_missing_status=42
 remote_conflict_status=43
 active_worktree=""
+active_remote_staging=""
 pruned_any=0
 deferred_latest_prune=0
 lock_held=0
 lock_cleanup_needed=0
-lock_heartbeat_pid=""
+mutation_in_flight=0
+aborted_by_signal=0
+mutating_child_pid=""
 
 current_epoch() {
   if [ -n "${DRIVE9_ARCHIVE_NOW_FILE:-}" ] && [ -f "${DRIVE9_ARCHIVE_NOW_FILE}" ]; then
@@ -80,8 +82,13 @@ wall_epoch() {
   date -u '+%s'
 }
 
-lock_owner_host="$(hostname -s 2>/dev/null | tr -cd 'A-Za-z0-9_-' | cut -c1-24 || true)"
-lock_owner_id="${lock_owner_host:-publisher}-$$-$(current_epoch)-${RANDOM:-0}"
+if [ -n "${GITHUB_RUN_ID:-}" ]; then
+  lock_owner_prefix="$(printf 'gha-%s-%s' "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT:-1}" | tr -cd 'A-Za-z0-9_-' | cut -c1-32)"
+else
+  lock_owner_host="$(hostname -s 2>/dev/null | tr -cd 'A-Za-z0-9_-' | cut -c1-24 || true)"
+  lock_owner_prefix="${lock_owner_host:-publisher}"
+fi
+lock_owner_id="${lock_owner_prefix}-$$-$(wall_epoch)-${RANDOM:-0}"
 
 if [ -z "${DRIVE9_SERVER:-}" ]; then
   die "DRIVE9_SERVER is required"
@@ -111,11 +118,8 @@ fi
 if ! [[ "$quota_retry_delay" =~ ^(0|[1-9][0-9]{0,3})$ ]]; then
   die "invalid DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY: ${quota_retry_delay}"
 fi
-if ! [[ "$lock_ttl_seconds" =~ ^[1-9][0-9]{0,4}$ ]]; then
-  die "invalid DRIVE9_ARCHIVE_LOCK_TTL_SECONDS: ${lock_ttl_seconds}"
-fi
-if ! [[ "$lock_skew_margin_seconds" =~ ^(0|[1-9][0-9]{0,3})$ ]]; then
-  die "invalid DRIVE9_ARCHIVE_LOCK_SKEW_SECONDS: ${lock_skew_margin_seconds}"
+if ! [[ "$lock_token_ttl_seconds" =~ ^[1-9][0-9]{0,5}$ ]]; then
+  die "invalid DRIVE9_ARCHIVE_LOCK_TOKEN_TTL_SECONDS: ${lock_token_ttl_seconds}"
 fi
 if ! [[ "$lock_wait_seconds" =~ ^(0|[1-9][0-9]{0,5})$ ]]; then
   die "invalid DRIVE9_ARCHIVE_LOCK_WAIT_SECONDS: ${lock_wait_seconds}"
@@ -123,19 +127,10 @@ fi
 if ! [[ "$lock_poll_seconds" =~ ^[1-9][0-9]{0,3}$ ]]; then
   die "invalid DRIVE9_ARCHIVE_LOCK_POLL_SECONDS: ${lock_poll_seconds}"
 fi
-if [ -z "$lock_renew_seconds" ]; then
-  lock_renew_seconds=$((lock_ttl_seconds / 3))
-  if [ "$lock_ttl_seconds" -gt 1 ] && [ "$lock_renew_seconds" -lt 1 ]; then
-    lock_renew_seconds=1
-  elif [ "$lock_renew_seconds" -gt 60 ]; then
-    lock_renew_seconds=60
+if [ -n "$lock_break_owner" ]; then
+  if ! [[ "$lock_break_owner" =~ ^[A-Za-z0-9_-]+$ ]] || [ "$lock_break_owner" = "init" ] || [[ "$lock_break_owner" == free-* ]]; then
+    die "invalid DRIVE9_ARCHIVE_LOCK_BREAK_OWNER: ${lock_break_owner}"
   fi
-fi
-if ! [[ "$lock_renew_seconds" =~ ^(0|[1-9][0-9]{0,4})$ ]]; then
-  die "invalid DRIVE9_ARCHIVE_LOCK_RENEW_SECONDS: ${lock_renew_seconds}"
-fi
-if [ "$lock_renew_seconds" -ne 0 ] && [ "$lock_renew_seconds" -ge "$lock_ttl_seconds" ]; then
-  die "invalid DRIVE9_ARCHIVE_LOCK_RENEW_SECONDS (${lock_renew_seconds}): must be less than DRIVE9_ARCHIVE_LOCK_TTL_SECONDS (${lock_ttl_seconds})"
 fi
 
 init_work_root() {
@@ -144,12 +139,9 @@ init_work_root() {
   artifact_root="${work_root}/artifacts"
   worktree_root="${work_root}/worktrees"
   lock_state_dir="${work_root}/lock-state"
-  lock_state_mutex="${lock_state_dir}/mutex"
   lock_lease_file="${lock_state_dir}/lease-name"
   lock_token_file="${lock_state_dir}/scoped-token"
   lock_token_exp_file="${lock_state_dir}/scoped-token-exp"
-  lock_issued_tokens_file="${lock_state_dir}/issued-token-ids"
-  lock_stop_file="${lock_state_dir}/stop"
   mkdir -p "$artifact_root" "$worktree_root" "$lock_state_dir"
   chmod 700 "$lock_state_dir"
 }
@@ -251,10 +243,30 @@ remote_stat_mtime() {
   return 1
 }
 
+run_mutating_remote() {
+  local stdout_file=$1
+  local stderr_file=$2
+  shift 2
+  local rc=0
+
+  mutation_in_flight=1
+  remote "$@" >"$stdout_file" 2>"$stderr_file" &
+  mutating_child_pid=$!
+  set +e
+  wait "$mutating_child_pid"
+  rc=$?
+  set -e
+  mutating_child_pid=""
+  if [ "$aborted_by_signal" -eq 0 ]; then
+    mutation_in_flight=0
+  fi
+  return "$rc"
+}
+
 remote_rm_rf() {
   local path=$1
   local err="${work_root}/rm.stderr"
-  if remote fs rm -r "$(remote_ref "$path")" >/dev/null 2>"$err"; then
+  if run_mutating_remote /dev/null "$err" fs rm -r "$(remote_ref "$path")"; then
     rm -f "$err"
     return 0
   fi
@@ -280,7 +292,44 @@ remote_cp_to_local() {
 
 remote_mkdir() {
   local path=$1
-  remote fs mkdir "$(remote_ref "$path")" >/dev/null
+  local err="${work_root}/mkdir.stderr"
+  if run_mutating_remote /dev/null "$err" fs mkdir "$(remote_ref "$path")"; then
+    rm -f "$err"
+    return 0
+  fi
+  if grep -qiE '(path already exists|already exists|HTTP 409)' "$err"; then
+    rm -f "$err"
+    return 0
+  fi
+  cat "$err" >&2
+  rm -f "$err"
+  return 1
+}
+
+remote_mv() {
+  local old_path=$1
+  local new_path=$2
+  local err="${work_root}/mv.stderr"
+  if run_mutating_remote /dev/null "$err" fs mv "$(remote_ref "$old_path")" "$(remote_ref "$new_path")"; then
+    rm -f "$err"
+    return 0
+  fi
+  if grep -qiE '(^|[^[:alnum:]])(not found|HTTP 404)([^[:alnum:]]|$)' "$err"; then
+    rm -f "$err"
+    return "$remote_missing_status"
+  fi
+  if grep -qiE '(path already exists|already exists|HTTP 409)' "$err"; then
+    rm -f "$err"
+    return "$remote_conflict_status"
+  fi
+  if grep -qiE '(HTTP 401|HTTP 403|invalid API key|token expired|token revoked|unauthorized)' "$err"; then
+    cat "$err" >&2
+    rm -f "$err"
+    return "$remote_auth_status"
+  fi
+  cat "$err" >&2
+  rm -f "$err"
+  return 1
 }
 
 lock_ls() {
@@ -384,7 +433,7 @@ issue_scoped_archive_token() {
 
   if ! remote_owner token issue \
     --subject "$subject" \
-    --ttl "${lock_ttl_seconds}s" \
+    --ttl "${lock_token_ttl_seconds}s" \
     --allow "${archive_root}:read,list,write,delete" \
     --json >"$out_file" 2>"$err_file"; then
     cat "$err_file" >&2
@@ -427,12 +476,6 @@ revoke_scoped_token_id() {
   return 1
 }
 
-record_issued_token_id() {
-  local tok_id=$1
-  [ -n "$tok_id" ] || return 0
-  printf '%s\n' "$tok_id" >>"$lock_issued_tokens_file"
-}
-
 commit_local_lock_state() {
   local lease_name=$1
   local tok_exp=$2
@@ -451,13 +494,13 @@ commit_local_lock_state() {
 
 parse_lease_entry() {
   local name=$1
-  local rest exp rest2 tid owner
+  local rest started rest2 tid owner
   case "$name" in
   lease.*)
     rest="${name#lease.}"
-    exp="${rest%%.*}"
+    started="${rest%%.*}"
     rest2="${rest#*.}"
-    if ! [[ "$exp" =~ ^[0-9]+$ ]] || [ -z "$rest2" ] || [ "$rest2" = "$rest" ]; then
+    if ! [[ "$started" =~ ^[0-9]+$ ]] || [ -z "$rest2" ] || [ "$rest2" = "$rest" ]; then
       return 1
     fi
     if [[ "$rest2" == *.* ]]; then
@@ -469,7 +512,7 @@ parse_lease_entry() {
     fi
     [ -n "$tid" ] || tid="-"
     [ -n "$owner" ] || return 1
-    printf '%s\t%s\t%s\n' "$exp" "$tid" "$owner"
+    printf '%s\t%s\t%s\n' "$started" "$tid" "$owner"
     return 0
     ;;
   *)
@@ -481,146 +524,6 @@ parse_lease_entry() {
 is_revocable_token_id() {
   local tok_id=$1
   [ -n "$tok_id" ] && [ "$tok_id" != "free" ] && [ "$tok_id" != "none" ] && [ "$tok_id" != "-" ]
-}
-
-acquire_local_lock_mutex() {
-  mkdir -p "$lock_state_dir"
-  local spins=0
-  while ! mkdir "$lock_state_mutex" 2>/dev/null; do
-    spins=$((spins + 1))
-    if [ "$spins" -ge 600 ]; then
-      return 1
-    fi
-    sleep 0.05
-  done
-}
-
-release_local_lock_mutex() {
-  rmdir "$lock_state_mutex" 2>/dev/null || true
-}
-
-start_archive_lock_heartbeat() {
-  if [ "$lock_renew_seconds" -eq 0 ]; then
-    return 0
-  fi
-
-  local retry_delay=$((lock_renew_seconds / 2))
-  if [ "$retry_delay" -lt 1 ]; then
-    retry_delay=1
-  elif [ "$retry_delay" -gt 5 ]; then
-    retry_delay=5
-  fi
-
-  rm -f "$lock_stop_file"
-  (
-    exec >/dev/null 2>&1
-    set +e
-    sleep_pid=""
-    trap '[ -n "$sleep_pid" ] && kill "$sleep_pid" 2>/dev/null || true; exit 0' TERM INT
-    next_sleep="$lock_renew_seconds"
-    while [ ! -f "$lock_stop_file" ]; do
-      sleep "$next_sleep" &
-      sleep_pid=$!
-      wait "$sleep_pid" 2>/dev/null
-      sleep_pid=""
-      [ -f "$lock_stop_file" ] && exit 0
-      acquire_local_lock_mutex || exit 0
-      if [ -f "$lock_stop_file" ] || [ ! -f "$lock_lease_file" ]; then
-        release_local_lock_mutex
-        exit 0
-      fi
-      cur_lease="$(cat "$lock_lease_file" 2>/dev/null || true)"
-      cur_tok_exp="$(cat "$lock_token_exp_file" 2>/dev/null || true)"
-      if [ -z "$cur_lease" ] || ! [[ "$cur_tok_exp" =~ ^[0-9]+$ ]]; then
-        release_local_lock_mutex
-        exit 0
-      fi
-
-      issued="$(issue_scoped_archive_token 2>/dev/null || true)"
-      if [ -z "$issued" ]; then
-        now="$(current_epoch)"
-        release_local_lock_mutex
-        if [ "$now" -ge "$cur_tok_exp" ]; then
-          exit 0
-        fi
-        next_sleep="$retry_delay"
-        continue
-      fi
-
-      IFS=$'\t' read -r new_tid new_tok_exp new_tok <<<"$issued"
-      record_issued_token_id "$new_tid"
-      new_lease_exp=$((new_tok_exp + lock_skew_margin_seconds))
-      new_lease="lease.${new_lease_exp}.${new_tid}.${lock_owner_id}"
-
-      if lock_mv "${archive_lock_path}/${cur_lease}" "${archive_lock_path}/${new_lease}" 2>/dev/null; then
-        commit_local_lock_state "$new_lease" "$new_tok_exp" "$new_tok"
-        release_local_lock_mutex
-        next_sleep="$lock_renew_seconds"
-        continue
-      fi
-
-      # Ambiguous move or transient failure: reconcile ownership of new_lease vs cur_lease.
-      # Only revoke new_tid after confirming new_lease is absent (404 / remote_missing_status);
-      # on inconclusive stat errors (e.g. 503), keep polling until confirmed or expired so we
-      # never revoke the live lease's token.
-      reconciled=""
-      while [ ! -f "$lock_stop_file" ]; do
-        stat_rc=0
-        lock_stat_exists "${archive_lock_path}/${new_lease}" || stat_rc=$?
-        if [ "$stat_rc" -eq 0 ]; then
-          commit_local_lock_state "$new_lease" "$new_tok_exp" "$new_tok"
-          release_local_lock_mutex
-          reconciled="committed"
-          break
-        elif [ "$stat_rc" -eq "$remote_missing_status" ]; then
-          reconciled="absent"
-          break
-        fi
-        now="$(current_epoch)"
-        if [ "$now" -ge "$new_tok_exp" ]; then
-          release_local_lock_mutex
-          exit 0
-        fi
-        release_local_lock_mutex
-        sleep "$retry_delay" &
-        sleep_pid=$!
-        wait "$sleep_pid" 2>/dev/null
-        sleep_pid=""
-        [ -f "$lock_stop_file" ] && exit 0
-        acquire_local_lock_mutex || exit 0
-        if [ -f "$lock_stop_file" ] || [ ! -f "$lock_lease_file" ]; then
-          release_local_lock_mutex
-          exit 0
-        fi
-      done
-      if [ "$reconciled" = "committed" ]; then
-        next_sleep="$lock_renew_seconds"
-        continue
-      fi
-      if [ "$reconciled" != "absent" ]; then
-        release_local_lock_mutex
-        exit 0
-      fi
-
-      # Confirmed new_lease does not exist on server: safe to revoke unused new_tid.
-      revoke_scoped_token_id "$new_tid" >/dev/null 2>&1 || true
-      now="$(current_epoch)"
-      if [ "$now" -lt "$cur_tok_exp" ]; then
-        cur_rc=0
-        lock_stat_exists "${archive_lock_path}/${cur_lease}" || cur_rc=$?
-        if [ "$cur_rc" -eq 0 ] || [ "$cur_rc" -ne "$remote_missing_status" ]; then
-          release_local_lock_mutex
-          next_sleep="$retry_delay"
-          continue
-        fi
-      fi
-
-      # Neither lease belongs to this invocation (or current token expired); stop renewing.
-      release_local_lock_mutex
-      exit 0
-    done
-  ) &
-  lock_heartbeat_pid=$!
 }
 
 verify_exclusive_lock_entry() {
@@ -645,34 +548,46 @@ verify_exclusive_lock_entry() {
 }
 
 acquire_archive_lock() {
-  local wall_deadline now rc ls_out entry name parsed exp tid owner
-  local active_found active_desc candidate_entry candidate_exp candidate_tid initialized_found
-  local mtime age issued new_tid new_tok_exp new_tok new_lease_exp lease_name mv_rc stat_rc mv_confirmed
+  local wall_deadline rc ls_out entry name parsed started tid owner
+  local active_found active_entry active_started active_tid active_owner active_desc
+  local free_entry candidate_entry breaking_active initialized_found
+  local mtime age issued new_tid new_tok_exp new_tok started_epoch lease_name mv_rc stat_rc mv_confirmed
   local logged_wait=0
   local free_lease="lease.0.free.${lock_owner_id}"
 
   mkdir -p "$lock_state_dir"
-  rm -f "$lock_stop_file" "$lock_lease_file" "$lock_token_file" "$lock_token_exp_file" "$lock_issued_tokens_file"
+  rm -f "$lock_lease_file" "$lock_token_file" "$lock_token_exp_file"
+  lock_token_id=""
   wall_deadline=$(( $(wall_epoch) + lock_wait_seconds ))
   ls_out="${lock_state_dir}/lock-ls.txt"
 
-  # Permanent lock container directory: never deleted on release so DeleteEmptyDir
-  # can never race a newly committed child lease entry. Inside it live one permanent
-  # `initialized` bootstrap marker and one circulating generation-unique `lease.*`
-  # entry (no fixed-name mutable acquire marker, eliminating ABA races).
+  # Permanent fail-closed lock container directory: never deleted on release so
+  # DeleteEmptyDir can never race a newly committed child lease entry. Inside it
+  # live one permanent `initialized` bootstrap marker and one circulating
+  # generation-unique `lease.<started>.<tid>.<owner>` entry.
+  #
+  # Automatic lease-expiry takeover is intentionally disabled: drive9-server does
+  # not carry a lock generation into mutation commits or drain already-admitted
+  # requests on token revocation, so stealing an active/ambiguous lock automatically
+  # could overlap an in-flight server mutation. Only an explicit operator break-glass
+  # matching the exact confirmed-dead owner (`DRIVE9_ARCHIVE_LOCK_BREAK_OWNER`) may
+  # take over a held lock.
   remote_owner fs mkdir "$(remote_ref "$archive_root")" >/dev/null 2>&1 || true
   remote_owner fs mkdir "$(remote_ref "$archive_lock_path")" >/dev/null 2>&1 || true
 
   while true; do
     active_found=0
+    active_entry=""
+    active_started=0
+    active_tid=""
+    active_owner=""
     active_desc=""
+    free_entry=""
     candidate_entry=""
-    candidate_exp=0
-    candidate_tid=""
+    breaking_active=0
     initialized_found=0
 
     if lock_ls "$archive_lock_path" "$ls_out"; then
-      now="$(current_epoch)"
       while IFS= read -r entry; do
         entry="${entry%$'\r'}"
         [ -n "$entry" ] || continue
@@ -680,86 +595,103 @@ acquire_archive_lock() {
         if [ "$name" = "initialized" ]; then
           initialized_found=1
         elif parsed="$(parse_lease_entry "$name")"; then
-          IFS=$'\t' read -r exp tid owner <<<"$parsed"
-          if [ "$now" -lt "$exp" ]; then
+          IFS=$'\t' read -r started tid owner <<<"$parsed"
+          if [ "$started" -gt 0 ]; then
             active_found=1
-            active_desc="owner=${owner} expires=${exp}"
-          elif [ -z "$candidate_entry" ]; then
-            candidate_entry="$name"
-            candidate_exp="$exp"
-            candidate_tid="$tid"
+            if [ -z "$active_entry" ]; then
+              active_entry="$name"
+              active_started="$started"
+              active_tid="$tid"
+              active_owner="$owner"
+              active_desc="owner=${owner} started=${started}"
+            fi
+          elif [ -z "$free_entry" ]; then
+            free_entry="$name"
           fi
         fi
       done <"$ls_out"
       rm -f "$ls_out"
 
-      if [ "$active_found" -eq 0 ] && [ -n "$candidate_entry" ]; then
-        # Taking over an expired active lease requires confirmed revocation of its
-        # prior scoped token BEFORE committing the takeover, so clock skew cannot
-        # allow the prior token to keep authorizing writes after takeover.
-        if [ "$candidate_exp" -gt 0 ] && is_revocable_token_id "$candidate_tid"; then
-          info "reclaiming expired archive lock entry ${candidate_entry}"
-          if ! revoke_scoped_token_id "$candidate_tid"; then
-            warn "failed to revoke expired archive lock token ${candidate_tid}; retrying before takeover"
-            active_desc="revoking expired token"
-            candidate_entry=""
-          fi
-        fi
-
-        if [ -n "$candidate_entry" ]; then
-          if issued="$(issue_scoped_archive_token)"; then
-            IFS=$'\t' read -r new_tid new_tok_exp new_tok <<<"$issued"
-            record_issued_token_id "$new_tid"
-            lock_cleanup_needed=1
-            new_lease_exp=$((new_tok_exp + lock_skew_margin_seconds))
-            lease_name="lease.${new_lease_exp}.${new_tid}.${lock_owner_id}"
-            mv_rc=0
-            mv_confirmed=0
-            if lock_mv "${archive_lock_path}/${candidate_entry}" "${archive_lock_path}/${lease_name}"; then
-              mv_confirmed=1
+      if [ "$active_found" -eq 1 ]; then
+        if [ -n "$lock_break_owner" ] && [ "$active_owner" = "$lock_break_owner" ]; then
+          # Operator-confirmed manual break-glass pinned to the exact active owner:
+          # require confirmed revocation of the prior token BEFORE committing the rename.
+          info "breaking confirmed-dead archive lock ${active_entry} (owner=${active_owner})"
+          if is_revocable_token_id "$active_tid"; then
+            if revoke_scoped_token_id "$active_tid"; then
+              candidate_entry="$active_entry"
+              breaking_active=1
             else
-              mv_rc=$?
-              if [ "$mv_rc" -ne "$remote_missing_status" ] && [ "$mv_rc" -ne "$remote_conflict_status" ]; then
-                # Ambiguous mv failure (e.g. 503 after server rename): confirm before revoking new_tid.
-                while true; do
-                  stat_rc=0
-                  lock_stat_exists "${archive_lock_path}/${lease_name}" || stat_rc=$?
-                  if [ "$stat_rc" -eq 0 ]; then
-                    mv_confirmed=1
-                    break
-                  elif [ "$stat_rc" -eq "$remote_missing_status" ]; then
-                    break
-                  fi
-                  if [ "$(wall_epoch)" -ge "$wall_deadline" ]; then
-                    break
-                  fi
-                  sleep "$lock_poll_seconds"
-                done
-              fi
+              warn "failed to revoke archive lock token ${active_tid} for owner ${active_owner}; retrying before break-glass takeover"
+              active_desc="revoking token for owner=${active_owner}"
             fi
-
-            if [ "$mv_confirmed" -eq 1 ]; then
-              if verify_exclusive_lock_entry "$lease_name"; then
-                commit_local_lock_state "$lease_name" "$new_tok_exp" "$new_tok"
-                lock_held=1
-                if [ "$candidate_exp" -gt 0 ]; then
-                  info "acquired archive lock ${archive_lock_path} via expired lease reclaim (owner=${lock_owner_id}, ttl=${lock_ttl_seconds}s)"
-                else
-                  info "acquired archive lock ${archive_lock_path} (owner=${lock_owner_id}, ttl=${lock_ttl_seconds}s)"
-                fi
-                start_archive_lock_heartbeat
-                return 0
-              fi
-              # Relinquish back to free sentinel rather than deleting the circulating token.
-              lock_mv "${archive_lock_path}/${lease_name}" "${archive_lock_path}/${free_lease}" >/dev/null 2>&1 || true
-            fi
-            revoke_scoped_token_id "$new_tid" >/dev/null 2>&1 || true
-          fi
-          if [ "$candidate_exp" -gt 0 ]; then
-            active_desc="expired lease reclaim contention"
           else
-            active_desc="lock acquisition contention"
+            candidate_entry="$active_entry"
+            breaking_active=1
           fi
+        elif [ -n "$lock_break_owner" ]; then
+          active_desc="owner=${active_owner} started=${active_started} (DRIVE9_ARCHIVE_LOCK_BREAK_OWNER=${lock_break_owner} did not match)"
+        fi
+      elif [ -n "$free_entry" ]; then
+        candidate_entry="$free_entry"
+      fi
+
+      if [ -n "$candidate_entry" ]; then
+        if issued="$(issue_scoped_archive_token)"; then
+          IFS=$'\t' read -r new_tid new_tok_exp new_tok <<<"$issued"
+          lock_token_id="$new_tid"
+          lock_cleanup_needed=1
+          started_epoch="$(current_epoch)"
+          if [ "$started_epoch" -le 0 ]; then
+            started_epoch=1
+          fi
+          lease_name="lease.${started_epoch}.${new_tid}.${lock_owner_id}"
+          mv_rc=0
+          mv_confirmed=0
+          if lock_mv "${archive_lock_path}/${candidate_entry}" "${archive_lock_path}/${lease_name}"; then
+            mv_confirmed=1
+          else
+            mv_rc=$?
+            if [ "$mv_rc" -ne "$remote_missing_status" ] && [ "$mv_rc" -ne "$remote_conflict_status" ]; then
+              # Ambiguous mv failure (e.g. 503 after server rename): confirm before revoking new_tid.
+              while true; do
+                stat_rc=0
+                lock_stat_exists "${archive_lock_path}/${lease_name}" || stat_rc=$?
+                if [ "$stat_rc" -eq 0 ]; then
+                  mv_confirmed=1
+                  break
+                elif [ "$stat_rc" -eq "$remote_missing_status" ]; then
+                  break
+                fi
+                if [ "$(wall_epoch)" -ge "$wall_deadline" ]; then
+                  break
+                fi
+                sleep "$lock_poll_seconds"
+              done
+            fi
+          fi
+
+          if [ "$mv_confirmed" -eq 1 ]; then
+            if verify_exclusive_lock_entry "$lease_name"; then
+              commit_local_lock_state "$lease_name" "$new_tok_exp" "$new_tok"
+              lock_held=1
+              if [ "$breaking_active" -eq 1 ]; then
+                info "acquired archive lock ${archive_lock_path} via manual break-glass (previous_owner=${active_owner}, owner=${lock_owner_id}, token_ttl=${lock_token_ttl_seconds}s)"
+              else
+                info "acquired archive lock ${archive_lock_path} (owner=${lock_owner_id}, token_ttl=${lock_token_ttl_seconds}s)"
+              fi
+              return 0
+            fi
+            # Relinquish back to free sentinel rather than deleting the circulating token.
+            lock_mv "${archive_lock_path}/${lease_name}" "${archive_lock_path}/${free_lease}" >/dev/null 2>&1 || true
+          fi
+          revoke_scoped_token_id "$new_tid" >/dev/null 2>&1 || true
+          lock_token_id=""
+        fi
+        if [ "$breaking_active" -eq 1 ]; then
+          active_desc="break-glass lock contention"
+        else
+          active_desc="lock acquisition contention"
         fi
       elif [ "$active_found" -eq 0 ] && [ "$initialized_found" -eq 0 ]; then
         # One-time bootstrap: race atomic mkdir on permanent `initialized` marker;
@@ -784,7 +716,7 @@ acquire_archive_lock() {
         # `initialized` and creating `lease.0.none.init`.
         if mtime="$(lock_stat_mtime "${archive_lock_path}/initialized")"; then
           age=$(( $(wall_epoch) - mtime ))
-          if [ "$age" -ge "$lock_ttl_seconds" ]; then
+          if [ "$age" -ge "$lock_bootstrap_recovery_seconds" ]; then
             info "recovering incomplete archive lock bootstrap under ${archive_lock_path} (age=${age}s)"
             if ! lock_mkdir_exclusive "${archive_lock_path}/lease.0.none.init"; then
               rc=$?
@@ -811,6 +743,9 @@ acquire_archive_lock() {
     # Route every unsuccessful attempt through one unified wall-clock deadline + backoff block
     # so frozen test clocks (DRIVE9_ARCHIVE_NOW_FILE) still honor DRIVE9_ARCHIVE_LOCK_WAIT_SECONDS.
     if [ "$(wall_epoch)" -ge "$wall_deadline" ]; then
+      if [ "$active_found" -eq 1 ] && [ -n "$active_owner" ]; then
+        die "archive lock ${archive_lock_path} is held by another active publisher (${active_desc}); timed out after ${lock_wait_seconds}s. Confirm the prior run and all in-flight requests have finished, then re-run with DRIVE9_ARCHIVE_LOCK_BREAK_OWNER=${active_owner} (workflow_dispatch input: break_lock_owner) to break a stuck lock"
+      fi
       die "archive lock ${archive_lock_path} is held by another active publisher (${active_desc:-busy}); timed out after ${lock_wait_seconds}s"
     fi
 
@@ -829,28 +764,23 @@ check_archive_lock_held() {
     return 1
   fi
 
-  acquire_local_lock_mutex || return 1
   cur_lease="$(cat "$lock_lease_file" 2>/dev/null || true)"
   cur_tok_exp="$(cat "$lock_token_exp_file" 2>/dev/null || true)"
   if [ -z "$cur_lease" ] || ! [[ "$cur_tok_exp" =~ ^[0-9]+$ ]]; then
-    release_local_lock_mutex
     lock_held=0
     return 1
   fi
 
   now="$(current_epoch)"
   if [ "$now" -ge "$cur_tok_exp" ]; then
-    release_local_lock_mutex
     lock_held=0
     return 1
   fi
 
   if lock_stat_exists "${archive_lock_path}/${cur_lease}"; then
-    release_local_lock_mutex
     return 0
   fi
 
-  release_local_lock_mutex
   lock_held=0
   return 1
 }
@@ -862,53 +792,50 @@ assert_archive_lock_held() {
 }
 
 release_archive_lock() {
-  local cur_lease ls_out entry name parsed exp tid owner tok_id
+  local cur_lease ls_out entry name parsed started tid owner
   local free_lease="lease.0.free.${lock_owner_id}"
-
-  if [ -n "${lock_heartbeat_pid:-}" ]; then
-    touch "$lock_stop_file" 2>/dev/null || true
-    kill "$lock_heartbeat_pid" 2>/dev/null || true
-    wait "$lock_heartbeat_pid" 2>/dev/null || true
-    lock_heartbeat_pid=""
-  fi
-  if [ -n "${lock_state_mutex:-}" ]; then
-    rmdir "$lock_state_mutex" 2>/dev/null || true
-  fi
 
   # Track cleanup eligibility separately from lock_held so a transient stat failure
   # still releases surviving active lease entries owned by this exact lock_owner_id.
   # Release moves our active lease to a unique free sentinel (lease.0.free.<owner>)
   # instead of deleting it, preserving the single circulating lock token invariant.
+  # If interrupted while a remote mutation was still in flight, retain the lock
+  # fail-closed so no subsequent publisher can overlap the already-admitted request.
   if [ "$lock_cleanup_needed" -eq 1 ]; then
     cur_lease="$(cat "$lock_lease_file" 2>/dev/null || true)"
-    if [ -n "$cur_lease" ] && [ "$cur_lease" != "$free_lease" ]; then
-      lock_mv "${archive_lock_path}/${cur_lease}" "${archive_lock_path}/${free_lease}" >/dev/null 2>&1 || true
-    fi
-    ls_out="${lock_state_dir}/release-ls.txt"
-    if lock_ls "$archive_lock_path" "$ls_out" >/dev/null 2>&1; then
-      while IFS= read -r entry; do
-        entry="${entry%$'\r'}"
-        [ -n "$entry" ] || continue
-        name="${entry%/}"
-        if parsed="$(parse_lease_entry "$name")"; then
-          IFS=$'\t' read -r exp tid owner <<<"$parsed"
-          if [ "$owner" = "$lock_owner_id" ] && [ "$exp" -gt 0 ]; then
-            lock_mv "${archive_lock_path}/${name}" "${archive_lock_path}/${free_lease}" >/dev/null 2>&1 || true
+    if [ "$mutation_in_flight" -eq 1 ]; then
+      warn "interrupted while remote mutation was in flight; retaining archive lock ${cur_lease:-unknown} (owner=${lock_owner_id}) fail-closed until prior request completes"
+      if [ -n "${lock_token_id:-}" ]; then
+        revoke_scoped_token_id "$lock_token_id" >/dev/null 2>&1 || true
+      fi
+    else
+      if [ -n "$cur_lease" ] && [ "$cur_lease" != "$free_lease" ]; then
+        lock_mv "${archive_lock_path}/${cur_lease}" "${archive_lock_path}/${free_lease}" >/dev/null 2>&1 || true
+      fi
+      ls_out="${lock_state_dir}/release-ls.txt"
+      if lock_ls "$archive_lock_path" "$ls_out" >/dev/null 2>&1; then
+        while IFS= read -r entry; do
+          entry="${entry%$'\r'}"
+          [ -n "$entry" ] || continue
+          name="${entry%/}"
+          if parsed="$(parse_lease_entry "$name")"; then
+            IFS=$'\t' read -r started tid owner <<<"$parsed"
+            if [ "$owner" = "$lock_owner_id" ] && [ "$started" -gt 0 ]; then
+              lock_mv "${archive_lock_path}/${name}" "${archive_lock_path}/${free_lease}" >/dev/null 2>&1 || true
+            fi
           fi
-        fi
-      done <"$ls_out"
-      rm -f "$ls_out"
-    fi
+        done <"$ls_out"
+        rm -f "$ls_out"
+      fi
 
-    if [ -n "${lock_issued_tokens_file:-}" ] && [ -f "$lock_issued_tokens_file" ]; then
-      while IFS= read -r tok_id; do
-        [ -n "$tok_id" ] || continue
-        revoke_scoped_token_id "$tok_id" >/dev/null 2>&1 || true
-      done <"$lock_issued_tokens_file"
+      if [ -n "${lock_token_id:-}" ]; then
+        revoke_scoped_token_id "$lock_token_id" >/dev/null 2>&1 || true
+      fi
     fi
 
     lock_held=0
     lock_cleanup_needed=0
+    lock_token_id=""
   fi
 
   if [ -n "${lock_state_dir:-}" ]; then
@@ -929,10 +856,7 @@ remote_upload() {
   info "upload ${remote_path}"
   while true; do
     assert_archive_lock_held
-    if [ -n "${DRIVE9_ARCHIVE_TEST_PRE_UPLOAD_HOOK:-}" ]; then
-      "${DRIVE9_ARCHIVE_TEST_PRE_UPLOAD_HOOK}" "$remote_path"
-    fi
-    if remote fs cp "$local_path" "$(remote_ref "$remote_path")" 2>"$err"; then
+    if run_mutating_remote /dev/null "$err" fs cp "$local_path" "$(remote_ref "$remote_path")"; then
       rm -f "$err"
       return 0
     fi
@@ -1206,7 +1130,8 @@ publish_commit() {
   local sha=$1
   local artifact_dir="${artifact_root}/${sha}"
   local commit_path="${archive_root}/commits/${sha}"
-  local state
+  local staging_path="${archive_staging_root}/${sha}.${lock_owner_id}"
+  local state mv_rc
 
   state="$(remote_commit_self_state "$sha")"
   if [ "$state" = "complete" ]; then
@@ -1225,16 +1150,38 @@ publish_commit() {
 
   remote_mkdir "$archive_root" || true
   remote_mkdir "${archive_root}/commits" || true
-  remote_mkdir "$commit_path" || true
-  remote_mkdir "${commit_path}/bin" || true
+  remote_mkdir "$archive_staging_root" || true
+  remote_mkdir "$staging_path" || true
+  remote_mkdir "${staging_path}/bin" || true
 
-  remote_upload "${artifact_dir}/source.tar.gz" "${commit_path}/source.tar.gz"
+  active_remote_staging="$staging_path"
+  remote_upload "${artifact_dir}/source.tar.gz" "${staging_path}/source.tar.gz"
   while IFS= read -r binary; do
-    remote_upload "${artifact_dir}/${binary}" "${commit_path}/${binary}"
+    remote_upload "${artifact_dir}/${binary}" "${staging_path}/${binary}"
   done < <(cd "$artifact_dir" && find bin -type f -name 'drive9-*' | sort)
-  remote_upload "${artifact_dir}/checksums.txt" "${commit_path}/checksums.txt"
-  verify_remote_artifacts "$commit_path" "${artifact_dir}/checksums.txt"
-  remote_upload "${artifact_dir}/manifest.json" "${commit_path}/manifest.json"
+  remote_upload "${artifact_dir}/checksums.txt" "${staging_path}/checksums.txt"
+  verify_remote_artifacts "$staging_path" "${artifact_dir}/checksums.txt"
+  remote_upload "${artifact_dir}/manifest.json" "${staging_path}/manifest.json"
+
+  assert_archive_lock_held
+  info "promote ${staging_path} -> ${commit_path}"
+  if remote_mv "$staging_path" "$commit_path"; then
+    active_remote_staging=""
+    return 0
+  else
+    mv_rc=$?
+    if [ "$mv_rc" -eq "$remote_conflict_status" ]; then
+      remote_rm_rf "$staging_path" >/dev/null 2>&1 || true
+      active_remote_staging=""
+      state="$(remote_commit_state "$sha" "$artifact_dir")"
+      if [ "$state" = "complete" ]; then
+        info "commit ${sha} already complete"
+        return 0
+      fi
+      die "cannot promote ${staging_path} to ${commit_path}: target already exists and is incomplete"
+    fi
+    die "failed to promote ${staging_path} to ${commit_path}"
+  fi
 }
 
 publish_latest_index() {
@@ -1452,6 +1399,69 @@ prune_lock_fence() {
   return 1
 }
 
+prune_remote_staging() {
+  local lock_fatal=$1
+  local ls_out="${work_root}/remote-staging-ls.txt"
+  local ls_status entry name mtime mtime_status age now_epoch rm_status
+
+  prune_lock_fence "$lock_fatal" || return 0
+
+  if remote_ls "$archive_staging_root" "$ls_out"; then
+    :
+  else
+    ls_status=$?
+    if [ "$ls_status" -eq "$remote_missing_status" ]; then
+      return 0
+    fi
+    warn "failed to list ${archive_staging_root}; skipping orphaned staging cleanup"
+    return 0
+  fi
+
+  now_epoch="$(current_epoch)"
+  while IFS= read -r entry; do
+    entry="${entry%$'\r'}"
+    case "$entry" in
+    */)
+      name="${entry%/}"
+      if ! [[ "$name" =~ ^[0-9a-f]{40}\.[A-Za-z0-9_-]+$ ]]; then
+        continue
+      fi
+      if [ "$incomplete_grace_seconds" -gt 0 ]; then
+        if mtime="$(remote_stat_mtime "${archive_staging_root}/${name}")"; then
+          age=$((now_epoch - mtime))
+          if [ "$age" -lt "$incomplete_grace_seconds" ]; then
+            continue
+          fi
+        else
+          mtime_status=$?
+          if [ "$mtime_status" -ne "$remote_missing_status" ]; then
+            warn "cannot verify age of orphaned staging ${name}; preserving it"
+          fi
+          continue
+        fi
+      fi
+      prune_lock_fence "$lock_fatal" || return 0
+      info "remove ${archive_staging_root}/${name} (orphaned staging)"
+      if remote_rm_rf "${archive_staging_root}/${name}"; then
+        pruned_any=1
+      else
+        rm_status=$?
+        if [ "$rm_status" -eq "$remote_auth_status" ]; then
+          lock_held=0
+          if [ "$lock_fatal" -eq 1 ]; then
+            die "remote server rejected cleanup of ${archive_staging_root}/${name} (expired/revoked scoped token)"
+          fi
+          warn "remote server rejected post-publish cleanup of ${archive_staging_root}/${name}; stopping"
+          return 0
+        fi
+        warn "failed to remove orphaned staging ${archive_staging_root}/${name}; continuing"
+      fi
+      ;;
+    esac
+  done <"$ls_out"
+  rm -f "$ls_out"
+}
+
 prune_remote_commits() {
   local keep_budget=$1
   local lock_fatal=$2
@@ -1479,6 +1489,7 @@ prune_remote_commits() {
   fi
 
   prune_lock_fence "$lock_fatal" || return 0
+  prune_remote_staging "$lock_fatal"
 
   if remote_ls "${archive_root}/commits" "$ls_out"; then
     :
@@ -1613,9 +1624,6 @@ prune_remote_commits() {
     while IFS= read -r sha; do
       [ -n "$sha" ] || continue
       prune_lock_fence "$lock_fatal" || return 0
-      if [ -n "${DRIVE9_ARCHIVE_TEST_PRE_RM_HOOK:-}" ]; then
-        "${DRIVE9_ARCHIVE_TEST_PRE_RM_HOOK}" "${archive_root}/commits/${sha}"
-      fi
       info "remove ${archive_root}/commits/${sha} (incomplete target)"
       if remote_rm_rf "${archive_root}/commits/${sha}"; then
         pruned_any=1
@@ -1640,9 +1648,6 @@ prune_remote_commits() {
     while IFS= read -r sha; do
       [ -n "$sha" ] || continue
       prune_lock_fence "$lock_fatal" || return 0
-      if [ -n "${DRIVE9_ARCHIVE_TEST_PRE_RM_HOOK:-}" ]; then
-        "${DRIVE9_ARCHIVE_TEST_PRE_RM_HOOK}" "${archive_root}/commits/${sha}"
-      fi
       info "remove ${archive_root}/commits/${sha} (incomplete)"
       if remote_rm_rf "${archive_root}/commits/${sha}"; then
         pruned_any=1
@@ -1668,9 +1673,6 @@ prune_remote_commits() {
     while IFS= read -r sha; do
       [ -n "$sha" ] || continue
       prune_lock_fence "$lock_fatal" || return 0
-      if [ -n "${DRIVE9_ARCHIVE_TEST_PRE_RM_HOOK:-}" ]; then
-        "${DRIVE9_ARCHIVE_TEST_PRE_RM_HOOK}" "${archive_root}/commits/${sha}"
-      fi
       info "remove ${archive_root}/commits/${sha} (expired)"
       if remote_rm_rf "${archive_root}/commits/${sha}"; then
         pruned_any=1
@@ -1714,12 +1716,22 @@ resolve_commits() {
 
 cleanup_on_exit() {
   local exit_code=$?
+  if [ -n "${active_remote_staging:-}" ] && [ "$mutation_in_flight" -eq 0 ] && [ "$aborted_by_signal" -eq 0 ] && [ "$lock_held" -eq 1 ]; then
+    remote_rm_rf "$active_remote_staging" >/dev/null 2>&1 || true
+    active_remote_staging=""
+  fi
   release_archive_lock || true
   cleanup_active_worktree || true
   if [ -n "${work_root:-}" ] && [ -d "$work_root" ]; then
     rm -rf "$work_root" || true
   fi
   exit "$exit_code"
+}
+
+on_signal() {
+  local sig_code=$1
+  aborted_by_signal=1
+  exit "$sig_code"
 }
 
 main() {
@@ -1760,7 +1772,7 @@ main() {
 }
 
 trap cleanup_on_exit EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 
 main "$@"
