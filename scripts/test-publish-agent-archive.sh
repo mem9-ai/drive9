@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Regression tests for scripts/publish-agent-archive.sh retention, incomplete
-# commit cleanup, latest.json protection, and post-prune async-GC upload retry.
+# commit cleanup, latest.json protection, cross-branch ranking, failure
+# isolation, and post-prune async-GC upload retry.
 #
 # Usage: scripts/test-publish-agent-archive.sh
 
@@ -38,12 +39,20 @@ set -euo pipefail
 root="${FAKE_REMOTE_ROOT:?}"
 ops_log="${FAKE_OPS_LOG:?}"
 fail_quota_file="${FAKE_FAIL_QUOTA_COUNT_FILE:-}"
+fail_rm_pattern="${FAKE_FAIL_RM_PATTERN:-}"
+fail_stat_pattern="${FAKE_FAIL_STAT_PATTERN:-}"
+fail_ls_call="${FAKE_FAIL_LS_ON_CALL:-}"
+ls_count_file="${FAKE_LS_COUNT_FILE:-}"
 
 strip_ref() {
   local ref=$1
   ref="${ref#:}"
   ref="${ref#/}"
   printf '%s\n' "$ref"
+}
+
+file_mtime() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"
 }
 
 cmd="${1:-}"
@@ -57,6 +66,19 @@ shift 2
 case "$sub" in
 ls)
   rel="$(strip_ref "$1")"
+  if [ -n "$ls_count_file" ]; then
+    count=0
+    if [ -f "$ls_count_file" ]; then
+      count="$(cat "$ls_count_file")"
+    fi
+    count=$((count + 1))
+    printf '%d\n' "$count" >"$ls_count_file"
+    if [ -n "$fail_ls_call" ] && [ "$count" -eq "$fail_ls_call" ]; then
+      printf 'ls-fail %s\n' "$rel" >>"$ops_log"
+      echo "fs ls: HTTP 503: upstream unavailable" >&2
+      exit 1
+    fi
+  fi
   target="${root}/${rel}"
   if [ ! -d "$target" ]; then
     echo "fs ls: HTTP 404: not found" >&2
@@ -74,17 +96,36 @@ ls)
   done | LC_ALL=C sort
   ;;
 stat)
+  output_format="text"
+  if [ "${1:-}" = "-o" ]; then
+    output_format="${2:-}"
+    shift 2
+  fi
   rel="$(strip_ref "$1")"
+  if [ -n "$fail_stat_pattern" ] && [[ "$rel" == *"$fail_stat_pattern"* ]]; then
+    printf 'stat-fail %s\n' "$rel" >>"$ops_log"
+    echo "fs stat: HTTP 503: upstream unavailable" >&2
+    exit 1
+  fi
   target="${root}/${rel}"
   if [ ! -e "$target" ]; then
     echo "fs stat: HTTP 404: not found" >&2
     exit 1
   fi
   printf 'stat %s\n' "$rel" >>"$ops_log"
-  if [ -d "$target" ]; then
-    printf 'isdir: true\n'
+  mtime="$(file_mtime "$target")"
+  if [ "$output_format" = "json" ]; then
+    if [ -d "$target" ]; then
+      printf '{"isdir":true,"mtime":%s}\n' "$mtime"
+    else
+      printf '{"isdir":false,"mtime":%s}\n' "$mtime"
+    fi
   else
-    printf 'isdir: false\n'
+    if [ -d "$target" ]; then
+      printf 'isdir: true\n'
+    else
+      printf 'isdir: false\n'
+    fi
   fi
   ;;
 cat)
@@ -114,6 +155,11 @@ rm)
     shift
   fi
   rel="$(strip_ref "$1")"
+  if [ -n "$fail_rm_pattern" ] && [[ "$rel" == *"$fail_rm_pattern"* ]]; then
+    printf 'rm-fail %s\n' "$rel" >>"$ops_log"
+    echo "fs rm: HTTP 503: upstream timeout" >&2
+    exit 1
+  fi
   target="${root}/${rel}"
   if [ ! -e "$target" ]; then
     echo "fs rm: HTTP 404: not found" >&2
@@ -217,6 +263,7 @@ C5="$(make_commit c5)"
 seed_complete_commit() {
   local remote_root=$1
   local sha=$2
+  local published_at=${3:-2026-10-04T00:00:00Z}
   local dir="${remote_root}/drive9/commits/${sha}"
   mkdir -p "${dir}/bin"
   printf 'src-%s\n' "$sha" >"${dir}/source.tar.gz"
@@ -228,6 +275,7 @@ seed_complete_commit() {
   jq -n \
     --arg sha "$sha" \
     --arg short "${sha:0:7}" \
+    --arg published_at "$published_at" \
     --arg src_sha "$src_sha" \
     --arg bin_sha "$bin_sha" \
     '{
@@ -236,7 +284,7 @@ seed_complete_commit() {
       branch: "main",
       commit_sha: $sha,
       short_sha: $short,
-      published_at: "2026-10-04T00:00:00Z",
+      published_at: $published_at,
       source_archive: "source.tar.gz",
       checksums: {
         "source.tar.gz": $src_sha,
@@ -255,12 +303,13 @@ seed_latest_index() {
   jq -n --arg sha "$sha" '{schema_version: 1, commit_sha: $sha}' >"${remote_root}/drive9/latest.json"
 }
 
-run_publisher() {
-  local remote_root=$1
-  local ops_log=$2
-  shift 2
+run_publisher_in() {
+  local repo_dir=$1
+  local remote_root=$2
+  local ops_log=$3
+  shift 3
   (
-    cd "$REPO"
+    cd "$repo_dir"
     DRIVE9_SERVER="https://api.example.test" \
     DRIVE9_API_KEY="test-key" \
     DRIVE9_PUBLISHER="$FAKE_CLI" \
@@ -274,7 +323,14 @@ run_publisher() {
   )
 }
 
-echo "== 1. Pre-publish prune removes incomplete + oldest expired commits and preserves latest/non-SHA entries"
+run_publisher() {
+  local remote_root=$1
+  local ops_log=$2
+  shift 2
+  run_publisher_in "$REPO" "$remote_root" "$ops_log" "$@"
+}
+
+echo "== 1. Pre-publish prune removes incomplete target, aged incomplete, and oldest expired commits; preserves latest and non-SHA entries"
 R1="${WORK}/remote1"
 L1="${WORK}/ops1.log"
 : >"$L1"
@@ -282,10 +338,13 @@ seed_complete_commit "$R1" "$C1"
 seed_complete_commit "$R1" "$C2"
 seed_complete_commit "$R1" "$C3"
 seed_latest_index "$R1" "$C3"
-# Incomplete directories from prior failed runs (including target C5 itself).
+# Aged incomplete directory from a failed prior run (older than default 3600s grace window).
 mkdir -p "${R1}/drive9/commits/${C4}/bin"
 printf 'partial\n' >"${R1}/drive9/commits/${C4}/source.tar.gz"
+touch -t 202001010000 "${R1}/drive9/commits/${C4}"
+# Incomplete target directory with stale leftover file from a failed retry.
 mkdir -p "${R1}/drive9/commits/${C5}/bin"
+printf 'stale-extra\n' >"${R1}/drive9/commits/${C5}/bin/drive9-stale-old"
 # Non-SHA entries must never be pruned.
 mkdir -p "${R1}/drive9/commits/notes"
 printf 'keep\n' >"${R1}/drive9/commits/README.txt"
@@ -295,20 +354,21 @@ run_publisher "$R1" "$L1" env DRIVE9_ARCHIVE_RETAIN_COMMITS=2 >/dev/null
 assert_missing "${R1}/drive9/commits/${C1}"
 assert_missing "${R1}/drive9/commits/${C2}"
 assert_missing "${R1}/drive9/commits/${C4}"
+assert_missing "${R1}/drive9/commits/${C5}/bin/drive9-stale-old"
 assert_exists "${R1}/drive9/commits/${C3}/manifest.json"
 assert_exists "${R1}/drive9/commits/${C5}/manifest.json"
 assert_exists "${R1}/drive9/commits/notes"
 assert_exists "${R1}/drive9/commits/README.txt"
 [ "$(jq -r '.commit_sha' "${R1}/drive9/latest.json")" = "$C5" ] || fail "latest.json did not advance to C5"
 
-# Verify deletion order: incomplete C4 first, then expired oldest-first (C1 before C2), all before any upload.
+# Verify deletion order: incomplete target C5, aged incomplete C4, then expired oldest-first (C1 before C2), all before upload.
 rm_lines="$(grep '^rm ' "$L1")"
-want_rm="$(printf 'rm drive9/commits/%s\nrm drive9/commits/%s\nrm drive9/commits/%s' "$C4" "$C1" "$C2")"
+want_rm="$(printf 'rm drive9/commits/%s\nrm drive9/commits/%s\nrm drive9/commits/%s\nrm drive9/commits/%s' "$C5" "$C4" "$C1" "$C2")"
 [ "$rm_lines" = "$want_rm" ] || fail "unexpected rm order:\ngot:\n${rm_lines}\nwant:\n${want_rm}"
 first_upload_line="$(grep -n '^upload ' "$L1" | head -n 1 | cut -d: -f1)"
 last_rm_line="$(grep -n '^rm ' "$L1" | tail -n 1 | cut -d: -f1)"
 [ "$last_rm_line" -lt "$first_upload_line" ] || fail "expected pruning to finish before first upload"
-pass "pruned C4, C1, C2 oldest-first before upload; kept C3, C5, and non-SHA entries"
+pass "pruned incomplete target C5, aged incomplete C4, and expired C1/C2 oldest-first before upload"
 
 echo "== 2. Idempotent rerun on already-complete commit prunes nothing"
 L2="${WORK}/ops2.log"
@@ -338,20 +398,21 @@ rm_c5_line="$(grep -n "^rm drive9/commits/${C5}$" "$L3" | head -n 1 | cut -d: -f
 [ "$rm_c5_line" -gt "$latest_upload_line" ] || fail "expected old latest C5 pruned only AFTER latest.json update"
 pass "protected C5 until latest.json pointed to C6, then pruned C5"
 
-echo "== 4. Post-prune upload retries transient quota exceeded (async file_gc drain)"
-# Seed an expired commit so pre-publish pruning deletes it and enables post-prune quota retry.
-seed_complete_commit "$R1" "$C1"
+echo "== 4. Post-prune upload retries transient quota exceeded (including incomplete target cleanup retry)"
 C7="$(make_commit c7)"
 L4="${WORK}/ops4.log"
 : >"$L4"
 Q4="${WORK}/quota-fail-count"
 printf '2\n' >"$Q4"
-run_publisher "$R1" "$L4" env DRIVE9_ARCHIVE_RETAIN_COMMITS=1 FAKE_FAIL_QUOTA_COUNT_FILE="$Q4" >/dev/null
-assert_missing "${R1}/drive9/commits/${C1}"
+# Only an incomplete leftover of target C7 exists (no other expired/incomplete commits); cleaning it must enable quota retry.
+mkdir -p "${R1}/drive9/commits/${C7}/bin"
+printf 'stale-from-aborted-run\n' >"${R1}/drive9/commits/${C7}/bin/drive9-stale"
+run_publisher "$R1" "$L4" env DRIVE9_ARCHIVE_RETAIN_COMMITS=5 FAKE_FAIL_QUOTA_COUNT_FILE="$Q4" >/dev/null
+assert_missing "${R1}/drive9/commits/${C7}/bin/drive9-stale"
 assert_exists "${R1}/drive9/commits/${C7}/manifest.json"
-assert_missing "${R1}/drive9/commits/${C6}"
-[ "$(cat "$Q4")" = "0" ] || fail "expected both transient quota errors to be retried"
-pass "retried quota exceeded after pruning and succeeded"
+assert_exists "${R1}/drive9/commits/${C6}/manifest.json"
+[ "$(cat "$Q4")" = "0" ] || fail "expected both transient quota errors to be retried after incomplete target cleanup"
+pass "cleaned incomplete target C7, removed stale files, and retried quota exceeded"
 
 echo "== 5. Without prior pruning, quota exceeded fails immediately without retry"
 C8="$(make_commit c8)"
@@ -367,7 +428,7 @@ set -e
 [ "$(cat "$Q5")" = "1" ] || fail "expected fail-fast (1 attempt), remaining=$(cat "$Q5")"
 pass "failed fast without retrying when nothing was pruned"
 
-echo "== 6. DRIVE9_ARCHIVE_RETAIN_COMMITS=0 disables pruning and invalid values fail fast"
+echo "== 6. DRIVE9_ARCHIVE_RETAIN_COMMITS=0 disables pruning and invalid/overflowing values fail fast"
 L6="${WORK}/ops6.log"
 : >"$L6"
 run_publisher "$R1" "$L6" env DRIVE9_ARCHIVE_RETAIN_COMMITS=0 >/dev/null
@@ -382,17 +443,18 @@ run_publisher "$R1" "$L6" env DRIVE9_ARCHIVE_RETAIN_COMMITS=invalid >/dev/null 2
 bad_rc=$?
 run_publisher "$R1" "$L6" env DRIVE9_ARCHIVE_RETAIN_COMMITS=999999999999999999999999 >/dev/null 2>&1
 overflow_rc=$?
+run_publisher "$R1" "$L6" env DRIVE9_ARCHIVE_INCOMPLETE_GRACE_SECONDS=999999999999999999999999 >/dev/null 2>&1
+bad_grace_rc=$?
 set -e
 [ "$bad_rc" -ne 0 ] || fail "expected invalid DRIVE9_ARCHIVE_RETAIN_COMMITS to fail"
 [ "$overflow_rc" -ne 0 ] || fail "expected overflowing DRIVE9_ARCHIVE_RETAIN_COMMITS to fail"
+[ "$bad_grace_rc" -ne 0 ] || fail "expected overflowing DRIVE9_ARCHIVE_INCOMPLETE_GRACE_SECONDS to fail"
 pass "DRIVE9_ARCHIVE_RETAIN_COMMITS=0 and bounded validation behave as expected"
 
-echo "== 7. Stale branch dispatch ranks commits globally by timestamp instead of pruning newer main archives"
+echo "== 7. Stale branch dispatch ranks globally, does not overwrite main's latest.json, and preserves main under retain_commits=1"
 R7="${WORK}/remote7"
 L7="${WORK}/ops7.log"
 : >"$L7"
-# Create an older diverged branch with two ancient commits (STALE_OLD -> STALE_TIP),
-# while main has a much newer commit MAIN_NEW (not protected by latest.json).
 git -C "$REPO" checkout -q -b stale-branch "$C1"
 printf 'stale-old\n' >"${REPO}/stale.txt"
 git -C "$REPO" add -A
@@ -415,14 +477,153 @@ GIT_AUTHOR_DATE="2027-01-01T00:00:00Z" GIT_COMMITTER_DATE="2027-01-01T00:00:00Z"
 git -C "$REPO" push -q origin HEAD:main
 MAIN_NEW="$(git -C "$REPO" rev-parse HEAD)"
 
-# Seed STALE_OLD (2025-01-01, direct parent of stale-branch) and MAIN_NEW (2027-01-01, NOT latest.json).
-seed_complete_commit "$R7" "$STALE_OLD"
-seed_complete_commit "$R7" "$MAIN_NEW"
+seed_complete_commit "$R7" "$STALE_OLD" "2025-01-01T00:00:00Z"
+seed_complete_commit "$R7" "$MAIN_NEW" "2027-01-01T00:00:00Z"
+seed_latest_index "$R7" "$MAIN_NEW"
 
-run_publisher "$R7" "$L7" env GITHUB_EVENT_NAME=workflow_dispatch DRIVE9_ARCHIVE_BRANCH=stale-branch DRIVE9_ARCHIVE_RETAIN_COMMITS=2 >/dev/null
+run_publisher "$R7" "$L7" env GITHUB_EVENT_NAME=workflow_dispatch DRIVE9_ARCHIVE_BRANCH=stale-branch DRIVE9_ARCHIVE_RETAIN_COMMITS=1 >/dev/null
 assert_missing "${R7}/drive9/commits/${STALE_OLD}"
 assert_exists "${R7}/drive9/commits/${MAIN_NEW}/manifest.json"
 assert_exists "${R7}/drive9/commits/${STALE_TIP}/manifest.json"
-pass "stale branch dispatch pruned ancient ancestor STALE_OLD and preserved newer main commit"
+[ "$(jq -r '.commit_sha' "${R7}/drive9/latest.json")" = "$MAIN_NEW" ] || fail "stale-branch dispatch overwrote shared latest.json"
+pass "stale-branch dispatch kept main's latest.json and preserved MAIN_NEW even with retain_commits=1"
+
+echo "== 8. Remote SHA absent from local git is ranked by remote manifest published_at (not treated as oldest)"
+# Clone ONLY stale-branch from a bare repo that does NOT have MAIN_NEW at all (simulates deleted/unfetched branch).
+ISOLATED_ORIGIN="${WORK}/isolated-origin.git"
+ISOLATED_REPO="${WORK}/isolated-repo"
+git init -q --bare "$ISOLATED_ORIGIN"
+git -C "$REPO" push -q "$ISOLATED_ORIGIN" stale-branch:stale-branch
+git clone -q --single-branch --branch stale-branch "$ISOLATED_ORIGIN" "$ISOLATED_REPO"
+
+R8="${WORK}/remote8"
+L8="${WORK}/ops8.log"
+: >"$L8"
+# MAIN_NEW does not exist in ISOLATED_REPO or ISOLATED_ORIGIN, and is NOT protected by latest.json.
+seed_complete_commit "$R8" "$STALE_OLD" "2025-01-01T00:00:00Z"
+seed_complete_commit "$R8" "$MAIN_NEW" "2027-01-01T00:00:00Z"
+
+run_publisher_in "$ISOLATED_REPO" "$R8" "$L8" env GITHUB_EVENT_NAME=workflow_dispatch DRIVE9_ARCHIVE_BRANCH=stale-branch DRIVE9_ARCHIVE_RETAIN_COMMITS=2 >/dev/null
+assert_missing "${R8}/drive9/commits/${STALE_OLD}"
+assert_exists "${R8}/drive9/commits/${MAIN_NEW}/manifest.json"
+assert_exists "${R8}/drive9/commits/${STALE_TIP}/manifest.json"
+pass "unfetched remote commit MAIN_NEW ranked by remote manifest published_at and preserved over STALE_OLD"
+
+echo "== 9. Recent in-progress incomplete directory is preserved by grace window while aged incomplete is pruned"
+R9="${WORK}/remote9"
+L9="${WORK}/ops9.log"
+: >"$L9"
+seed_complete_commit "$R9" "$C1"
+seed_latest_index "$R9" "$C1"
+# Recent in-progress upload (mtime = now, within 3600s grace window) — must NOT be pruned.
+mkdir -p "${R9}/drive9/commits/${C2}/bin"
+printf 'in-flight\n' >"${R9}/drive9/commits/${C2}/source.tar.gz"
+# Aged abandoned upload (mtime = 2020, older than 3600s grace window) — MUST be pruned.
+mkdir -p "${R9}/drive9/commits/${C3}/bin"
+printf 'abandoned\n' >"${R9}/drive9/commits/${C3}/source.tar.gz"
+touch -t 202001010000 "${R9}/drive9/commits/${C3}"
+
+run_publisher "$R9" "$L9" env DRIVE9_ARCHIVE_RETAIN_COMMITS=1 DRIVE9_ARCHIVE_INCOMPLETE_GRACE_SECONDS=3600 >/dev/null
+assert_exists "${R9}/drive9/commits/${C2}/source.tar.gz"
+assert_missing "${R9}/drive9/commits/${C3}"
+assert_exists "${R9}/drive9/commits/${MAIN_NEW}/manifest.json"
+pass "preserved fresh in-progress C2 under grace window (even with retain_commits=1) and pruned aged C3"
+
+echo "== 10. Partial rm failure logs warning, continues deleting remaining expired commits, and still publishes"
+R10="${WORK}/remote10"
+L10="${WORK}/ops10.log"
+: >"$L10"
+seed_complete_commit "$R10" "$C1"
+seed_complete_commit "$R10" "$C2"
+seed_complete_commit "$R10" "$C3"
+seed_latest_index "$R10" "$C3"
+
+err10="${WORK}/err10.log"
+run_publisher "$R10" "$L10" env DRIVE9_ARCHIVE_RETAIN_COMMITS=2 FAKE_FAIL_RM_PATTERN="$C1" >/dev/null 2>"$err10"
+assert_exists "${R10}/drive9/commits/${C1}/manifest.json"
+assert_missing "${R10}/drive9/commits/${C2}"
+assert_exists "${R10}/drive9/commits/${C3}/manifest.json"
+assert_exists "${R10}/drive9/commits/${MAIN_NEW}/manifest.json"
+grep -q "partial failures: removed=1 failed=1" "$err10" || fail "expected partial failure summary in stderr"
+pass "continued past rm failure on C1, pruned C2, logged summary, and published MAIN_NEW"
+
+echo "== 11. Transient ls/stat errors (pre-publish and post-publish) warn without failing publish"
+# 11a: Pre-publish ls 503 skips prune and still publishes.
+R11A="${WORK}/remote11a"
+L11A="${WORK}/ops11a.log"
+: >"$L11A"
+seed_complete_commit "$R11A" "$C1"
+seed_complete_commit "$R11A" "$C2"
+LS11A="${WORK}/ls11a.count"
+err11a="${WORK}/err11a.log"
+run_publisher "$R11A" "$L11A" env DRIVE9_ARCHIVE_RETAIN_COMMITS=1 FAKE_LS_COUNT_FILE="$LS11A" FAKE_FAIL_LS_ON_CALL=1 >/dev/null 2>"$err11a"
+assert_exists "${R11A}/drive9/commits/${MAIN_NEW}/manifest.json"
+grep -q "skipping retention prune" "$err11a" || fail "expected warning on pre-publish ls error"
+
+# 11b: Pre-publish stat 503 preserves affected commit and still prunes others + publishes.
+R11B="${WORK}/remote11b"
+L11B="${WORK}/ops11b.log"
+: >"$L11B"
+seed_complete_commit "$R11B" "$C1"
+seed_complete_commit "$R11B" "$C2"
+seed_complete_commit "$R11B" "$C3"
+seed_latest_index "$R11B" "$C3"
+err11b="${WORK}/err11b.log"
+run_publisher "$R11B" "$L11B" env DRIVE9_ARCHIVE_RETAIN_COMMITS=2 FAKE_FAIL_STAT_PATTERN="$C2" >/dev/null 2>"$err11b"
+assert_missing "${R11B}/drive9/commits/${C1}"
+assert_exists "${R11B}/drive9/commits/${C2}/manifest.json"
+assert_exists "${R11B}/drive9/commits/${MAIN_NEW}/manifest.json"
+grep -q "failed to inspect remote manifest for ${C2}" "$err11b" || fail "expected warning on transient stat error"
+
+# 11c: Post-publish deferred_latest_prune ls 503 must NOT fail the already-published release.
+R11C="${WORK}/remote11c"
+L11C="${WORK}/ops11c.log"
+: >"$L11C"
+seed_complete_commit "$R11C" "$C1"
+seed_complete_commit "$R11C" "$C3"
+seed_latest_index "$R11C" "$C3"
+LS11C="${WORK}/ls11c.count"
+err11c="${WORK}/err11c.log"
+run_publisher "$R11C" "$L11C" env DRIVE9_ARCHIVE_RETAIN_COMMITS=1 FAKE_LS_COUNT_FILE="$LS11C" FAKE_FAIL_LS_ON_CALL=2 >/dev/null 2>"$err11c"
+assert_missing "${R11C}/drive9/commits/${C1}"
+assert_exists "${R11C}/drive9/commits/${MAIN_NEW}/manifest.json"
+[ "$(jq -r '.commit_sha' "${R11C}/drive9/latest.json")" = "$MAIN_NEW" ] || fail "latest.json should be updated to MAIN_NEW"
+grep -q "skipping retention prune" "$err11c" || fail "expected warning on post-publish ls error"
+pass "pre- and post-publish transient ls/stat errors warned without failing publish"
+
+echo "== 12. Missing/empty commits dir (404) and malformed latest.json are handled cleanly"
+# 12a: Brand new remote (commits/ returns 404).
+R12A="${WORK}/remote12a"
+L12A="${WORK}/ops12a.log"
+mkdir -p "$R12A"
+: >"$L12A"
+run_publisher "$R12A" "$L12A" env DRIVE9_ARCHIVE_RETAIN_COMMITS=5 >/dev/null
+assert_exists "${R12A}/drive9/commits/${MAIN_NEW}/manifest.json"
+[ "$(jq -r '.commit_sha' "${R12A}/drive9/latest.json")" = "$MAIN_NEW" ] || fail "fresh remote publish failed"
+
+# 12b: Empty commits/ directory + malformed latest.json.
+R12B="${WORK}/remote12b"
+L12B="${WORK}/ops12b.log"
+mkdir -p "${R12B}/drive9/commits"
+printf '{not-valid-json' >"${R12B}/drive9/latest.json"
+: >"$L12B"
+run_publisher "$R12B" "$L12B" env DRIVE9_ARCHIVE_RETAIN_COMMITS=5 >/dev/null
+assert_exists "${R12B}/drive9/commits/${MAIN_NEW}/manifest.json"
+[ "$(jq -r '.commit_sha' "${R12B}/drive9/latest.json")" = "$MAIN_NEW" ] || fail "malformed latest.json was not repaired"
+
+# 12c: Non-empty commits/ with malformed latest.json still prunes expired commits cleanly.
+R12C="${WORK}/remote12c"
+L12C="${WORK}/ops12c.log"
+seed_complete_commit "$R12C" "$C1"
+seed_complete_commit "$R12C" "$C2"
+printf '{not-valid-json' >"${R12C}/drive9/latest.json"
+: >"$L12C"
+err12c="${WORK}/err12c.log"
+run_publisher "$R12C" "$L12C" env DRIVE9_ARCHIVE_RETAIN_COMMITS=2 >/dev/null 2>"$err12c"
+assert_missing "${R12C}/drive9/commits/${C1}"
+assert_exists "${R12C}/drive9/commits/${C2}/manifest.json"
+assert_exists "${R12C}/drive9/commits/${MAIN_NEW}/manifest.json"
+grep -q "is malformed" "$err12c" || fail "expected malformed latest.json warning"
+pass "missing/empty commits dir and malformed latest.json handled cleanly"
 
 echo "ALL TESTS PASSED"

@@ -10,6 +10,10 @@ info() {
   echo "archive: $*"
 }
 
+warn() {
+  echo "archive: warning: $*" >&2
+}
+
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "$1 is required"
 }
@@ -31,7 +35,9 @@ artifact_root="${work_root}/artifacts"
 worktree_root="${work_root}/worktrees"
 repository="${GITHUB_REPOSITORY:-mem9-ai/drive9}"
 branch="${DRIVE9_ARCHIVE_BRANCH:-main}"
+latest_index_branch="${DRIVE9_ARCHIVE_LATEST_BRANCH:-main}"
 retain_commits="${DRIVE9_ARCHIVE_RETAIN_COMMITS:-20}"
+incomplete_grace_seconds="${DRIVE9_ARCHIVE_INCOMPLETE_GRACE_SECONDS:-3600}"
 quota_retry_attempts="${DRIVE9_ARCHIVE_QUOTA_RETRY_ATTEMPTS:-6}"
 quota_retry_delay="${DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY:-10}"
 remote_missing_status=42
@@ -51,8 +57,14 @@ fi
 if [ "${branch#-}" != "$branch" ] || ! git check-ref-format "refs/heads/${branch}" >/dev/null; then
   die "invalid DRIVE9_ARCHIVE_BRANCH: ${branch}"
 fi
+if [ -z "$latest_index_branch" ] || [ "${latest_index_branch#-}" != "$latest_index_branch" ] || ! git check-ref-format "refs/heads/${latest_index_branch}" >/dev/null; then
+  die "invalid DRIVE9_ARCHIVE_LATEST_BRANCH: ${latest_index_branch}"
+fi
 if ! [[ "$retain_commits" =~ ^(0|[1-9][0-9]{0,5})$ ]]; then
   die "invalid DRIVE9_ARCHIVE_RETAIN_COMMITS: ${retain_commits}"
+fi
+if ! [[ "$incomplete_grace_seconds" =~ ^(0|[1-9][0-9]{0,6})$ ]]; then
+  die "invalid DRIVE9_ARCHIVE_INCOMPLETE_GRACE_SECONDS: ${incomplete_grace_seconds}"
 fi
 if ! [[ "$quota_retry_attempts" =~ ^[1-9][0-9]{0,2}$ ]]; then
   die "invalid DRIVE9_ARCHIVE_QUOTA_RETRY_ATTEMPTS: ${quota_retry_attempts}"
@@ -110,6 +122,29 @@ remote_manifest_exists() {
   if remote fs stat "$(remote_ref "${commit_path}/manifest.json")" >"$out" 2>"$err"; then
     rm -f "$out" "$err"
     return 0
+  fi
+  if grep -qiE '(^|[^[:alnum:]])(not found|HTTP 404)([^[:alnum:]]|$)' "$err"; then
+    rm -f "$out" "$err"
+    return "$remote_missing_status"
+  fi
+  cat "$err" >&2
+  rm -f "$out" "$err"
+  return 1
+}
+
+remote_stat_mtime() {
+  local path=$1
+  local out="${work_root}/stat-mtime.json"
+  local err="${out}.stderr"
+  local mtime
+  if remote fs stat -o json "$(remote_ref "$path")" >"$out" 2>"$err"; then
+    mtime="$(jq -r 'if type == "object" and (.mtime | type == "number") then (.mtime | floor) else "" end' "$out" 2>/dev/null || true)"
+    rm -f "$out" "$err"
+    if [[ "$mtime" =~ ^[0-9]+$ ]] && [ "$mtime" -gt 0 ]; then
+      printf '%s\n' "$mtime"
+      return 0
+    fi
+    return 2
   fi
   if grep -qiE '(^|[^[:alnum:]])(not found|HTTP 404)([^[:alnum:]]|$)' "$err"; then
     rm -f "$out" "$err"
@@ -178,6 +213,9 @@ remote_upload() {
 
 fetch_archive_branch() {
   git fetch --quiet origin "refs/heads/${branch}:refs/remotes/origin/${branch}"
+  if [ "$branch" != "$latest_index_branch" ]; then
+    git fetch --quiet origin "refs/heads/${latest_index_branch}:refs/remotes/origin/${latest_index_branch}" 2>/dev/null || true
+  fi
 }
 
 archive_branch_tip() {
@@ -466,6 +504,11 @@ publish_latest_index() {
   local latest_manifest="${work_root}/latest.json"
   local branch_tip
 
+  if [ "$branch" != "$latest_index_branch" ]; then
+    info "skip latest index ${latest_index}; branch ${branch} does not own ${latest_index} (expected ${latest_index_branch})"
+    return
+  fi
+
   branch_tip="$(archive_branch_tip)"
   if [ "$sha" != "$branch_tip" ]; then
     info "skip latest index ${latest_index}; ${sha} is not current origin/${branch} tip ${branch_tip}"
@@ -509,6 +552,8 @@ remote_latest_commit_sha() {
     rm -f "$latest_file"
     if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
       printf '%s\n' "$sha"
+    else
+      warn "remote latest index ${latest_index} is malformed; proceeding without latest protection"
     fi
     return 0
   else
@@ -516,13 +561,71 @@ remote_latest_commit_sha() {
     if [ "$cat_status" -eq "$remote_missing_status" ]; then
       return 0
     fi
-    die "failed to read remote latest index ${latest_index}"
+    return 1
+  fi
+}
+
+remote_commit_timestamp() {
+  local sha=$1
+  local commit_path="${archive_root}/commits/${sha}"
+  local manifest_file="${work_root}/rank-manifest-${sha}.json"
+  local cat_status ts mtime
+
+  if remote_cat "${commit_path}/manifest.json" "$manifest_file"; then
+    ts="$(jq -r 'if type == "object" and (.published_at | type == "string") then (.published_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) else "" end' "$manifest_file" 2>/dev/null || true)"
+    rm -f "$manifest_file"
+    if [[ "$ts" =~ ^[0-9]+$ ]]; then
+      printf '%s\n' "$ts"
+      return 0
+    fi
+    if mtime="$(remote_stat_mtime "${commit_path}/manifest.json")"; then
+      printf '%s\n' "$mtime"
+      return 0
+    fi
+    return 2
+  else
+    cat_status=$?
+    if [ "$cat_status" -eq "$remote_missing_status" ]; then
+      if mtime="$(remote_stat_mtime "$commit_path")"; then
+        printf '%s\n' "$mtime"
+        return 0
+      fi
+      return 2
+    fi
+    return 1
+  fi
+}
+
+incomplete_commit_eligible_for_prune() {
+  local sha=$1
+  local now_epoch=$2
+  local mtime mtime_status age
+
+  if [ "$incomplete_grace_seconds" -eq 0 ]; then
+    return 0
+  fi
+
+  if mtime="$(remote_stat_mtime "${archive_root}/commits/${sha}")"; then
+    age=$((now_epoch - mtime))
+    if [ "$age" -ge "$incomplete_grace_seconds" ]; then
+      return 0
+    fi
+    info "preserve recent incomplete commit ${sha} (age=${age}s < grace=${incomplete_grace_seconds}s)"
+    return 1
+  else
+    mtime_status=$?
+    if [ "$mtime_status" -eq "$remote_missing_status" ]; then
+      return 1
+    fi
+    warn "cannot verify age of incomplete commit ${sha}; preserving it during this prune pass"
+    return 1
   fi
 }
 
 sort_remote_commits_newest_first() {
   local remote_shas_file=$1
   local sorted_out=$2
+  local unknown_age_out=$3
   local branch_revlist="${work_root}/branch-revlist.txt"
   local all_commits_ts="${work_root}/all-commits-ts.txt"
   local ranked_file="${work_root}/remote-commits-ranked.tsv"
@@ -532,6 +635,7 @@ sort_remote_commits_newest_first() {
   git log --all --format='%H %ct' >"$all_commits_ts"
   : >"$ranked_file"
   : >"$unranked_file"
+  : >"$unknown_age_out"
 
   # Rank every commit known to git globally by committer timestamp descending so
   # dispatching a stale branch never prefers ancient ancestors over newer main
@@ -565,7 +669,11 @@ sort_remote_commits_newest_first() {
       if [[ "$ct" =~ ^[0-9]+$ ]]; then
         inv_ct=$((9999999999 - ct))
         printf '0\t%012d\t999999999\t%s\n' "$inv_ct" "$sha" >>"$ranked_file"
+      elif ct="$(remote_commit_timestamp "$sha")"; then
+        inv_ct=$((9999999999 - ct))
+        printf '0\t%012d\t999999999\t%s\n' "$inv_ct" "$sha" >>"$ranked_file"
       else
+        printf '%s\n' "$sha" >>"$unknown_age_out"
         printf '1\t999999999999\t999999999\t%s\n' "$sha" >>"$ranked_file"
       fi
     done <"$unranked_file"
@@ -586,6 +694,12 @@ is_sha_in_list() {
   return 1
 }
 
+is_sha_in_file() {
+  local needle=$1
+  local file=$2
+  [ -s "$file" ] && grep -Fxq "$needle" "$file"
+}
+
 prune_remote_commits() {
   local keep_budget=$1
   shift
@@ -593,11 +707,16 @@ prune_remote_commits() {
   local ls_out="${work_root}/remote-commits-ls.txt"
   local remote_shas_file="${work_root}/remote-commits-shas.txt"
   local sorted_shas_file="${work_root}/remote-commits-sorted.txt"
+  local unknown_age_file="${work_root}/remote-commits-unknown-age.txt"
+  local incomplete_target_file="${work_root}/remote-commits-prune-incomplete-target.txt"
   local incomplete_file="${work_root}/remote-commits-prune-incomplete.txt"
   local expired_file="${work_root}/remote-commits-prune-expired.txt"
-  local ls_status latest_sha kept_complete sha entry name stat_status
+  local ls_status latest_sha kept_complete sha entry name stat_status now_epoch
+  local incomplete_target_count=0
   local incomplete_count=0
   local expired_count=0
+  local pruned_ok=0
+  local prune_failures=0
 
   deferred_latest_prune=0
 
@@ -613,7 +732,8 @@ prune_remote_commits() {
     if [ "$ls_status" -eq "$remote_missing_status" ]; then
       return 0
     fi
-    die "failed to list ${archive_root}/commits"
+    warn "failed to list ${archive_root}/commits; skipping retention prune"
+    return 0
   fi
 
   : >"$remote_shas_file"
@@ -633,12 +753,20 @@ prune_remote_commits() {
     return 0
   fi
 
-  latest_sha="$(remote_latest_commit_sha)"
-  sort_remote_commits_newest_first "$remote_shas_file" "$sorted_shas_file"
+  if latest_sha="$(remote_latest_commit_sha)"; then
+    :
+  else
+    warn "failed to read remote latest index ${latest_index}; skipping retention prune"
+    return 0
+  fi
+
+  sort_remote_commits_newest_first "$remote_shas_file" "$sorted_shas_file" "$unknown_age_file"
+  now_epoch="$(date -u '+%s')"
 
   # Reserve one retention slot per target commit being published so pre-publish
   # pruning leaves room for new commits without over-pruning idempotent reruns.
   kept_complete="${#protected_shas[@]}"
+  : >"$incomplete_target_file"
   : >"$incomplete_file"
   : >"$expired_file"
 
@@ -646,6 +774,19 @@ prune_remote_commits() {
     [ -n "$sha" ] || continue
 
     if [ "${#protected_shas[@]}" -gt 0 ] && is_sha_in_list "$sha" "${protected_shas[@]}"; then
+      if remote_manifest_exists "${archive_root}/commits/${sha}"; then
+        :
+      else
+        stat_status=$?
+        if [ "$stat_status" -eq "$remote_missing_status" ]; then
+          if [ -z "$latest_sha" ] || [ "$sha" != "$latest_sha" ]; then
+            printf '%s\n' "$sha" >>"$incomplete_target_file"
+            incomplete_target_count=$((incomplete_target_count + 1))
+          fi
+        else
+          warn "failed to inspect remote manifest for target ${sha}; preserving it before publish"
+        fi
+      fi
       continue
     fi
 
@@ -658,7 +799,7 @@ prune_remote_commits() {
           if [ "$stat_status" -eq "$remote_missing_status" ]; then
             deferred_latest_prune=1
           else
-            die "failed to inspect remote manifest for ${sha}"
+            warn "failed to inspect remote manifest for latest ${sha}; preserving it during this prune pass"
           fi
         fi
       else
@@ -667,37 +808,75 @@ prune_remote_commits() {
       continue
     fi
 
-    if [ "$kept_complete" -lt "$keep_budget" ]; then
+    if is_sha_in_file "$sha" "$unknown_age_file"; then
       if remote_manifest_exists "${archive_root}/commits/${sha}"; then
-        kept_complete=$((kept_complete + 1))
+        warn "cannot determine age for commit ${sha}; preserving it during this prune pass"
       else
         stat_status=$?
         if [ "$stat_status" -eq "$remote_missing_status" ]; then
-          printf '%s\n' "$sha" >>"$incomplete_file"
-          incomplete_count=$((incomplete_count + 1))
+          if incomplete_commit_eligible_for_prune "$sha" "$now_epoch"; then
+            printf '%s\n' "$sha" >>"$incomplete_file"
+            incomplete_count=$((incomplete_count + 1))
+          fi
         else
-          die "failed to inspect remote manifest for ${sha}"
+          warn "failed to inspect remote manifest for ${sha}; preserving it during this prune pass"
         fi
       fi
+      continue
+    fi
+
+    if remote_manifest_exists "${archive_root}/commits/${sha}"; then
+      if [ "$kept_complete" -lt "$keep_budget" ]; then
+        kept_complete=$((kept_complete + 1))
+      else
+        printf '%s\n' "$sha" >>"$expired_file"
+        expired_count=$((expired_count + 1))
+      fi
     else
-      printf '%s\n' "$sha" >>"$expired_file"
-      expired_count=$((expired_count + 1))
+      stat_status=$?
+      if [ "$stat_status" -eq "$remote_missing_status" ]; then
+        if incomplete_commit_eligible_for_prune "$sha" "$now_epoch"; then
+          printf '%s\n' "$sha" >>"$incomplete_file"
+          incomplete_count=$((incomplete_count + 1))
+        fi
+      else
+        warn "failed to inspect remote manifest for ${sha}; preserving it during this prune pass"
+      fi
     fi
   done <"$sorted_shas_file"
 
-  if [ "$incomplete_count" -eq 0 ] && [ "$expired_count" -eq 0 ]; then
+  if [ "$incomplete_target_count" -eq 0 ] && [ "$incomplete_count" -eq 0 ] && [ "$expired_count" -eq 0 ]; then
     info "retention check: no commits to prune (retaining up to ${keep_budget} complete commits)"
     return 0
   fi
 
-  info "prune ${incomplete_count} incomplete and ${expired_count} expired remote commit(s) (retaining up to ${keep_budget} complete commits)"
+  info "prune ${incomplete_target_count} incomplete target, ${incomplete_count} incomplete, and ${expired_count} expired remote commit(s) (retaining up to ${keep_budget} complete commits)"
+
+  if [ "$incomplete_target_count" -gt 0 ]; then
+    while IFS= read -r sha; do
+      [ -n "$sha" ] || continue
+      info "remove ${archive_root}/commits/${sha} (incomplete target)"
+      if remote_rm_rf "${archive_root}/commits/${sha}"; then
+        pruned_any=1
+        pruned_ok=$((pruned_ok + 1))
+      else
+        warn "failed to remove ${archive_root}/commits/${sha} (incomplete target); continuing"
+        prune_failures=$((prune_failures + 1))
+      fi
+    done <"$incomplete_target_file"
+  fi
 
   if [ "$incomplete_count" -gt 0 ]; then
     while IFS= read -r sha; do
       [ -n "$sha" ] || continue
       info "remove ${archive_root}/commits/${sha} (incomplete)"
-      remote_rm_rf "${archive_root}/commits/${sha}"
-      pruned_any=1
+      if remote_rm_rf "${archive_root}/commits/${sha}"; then
+        pruned_any=1
+        pruned_ok=$((pruned_ok + 1))
+      else
+        warn "failed to remove ${archive_root}/commits/${sha} (incomplete); continuing"
+        prune_failures=$((prune_failures + 1))
+      fi
     done <"$incomplete_file"
   fi
 
@@ -706,9 +885,18 @@ prune_remote_commits() {
     while IFS= read -r sha; do
       [ -n "$sha" ] || continue
       info "remove ${archive_root}/commits/${sha} (expired)"
-      remote_rm_rf "${archive_root}/commits/${sha}"
-      pruned_any=1
+      if remote_rm_rf "${archive_root}/commits/${sha}"; then
+        pruned_any=1
+        pruned_ok=$((pruned_ok + 1))
+      else
+        warn "failed to remove ${archive_root}/commits/${sha} (expired); continuing"
+        prune_failures=$((prune_failures + 1))
+      fi
     done < <(awk '{ lines[NR] = $0 } END { for (i = NR; i >= 1; i--) print lines[i] }' "$expired_file")
+  fi
+
+  if [ "$prune_failures" -gt 0 ]; then
+    warn "retention prune completed with partial failures: removed=${pruned_ok} failed=${prune_failures}"
   fi
 }
 
@@ -750,7 +938,7 @@ main() {
     fi
   done
 
-  prune_remote_commits "$retain_commits" "${commits[@]}"
+  prune_remote_commits "$retain_commits" "${commits[@]}" || warn "pre-publish retention prune failed; continuing"
 
   for sha in "${commits[@]}"; do
     publish_commit "$sha"
@@ -758,7 +946,7 @@ main() {
   done
 
   if [ "$deferred_latest_prune" -eq 1 ]; then
-    prune_remote_commits "$retain_commits" "${commits[@]}"
+    prune_remote_commits "$retain_commits" "${commits[@]}" || warn "post-publish retention prune failed; publish already succeeded"
   fi
 }
 
