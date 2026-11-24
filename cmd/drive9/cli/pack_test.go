@@ -1751,7 +1751,7 @@ func TestSupervisedLayerPinsResolvedArchiveIdentity(t *testing.T) {
 		t.Setenv(EnvMountRemoteOnlyPatterns, "**/results/**")
 		var got mountSuperviseStartRequest
 		runSuperviseForeground = func(req mountSuperviseStartRequest) error { got = req; return nil }
-		args := []string{"--supervise-foreground", "--mode=fuse", "--auth=local", "--read-only", "--profile=coding-agent", "--local-root", base, "--server", srv.URL, "--api-key", "test"}
+		args := []string{"--supervise-foreground", "--mode=fuse", "--auth", "local", "--read-only", "--profile=coding-agent", "--local-root", base, "--server", srv.URL, "--api-key", "test"}
 		args = append(args, flags...)
 		if err := MountCmd(append(args, t.TempDir())); err != nil {
 			t.Fatal(err)
@@ -1772,5 +1772,39 @@ func TestSupervisedLayerPinsResolvedArchiveIdentity(t *testing.T) {
 		if !reflect.DeepEqual(worker, want) {
 			t.Errorf("worker args differ: got %q, want %q", worker, want)
 		}
+	}
+}
+
+func TestLayerDefaultRootUsesResolvedRemoteRoot(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
+	const id = "layer_01j8z6kh2m9q7w3r5t6y8v0p1a"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/layers/work" {
+			_, _ = io.WriteString(w, `{"layer_id":"`+id+`","base_root_path":"/repo"}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	old := runSuperviseForeground
+	t.Cleanup(func() { runSuperviseForeground = old })
+	var roots []string
+	runSuperviseForeground = func(req mountSuperviseStartRequest) error {
+		roots = append(roots, req.LocalRoot)
+		if req.RemoteRoot != "/repo" || req.LayerID != id {
+			t.Fatalf("layer metadata %q %q", req.RemoteRoot, req.LayerID)
+		}
+		return nil
+	}
+	for _, remote := range [][]string{nil, {":/repo"}} {
+		args := []string{"--supervise-foreground", "--mode=fuse", "--auth", "server", "--no-auto-unpack", "--profile=coding-agent", "--layer", "work", "--server", srv.URL, "--api-key", "test"}
+		args = append(args, remote...)
+		if err := MountCmd(append(args, t.TempDir())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(roots) != 2 || roots[0] == "" || roots[0] != roots[1] {
+		t.Fatalf("default roots %v", roots)
 	}
 }

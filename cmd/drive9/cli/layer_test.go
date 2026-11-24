@@ -191,6 +191,7 @@ func TestBoundLayerRejectsIncompatibleBackends(t *testing.T) {
 	}{
 		{"rm", Rm, []string{"--auth=local", "s3://test-fixture/a"}, "drive9-only"},
 		{"mv", Mv, []string{"--auth=local", "s3://test-fixture/a", "s3://test-fixture/b"}, "drive9-only"},
+		{"tasks", Tasks, []string{"example:/dir"}, "context-scoped"},
 		{"archive", Archive, []string{"example:/dir", filepath.Join(t.TempDir(), "out")}, "context-scoped"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

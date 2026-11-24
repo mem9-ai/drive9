@@ -18,6 +18,8 @@ const (
 	// write-side work behind: the mount is gone, and so may be acknowledged
 	// bytes the uploader never landed.
 	ExitDrainFailed = 7
+	// ExitLayerLeaseBusy lets a supervisor recovering a worker wait for its lease.
+	ExitLayerLeaseBusy = 8
 )
 
 // MountExitReason classifies why a mount process ended.
@@ -33,7 +35,8 @@ const (
 	ExitReasonStartupTransient MountExitReason = "startup_transient"
 	// ExitReasonDrainFailed is recorded (and reported to `drive9 umount`)
 	// when the shutdown drain could not commit everything it held.
-	ExitReasonDrainFailed MountExitReason = "drain_failed"
+	ExitReasonDrainFailed    MountExitReason = "drain_failed"
+	ExitReasonLayerLeaseBusy MountExitReason = "layer_lease_busy"
 )
 
 // MountExitError is a typed mount failure that carries a process exit code

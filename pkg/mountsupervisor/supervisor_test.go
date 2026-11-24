@@ -375,3 +375,62 @@ func TestSupervisorReplacesStoredLayerMetadata(t *testing.T) {
 		}
 	}
 }
+
+func TestSupervisorRecoversAfterOldWorkerLeaseExpires(t *testing.T) {
+	dir := t.TempDir()
+	mountPoint := filepath.Join(dir, "mount")
+	if err := os.Mkdir(mountPoint, 0700); err != nil {
+		t.Fatal(err)
+	}
+	worker := filepath.Join(dir, "worker")
+	script := `#!/bin/sh
+echo attempt >> "$1/attempts"
+if [ ! -f "$1/expired" ]; then exit 8; fi
+trap 'exit 0' TERM INT
+touch "$1/recovered"
+sleep 1
+`
+	if err := os.WriteFile(worker, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	start := now
+	cfg := Config{
+		MountPoint: mountPoint, Executable: worker, WorkerArgs: []string{dir}, Adopt: true,
+		AdoptWorkerPID: 1 << 30, AdoptWorkerCreation: 1,
+		Now: func() time.Time { return now },
+		Sleep: func(d time.Duration) {
+			if d == time.Second {
+				now = now.Add(d)
+				if now.Sub(start) >= drive9fuse.LayerMountLeaseTTL {
+					if err := os.WriteFile(filepath.Join(dir, "expired"), nil, 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+			} else {
+				time.Sleep(d)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "recovered")); err == nil {
+				if err := mountstate.WriteStopToken(mountPoint, "test complete"); err != nil {
+					t.Fatal(err)
+				}
+			}
+		},
+	}
+	if err := Run(cfg); err != nil {
+		t.Fatal(err)
+	}
+	attempts, err := os.ReadFile(filepath.Join(dir, "attempts"))
+	if err != nil || string(attempts) != "attempt\nattempt\n" {
+		t.Fatalf("attempts %q, %v", attempts, err)
+	}
+}
+
+func TestLayerLeaseWaitHonorsStop(t *testing.T) {
+	stop := make(chan os.Signal, 1)
+	stop <- syscall.SIGTERM
+	s := &supervisor{cfg: applyDefaults(Config{MountPoint: t.TempDir()})}
+	if s.waitForLayerLease(stop) || !s.isStopRequested() {
+		t.Fatal("lease recovery ignored stop")
+	}
+}

@@ -713,15 +713,6 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 			return fmt.Errorf("drive9 mount: --unpack requires an overlay profile")
 		}
 	}
-	if normalizedLocalRoot == "" && overlayProfile && resolved == MountModeFUSE {
-		normalizedLocalRoot, err = defaultMountLocalRoot(*server, remoteRoot, mountCredentialCacheKey(apiKeyVal, tokenVal))
-		if err != nil {
-			return err
-		}
-	}
-	if err := validateMountProfileFlags(profileCfg.Name, normalizedLocalRoot, effectiveLocalOnlyPatterns, effectiveLocalGitignoreAwarePatterns, effectiveRemoteOnlyPatterns, effectivePackPaths); err != nil {
-		return err
-	}
 	if resolved == MountModeFUSE && runtime.GOOS != "windows" && len(profileCfg.AppendLogPatterns) > 0 {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		supported := mountProfileAppendLogSupported(ctx, serverVal, apiKeyVal, tokenVal)
@@ -745,9 +736,9 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	envSuperviseOff := strings.EqualFold(strings.TrimSpace(os.Getenv("DRIVE9_MOUNT_SUPERVISE")), "off")
 	wantSupervise := !*noSupervise && !envSuperviseOff
 	supervising := *superviseForeground || (background && !*foreground && wantSupervise && runtime.GOOS != "windows")
-	packLocalRoot := normalizedLocalRoot
+	needDefaultRoot := normalizedLocalRoot == "" && overlayProfile && resolved == MountModeFUSE
 	var archiveClient *client.Client
-	if autoUnpack || len(unpackArchives) > 0 || (supervising && layerRef != "") {
+	if autoUnpack || len(unpackArchives) > 0 || ((supervising || needDefaultRoot) && layerRef != "") {
 		if token != "" {
 			archiveClient = client.NewWithToken(serverVal, token)
 		} else {
@@ -766,10 +757,6 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 			if err != nil {
 				return err
 			}
-			packLocalRoot, err = mountstate.LayerLocalRoot(normalizedLocalRoot, info.LayerID)
-			if err != nil {
-				return err
-			}
 			// Pin child processes to the same layer as the supervisor and archive.
 			if strings.HasPrefix(originalArgs[layerArgIndex], "-layer=") || strings.HasPrefix(originalArgs[layerArgIndex], "--layer=") {
 				originalArgs[layerArgIndex] = "--layer=" + info.LayerID
@@ -778,6 +765,22 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 			}
 			layerRef = info.LayerID
 			remoteRootDefaulted = false
+		}
+	}
+	if needDefaultRoot {
+		normalizedLocalRoot, err = defaultMountLocalRoot(*server, remoteRoot, mountCredentialCacheKey(apiKeyVal, tokenVal))
+		if err != nil {
+			return err
+		}
+	}
+	if err := validateMountProfileFlags(profileCfg.Name, normalizedLocalRoot, effectiveLocalOnlyPatterns, effectiveLocalGitignoreAwarePatterns, effectiveRemoteOnlyPatterns, effectivePackPaths); err != nil {
+		return err
+	}
+	packLocalRoot := normalizedLocalRoot
+	if layerRef != "" && archiveClient != nil {
+		packLocalRoot, err = mountstate.LayerLocalRoot(normalizedLocalRoot, layerRef)
+		if err != nil {
+			return err
 		}
 	}
 	if runtime.GOOS == "windows" && resolved == MountModeFUSE && len(unpackArchives) == 0 && !autoUnpack {

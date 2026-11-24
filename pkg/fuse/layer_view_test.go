@@ -233,6 +233,7 @@ func TestResolveLayerMountViewRejectsActiveOddFenceAndInvalidPostExpireFence(t *
 	if err == nil {
 		t.Fatal("expected conflict error when layer already has active odd fence")
 	}
+	assertMountExit(t, err, ExitLayerLeaseBusy, ExitReasonLayerLeaseBusy)
 	if !errors.Is(err, client.ErrConflict) {
 		t.Fatalf("expected ErrConflict cause, got %v", err)
 	}

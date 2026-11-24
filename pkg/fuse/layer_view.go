@@ -22,7 +22,7 @@ const (
 	defaultLayerLeaseSelfFenceMargin = 10 * time.Second
 	defaultLayerLeaseRetryInterval   = 2 * time.Second
 	defaultLayerLeaseCallTimeout     = 5 * time.Second
-	defaultLayerLeaseFallbackTTL     = 60 * time.Second
+	LayerMountLeaseTTL     = 60 * time.Second
 )
 
 // ErrLayerLeaseSelfFenced reports that the mount's exclusive Layer lease
@@ -169,7 +169,7 @@ func resolveLayerMountView(
 	expectedFence := info.Fence
 	if expectedFence%2 == 1 {
 		if !info.MountExpired {
-			return nil, ExitStartupPermanentErr(
+			return nil, newMountExit(ExitLayerLeaseBusy, ExitReasonLayerLeaseBusy,
 				fmt.Sprintf("layer %s already has an active exclusive mount lease (fence=%d)", info.LayerID, info.Fence),
 				client.ErrConflict,
 			)
@@ -249,7 +249,7 @@ func (b *layerMountBinding) startRenewLoop(initialCallStart time.Time, initialTT
 		timing.callTimeout = defaultLayerLeaseCallTimeout
 	}
 
-	ttl := defaultLayerLeaseFallbackTTL
+	ttl := LayerMountLeaseTTL
 	if initialTTLMS > 0 {
 		ttl = time.Duration(initialTTLMS) * time.Millisecond
 	}
@@ -287,7 +287,7 @@ func (b *layerMountBinding) runRenewLoop(ctx context.Context, deadline time.Time
 			return
 		}
 		if err == nil {
-			ttl := defaultLayerLeaseFallbackTTL
+			ttl := LayerMountLeaseTTL
 			if resp != nil && resp.MountLeaseTTLMS > 0 {
 				ttl = time.Duration(resp.MountLeaseTTLMS) * time.Millisecond
 			}

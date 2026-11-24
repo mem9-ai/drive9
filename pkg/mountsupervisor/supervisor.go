@@ -235,6 +235,7 @@ func (s *supervisor) loop() error {
 		readyOnce.Do(func() { close(s.cfg.ReadyNotify) })
 	}
 
+	recoverLayerLease := s.adopted
 	// Adopt-by-monitor: do not force-clean a live healthy orphan worker.
 	if s.adopted {
 		if !processAlive(s.state.WorkerPID, s.state.WorkerCreation) {
@@ -325,6 +326,20 @@ func (s *supervisor) loop() error {
 			if code == drive9fuse.ExitOK {
 				return s.shutdownClean()
 			}
+			if code == drive9fuse.ExitLayerLeaseBusy {
+				if !recoverLayerLease {
+					s.setState(mountstate.SupervisorStateFailed)
+					return giveUpError("layer already has an active exclusive mount lease")
+				}
+				// A killed worker cannot release its lease. Give it one TTL
+				// before trying again with a fresh worker and mount identity.
+				recoverLayerLease = false
+				s.logf("waiting for previous worker layer lease to expire")
+				if !s.waitForLayerLease(sigCh) {
+					return s.shutdownClean()
+				}
+				continue
+			}
 			if code == drive9fuse.ExitStartupPermanent || code == drive9fuse.ExitUsage {
 				s.permanentFails++
 				if s.permanentFails >= 3 {
@@ -351,6 +366,7 @@ func (s *supervisor) loop() error {
 		s.backoff = time.Second
 		s.healthFails = 0
 		s.workerReady = true
+		recoverLayerLease = true
 		s.setState(mountstate.SupervisorStateRunning)
 		notifyReady()
 		s.logf("worker ready pid=%d", s.state.WorkerPID)
@@ -648,6 +664,26 @@ func (s *supervisor) spawnWorker() error {
 	_ = s.persist()
 	_ = s.writeAuthoritativeProcessState()
 	return nil
+}
+
+func (s *supervisor) waitForLayerLease(sigCh <-chan os.Signal) bool {
+	deadline := s.cfg.Now().Add(drive9fuse.LayerMountLeaseTTL)
+	for {
+		select {
+		case <-sigCh:
+			s.requestStop("signal during layer lease recovery")
+			return false
+		default:
+		}
+		if mountstate.StopTokenPresent(s.cfg.MountPoint) || s.isStopRequested() {
+			return false
+		}
+		remaining := deadline.Sub(s.cfg.Now())
+		if remaining <= 0 {
+			return true
+		}
+		s.cfg.Sleep(min(remaining, time.Second))
+	}
 }
 
 func (s *supervisor) waitWorkerReady(sigCh <-chan os.Signal) error {
