@@ -31,8 +31,13 @@ artifact_root="${work_root}/artifacts"
 worktree_root="${work_root}/worktrees"
 repository="${GITHUB_REPOSITORY:-mem9-ai/drive9}"
 branch="${DRIVE9_ARCHIVE_BRANCH:-main}"
+retain_commits="${DRIVE9_ARCHIVE_RETAIN_COMMITS:-20}"
+quota_retry_attempts="${DRIVE9_ARCHIVE_QUOTA_RETRY_ATTEMPTS:-6}"
+quota_retry_delay="${DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY:-10}"
 remote_missing_status=42
 active_worktree=""
+pruned_any=0
+deferred_latest_prune=0
 
 if [ -z "${DRIVE9_SERVER:-}" ]; then
   die "DRIVE9_SERVER is required"
@@ -45,6 +50,15 @@ if [ -z "$branch" ]; then
 fi
 if [ "${branch#-}" != "$branch" ] || ! git check-ref-format "refs/heads/${branch}" >/dev/null; then
   die "invalid DRIVE9_ARCHIVE_BRANCH: ${branch}"
+fi
+if ! [[ "$retain_commits" =~ ^[0-9]+$ ]]; then
+  die "invalid DRIVE9_ARCHIVE_RETAIN_COMMITS: ${retain_commits}"
+fi
+if ! [[ "$quota_retry_attempts" =~ ^[1-9][0-9]*$ ]]; then
+  die "invalid DRIVE9_ARCHIVE_QUOTA_RETRY_ATTEMPTS: ${quota_retry_attempts}"
+fi
+if ! [[ "$quota_retry_delay" =~ ^[0-9]+$ ]]; then
+  die "invalid DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY: ${quota_retry_delay}"
 fi
 
 remote() {
@@ -72,6 +86,56 @@ remote_cat() {
   return 1
 }
 
+remote_ls() {
+  local path=$1
+  local out=$2
+  local err="${out}.stderr"
+  if remote fs ls "$(remote_ref "$path")" >"$out" 2>"$err"; then
+    rm -f "$err"
+    return 0
+  fi
+  if grep -qiE '(^|[^[:alnum:]])(not found|HTTP 404)([^[:alnum:]]|$)' "$err"; then
+    rm -f "$out" "$err"
+    return "$remote_missing_status"
+  fi
+  cat "$err" >&2
+  rm -f "$out" "$err"
+  return 1
+}
+
+remote_manifest_exists() {
+  local commit_path=$1
+  local out="${work_root}/stat-manifest.out"
+  local err="${out}.stderr"
+  if remote fs stat "$(remote_ref "${commit_path}/manifest.json")" >"$out" 2>"$err"; then
+    rm -f "$out" "$err"
+    return 0
+  fi
+  if grep -qiE '(^|[^[:alnum:]])(not found|HTTP 404)([^[:alnum:]]|$)' "$err"; then
+    rm -f "$out" "$err"
+    return "$remote_missing_status"
+  fi
+  cat "$err" >&2
+  rm -f "$out" "$err"
+  return 1
+}
+
+remote_rm_rf() {
+  local path=$1
+  local err="${work_root}/rm.stderr"
+  if remote fs rm -r "$(remote_ref "$path")" >/dev/null 2>"$err"; then
+    rm -f "$err"
+    return 0
+  fi
+  if grep -qiE '(^|[^[:alnum:]])(not found|HTTP 404)([^[:alnum:]]|$)' "$err"; then
+    rm -f "$err"
+    return 0
+  fi
+  cat "$err" >&2
+  rm -f "$err"
+  return 1
+}
+
 remote_cp_to_local() {
   local remote_path=$1
   local local_path=$2
@@ -86,8 +150,30 @@ remote_mkdir() {
 remote_upload() {
   local local_path=$1
   local remote_path=$2
+  local err="${work_root}/upload.stderr"
+  local max_attempts=1
+  local attempt=1
+  if [ "$pruned_any" -eq 1 ]; then
+    max_attempts="$quota_retry_attempts"
+  fi
+
   info "upload ${remote_path}"
-  remote fs cp "$local_path" "$(remote_ref "$remote_path")"
+  while true; do
+    if remote fs cp "$local_path" "$(remote_ref "$remote_path")" 2>"$err"; then
+      rm -f "$err"
+      return 0
+    fi
+    if [ "$pruned_any" -eq 1 ] && [ "$attempt" -lt "$max_attempts" ] && grep -qi 'tenant storage quota exceeded' "$err"; then
+      info "storage quota still draining after prune; waiting ${quota_retry_delay}s before retrying ${remote_path} (attempt ${attempt}/${max_attempts})"
+      rm -f "$err"
+      sleep "$quota_retry_delay"
+      attempt=$((attempt + 1))
+      continue
+    fi
+    cat "$err" >&2
+    rm -f "$err"
+    return 1
+  done
 }
 
 fetch_archive_branch() {
@@ -415,6 +501,205 @@ publish_latest_index() {
   remote_upload "$latest_manifest" "$latest_index"
 }
 
+remote_latest_commit_sha() {
+  local latest_file="${work_root}/remote-latest.json"
+  local cat_status sha
+  if remote_cat "$latest_index" "$latest_file"; then
+    sha="$(jq -r 'if type == "object" and (.commit_sha | type == "string") then .commit_sha else "" end' "$latest_file" 2>/dev/null || true)"
+    rm -f "$latest_file"
+    if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+      printf '%s\n' "$sha"
+    fi
+    return 0
+  else
+    cat_status=$?
+    if [ "$cat_status" -eq "$remote_missing_status" ]; then
+      return 0
+    fi
+    die "failed to read remote latest index ${latest_index}"
+  fi
+}
+
+sort_remote_commits_newest_first() {
+  local remote_shas_file=$1
+  local sorted_out=$2
+  local branch_revlist="${work_root}/branch-revlist.txt"
+  local ranked_file="${work_root}/remote-commits-ranked.tsv"
+  local unranked_file="${work_root}/remote-commits-unranked.txt"
+
+  git rev-list "refs/remotes/origin/${branch}" >"$branch_revlist"
+  : >"$ranked_file"
+  : >"$unranked_file"
+
+  awk -v unranked="$unranked_file" '
+    NR == FNR {
+      rank[$1] = NR
+      next
+    }
+    {
+      if ($1 in rank) {
+        printf "0\t%d\t%s\n", rank[$1], $1
+      } else {
+        print $1 > unranked
+      }
+    }
+  ' "$branch_revlist" "$remote_shas_file" >"$ranked_file"
+
+  if [ -s "$unranked_file" ]; then
+    local sha ct inv_ct
+    while IFS= read -r sha; do
+      [ -n "$sha" ] || continue
+      ct="$(git show -s --format=%ct "${sha}^{commit}" 2>/dev/null || true)"
+      if [[ "$ct" =~ ^[0-9]+$ ]]; then
+        inv_ct=$((9999999999 - ct))
+        printf '1\t%s\t%s\n' "$inv_ct" "$sha" >>"$ranked_file"
+      else
+        printf '2\t0\t%s\n' "$sha" >>"$ranked_file"
+      fi
+    done <"$unranked_file"
+  fi
+
+  LC_ALL=C sort -t $'\t' -k1,1n -k2,2n -k3,3 "$ranked_file" | cut -f3 >"$sorted_out"
+}
+
+is_sha_in_list() {
+  local needle=$1
+  shift
+  local item
+  for item in "$@"; do
+    if [ "$item" = "$needle" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+prune_remote_commits() {
+  local keep_budget=$1
+  shift
+  local protected_shas=("$@")
+  local ls_out="${work_root}/remote-commits-ls.txt"
+  local remote_shas_file="${work_root}/remote-commits-shas.txt"
+  local sorted_shas_file="${work_root}/remote-commits-sorted.txt"
+  local incomplete_file="${work_root}/remote-commits-prune-incomplete.txt"
+  local expired_file="${work_root}/remote-commits-prune-expired.txt"
+  local ls_status latest_sha kept_complete sha entry name stat_status
+  local incomplete_count=0
+  local expired_count=0
+
+  deferred_latest_prune=0
+
+  if [ "$keep_budget" -eq 0 ]; then
+    info "retention pruning disabled (DRIVE9_ARCHIVE_RETAIN_COMMITS=0)"
+    return 0
+  fi
+
+  if remote_ls "${archive_root}/commits" "$ls_out"; then
+    :
+  else
+    ls_status=$?
+    if [ "$ls_status" -eq "$remote_missing_status" ]; then
+      return 0
+    fi
+    die "failed to list ${archive_root}/commits"
+  fi
+
+  : >"$remote_shas_file"
+  while IFS= read -r entry; do
+    entry="${entry%$'\r'}"
+    case "$entry" in
+    */)
+      name="${entry%/}"
+      if [[ "$name" =~ ^[0-9a-f]{40}$ ]]; then
+        printf '%s\n' "$name" >>"$remote_shas_file"
+      fi
+      ;;
+    esac
+  done <"$ls_out"
+
+  if [ ! -s "$remote_shas_file" ]; then
+    return 0
+  fi
+
+  latest_sha="$(remote_latest_commit_sha)"
+  sort_remote_commits_newest_first "$remote_shas_file" "$sorted_shas_file"
+
+  # Reserve one retention slot per target commit being published so pre-publish
+  # pruning leaves room for new commits without over-pruning idempotent reruns.
+  kept_complete="${#protected_shas[@]}"
+  : >"$incomplete_file"
+  : >"$expired_file"
+
+  while IFS= read -r sha; do
+    [ -n "$sha" ] || continue
+
+    if [ "${#protected_shas[@]}" -gt 0 ] && is_sha_in_list "$sha" "${protected_shas[@]}"; then
+      continue
+    fi
+
+    if [ -n "$latest_sha" ] && [ "$sha" = "$latest_sha" ]; then
+      if [ "$kept_complete" -lt "$keep_budget" ]; then
+        if remote_manifest_exists "${archive_root}/commits/${sha}"; then
+          kept_complete=$((kept_complete + 1))
+        else
+          stat_status=$?
+          if [ "$stat_status" -eq "$remote_missing_status" ]; then
+            deferred_latest_prune=1
+          else
+            die "failed to inspect remote manifest for ${sha}"
+          fi
+        fi
+      else
+        deferred_latest_prune=1
+      fi
+      continue
+    fi
+
+    if [ "$kept_complete" -lt "$keep_budget" ]; then
+      if remote_manifest_exists "${archive_root}/commits/${sha}"; then
+        kept_complete=$((kept_complete + 1))
+      else
+        stat_status=$?
+        if [ "$stat_status" -eq "$remote_missing_status" ]; then
+          printf '%s\n' "$sha" >>"$incomplete_file"
+          incomplete_count=$((incomplete_count + 1))
+        else
+          die "failed to inspect remote manifest for ${sha}"
+        fi
+      fi
+    else
+      printf '%s\n' "$sha" >>"$expired_file"
+      expired_count=$((expired_count + 1))
+    fi
+  done <"$sorted_shas_file"
+
+  if [ "$incomplete_count" -eq 0 ] && [ "$expired_count" -eq 0 ]; then
+    info "retention check: no commits to prune (retaining up to ${keep_budget} complete commits)"
+    return 0
+  fi
+
+  info "prune ${incomplete_count} incomplete and ${expired_count} expired remote commit(s) (retaining up to ${keep_budget} complete commits)"
+
+  if [ "$incomplete_count" -gt 0 ]; then
+    while IFS= read -r sha; do
+      [ -n "$sha" ] || continue
+      info "remove ${archive_root}/commits/${sha} (incomplete)"
+      remote_rm_rf "${archive_root}/commits/${sha}"
+      pruned_any=1
+    done <"$incomplete_file"
+  fi
+
+  if [ "$expired_count" -gt 0 ]; then
+    # Delete oldest expired commits first so an interrupted prune preserves the newest history.
+    while IFS= read -r sha; do
+      [ -n "$sha" ] || continue
+      info "remove ${archive_root}/commits/${sha} (expired)"
+      remote_rm_rf "${archive_root}/commits/${sha}"
+      pruned_any=1
+    done < <(awk '{ lines[NR] = $0 } END { for (i = NR; i >= 1; i--) print lines[i] }' "$expired_file")
+  fi
+}
+
 resolve_commits() {
   if [ "$#" -gt 0 ]; then
     printf '%s\n' "$@"
@@ -432,19 +717,37 @@ resolve_commits() {
 }
 
 main() {
+  local raw_commits=()
+  local commits=()
+  local sha resolved
+
   mkdir -p "$artifact_root" "$worktree_root"
   fetch_archive_branch
 
-  mapfile -t commits < <(resolve_commits "$@")
-  if [ "${#commits[@]}" -eq 0 ]; then
+  while IFS= read -r sha; do
+    [ -n "$sha" ] && raw_commits+=("$sha")
+  done < <(resolve_commits "$@")
+  if [ "${#raw_commits[@]}" -eq 0 ]; then
     die "no commits to archive"
   fi
 
+  for sha in "${raw_commits[@]}"; do
+    resolved="$(git rev-parse "${sha}^{commit}")"
+    if [ "${#commits[@]}" -eq 0 ] || ! is_sha_in_list "$resolved" "${commits[@]}"; then
+      commits+=("$resolved")
+    fi
+  done
+
+  prune_remote_commits "$retain_commits" "${commits[@]}"
+
   for sha in "${commits[@]}"; do
-    sha="$(git rev-parse "${sha}^{commit}")"
     publish_commit "$sha"
     publish_latest_index "$sha"
   done
+
+  if [ "$deferred_latest_prune" -eq 1 ]; then
+    prune_remote_commits "$retain_commits" "${commits[@]}"
+  fi
 }
 
 trap cleanup_active_worktree EXIT
