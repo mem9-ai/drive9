@@ -1598,3 +1598,167 @@ func TestPackPathWithinUsesFilesystemIdentity(t *testing.T) {
 		t.Fatal("descendant of a scope entry was not matched")
 	}
 }
+
+func TestLayerMountUnpacksIntoSelectedOverlay(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
+	oldMount := mountFuse
+	t.Cleanup(func() { mountFuse = oldMount })
+	writeTestProfile(t, "layer-pack", "[pack]\n.git\n")
+	const id = "layer_01j8z6kh2m9q7w3r5t6y8v0p1a"
+	const base = "/repo"
+	const file = ".git/config"
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "overlay", file), []byte("layer data"), 0600)
+	var archive bytes.Buffer
+	if _, err := writePackArchive(context.Background(), &archive, packOptions{LocalRoot: src, RemoteRoot: base, Paths: []string{".git"}}); err != nil {
+		t.Fatal(err)
+	}
+	defaultPath, err := defaultPackArchivePath(base, "layer-pack")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		name, archivePath string
+		args              []string
+	}{
+		{"automatic", base + defaultPath, nil},
+		{"explicit", base + "/packs/explicit.tar.gz", []string{"--no-auto-unpack", "--unpack", ":/repo/packs/explicit.tar.gz"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/v1/layers/task=auth":
+					_, _ = io.WriteString(w, `{"layer_id":"`+id+`","base_root_path":"/repo"}`)
+				case "/v1/views/" + id + "/v1/fs" + tt.archivePath:
+					_, _ = w.Write(archive.Bytes())
+				default:
+					if strings.HasPrefix(r.URL.Path, "/v1/fs/") {
+						t.Errorf("unexpected main read %s", r.URL.Path)
+					}
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+			local := t.TempDir()
+			mustWriteFile(t, filepath.Join(local, "overlay", file), []byte("main data"), 0600)
+			mounted := false
+			mountFuse = func(opts *mountFuseOptions) error {
+				mounted = true
+				if opts.LayerRef != id || opts.RemoteRoot != base || opts.LocalRoot != local {
+					t.Errorf("unexpected mount roots or identity")
+				}
+				return nil
+			}
+			args := []string{"--foreground", "--mode=fuse", "--server", srv.URL, "--api-key", "test", "--layer=task=auth", "--profile=layer-pack", "--local-root", local}
+			args = append(args, tt.args...)
+			if err := MountCmd(append(args, t.TempDir())); err != nil {
+				t.Fatal(err)
+			}
+			if !mounted {
+				t.Fatal("mount not reached")
+			}
+			assertFileContent(t, filepath.Join(local, "overlay", file), "main data")
+			viewLocal, err := mountstate.LayerLocalRoot(local, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertFileContent(t, filepath.Join(viewLocal, "overlay", file), "layer data")
+			mountPoint := t.TempDir()
+			state := mountstate.ProcessState{PID: os.Getpid(), MountPoint: mountPoint, Server: srv.URL, LocalRoot: local, RemoteRoot: base, Profile: "layer-pack", LayerID: id, LayerReadOnly: true}
+			pidFile, err := mountstate.WriteProcessState(mountPoint, state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Remove(pidFile) })
+			if err := os.Remove(filepath.Join(viewLocal, "overlay", file)); err != nil {
+				t.Fatal(err)
+			}
+			c := client.New(srv.URL, "test")
+			if err := Unpack(c, []string{"--mount", mountPoint, ":" + tt.archivePath}); err != nil {
+				t.Fatal(err)
+			}
+			assertFileContent(t, filepath.Join(viewLocal, "overlay", file), "layer data")
+			if err := Pack(c, []string{"--mount", mountPoint, ":" + tt.archivePath}); err == nil || !strings.Contains(err.Error(), "read-only") {
+				t.Fatalf("pack into read-only layer: %v", err)
+			}
+			if err := Unpack(client.New("https://example.invalid", ""), []string{"--mount", mountPoint, ":" + tt.archivePath}); err == nil || !strings.Contains(err.Error(), "different servers") {
+				t.Fatalf("foreign server selected: %v", err)
+			}
+		})
+	}
+}
+
+func TestLayerUnmountPacksOnlyTheLayerOverlay(t *testing.T) {
+	const id = "layer_01j8z6kh2m9q7w3r5t6y8v0p1a"
+	const file = "dist/file"
+	uploaded := make(chan []byte, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/status" {
+			_, _ = io.WriteString(w, `{"inline_threshold":1048576,"max_upload_bytes":10485760}`)
+			return
+		}
+		if r.Method == http.MethodPut && r.URL.Path == "/v1/views/"+id+"/v1/fs/repo/archive" {
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Error(err)
+			}
+			uploaded <- data
+			_, _ = io.WriteString(w, `{"revision":1}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	base := t.TempDir()
+	viewRoot, err := mountstate.LayerLocalRoot(base, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, filepath.Join(base, "overlay", file), []byte("main file"), 0600)
+	mustWriteFile(t, filepath.Join(viewRoot, "overlay", file), []byte("layer file"), 0600)
+	state := mountstate.ProcessState{Server: srv.URL, CredentialKind: mountstate.CredentialKindAPIKey, APIKey: "test", LocalRoot: base, RemoteRoot: "/repo", Profile: "coding-agent", LayerID: id}
+	if err := defaultPackAfterUnmount(context.Background(), state, []string{":/repo/archive"}, []string{"dist"}); err != nil {
+		t.Fatal(err)
+	}
+	dst := t.TempDir()
+	select {
+	case data := <-uploaded:
+		if _, err := extractPackArchive(context.Background(), bytes.NewReader(data), unpackOptions{LocalRoot: dst}); err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatal("layer upload missing")
+	}
+	assertFileContent(t, filepath.Join(dst, "overlay", file), "layer file")
+}
+
+func TestSupervisedLayerPinsResolvedArchiveIdentity(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
+	const id = "layer_01j8z6kh2m9q7w3r5t6y8v0p1a"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/layers/task=auth" {
+			_, _ = io.WriteString(w, `{"layer_id":"`+id+`","base_root_path":"/repo"}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	old := runSuperviseForeground
+	t.Cleanup(func() { runSuperviseForeground = old })
+	base := t.TempDir()
+	for _, flags := range [][]string{{"--layer", "task=auth"}, {"--layer=task=auth"}} {
+		var got mountSuperviseStartRequest
+		runSuperviseForeground = func(req mountSuperviseStartRequest) error { got = req; return nil }
+		args := []string{"--supervise-foreground", "--mode=fuse", "--auth=local", "--read-only", "--profile=coding-agent", "--local-root", base, "--server", srv.URL, "--api-key", "test"}
+		args = append(args, flags...)
+		if err := MountCmd(append(args, t.TempDir())); err != nil {
+			t.Fatal(err)
+		}
+		if got.LayerID != id || !got.LayerReadOnly || got.LocalRoot != base || got.RemoteRoot != "/repo" {
+			t.Fatalf("incorrect supervisor layer metadata")
+		}
+		if strings.Contains(strings.Join(got.OriginalArgs, " "), "task=auth") || !strings.Contains(strings.Join(got.OriginalArgs, " "), id) {
+			t.Fatal("worker layer not pinned")
+		}
+	}
+}

@@ -422,7 +422,13 @@ func parseExecArgs(args []string) (execOptions, error) {
 	}
 	fs.Var(&env, "e", "")
 	fs.Var(&env, "env", "")
-	fs.StringVar(&options.layer, "layer", "", "")
+	fs.Func("layer", "", func(value string) error {
+		if flagProvided(fs, "layer") {
+			return errors.New("--layer specified multiple times")
+		}
+		options.layer = value
+		return nil
+	})
 	fs.BoolVar(&options.readOnly, "read-only", false, "")
 	fs.BoolVar(&options.fresh, "fresh", false, "")
 	if err := fs.Parse(args); err != nil {

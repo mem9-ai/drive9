@@ -805,6 +805,10 @@ func mountWithConfig(cfg MountConfig) error {
 	if layerBinding.LayerID != "" {
 		cfg.LayerRef = layerBinding.LayerID
 	}
+	viewLocalRoot, err := mountstate.LayerLocalRoot(cfg.LocalRoot, layerBinding.LayerID)
+	if err != nil {
+		return err
+	}
 	cl := layerBinding.ViewClient
 
 	// v1 validateRemoteRoot: refuse to mount a remote source that does not
@@ -1077,7 +1081,7 @@ func mountWithConfig(cfg MountConfig) error {
 	var gitExt *git.Git
 	if wantExt["git"] && cfg.EnableGitWorkspaces {
 		var gerr error
-		gitExt, gerr = git.New(git.Options{Client: cl, Events: bus, LocalRoot: cfg.LocalRoot, RemoteRoot: remoteRoot, SyncPolicy: string(cfg.WritePolicy),
+		gitExt, gerr = git.New(git.Options{Client: cl, Events: bus, LocalRoot: viewLocalRoot, RemoteRoot: remoteRoot, SyncPolicy: string(cfg.WritePolicy),
 			OnWorkspaceRefresh: sharedCounters.RecordGitWorkspaceRefresh})
 		if gerr != nil {
 			return fmt.Errorf("fuse: git extension: %w", gerr)
@@ -1087,9 +1091,9 @@ func mountWithConfig(cfg MountConfig) error {
 
 	// localize routes declared local-only paths to the local overlay
 	// (v1 local_overlay/local_policy semantics).
-	if wantExt["localize"] && cfg.LocalRoot != "" {
+	if wantExt["localize"] && viewLocalRoot != "" {
 		localizeOpts := localize.Options{
-			LocalRoot:                   cfg.LocalRoot,
+			LocalRoot:                   viewLocalRoot,
 			QuotaBytes:                  cfg.LocalizeQuotaBytes,
 			FreeRatio:                   cfg.LocalizeFreeRatio,
 			LocalOnlyPatterns:           cfg.LocalOnlyPatterns,
@@ -1440,11 +1444,14 @@ func mountWithConfig(cfg MountConfig) error {
 		if ctrl != nil {
 			controlSock = ctrl.SocketPath()
 		}
-		pidFile, pidErr := mountstate.WriteProcessState(cfg.MountPoint, buildMountProcessState(
+		state := buildMountProcessState(
 			cfg.RemoteRoot, cfg.Profile, cfg.LocalRoot, cfg.Server, cfg.APIKey, cfg.Token,
 			cfg.PackPaths, prof, cfg.Supervised, cfg.OmitProcessStateCredentials,
 			stateMountPoint, creationTime, credentialKind, controlSock, time.Now().UTC(),
-		))
+		)
+		state.LayerID = layerBinding.LayerID
+		state.LayerReadOnly = state.LayerID != "" && cfg.ReadOnly
+		pidFile, pidErr := mountstate.WriteProcessState(cfg.MountPoint, state)
 		if pidErr != nil {
 			return fmt.Errorf("fuse: write mount pid file: %w", pidErr)
 		}

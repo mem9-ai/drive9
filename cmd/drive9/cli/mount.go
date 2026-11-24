@@ -214,7 +214,17 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	durability := fs.String("durability", string(fuseDurabilityAuto), "write durability: auto, interactive, fsync, close-sync, or write-sync")
 	extensions := fs.String("extensions", "", "comma-separated fs extensions in build-up order (core first, each entry wrapping the previous ones; chain assembly is the reverse, core the terminal; default: the full set). e.g. --extensions core for a minimal write-sync fs, or --extensions core,sse,cache,writeback for the durability stack")
 	wbSyncWindow := fs.String("writeback-sync-window", "1s", "write-back close staging durability: a duration bounds the power-loss window via a background WAL syncer (default 1s); \"0\"/\"off\" defers all fsyncs to fsync(2)/umount; \"close\" restores fsync-at-close staging (legacy power-loss-safe behavior; see issue #964)")
-	layerRef := fs.String("layer", "", "mount through fs layer view (layer id, name, or tag ref)")
+	var layerRef string
+	layerArgIndex := -1
+	duplicateLayer := false
+	fs.Func("layer", "mount through fs layer view (layer id, name, or tag ref)", func(value string) error {
+		if layerArgIndex >= 0 {
+			duplicateLayer = true
+		}
+		layerRef = strings.TrimSpace(value)
+		layerArgIndex = len(originalArgs) - len(fs.Args()) - 1
+		return nil
+	})
 	profile := fs.String("profile", "", "mount profile: coding-agent (default), portable, none, extent, interactive, or a ~/.drive9/profiles/<name> file")
 	localRoot := fs.String("local-root", "", "local-only overlay storage root (auto-generated for overlay profiles)")
 	localizeQuotaMB := fs.Int64("localize-quota-mb", 0, "byte quota in MiB for the local-only overlay on the host disk; local writes past it fail with ENOSPC (0 disables)")
@@ -263,7 +273,10 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if flagProvided(fs, "layer") && strings.TrimSpace(*layerRef) == "" {
+	if duplicateLayer {
+		return fmt.Errorf("--layer specified multiple times")
+	}
+	if flagProvided(fs, "layer") && layerRef == "" {
 		return fmt.Errorf("--layer requires a non-empty argument")
 	}
 	credentialSecrets := []string{*server, *apiKey}
@@ -350,7 +363,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 		if legacyInterruptibleMutationsGiven && *legacyInterruptibleMutations {
 			return fmt.Errorf("drive9 mount: --legacy-interruptible-mutations is only supported with Drive9 FUSE mounts")
 		}
-		if err := validateObjectMount(runtime.GOOS, *mode, *layerRef, *profile); err != nil {
+		if err := validateObjectMount(runtime.GOOS, *mode, layerRef, *profile); err != nil {
 			return err
 		}
 		var serverVal, apiKeyVal, tokenVal string
@@ -681,7 +694,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	if resolved == MountModeWebDAV && perfDirGiven {
 		return fmt.Errorf("--perf-dir is only supported with --mode=fuse")
 	}
-	if resolved == MountModeWebDAV && strings.TrimSpace(*layerRef) != "" {
+	if resolved == MountModeWebDAV && layerRef != "" {
 		return fmt.Errorf("drive9 mount: --layer is only supported with --mode=fuse")
 	}
 
@@ -733,13 +746,51 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	}
 
 	autoUnpack := overlayProfile && len(effectivePackPaths) > 0 && !*noAutoUnpack
+	envSuperviseOff := strings.EqualFold(strings.TrimSpace(os.Getenv("DRIVE9_MOUNT_SUPERVISE")), "off")
+	wantSupervise := !*noSupervise && !envSuperviseOff
+	supervising := *superviseForeground || (background && !*foreground && wantSupervise && runtime.GOOS != "windows")
+	packLocalRoot := normalizedLocalRoot
+	var archiveClient *client.Client
+	if autoUnpack || len(unpackArchives) > 0 || (supervising && layerRef != "") {
+		if token != "" {
+			archiveClient = client.NewWithToken(serverVal, token)
+		} else {
+			archiveClient = client.New(serverVal, apiKeyVal)
+		}
+		if layerRef != "" {
+			info, err := archiveClient.GetLayer(context.Background(), layerRef)
+			if err != nil {
+				return err
+			}
+			archiveClient, err = archiveClient.WithView(client.ViewBinding{LayerID: info.LayerID})
+			if err != nil {
+				return err
+			}
+			_, remoteRoot, err = mountpath.LayerRoots(info.BaseRootPath, remoteRoot, remoteRootDefaulted)
+			if err != nil {
+				return err
+			}
+			packLocalRoot, err = mountstate.LayerLocalRoot(normalizedLocalRoot, info.LayerID)
+			if err != nil {
+				return err
+			}
+			// Pin child processes to the same layer as the supervisor and archive.
+			if strings.HasPrefix(originalArgs[layerArgIndex], "-layer=") || strings.HasPrefix(originalArgs[layerArgIndex], "--layer=") {
+				originalArgs[layerArgIndex] = "--layer=" + info.LayerID
+			} else {
+				originalArgs[layerArgIndex] = info.LayerID
+			}
+			layerRef = info.LayerID
+			remoteRootDefaulted = false
+		}
+	}
 	if runtime.GOOS == "windows" && resolved == MountModeFUSE && len(unpackArchives) == 0 && !autoUnpack {
 		return mountFuse(&mountFuseOptions{
 			MountPoint:                   mountPoint,
 			RemoteRoot:                   remoteRoot,
 			RemoteRootDefaulted:          remoteRootDefaulted,
 			Profile:                      profileCfg.Name,
-			LayerRef:                     strings.TrimSpace(*layerRef),
+			LayerRef:                     layerRef,
 			LocalRoot:                    normalizedLocalRoot,
 			LocalOnlyPatterns:            append([]string(nil), effectiveLocalOnlyPatterns...),
 			LocalGitignoreAwarePatterns:  append([]string(nil), effectiveLocalGitignoreAwarePatterns...),
@@ -755,10 +806,6 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 		})
 	}
 
-	// Resolve supervision mode from flags + env.
-	// DRIVE9_MOUNT_SUPERVISE=off forces legacy behavior.
-	envSuperviseOff := strings.EqualFold(strings.TrimSpace(os.Getenv("DRIVE9_MOUNT_SUPERVISE")), "off")
-	wantSupervise := !*noSupervise && !envSuperviseOff
 	if *noPersistCredentials && (*superviseForeground || background && !*foreground && wantSupervise) {
 		return fmt.Errorf("drive9 mount: --no-persist-credentials requires --foreground or --no-supervise")
 	}
@@ -773,6 +820,8 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 			RemoteRoot:        remoteRoot,
 			Profile:           profileCfg.Name,
 			LocalRoot:         normalizedLocalRoot,
+			LayerID:           layerRef,
+			LayerReadOnly:     layerRef != "" && *readOnly,
 			PackPaths:         append([]string(nil), effectivePackPaths...),
 			MaxRestarts:       *maxRestarts,
 			RestartWindow:     *restartWindow,
@@ -796,6 +845,8 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 				RemoteRoot:        remoteRoot,
 				Profile:           profileCfg.Name,
 				LocalRoot:         normalizedLocalRoot,
+				LayerID:           layerRef,
+				LayerReadOnly:     layerRef != "" && *readOnly,
 				PackPaths:         append([]string(nil), effectivePackPaths...),
 				MaxRestarts:       *maxRestarts,
 				RestartWindow:     *restartWindow,
@@ -839,31 +890,25 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	}
 
 	if autoUnpack || len(unpackArchives) > 0 {
-		var c *client.Client
-		if token != "" {
-			c = client.NewWithToken(*server, token)
-		} else {
-			c = client.New(*server, *apiKey)
-		}
 		if autoUnpack {
-			archivePath, err := defaultPackArchivePath(remoteRoot, profileCfg.Name)
+			archivePath, err := mountPackArchivePath(remoteRoot, profileCfg.Name, layerRef)
 			if err != nil {
 				return err
 			}
-			if _, err := unpackRemoteArchiveIfExists(context.Background(), c, archivePath, unpackOptions{
-				LocalRoot: normalizedLocalRoot,
+			if _, err := unpackRemoteArchiveIfExists(context.Background(), archiveClient, archivePath, unpackOptions{
+				LocalRoot: packLocalRoot,
 				Replace:   true,
 			}); err != nil {
 				return fmt.Errorf("drive9 mount: auto-unpack :%s: %w", archivePath, err)
 			}
 		}
 		for _, archiveArg := range unpackArchives {
-			archiveClient, archivePath, err := clientForRemoteArchiveArg(c, archiveArg)
+			archiveClient, archivePath, err := clientForRemoteArchiveArg(archiveClient, archiveArg)
 			if err != nil {
 				return err
 			}
 			if err := unpackRemoteArchive(context.Background(), archiveClient, archivePath, unpackOptions{
-				LocalRoot: normalizedLocalRoot,
+				LocalRoot: packLocalRoot,
 				Replace:   true,
 			}); err != nil {
 				return fmt.Errorf("drive9 mount: unpack %s: %w", archiveArg, err)
@@ -877,7 +922,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 			RemoteRoot:                   remoteRoot,
 			RemoteRootDefaulted:          remoteRootDefaulted,
 			Profile:                      profileCfg.Name,
-			LayerRef:                     strings.TrimSpace(*layerRef),
+			LayerRef:                     layerRef,
 			LocalRoot:                    normalizedLocalRoot,
 			LocalOnlyPatterns:            append([]string(nil), effectiveLocalOnlyPatterns...),
 			LocalGitignoreAwarePatterns:  append([]string(nil), effectiveLocalGitignoreAwarePatterns...),
@@ -926,7 +971,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 		WritebackLazyStaging:         wbLazyStaging,
 		WritebackSyncWindow:          wbSyncWindowDur,
 		Profile:                      profileCfg.Name,
-		LayerRef:                     strings.TrimSpace(*layerRef),
+		LayerRef:                     layerRef,
 		LocalRoot:                    normalizedLocalRoot,
 		LocalOnlyPatterns:            append([]string(nil), effectiveLocalOnlyPatterns...),
 		LocalGitignoreAwarePatterns:  append([]string(nil), effectiveLocalGitignoreAwarePatterns...),
@@ -1009,6 +1054,8 @@ func (e mountCommandRedactedError) ExitCode() int {
 }
 
 type mountSuperviseStartRequest struct {
+	LayerID           string
+	LayerReadOnly     bool
 	OriginalArgs      []string
 	MountPoint        string
 	Server            string
@@ -1075,6 +1122,12 @@ func superviseCommandArgs(req mountSuperviseStartRequest, logPath string) ([]str
 		"--profile", req.Profile,
 		"--local-root-meta", req.LocalRoot,
 		"--sanitized-args-json", string(sanitized),
+	}
+	if req.LayerID != "" {
+		out = append(out, "--layer-id-meta", req.LayerID)
+		if req.LayerReadOnly {
+			out = append(out, "--layer-read-only-meta")
+		}
 	}
 	if req.MountKind != "" {
 		out = append(out, "--mount-kind", req.MountKind)
@@ -2148,6 +2201,10 @@ func runUmount(args []string, deps umountDeps) error {
 		}
 	}
 
+	if packState.LayerReadOnly && (len(packArchives) > 0 || len(packPaths) > 0) {
+		return fmt.Errorf("drive9 umount: cannot pack into a read-only layer")
+	}
+
 	// Drain BEFORE stopping the writer. A mount that is detached with pending
 	// writes loses them silently: the unmount itself succeeds, and the only
 	// later evidence is a recovery directory nobody looks at. Ask the live
@@ -2245,11 +2302,11 @@ func runUmount(args []string, deps umountDeps) error {
 				return err
 			}
 		}
-		if !*noAutoPack && (len(packState.PackPaths) > 0 || len(packPaths) > 0) {
+		if !packState.LayerReadOnly && !*noAutoPack && (len(packState.PackPaths) > 0 || len(packPaths) > 0) {
 			if err := validateUmountPackState(packState); err != nil {
 				return err
 			}
-			defaultArchive, err := defaultPackArchivePath(packState.RemoteRoot, packState.Profile)
+			defaultArchive, err := mountPackArchivePath(packState.RemoteRoot, packState.Profile, packState.LayerID)
 			if err != nil {
 				return err
 			}
@@ -2592,8 +2649,12 @@ func defaultPackAfterUnmount(ctx context.Context, state mountstate.ProcessState,
 	warmCtx, cancel := context.WithTimeout(ctx, fsClientWarmTimeout)
 	c.Warm(warmCtx)
 	cancel()
+	localRoot, err := mountstate.LayerLocalRoot(state.LocalRoot, state.LayerID)
+	if err != nil {
+		return err
+	}
 	opts := packOptions{
-		LocalRoot:        state.LocalRoot,
+		LocalRoot:        localRoot,
 		RemoteRoot:       state.RemoteRoot,
 		Profile:          state.Profile,
 		Paths:            append([]string(nil), paths...),
@@ -2622,10 +2683,16 @@ func packClientFromMountState(state mountstate.ProcessState) (*client.Client, er
 	if err != nil {
 		return nil, err
 	}
+	var c *client.Client
 	if auth.Token != "" {
-		return client.NewWithToken(auth.Server, auth.Token), nil
+		c = client.NewWithToken(auth.Server, auth.Token)
+	} else {
+		c = client.New(auth.Server, auth.APIKey)
 	}
-	return client.New(auth.Server, auth.APIKey), nil
+	if state.LayerID != "" {
+		return c.WithView(client.ViewBinding{LayerID: state.LayerID})
+	}
+	return c, nil
 }
 
 func packAuthFromMountState(state mountstate.ProcessState) (mountPackAuth, error) {

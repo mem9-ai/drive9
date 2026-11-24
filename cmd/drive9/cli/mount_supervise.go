@@ -37,6 +37,8 @@ func runMountSupervise(args []string) error {
 	remoteRoot := fs.String("remote-root", "", "remote root for status metadata")
 	profile := fs.String("profile", "", "profile for status metadata")
 	mountKind := fs.String("mount-kind", "", "mount kind recorded in process state (fuse or object)")
+	layerID := fs.String("layer-id-meta", "", "canonical layer for pack metadata")
+	layerReadOnly := fs.Bool("layer-read-only-meta", false, "read-only layer mount")
 	localRootMeta := fs.String("local-root-meta", "", "local root for pack metadata")
 	packPathsJSON := fs.String("pack-paths-json", "", "JSON array of pack paths")
 	sanitizedJSON := fs.String("sanitized-args-json", "", "JSON array of sanitized args")
@@ -153,6 +155,8 @@ func runMountSupervise(args []string) error {
 		Profile:             *profile,
 		MountKind:           *mountKind,
 		LocalRoot:           *localRootMeta,
+		LayerID:             *layerID,
+		LayerReadOnly:       *layerReadOnly,
 		PackPaths:           packPaths,
 		Adopt:               *adopt,
 		AdoptWorkerPID:      *adoptWorkerPID,
@@ -388,6 +392,7 @@ func ensureAdoptSupervisor(mp string, snap mountsupervisor.StatusSnapshot) error
 	workerCreation := snap.WorkerCreation
 	var sanitized []string
 	var storedServer, storedAPIKey, storedToken, storedKind string
+	var packState mountstate.ProcessState
 	if st, _, err := mountstate.ReadSupervisorState(mp); err == nil {
 		if workerCreation == 0 {
 			workerCreation = st.WorkerCreation
@@ -401,6 +406,9 @@ func ensureAdoptSupervisor(mp string, snap mountsupervisor.StatusSnapshot) error
 		}
 		if storedServer == "" {
 			storedServer = ps.Server
+		}
+		if ps.WorkerPID == snap.WorkerPID || ps.PID == snap.WorkerPID {
+			packState = ps
 		}
 		storedKind = ps.MountKind
 		storedAPIKey, storedToken = ps.APIKey, ps.Token
@@ -429,6 +437,16 @@ func ensureAdoptSupervisor(mp string, snap mountsupervisor.StatusSnapshot) error
 		return err
 	}
 	args := adoptSupervisorCommandArgs(mp, logPath, storedServer, string(sanitizedJSON), snap.WorkerPID, workerCreation, storedKind)
+	if packState.LayerID != "" {
+		packPaths, err := json.Marshal(packState.PackPaths)
+		if err != nil {
+			return err
+		}
+		args = append(args, "--layer-id-meta", packState.LayerID, "--local-root-meta", packState.LocalRoot, "--remote-root", packState.RemoteRoot, "--profile", packState.Profile, "--pack-paths-json", string(packPaths))
+		if packState.LayerReadOnly {
+			args = append(args, "--layer-read-only-meta")
+		}
+	}
 	return withEnsureCredentialEnv(storedServer, storedAPIKey, storedToken, func() error {
 		cmd := exec.Command(exe, args...)
 		cmd.Env = mountBackgroundEnv(os.Environ(), mountBackgroundRequest{

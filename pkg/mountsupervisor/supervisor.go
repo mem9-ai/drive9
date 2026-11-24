@@ -45,6 +45,8 @@ type Config struct {
 	// SanitizedArgs stored for ensure (no secrets).
 	SanitizedArgs []string
 	Server        string
+	LayerID       string
+	LayerReadOnly bool
 	RemoteRoot    string
 	Profile       string
 	MountKind     string
@@ -721,6 +723,8 @@ func (s *supervisor) writeAuthoritativeProcessState() error {
 	// empty current values clear stale pidfile metadata from a prior mount.
 	base.Server = s.cfg.Server
 	base.RemoteRoot = s.cfg.RemoteRoot
+	base.LayerID = s.cfg.LayerID
+	base.LayerReadOnly = s.cfg.LayerReadOnly
 	base.Profile = s.cfg.Profile
 	base.LocalRoot = s.cfg.LocalRoot
 	base.PackPaths = append([]string(nil), s.cfg.PackPaths...)
