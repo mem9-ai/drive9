@@ -181,3 +181,62 @@ func TestPortSetAttrModeWaitsForPendingCommit(t *testing.T) {
 	}
 	_ = wb.Drain(context.Background())
 }
+
+func TestClosedFileChmodEmitsAuthoritativeSize(t *testing.T) {
+	ctx := context.Background()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "19")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "4")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPatch, http.MethodPut, http.MethodPost:
+			w.Header().Set("X-Dat9-Revision", "4")
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	bus := fs.NewEventBus()
+	var landed []fs.Event
+	bus.On(fs.EventLanded, func(e fs.Event) {
+		landed = append(landed, e)
+	})
+	ledger, err := staging.NewStaging(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ledger.Close)
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, Events: bus, Staging: ledger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/chmod-size.txt", Mode: 0o644, HasMode: true, Size: -1})
+	if err != nil {
+		t.Fatalf("chmod closed file: %v", err)
+	}
+	if res.Attr == nil || res.Attr.Size != 19 {
+		t.Fatalf("chmod reply attr = %+v, want size 19", res.Attr)
+	}
+	if len(landed) == 0 {
+		t.Fatal("expected EventLanded from closed-file chmod")
+	}
+	for _, ev := range landed {
+		if ev.Path == "/chmod-size.txt" && ev.Size != 19 {
+			t.Fatalf("chmod emitted EventLanded with size %d, want 19", ev.Size)
+		}
+	}
+}

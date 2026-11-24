@@ -85,7 +85,7 @@ BUILDINFO_LDFLAGS = -X github.com/mem9-ai/drive9/pkg/buildinfo.Version=$(if $(VE
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.BuildTime=$(BUILD_TIME)
 
-.PHONY: mod test test-race test-failpoint test-podman test-object-store-bootstrap test-minio-bootstrap fmt lint install-lint gitleaks install-gitleaks test-gitleaks-fail-closed test-gitleaks-scan-coverage build build-server build-cli build-cli-release build-migration build-migration-release build-migration-kube-plugin build-migration-kube-plugin-release run-server-local e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
+.PHONY: mod test test-fuse-kernel test-race test-failpoint test-podman fmt lint install-lint gitleaks install-gitleaks test-gitleaks-fail-closed test-gitleaks-scan-coverage build build-server build-cli build-cli-release build-simulator build-simulator-release build-migration build-migration-release build-migration-kube-plugin build-migration-kube-plugin-release test-simulator e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
 
 mod:
 	$(GO) mod tidy
@@ -126,19 +126,14 @@ test-race:
 	$(GO) test -race -count=1 -tags "$(GO_TAGS)" -timeout $(TEST_TIMEOUT) ./pkg/extensions/extent/...
 	$(GO) test -race -count=1 -tags "$(GO_TAGS)" -timeout $(TEST_TIMEOUT) ./pkg/fuse/ -run 'TestExtent|TestEnsureExtent|TestCloseExtentRuntime'
 
+test-fuse-kernel:
+	$(GO) test -count=1 -tags "$(GO_TAGS)" -timeout 3m ./pkg/fuse -run '^Test(ReadDirPlus(PendingKernel|ReplacedInodeKernel)|SSEDisconnectReadKernel|Unlink(Hardlink|Recreate|ParentRename)Kernel|RenameLongPathKernel)$$'
+
 # Run only failpoint-tagged tests through repository-wide instrumentation.
 # Do not run this concurrently with the normal test target because failpoint-ctl
 # rewrites the source tree while the tests are running.
 test-failpoint:
 	./scripts/run_failpoint_tests.py
-
-# Hermetic object store bootstrap regression (fake container runtime + real local
-# health probes); no docker/podman required.
-test-object-store-bootstrap:
-	bash scripts/test-object-store-bootstrap.sh
-
-# Deprecated compatibility alias.
-test-minio-bootstrap: test-object-store-bootstrap
 
 fmt:
 	$(MAKE) install-lint
@@ -217,44 +212,82 @@ build-server:
 	mkdir -p $(BIN_DIR)
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -tags "$(GO_TAGS)" -ldflags "$(BUILDINFO_LDFLAGS)" -o $(SERVER_BIN) ./cmd/drive9-server
 
-# Local server (provider=local). Object store:
-#   DRIVE9_S3_BACKEND=auto (default) — real object store via scripts/local-object-store.sh, else filesystem mock
-#   DRIVE9_S3_BACKEND=s3|mock     — require object store, or force the mock
-#   DRIVE9_S3_BUCKET already set     — skip bootstrap (use that bucket)
-#   bash scripts/local-object-store.sh stop — tear down the named local object store
-run-server-local: build-server
-	@set -euo pipefail; \
-	export DRIVE9_TENANT_PROVIDER="$${DRIVE9_TENANT_PROVIDER:-local}"; \
-	export DRIVE9_EXTENT_ALLOW_STATIC_CREDENTIALS="$${DRIVE9_EXTENT_ALLOW_STATIC_CREDENTIALS:-1}"; \
-	s3_env="$$(bash scripts/local-object-store.sh apply)"; \
-	eval "$$s3_env"; \
-	exec "./$(SERVER_BIN)"
+SIMULATOR_NAME ?= drive9-simulator
+SIMULATOR_TIER ?= pr-no-mount
+SIMULATOR_JOBS ?= 4
+SIMULATOR_BIN ?= tests/simulator/target/release/$(SIMULATOR_NAME)
+SIMULATOR_PREBUILT ?= 0
+RUST_TARGET ?=
 
-# One-shot local e2e: start TiDB if needed, start drive9-server (provider=local),
-# run e2e/smoke-all.sh (local-e2e.yml PR set, including FUSE). Extra flags:
-#   make e2e-local
-#   make e2e-local E2E_LOCAL_ARGS="--keep-server"
-#   RUN_API_ONLY=1 make e2e-local
-#   RUN_FUSE_SMOKE=0 make e2e-local
-#   FUSE_PROFILE=coding-agent-extent make e2e-local
-#   DRIVE9_S3_BACKEND=s3 make e2e-local
-#   DRIVE9_S3_BACKEND=mock make e2e-local
-e2e-local:
-	bash scripts/e2e-local.sh $(E2E_LOCAL_ARGS)
+# Build the standalone single-file scenario simulator (embeds built-in server
+# and all `fstest` suites; scenario `.t` cases live externally in `tests/cases/`).
+build-simulator:
+	@if [ "$(SIMULATOR_PREBUILT)" != "1" ]; then \
+		if [ -n "$(RUST_TARGET)" ]; then \
+			cargo build --release --target "$(RUST_TARGET)" --manifest-path tests/simulator/Cargo.toml; \
+		else \
+			cargo build --release --manifest-path tests/simulator/Cargo.toml; \
+		fi; \
+	fi
+
+# Package a standalone stripped simulator binary for the current or target host
+# into $(DIST_DIR)/drive9-simulator-<os>-<arch> + simulator-checksums.txt.
+build-simulator-release:
+	@set -euo pipefail; \
+	mkdir -p $(DIST_DIR); \
+	target="$(RUST_TARGET)"; \
+	if [ -z "$$target" ]; then \
+		case "$(GOOS)/$(GOARCH)" in \
+			linux/amd64)  target="x86_64-unknown-linux-musl" ;; \
+			linux/arm64)  target="aarch64-unknown-linux-musl" ;; \
+			darwin/arm64) target="aarch64-apple-darwin" ;; \
+			darwin/amd64) target="x86_64-apple-darwin" ;; \
+			*) echo "Unsupported simulator target $(GOOS)/$(GOARCH); set RUST_TARGET explicitly" >&2; exit 1 ;; \
+		esac; \
+		host_os_arch="$$($(GO) env GOHOSTOS)/$$($(GO) env GOHOSTARCH)"; \
+		if ! rustup target list --installed 2>/dev/null | grep -qx "$$target"; then \
+			if [ "$(GOOS)/$(GOARCH)" != "$$host_os_arch" ]; then \
+				echo "Rust target $$target is not installed for cross-compiling $(GOOS)/$(GOARCH) on $$host_os_arch; run: rustup target add $$target" >&2; \
+				exit 1; \
+			fi; \
+			target=""; \
+		fi; \
+	fi; \
+	out="$(DIST_DIR)/$(SIMULATOR_NAME)-$(GOOS)-$(GOARCH)"; \
+	if [ -n "$$target" ]; then \
+		echo "Building $$(basename "$$out") ($$target)..."; \
+		cargo build --release --target "$$target" --manifest-path tests/simulator/Cargo.toml; \
+		cp "tests/simulator/target/$$target/release/$(SIMULATOR_NAME)" "$$out"; \
+	else \
+		echo "Building $$(basename "$$out") (host target)..."; \
+		cargo build --release --manifest-path tests/simulator/Cargo.toml; \
+		cp "tests/simulator/target/release/$(SIMULATOR_NAME)" "$$out"; \
+	fi; \
+	chmod +x "$$out"; \
+	(cd $(DIST_DIR) && rm -f $(SIMULATOR_NAME)-*.sha256 && (sha256sum $(SIMULATOR_NAME)-* 2>/dev/null || shasum -a 256 $(SIMULATOR_NAME)-*) > simulator-checksums.txt)
+
+# Build and run the unified scenario simulator (`tests/simulator` + `tests/cases`).
+# Pass SIMULATOR_PREBUILT=1 SIMULATOR_BIN=/path/to/drive9-simulator to reuse a
+# prebuilt downloaded binary without running cargo.
+# Examples:
+#   make test-simulator
+#   make test-simulator SIMULATOR_TIER=pr-fuse
+#   make test-simulator SIMULATOR_ARGS="--server http://127.0.0.1:9009"
+test-simulator: build-cli build-simulator
+	$(SIMULATOR_BIN) validate tests/cases
+	$(SIMULATOR_BIN) run-suite tests/cases/suites.toml --tier "$(SIMULATOR_TIER)" --jobs "$(SIMULATOR_JOBS)" --bin ./$(CLI_BIN) $(SIMULATOR_ARGS)
+
+e2e-local: test-simulator
 
 # Run the cross-SDK live-server integration suites for all drive9 SDKs
-# (Go, TypeScript, Rust, Python, Kotlin, Swift). Expects TiDB on
-# DRIVE9_LOCAL_DSN (default 127.0.0.1:4000), starts drive9-server (provider=local),
-# points each SDK at it via
-# DRIVE9_SERVER/DRIVE9_API_KEY, runs every suite, and tears it all down.
-# Pass extra args through to the runner via SDK_INTEGRATION_ARGS, e.g.:
+# (Go, TypeScript, Rust, Python, Kotlin, Swift) via `drive9-simulator`
+# (`tests/cases/drive9/api/sdk-integration.t`). Uses the built-in contract
+# server by default, or pass an external server via SIMULATOR_ARGS:
 #   make sdk-integration-tests
-#   make sdk-integration-tests SDK_INTEGRATION_ARGS="--only go,ts"
-#   make sdk-integration-tests SDK_INTEGRATION_ARGS="--keep-server"
-# (GNU make treats tokens after `--` as goals, so forward args through the
-#  SDK_INTEGRATION_ARGS variable rather than `make ... -- ...`.)
-sdk-integration-tests:
-	bash scripts/sdk-integration-tests.sh $(SDK_INTEGRATION_ARGS)
+#   make sdk-integration-tests DRIVE9_SDK_ONLY="go,ts"
+#   make sdk-integration-tests SIMULATOR_ARGS="--server https://... --api-key ..."
+sdk-integration-tests: build-simulator
+	$(SIMULATOR_BIN) run --no-mount tests/cases/drive9/api/sdk-integration.t $(SIMULATOR_ARGS)
 
 build-cli:
 	mkdir -p $(BIN_DIR)

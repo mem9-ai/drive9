@@ -14,7 +14,8 @@ import FoundationNetworking
 /// Each test calls `try XCTSkipUnless(serverReachable)` at the top, so the
 /// default `swift test` (which also runs the in-process mock suite in
 /// Drive9Tests.swift) skips these when no server is running. The cross-SDK
-/// runner (scripts/sdk-integration-tests.sh) exports the env vars and invokes:
+/// scenario (`make sdk-integration-tests` / `tests/cases/drive9/api/sdk-integration.t`)
+/// exports the env vars and invokes:
 ///
 ///   swift test --filter Drive9IntegrationTests
 final class Drive9IntegrationTests: XCTestCase {

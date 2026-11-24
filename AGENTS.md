@@ -56,30 +56,26 @@ testcontainers via `scripts/test-podman.sh`. Otherwise a Docker-compatible runti
 If a direct `go test` run fails with `rootless Docker not found`, retry with `make test`
 so the project can use `scripts/test-podman.sh` to route testcontainers through Podman.
 
-**E2E smoke tests** (not `go test`) live in `e2e/` and target live deployments.
-Read `e2e/AGENTS.md` first for endpoint selection, local `drive9-server` (provider=local) workflow,
-environment variables, script coverage, and known expectations.
+**Scenario & E2E tests** live in `tests/simulator/` (standalone single-binary Rust
+scenario engine + built-in contract server + embedded `fstest` suites) and
+`tests/cases/` (`suites.toml` + `drive9/{api,cli,fuse}`, `community`, `webdev`,
+`juicefs`). Read `tests/simulator/case-spec.md` and
+`tests/simulator/drive9-server-api-spec.md` first.
 
 Common entry points:
 
 ```bash
-DRIVE9_BASE=https://... bash e2e/api-smoke-test.sh
-DRIVE9_BASE=https://... bash e2e/cli-smoke-test.sh
-DRIVE9_BASE=https://... bash e2e/smoke-all.sh
+make build-simulator
+./tests/simulator/target/release/drive9-simulator validate tests/cases
+./tests/simulator/target/release/drive9-simulator run --no-mount --bin ./bin/drive9 tests/cases/drive9/api/api.t
+./tests/simulator/target/release/drive9-simulator run --no-mount --bin ./bin/drive9 tests/cases/drive9/cli/cli.t
+make test-simulator SIMULATOR_TIER=pr-no-mount
+make test-simulator SIMULATOR_TIER=pr
 ```
 
-Local e2e is `.github/workflows/local-e2e.yml` (TiDB playground +
-`DRIVE9_TENANT_PROVIDER=local`). On a machine:
-
-```bash
-make e2e-local
-```
-
-That runs `scripts/e2e-local.sh`: starts TiDB if `127.0.0.1:4000` is down,
-starts `drive9-server` with `provider=local`, then `e2e/smoke-all.sh` (the
-`local-e2e.yml` PR set, including FUSE). macOS needs macFUSE; suites pass
-`--mode=fuse`. Pass a pre-built server with `DRIVE9_SERVER_BIN`. For a
-long-running local server only, use `make run-server-local`.
+Pass `--server https://...` (and `--api-key <key>` or `--tidbcloud-public-key` /
+`--tidbcloud-private-key`) to run the same `.t` scenarios against a local or
+staging `drive9-server` deployment instead of the built-in contract server.
 
 ---
 
@@ -134,17 +130,17 @@ code from the pull request.
 
 ---
 
-## Local dev server
+## Local contract server
 
 ```bash
-make run-server-local
+cargo build --release --manifest-path tests/simulator/Cargo.toml
+./tests/simulator/target/release/drive9-simulator server --port 9009
 ```
 
-`make run-server-local` sets `DRIVE9_TENANT_PROVIDER=local`. Control-plane tables
-are migrated on startup, and each `POST /v1/provision` creates `drive9_<tenantid>`
-and inits tenant schema. Defaults assume TiDB at `127.0.0.1:4000` and local mock
-S3. Override any `DRIVE9_*` var before running. E2E scripts provision their own
-tenant when `DRIVE9_API_KEY` is unset.
+`drive9-simulator server` runs the zero-dependency `[core]` HTTP + S3 + Extent v2
+contract server locally (in-process SQLite metadata + filesystem-backed S3 under a
+temp or `--dir` directory). Each `POST /v1/provision` creates an isolated tenant and
+returns a `drive9_...` API key.
 
 ---
 
@@ -173,7 +169,8 @@ pkg/
   traceid/              Trace ID helpers
 internal/
   testtidb/             TiDB test helpers (shared across packages)
-e2e/                    Live bash smoke tests; read e2e/AGENTS.md first
+tests/simulator/        Scenario simulator engine + built-in contract server
+tests/cases/            Scenario `.t` cases (`drive9/{api,cli,fuse}`, `community`, `webdev`, `juicefs`)
 scripts/                Shell helpers for local dev and test
 docs/                   Design documents
 ```

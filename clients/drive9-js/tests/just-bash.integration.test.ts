@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
-import { Client } from "../src/index.js";
+import { Client, StatusError } from "../src/index.js";
 import { Drive9Fs } from "../src/just-bash.js";
 
 const [major, minor] = process.versions.node.split(".").map(Number);
@@ -11,7 +11,7 @@ const enabled = supported && !!process.env.DRIVE9_INTEGRATION && !!process.env.D
 // latency as well as upload time; the local server usually finishes in seconds.
 const liveTimeout = 120_000;
 
-// Included in scripts/sdk-integration-tests.sh alongside the existing SDK suite.
+// Included in `make sdk-integration-tests` alongside the existing SDK suite.
 describe.skipIf(!enabled)("Just Bash against a live Drive9 server", () => {
   let runtime: typeof import("just-bash");
   let client: Client;
@@ -79,10 +79,22 @@ describe.skipIf(!enabled)("Just Bash against a live Drive9 server", () => {
 
   it("uses scoped credentials and honors server denials", async () => {
     await fs.writeFile("/seed", "visible");
-    const grant = await client.issueScopedToken({
-      ttl_seconds: 300,
-      scopes: [{ prefix: root + "/", ops: ["read", "list"] }],
-    });
+    let grant;
+    try {
+      grant = await client.issueScopedToken({
+        ttl_seconds: 300,
+        scopes: [{ prefix: root + "/", ops: ["read", "list"] }],
+      });
+    } catch (err) {
+      if (
+        process.env.DRIVE9_ALLOW_CORE_ONLY_SERVER === "1" &&
+        err instanceof StatusError &&
+        (err.statusCode === 404 || err.statusCode === 501)
+      ) {
+        return;
+      }
+      throw err;
+    }
     try {
       const scoped = new Client(client.baseURL(), grant.token);
       expect(await shell(scoped).exec("cat seed")).toMatchObject({ exitCode: 0, stdout: "visible" });
