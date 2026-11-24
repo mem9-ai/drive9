@@ -2091,6 +2091,7 @@ type umountDeps struct {
 	// requestDrain asks a live mount to quiesce its write plane before the
 	// unmount detaches it (nil skips the pre-unmount drain).
 	requestDrain     func(context.Context, string, time.Duration) (*mountcontrol.DrainResponse, error)
+	requestStatus    func(context.Context, string, time.Duration) (*mountcontrol.StatusResponse, error)
 	remove           func(string) error
 	pidAlive         func(int) bool
 	packAfterUnmount func(context.Context, mountstate.ProcessState, []string, []string) error
@@ -2123,6 +2124,7 @@ func defaultUmountDeps() umountDeps {
 		terminate:        terminateProcess,
 		terminateState:   terminateMountProcess,
 		requestDrain:     mountcontrol.RequestDrain,
+		requestStatus:    mountcontrol.RequestStatus,
 		remove:           os.Remove,
 		pidAlive:         processAlive,
 		packAfterUnmount: defaultPackAfterUnmount,
@@ -2210,6 +2212,29 @@ func runUmount(args []string, deps umountDeps) error {
 			}
 		} else {
 			packState, packStateOK = preStopState, true
+		}
+	}
+
+	if packStateOK && deps.goos != "windows" && deps.requestStatus != nil {
+		if (strings.TrimSpace(packState.MountKind) == "" || packState.MountKind == mountstate.MountKindFUSE) &&
+			strings.TrimSpace(packState.ControlSocket) != "" {
+			stCtx, stCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			st, serr := deps.requestStatus(stCtx, strings.TrimSpace(packState.ControlSocket), 5*time.Second)
+			stCancel()
+			if serr == nil && st != nil && st.OK {
+				if strings.TrimSpace(st.RemoteRoot) != "" {
+					packState.RemoteRoot = st.RemoteRoot
+				}
+				if st.Binding != nil {
+					packState.LayerID = st.Binding.LayerID
+					packState.LayerReadOnly = st.Binding.LayerID != "" && st.Binding.ReadOnly
+				} else if st.Layer != nil {
+					packState.LayerID = *st.Layer
+					if packState.LayerID == "" {
+						packState.LayerReadOnly = false
+					}
+				}
+			}
 		}
 	}
 

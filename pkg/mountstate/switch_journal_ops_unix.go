@@ -204,6 +204,9 @@ func (j *SwitchJournal) QueueCurrentUnbindForUnmount() error {
 	if j.uncertain {
 		return ErrSwitchUncertain
 	}
+	if j.file == nil {
+		return ErrSwitchClosed
+	}
 	if j.pending != nil {
 		return j.appendAndApplyLocked(switchJournalRecord{Type: "abort_pending", OperationID: j.pending.OperationID})
 	}

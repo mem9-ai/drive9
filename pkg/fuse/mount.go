@@ -844,18 +844,26 @@ func mountWithConfig(cfg MountConfig) error {
 		if ctrl != nil {
 			controlSock = ctrl.SocketPath()
 		}
-		state := buildMountProcessState(
-			cfg.RemoteRoot, cfg.Profile, cfg.LocalRoot, cfg.Server, cfg.APIKey, cfg.Token,
-			cfg.PackPaths, prof, cfg.Supervised, cfg.OmitProcessStateCredentials,
-			stateMountPoint, creationTime, credentialKind, controlSock, time.Now().UTC(),
-		)
-		state.LayerID = rt.binding.LayerID
-		state.LayerReadOnly = state.LayerID != "" && rt.binding.ReadOnly
-		pidFile, pidErr := mountstate.WriteProcessState(cfg.MountPoint, state)
+		startedAt := time.Now().UTC()
+		makeState := func(layerID string, layerRO bool) mountstate.ProcessState {
+			st := buildMountProcessState(
+				cfg.RemoteRoot, cfg.Profile, cfg.LocalRoot, cfg.Server, cfg.APIKey, cfg.Token,
+				cfg.PackPaths, prof, cfg.Supervised, cfg.OmitProcessStateCredentials,
+				stateMountPoint, creationTime, credentialKind, controlSock, startedAt,
+			)
+			st.LayerID = layerID
+			st.LayerReadOnly = layerID != "" && layerRO
+			return st
+		}
+		pidFile, pidErr := mountstate.WriteProcessState(cfg.MountPoint, makeState(rt.binding.LayerID, rt.binding.ReadOnly))
 		if pidErr != nil {
 			return fmt.Errorf("fuse: write mount pid file: %w", pidErr)
 		}
+		mv.bindProcessStateUpdater(func(layerID string, layerRO bool) {
+			_, _ = mountstate.WriteProcessState(cfg.MountPoint, makeState(layerID, layerRO))
+		})
 		defer func() {
+			mv.bindProcessStateUpdater(nil)
 			if removeErr := os.Remove(pidFile); removeErr != nil && !os.IsNotExist(removeErr) {
 				fmt.Fprintf(os.Stderr, "drive9: remove mount pid file %s: %v\n", pidFile, removeErr)
 			}

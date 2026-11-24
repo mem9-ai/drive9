@@ -22,20 +22,17 @@ type DrainRequest struct {
 	TimeoutMS int64  `json:"timeout_ms,omitempty"`
 }
 
-// StatusResponse is a cheap liveness reply from the mount control socket.
 type StatusResponse struct {
 	OK         bool      `json:"ok"`
 	MountPoint string    `json:"mount_point,omitempty"`
+	RemoteRoot string    `json:"remote_root,omitempty"`
 	Op         string    `json:"op,omitempty"`
 	PID        int       `json:"pid,omitempty"`
 	StartedAt  time.Time `json:"started_at,omitempty"`
-	// Layer is the resolved fs layer ID the mount serves ("" for the base
-	// workspace). Nil means the mount predates layer reporting.
-	Layer *string `json:"layer,omitempty"`
-	Error string  `json:"error,omitempty"`
-	// ViewSwitch advertises same-connection ping -> switch/switch-operation
-	// negotiation on Linux FUSE mounts.
+	Layer      *string   `json:"layer,omitempty"`
+	Error      string    `json:"error,omitempty"`
 	ViewSwitch bool                        `json:"view_switch,omitempty"`
+	Recovering bool                        `json:"recovering,omitempty"`
 	MountID    string                      `json:"mount_id,omitempty"`
 	Generation uint64                      `json:"generation,omitempty"`
 	Binding    *viewprotocol.SwitchBinding `json:"binding,omitempty"`

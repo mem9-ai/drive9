@@ -113,8 +113,18 @@ func (m *InodeToPath) SetMemoryBudget(b *membudget.Budget) {
 		return
 	}
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.budget == b {
+		return
+	}
+	n := int64(len(m.byInode))
+	if m.budget != nil && n > 0 {
+		m.budget.Release(membudget.ClassInodeTable, n*inodeTableEntryBytes)
+	}
 	m.budget = b
-	m.mu.Unlock()
+	if m.budget != nil && n > 0 {
+		m.budget.ForceCharge(membudget.ClassInodeTable, n*inodeTableEntryBytes)
+	}
 }
 
 // MemoryBudget reports the budget the table charges, if any.

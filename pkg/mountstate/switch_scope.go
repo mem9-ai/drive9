@@ -12,18 +12,15 @@ import (
 	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
-// SwitchScope binds a local journal to one authenticated filesystem and mount.
-// TenantID must come from the authenticated server, never CLI input. The server
-// string is hashed so URLs or credentials are never persisted to disk.
-func SwitchScope(server, tenantID, remoteRoot, mountPoint string) (string, error) {
-	if strings.TrimSpace(server) == "" || tenantID == "" || strings.TrimSpace(tenantID) != tenantID || !filepath.IsAbs(mountPoint) {
+func SwitchScope(server, credScope, remoteRoot, mountPoint string) (string, error) {
+	if strings.TrimSpace(server) == "" || credScope == "" || strings.TrimSpace(credScope) != credScope || !filepath.IsAbs(mountPoint) {
 		return "", errors.New("incomplete mount switch scope")
 	}
 	root, err := mountpath.NormalizeRoot(remoteRoot)
 	if err != nil {
 		return "", err
 	}
-	data, err := json.Marshal([4]string{strings.TrimRight(server, "/"), tenantID, root, filepath.Clean(mountPoint)})
+	data, err := json.Marshal([4]string{strings.TrimRight(server, "/"), credScope, root, filepath.Clean(mountPoint)})
 	if err != nil {
 		return "", err
 	}

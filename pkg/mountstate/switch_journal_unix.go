@@ -268,6 +268,9 @@ func (j *SwitchJournal) appendAndApplyLocked(rec switchJournalRecord) error {
 	if j.uncertain {
 		return ErrSwitchUncertain
 	}
+	if j.file == nil {
+		return ErrSwitchClosed
+	}
 	payload, err := json.Marshal(rec)
 	if err != nil {
 		return err
@@ -300,6 +303,16 @@ func (j *SwitchJournal) appendAndApplyLocked(rec switchJournalRecord) error {
 	return j.applyRecordLocked(rec, j.generation == 0)
 }
 
+func (j *SwitchJournal) truncateTornTailLocked(validEnd int) error {
+	if err := j.file.Truncate(int64(validEnd)); err != nil {
+		return err
+	}
+	if _, err := j.file.Seek(int64(validEnd), io.SeekStart); err != nil {
+		return err
+	}
+	return j.file.Sync()
+}
+
 func (j *SwitchJournal) replayFileLocked() error {
 	if _, err := j.file.Seek(0, io.SeekStart); err != nil {
 		return err
@@ -310,15 +323,29 @@ func (j *SwitchJournal) replayFileLocked() error {
 	}
 	r := bytes.NewReader(raw)
 	count := 0
+	validEnd := 0
 	for r.Len() > 0 {
+		frameStart := len(raw) - r.Len()
 		if r.Len() < 4+sha256.Size {
+			if count > 0 {
+				return j.truncateTornTailLocked(validEnd)
+			}
 			return fmt.Errorf("%w: truncated frame header", ErrSwitchCorrupt)
+		}
+		if count > 0 && len(bytes.TrimRight(raw[frameStart:], "\x00")) == 0 {
+			return j.truncateTornTailLocked(validEnd)
 		}
 		var hdr [4]byte
 		_, _ = io.ReadFull(r, hdr[:])
 		n := int(binary.BigEndian.Uint32(hdr[:]))
-		if n <= 0 || n > maxSwitchRecordLen || r.Len() < n+sha256.Size {
+		if n <= 0 || n > maxSwitchRecordLen {
 			return fmt.Errorf("%w: invalid frame length %d", ErrSwitchCorrupt, n)
+		}
+		if r.Len() < n+sha256.Size {
+			if count > 0 {
+				return j.truncateTornTailLocked(validEnd)
+			}
+			return fmt.Errorf("%w: truncated frame body %d", ErrSwitchCorrupt, n)
 		}
 		payload := make([]byte, n)
 		_, _ = io.ReadFull(r, payload)
@@ -339,6 +366,7 @@ func (j *SwitchJournal) replayFileLocked() error {
 		if err := j.applyRecordLocked(rec, count == 0); err != nil {
 			return fmt.Errorf("%w: %v", ErrSwitchCorrupt, err)
 		}
+		validEnd = len(raw) - r.Len()
 		count++
 	}
 	if count == 0 {

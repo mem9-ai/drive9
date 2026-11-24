@@ -98,12 +98,9 @@ type Bridge struct {
 	// flush/close boundary (FlushFile) surfaces it — Bridge.Write itself
 	// returns success to keep the community writer clean (its sticky
 	// fileWriter.err otherwise stranded the handle after recovery).
-	commitErr map[meta.Ino]error
-	// closedRetained records closed handles whose final publication failed so
-	// background retry and Drain keep retrying and only forget the inode once
-	// all uncommitted state has landed.
-	closedRetained map[meta.Ino]string
-	onRetireClosed func(localPath string, ino meta.Ino)
+	commitErr      map[meta.Ino]error
+	closedRetained map[meta.Ino]struct{}
+	onRetireClosed func(localPath string, ino meta.Ino) bool
 
 	layoutPending map[meta.Ino]bool
 	// freshCreate marks inodes this bridge CREATED locally: their first
@@ -240,7 +237,7 @@ func NewBridge(cfg Config) *Bridge {
 		layoutPendingID:   make(map[meta.Ino]string),
 		freshCreate:       make(map[meta.Ino]bool),
 		commitErr:         make(map[meta.Ino]error),
-		closedRetained:    make(map[meta.Ino]string),
+		closedRetained:    make(map[meta.Ino]struct{}),
 		verifyBase:        make(map[meta.Ino]verifyBase),
 		emptyPlaceholders: make(map[string]verifyBase),
 	}
@@ -307,7 +304,7 @@ func (b *Bridge) ResetForGeneration(cl *client.Client) {
 	b.layoutPendingID = make(map[meta.Ino]string)
 	b.freshCreate = make(map[meta.Ino]bool)
 	b.commitErr = make(map[meta.Ino]error)
-	b.closedRetained = make(map[meta.Ino]string)
+	b.closedRetained = make(map[meta.Ino]struct{})
 	b.onRetireClosed = nil
 	b.verifyBase = make(map[meta.Ino]verifyBase)
 	b.emptyPlaceholders = make(map[string]verifyBase)

@@ -515,8 +515,8 @@ func newFakeV2(t *testing.T) *fakeV2 {
 			f.mu.Unlock()
 			var body struct {
 				Parts []struct {
-					Number   int    `json:"part_number"`
-					Checksum string `json:"checksum"`
+					Number   int             `json:"part_number"`
+					Checksum json.RawMessage `json:"checksum"`
 				} `json:"parts"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
@@ -526,8 +526,16 @@ func newFakeV2(t *testing.T) *fakeV2 {
 			const partSize = int64(4 << 20)
 			out := make([]map[string]any, 0, len(body.Parts))
 			for _, p := range body.Parts {
+				var csum string
+				if err := json.Unmarshal(p.Checksum, &csum); err != nil {
+					var obj struct {
+						Value string `json:"value"`
+					}
+					_ = json.Unmarshal(p.Checksum, &obj)
+					csum = obj.Value
+				}
 				f.mu.Lock()
-				exists := len(f.blocks[p.Checksum]) > 0
+				exists := csum != "" && len(f.blocks[csum]) > 0
 				f.mu.Unlock()
 				size := partSize
 				if rem := upSize - int64(p.Number-1)*partSize; rem < size {
@@ -536,7 +544,7 @@ func newFakeV2(t *testing.T) *fakeV2 {
 				if size < 0 {
 					size = 0
 				}
-				m := map[string]any{"number": p.Number, "url": fmt.Sprintf("%s/obj/%s", f.URL, p.Checksum), "size": size}
+				m := map[string]any{"number": p.Number, "url": fmt.Sprintf("%s/obj/%s", f.URL, csum), "size": size}
 				if exists {
 					m["skip_upload"] = true
 				}

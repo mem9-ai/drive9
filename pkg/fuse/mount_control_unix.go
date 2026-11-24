@@ -31,6 +31,7 @@ type mountControlServer struct {
 	fs         *FS
 	listener   net.Listener
 	socketPath string
+	mountPt    string
 	layer      string
 	startedAt  time.Time
 	done       chan struct{}
@@ -54,6 +55,10 @@ func startMountControlServerWithView(mountPoint, layer string, fs *FS, view *mou
 	if err != nil {
 		return nil, err
 	}
+	mp := mountPoint
+	if mp == "" && fs != nil {
+		mp = fs.mountPoint()
+	}
 	s := &mountControlServer{
 		view:       view,
 		lock:       lock,
@@ -61,6 +66,7 @@ func startMountControlServerWithView(mountPoint, layer string, fs *FS, view *mou
 		fs:         fs,
 		listener:   ln,
 		socketPath: socketPath,
+		mountPt:    mp,
 		layer:      layer,
 		startedAt:  time.Now().UTC(),
 		done:       make(chan struct{}),
@@ -222,20 +228,26 @@ func (s *mountControlServer) status(op string) mountcontrol.StatusResponse {
 		Layer:      &layer,
 	}
 	if s.view == nil {
+		if s.fs != nil {
+			resp.RemoteRoot = s.fs.rootTag
+		}
 		return resp
 	}
+	resp.RemoteRoot = s.view.remoteRoot
+	resp.ViewSwitch = s.view.supported()
+	snapshot := s.view.journal.Snapshot()
+	resp.MountID = snapshot.MountID
+	resp.Generation = snapshot.Generation
 	if s.view.journal.Uncertain() {
 		resp.OK = false
 		resp.Layer = nil
+		resp.Recovering = true
 		resp.Error = mountstate.ErrSwitchUncertain.Error()
 		return resp
 	}
-	snapshot := s.view.journal.Snapshot()
-	resp.ViewSwitch = s.view.supported()
-	resp.MountID = snapshot.MountID
-	resp.Generation = snapshot.Generation
 	resp.Binding = &snapshot.Binding
 	resp.Pending = snapshot.Pending
+	resp.Recovering = snapshot.Pending != nil || s.view.recoveringPaused.Load()
 	layer = snapshot.Binding.LayerID
 	return resp
 }
@@ -244,10 +256,8 @@ func (s *mountControlServer) mountPoint() string {
 	if s == nil {
 		return ""
 	}
-	if s.view != nil {
-		if rt := s.view.currentRuntime(); rt != nil && rt.fs != nil {
-			return rt.fs.mountPoint()
-		}
+	if s.mountPt != "" {
+		return s.mountPt
 	}
 	if s.fs != nil {
 		return s.fs.mountPoint()

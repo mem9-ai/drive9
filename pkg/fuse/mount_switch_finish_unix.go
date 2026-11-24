@@ -68,63 +68,19 @@ func (s *mountViewSwitch) finishPendingLocked(ctx context.Context, opID string) 
 		}
 	}
 
-	// Re-verify target before stopping outgoing runtime or installing target (v36 §6.3 #4).
-	var targetLease *layerMountBinding
-	if dec.Target.LayerID != "" {
-		if dec.Target.ReadOnly {
-			if _, gerr := s.baseClient.GetLayer(ctx, dec.Target.LayerID); gerr != nil {
-				if isRevokedTargetError(gerr) {
-					return s.markRevokedLocked(dec, gerr)
-				}
-				return s.recoveringResp(dec, gerr)
-			}
-			vc, verr := s.baseClient.WithView(client.ViewBinding{LayerID: dec.Target.LayerID, Fence: 0})
-			if verr != nil {
-				return s.recoveringResp(dec, verr)
-			}
-			targetLease = &layerMountBinding{
-				BaseClient: s.baseClient, ViewClient: vc, LayerID: dec.Target.LayerID,
-				BaseRootPath: dec.Target.BaseRootPath, RemoteRoot: s.remoteRoot, MountID: snap.MountID, ReadOnly: true,
-			}
-		} else {
-			callStart := time.Now()
-			renewed, rerr := s.baseClient.RenewLayerMount(ctx, dec.Target.LayerID, client.LayerMountRenewRequest{
-				MountID: snap.MountID,
-				Fence:   dec.Target.Fence,
-			})
-			if rerr != nil {
-				if isRevokedTargetError(rerr) {
-					return s.markRevokedLocked(dec, rerr)
-				}
-				return s.recoveringResp(dec, rerr)
-			}
-			targetLease = s.pendingLease
-			if targetLease == nil || targetLease.LayerID != dec.Target.LayerID || targetLease.Fence != dec.Target.Fence {
-				targetLease = &layerMountBinding{
-					BaseClient: s.baseClient, LayerID: dec.Target.LayerID, BaseRootPath: dec.Target.BaseRootPath,
-					RemoteRoot: s.remoteRoot, MountID: snap.MountID, OperationID: dec.OperationID, Fence: dec.Target.Fence,
-				}
-				vc, verr := s.baseClient.WithView(client.ViewBinding{
-					LayerID: dec.Target.LayerID, Fence: dec.Target.Fence, WriteGuard: targetLease.checkWriteAllowed, ReadUnfenced: targetLease.fenced.Load,
-				})
-				if verr != nil {
-					return s.recoveringResp(dec, verr)
-				}
-				targetLease.ViewClient = vc
-				targetLease.startRenewLoop(callStart, renewed.MountLeaseTTLMS, s.timing)
-				s.pendingLease = targetLease
-			}
-		}
+	targetLease, errResp := s.reverifyPendingTargetLeaseLocked(ctx, snap, dec)
+	if errResp != nil {
+		return *errResp
 	}
 
-	if s.current != nil {
+	if s.current != nil && !s.outgoingStopped {
 		if err := s.current.stop(ctx); err != nil {
 			return s.recoveringResp(dec, err)
 		}
+		s.outgoingStopped = true
 	}
 	if s.pendingTarget == nil {
-		gen := mountRuntimeGeneration{MountID: snap.MountID, Generation: dec.Generation}
-		rt, berr := s.buildRuntime(ctx, dec.Target, targetLease, gen)
+		rt, berr := s.buildRuntime(ctx, dec.Target, targetLease)
 		if berr != nil {
 			return s.recoveringResp(dec, berr)
 		}
@@ -143,7 +99,11 @@ func (s *mountViewSwitch) finishPendingLocked(ctx context.Context, opID string) 
 	}
 	if !s.pendingInstalled {
 		curGen := s.adapter.currentTarget().generation
-		if curGen != dec.Generation {
+		if curGen == dec.Generation {
+			if err := s.adapter.replaceTargetAtGeneration(ctx, pause, dec.Generation, s.pendingTarget.fs); err != nil {
+				return s.recoveringResp(dec, err)
+			}
+		} else {
 			if err := s.adapter.installTargetAtGeneration(ctx, pause, curGen, dec.Generation, s.pendingTarget.fs); err != nil {
 				return s.recoveringResp(dec, err)
 			}
@@ -172,7 +132,11 @@ func (s *mountViewSwitch) finishPendingLocked(ctx context.Context, opID string) 
 	s.pendingLease = nil
 	s.pendingTarget = nil
 	s.pendingInstalled = false
-	s.recoveringPaused = false
+	s.outgoingStopped = false
+	s.recoveringPaused.Store(false)
+	if s.onSwitchDone != nil {
+		s.onSwitchDone(completed.Target)
+	}
 	if len(s.journal.Snapshot().PendingUnbinds) > 0 {
 		s.kickAsyncDrainUnbinds()
 	}
@@ -183,10 +147,100 @@ func (s *mountViewSwitch) finishPendingLocked(ctx context.Context, opID string) 
 	}
 }
 
+func (s *mountViewSwitch) reverifyPendingTargetLeaseLocked(
+	ctx context.Context,
+	snap mountstate.SwitchSnapshot,
+	dec mountstate.SwitchReceipt,
+) (*layerMountBinding, *mountcontrol.SwitchResponse) {
+	if dec.Target.LayerID == "" {
+		return nil, nil
+	}
+	if dec.Target.ReadOnly {
+		callCtx, callCancel := context.WithTimeout(ctx, s.leaseCallTimeout())
+		_, gerr := s.baseClient.GetLayer(callCtx, dec.Target.LayerID)
+		callCancel()
+		if gerr != nil {
+			if isRevokedTargetError(gerr) {
+				resp := s.markRevokedLocked(dec, gerr)
+				return nil, &resp
+			}
+			resp := s.recoveringResp(dec, gerr)
+			return nil, &resp
+		}
+		vc, verr := s.baseClient.WithView(client.ViewBinding{LayerID: dec.Target.LayerID, Fence: 0})
+		if verr != nil {
+			resp := s.recoveringResp(dec, verr)
+			return nil, &resp
+		}
+		return &layerMountBinding{
+			BaseClient: s.baseClient, ViewClient: vc, LayerID: dec.Target.LayerID,
+			BaseRootPath: dec.Target.BaseRootPath, RemoteRoot: s.remoteRoot, MountID: snap.MountID, ReadOnly: true,
+		}, nil
+	}
+	callStart := time.Now()
+	callCtx, callCancel := context.WithTimeout(ctx, s.leaseCallTimeout())
+	renewed, rerr := s.baseClient.RenewLayerMount(callCtx, dec.Target.LayerID, client.LayerMountRenewRequest{
+		MountID: snap.MountID,
+		Fence:   dec.Target.Fence,
+	})
+	callCancel()
+	if rerr != nil {
+		if isRevokedTargetError(rerr) {
+			resp := s.markRevokedLocked(dec, rerr)
+			return nil, &resp
+		}
+		resp := s.recoveringResp(dec, rerr)
+		return nil, &resp
+	}
+	targetLease := s.pendingLease
+	needNewLease := targetLease == nil ||
+		targetLease.LayerID != dec.Target.LayerID ||
+		targetLease.Fence != dec.Target.Fence ||
+		targetLease.fenced.Load()
+	if !needNewLease {
+		targetLease.StopRenew()
+		if targetLease.fenced.Load() {
+			needNewLease = true
+		} else {
+			targetLease.startRenewLoop(callStart, renewed.MountLeaseTTLMS, s.timing)
+		}
+	}
+	if needNewLease {
+		if targetLease != nil {
+			targetLease.StopRenew()
+		}
+		if s.pendingTarget != nil {
+			_ = s.pendingTarget.stop(context.Background())
+			s.pendingTarget = nil
+		}
+		targetLease = &layerMountBinding{
+			BaseClient: s.baseClient, LayerID: dec.Target.LayerID, BaseRootPath: dec.Target.BaseRootPath,
+			RemoteRoot: s.remoteRoot, MountID: snap.MountID, OperationID: dec.OperationID, Fence: dec.Target.Fence,
+		}
+		vc, verr := s.baseClient.WithView(client.ViewBinding{
+			LayerID: dec.Target.LayerID, Fence: dec.Target.Fence, WriteGuard: targetLease.checkWriteAllowed, ReadUnfenced: targetLease.fenced.Load,
+		})
+		if verr != nil {
+			resp := s.recoveringResp(dec, verr)
+			return nil, &resp
+		}
+		targetLease.ViewClient = vc
+		targetLease.startRenewLoop(callStart, renewed.MountLeaseTTLMS, s.timing)
+		s.pendingLease = targetLease
+		s.pendingInstalled = false
+	}
+	return targetLease, nil
+}
+
 func (s *mountViewSwitch) markRevokedLocked(dec mountstate.SwitchReceipt, cause error) mountcontrol.SwitchResponse {
 	if s.pendingLease != nil {
 		s.pendingLease.StopRenew()
 		s.pendingLease = nil
+	}
+	if s.pendingTarget != nil {
+		_ = s.pendingTarget.stop(context.Background())
+		s.pendingTarget = nil
+		s.pendingInstalled = false
 	}
 	rev, merr := s.journal.MarkTargetRevoked(dec.OperationID)
 	if merr != nil {

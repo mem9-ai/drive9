@@ -23,6 +23,7 @@ const (
 var (
 	ErrSwitchUncertain     = errors.New("mount switch journal outcome uncertain; admission fail-closed")
 	ErrSwitchCorrupt       = errors.New("mount switch journal corrupt")
+	ErrSwitchClosed        = errors.New("mount switch journal closed")
 	ErrSwitchConflict      = errors.New("mount switch request conflicts with journal state")
 	ErrSwitchInvalid       = errors.New("invalid mount switch journal argument")
 	ErrSwitchPending       = errors.New("mount switch decision already pending")
@@ -62,6 +63,10 @@ func (u PendingUnbind) Validate() error {
 		if u.Fence <= 0 || u.Fence%2 == 0 {
 			return fmt.Errorf("%w: fence unbind requires positive odd fence, got %d", ErrSwitchInvalid, u.Fence)
 		}
+	case UnbindKindExpire:
+		if u.OperationID != "" || u.Fence != 0 {
+			return fmt.Errorf("%w: expire unbind must not carry operation_id or fence", ErrSwitchInvalid)
+		}
 	default:
 		return fmt.Errorf("%w: unsupported unbind kind %q", ErrSwitchInvalid, u.Kind)
 	}
@@ -85,4 +90,5 @@ type SwitchSnapshot struct {
 	Binding        viewprotocol.SwitchBinding `json:"binding"`
 	Pending        *SwitchReceipt             `json:"pending,omitempty"`
 	PendingUnbinds []PendingUnbind            `json:"pending_unbinds,omitempty"`
+	Recovering     bool                       `json:"recovering,omitempty"`
 }

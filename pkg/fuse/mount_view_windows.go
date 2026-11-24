@@ -37,6 +37,8 @@ func (v *mountView) drainShutdownResponse(context.Context) mountcontrol.DrainRes
 
 func (v *mountView) close(context.Context) error { return nil }
 
+func (v *mountView) bindProcessStateUpdater(func(string, bool)) {}
+
 func startMountViewControlServer(string, *mountViewSwitch) (*mountControlServer, error) {
 	return nil, nil
 }

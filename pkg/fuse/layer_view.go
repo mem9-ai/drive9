@@ -14,6 +14,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
+	"github.com/mem9-ai/drive9/pkg/mountstate"
 	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
@@ -22,7 +23,7 @@ const (
 	defaultLayerLeaseSelfFenceMargin = 10 * time.Second
 	defaultLayerLeaseRetryInterval   = 2 * time.Second
 	defaultLayerLeaseCallTimeout     = 5 * time.Second
-	LayerMountLeaseTTL     = 60 * time.Second
+	LayerMountLeaseTTL               = 60 * time.Second
 )
 
 // ErrLayerLeaseSelfFenced reports that the mount's exclusive Layer lease
@@ -356,7 +357,7 @@ func isTerminalLayerRenewError(err error) bool {
 
 // ClassifyLayerStartupError preserves the worker exit code for Layer control-plane failures.
 func ClassifyLayerStartupError(action string, err error) *MountExitError {
-	if isTerminalLayerRenewError(err) {
+	if isTerminalLayerRenewError(err) || errors.Is(err, mountstate.ErrSwitchCorrupt) || errors.Is(err, mountstate.ErrSwitchInvalid) {
 		return ExitStartupPermanentErr(action, err)
 	}
 	return ExitStartupTransientErr(action, err)
