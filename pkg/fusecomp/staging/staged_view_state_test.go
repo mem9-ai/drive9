@@ -777,3 +777,54 @@ func TestRecordViewLossNeverStoresNonFiniteGenerations(t *testing.T) {
 		t.Fatalf("bound = %d, want 0 for an unattributable record", got)
 	}
 }
+
+// TestRekeyKeepsTheSourceMarkerWhenTheDestinationWriteFails pins the durability
+// rule: the destination's marker is written before the source's is unlinked, so a
+// failed write (e.g. ENOSPC) leaves the only durable witness in place.
+func TestRekeyKeepsTheSourceMarkerWhenTheDestinationWriteFails(t *testing.T) {
+	dir := t.TempDir()
+	const (
+		src = "/rekey-src.txt"
+		dst = "/rekey-fail-dst.txt"
+	)
+	c, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.writeViewLoss(src, 9, os.ErrNotExist)
+	// A directory where the destination's marker file must go makes atomicWrite
+	// fail while the source marker stays readable.
+	if err := os.Mkdir(c.lostFile(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c.RekeyViewLoss(src, dst)
+	if _, err := os.Stat(c.lostFile(src)); err != nil {
+		t.Fatalf("the source marker was removed although the destination write failed: %v", err)
+	}
+	if err := c.ViewLoss(dst); err == nil {
+		t.Fatal("the destination does not fail closed in-process")
+	}
+}
+
+// TestRemoveIfGenerationKeepsANewerLoss pins the generation-scoped clear: a
+// landing that removes an older payload must not delete a newer image's loss
+// record for the same path.
+func TestRemoveIfGenerationKeepsANewerLoss(t *testing.T) {
+	const path = "/fenced.txt"
+	c, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Put(path, []byte("payload"), 7, PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	gen := c.MetaGeneration(path)
+	// A newer image's loss is recorded for the path.
+	c.writeViewLoss(path, gen+50, os.ErrNotExist)
+	if !c.RemoveIfGeneration(path, gen) {
+		t.Fatal("the fenced removal did not happen")
+	}
+	if err := c.ViewLoss(path); err == nil {
+		t.Fatal("a fenced removal cleared a newer image's loss record")
+	}
+}

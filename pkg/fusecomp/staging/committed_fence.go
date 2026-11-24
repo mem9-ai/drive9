@@ -207,6 +207,27 @@ func (idx *PendingIndex) clearCommittedFenceLocked(remotePath string) bool {
 	return true
 }
 
+// clearCommittedFencesLocked drops the in-memory fences for the given paths and
+// returns the ones whose file must be unlinked after c.mu is released. The caller
+// holds idx.mu.
+func (idx *PendingIndex) clearCommittedFencesLocked(paths ...string) []string {
+	idx.ensureCommittedFencesLoadedLocked()
+	var cleared []string
+	for _, path := range paths {
+		if idx.clearCommittedFenceLocked(path) {
+			cleared = append(cleared, path)
+		}
+	}
+	return cleared
+}
+
+// removeFenceFiles unlinks the fence files clearCommittedFencesLocked reported.
+func (idx *PendingIndex) removeFenceFiles(paths []string) {
+	for _, path := range paths {
+		idx.removeFenceFile(path)
+	}
+}
+
 // removeFenceFile unlinks a fence file (best effort: a stale fence only masks
 // frames at or below a generation that a newer publication superseded).
 func (idx *PendingIndex) removeFenceFile(remotePath string) {

@@ -299,15 +299,12 @@ func (idx *PendingIndex) Remove(remotePath string) {
 	delete(idx.items, remotePath)
 	// The name's incarnation ended: a landed-replay fence would otherwise keep
 	// a later re-creation of this path from being recovered.
-	idx.ensureCommittedFencesLoadedLocked()
-	clearedFence := idx.clearCommittedFenceLocked(remotePath)
+	cleared := idx.clearCommittedFencesLocked(remotePath)
 	idx.mu.Unlock()
 
 	metaPath := filepath.Join(idx.dir, HashPath(remotePath)+".meta")
 	_ = os.Remove(metaPath)
-	if clearedFence {
-		idx.removeFenceFile(remotePath)
-	}
+	idx.removeFenceFiles(cleared)
 	idx.releasePathLock(remotePath, pl)
 }
 
@@ -329,15 +326,12 @@ func (idx *PendingIndex) RemoveIfGeneration(remotePath string, expectedGen uint6
 		return false
 	}
 	delete(idx.items, remotePath)
-	idx.ensureCommittedFencesLoadedLocked()
-	clearedFence := idx.clearCommittedFenceLocked(remotePath)
+	cleared := idx.clearCommittedFencesLocked(remotePath)
 	idx.mu.Unlock()
 
 	metaPath := filepath.Join(idx.dir, HashPath(remotePath)+".meta")
 	_ = os.Remove(metaPath)
-	if clearedFence {
-		idx.removeFenceFile(remotePath)
-	}
+	idx.removeFenceFiles(cleared)
 	idx.releasePathLock(remotePath, pl)
 	return true
 }
@@ -403,19 +397,12 @@ func (idx *PendingIndex) RenamePending(oldPath, newPath string) bool {
 	idx.items[newPath] = &newMeta
 	// Both names changed incarnation: a landed fence at either endpoint would
 	// mask the entry that now lives there.
-	idx.ensureCommittedFencesLoadedLocked()
-	clearedOld := idx.clearCommittedFenceLocked(oldPath)
-	clearedNew := idx.clearCommittedFenceLocked(newPath)
+	cleared := idx.clearCommittedFencesLocked(oldPath, newPath)
 	idx.mu.Unlock()
 
 	oldMetaPath := filepath.Join(idx.dir, HashPath(oldPath)+".meta")
 	_ = os.Remove(oldMetaPath)
-	if clearedOld {
-		idx.removeFenceFile(oldPath)
-	}
-	if clearedNew {
-		idx.removeFenceFile(newPath)
-	}
+	idx.removeFenceFiles(cleared)
 
 	return true
 }
@@ -664,18 +651,11 @@ func (t *PendingConflictTransfer) Commit() (bool, error) {
 	delete(t.idx.items, t.oldPath)
 	// Both names changed incarnation: a landed fence at either endpoint would
 	// mask the marker that now lives at the destination (or the dead source).
-	t.idx.ensureCommittedFencesLoadedLocked()
-	clearedOld := t.idx.clearCommittedFenceLocked(t.oldPath)
-	clearedNew := t.idx.clearCommittedFenceLocked(t.newPath)
+	cleared := t.idx.clearCommittedFencesLocked(t.oldPath, t.newPath)
 	t.idx.mu.Unlock()
 
 	_ = os.Remove(filepath.Join(t.idx.dir, HashPath(t.oldPath)+".meta"))
-	if clearedOld {
-		t.idx.removeFenceFile(t.oldPath)
-	}
-	if clearedNew {
-		t.idx.removeFenceFile(t.newPath)
-	}
+	t.idx.removeFenceFiles(cleared)
 	safeLogPrintf("pending: conflict marker moved %s -> %s (gen %d -> %d)", t.oldPath, t.newPath, t.expectedOldGen, t.prepared.Generation)
 	return true, nil
 }
@@ -746,7 +726,12 @@ func (t *PendingConflictTransfer) PublishDestination() error {
 	t.idx.mu.Lock()
 	cp := *t.prepared
 	t.idx.items[t.newPath] = &cp
+	// The destination's previous incarnation is replaced by this marker, so a
+	// landed fence (or an undecodable one) for the name must go — Commit does the
+	// same for both endpoints.
+	cleared := t.idx.clearCommittedFencesLocked(t.newPath)
 	t.idx.mu.Unlock()
+	t.idx.removeFenceFiles(cleared)
 	safeLogPrintf("pending: conflict marker published at %s (payload stayed at %s)", t.newPath, t.oldPath)
 	return nil
 }
@@ -837,18 +822,11 @@ func (idx *PendingIndex) CommitRename(oldPath string, newMeta *WriteBackMeta) {
 	idx.mu.Lock()
 	delete(idx.items, oldPath)
 	idx.items[newMeta.Path] = newMeta
-	idx.ensureCommittedFencesLoadedLocked()
-	clearedOld := idx.clearCommittedFenceLocked(oldPath)
-	clearedNew := idx.clearCommittedFenceLocked(newMeta.Path)
+	cleared := idx.clearCommittedFencesLocked(oldPath, newMeta.Path)
 	idx.mu.Unlock()
 
 	_ = os.Remove(filepath.Join(idx.dir, HashPath(oldPath)+".meta"))
-	if clearedOld {
-		idx.removeFenceFile(oldPath)
-	}
-	if clearedNew {
-		idx.removeFenceFile(newMeta.Path)
-	}
+	idx.removeFenceFiles(cleared)
 }
 
 // AbortRename rolls back PrepareRename by deleting the prepared on-disk meta
@@ -1106,12 +1084,9 @@ func (idx *PendingIndex) EnsureConflictMarker(remotePath string) error {
 	if _, exists := idx.items[remotePath]; !exists {
 		cp := meta
 		idx.items[remotePath] = &cp
-		idx.ensureCommittedFencesLoadedLocked()
-		clearedFence := idx.clearCommittedFenceLocked(remotePath)
+		cleared := idx.clearCommittedFencesLocked(remotePath)
 		idx.mu.Unlock()
-		if clearedFence {
-			idx.removeFenceFile(remotePath)
-		}
+		idx.removeFenceFiles(cleared)
 		return nil
 	}
 	idx.mu.Unlock()
@@ -1367,12 +1342,9 @@ func (idx *PendingIndex) publishMeta(meta *WriteBackMeta, onlyIfAbsent bool) (ui
 	// keep suppressing nothing while still pinning a stale shadow at settle.
 	// Fences are loaded by recovery before any staging publication, so an
 	// unloaded map here means nothing to clear.
-	idx.ensureCommittedFencesLoadedLocked()
-	clearedFence := idx.clearCommittedFenceLocked(remotePath)
+	cleared := idx.clearCommittedFencesLocked(remotePath)
 	idx.mu.Unlock()
-	if clearedFence {
-		idx.removeFenceFile(remotePath)
-	}
+	idx.removeFenceFiles(cleared)
 
 	return gen, nil
 }
