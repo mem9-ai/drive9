@@ -63,6 +63,7 @@ deferred_latest_prune=0
 lock_held=0
 lock_cleanup_needed=0
 mutation_in_flight=0
+mutation_uncertain=0
 aborted_by_signal=0
 mutating_child_pid=""
 
@@ -243,6 +244,12 @@ remote_stat_mtime() {
   return 1
 }
 
+is_definitive_remote_rejection() {
+  local err_file=$1
+  [ -f "$err_file" ] || return 1
+  grep -qiE '(HTTP 400|HTTP 401|HTTP 403|HTTP 404|HTTP 409|HTTP 412|HTTP 413|HTTP 422|HTTP 429|not found|path already exists|already exists|directory not empty|invalid API key|token expired|token revoked|unauthorized|tenant storage quota exceeded)' "$err_file"
+}
+
 run_mutating_remote() {
   local stdout_file=$1
   local stderr_file=$2
@@ -259,6 +266,12 @@ run_mutating_remote() {
   mutating_child_pid=""
   if [ "$aborted_by_signal" -eq 0 ]; then
     mutation_in_flight=0
+  fi
+  if [ "$rc" -ne 0 ] && ! is_definitive_remote_rejection "$stderr_file"; then
+    # Sticky: an ambiguous transport/5xx/EOF/timeout failure cannot establish that
+    # an already-authenticated server mutation finished; retain the lock fail-closed
+    # on exit and never let subsequent operations erase this uncertainty.
+    mutation_uncertain=1
   fi
   return "$rc"
 }
@@ -799,12 +812,13 @@ release_archive_lock() {
   # still releases surviving active lease entries owned by this exact lock_owner_id.
   # Release moves our active lease to a unique free sentinel (lease.0.free.<owner>)
   # instead of deleting it, preserving the single circulating lock token invariant.
-  # If interrupted while a remote mutation was still in flight, retain the lock
-  # fail-closed so no subsequent publisher can overlap the already-admitted request.
+  # If interrupted while a remote mutation was in flight OR any remote mutation ended
+  # with an ambiguous outcome (EOF/timeout/5xx), retain the lock fail-closed so no
+  # subsequent publisher can overlap an already-admitted server request.
   if [ "$lock_cleanup_needed" -eq 1 ]; then
     cur_lease="$(cat "$lock_lease_file" 2>/dev/null || true)"
-    if [ "$mutation_in_flight" -eq 1 ]; then
-      warn "interrupted while remote mutation was in flight; retaining archive lock ${cur_lease:-unknown} (owner=${lock_owner_id}) fail-closed until prior request completes"
+    if [ "$mutation_in_flight" -eq 1 ] || [ "$mutation_uncertain" -eq 1 ]; then
+      warn "remote mutation was interrupted or ended with an ambiguous outcome; retaining archive lock ${cur_lease:-unknown} (owner=${lock_owner_id}) fail-closed until prior request completes"
       if [ -n "${lock_token_id:-}" ]; then
         revoke_scoped_token_id "$lock_token_id" >/dev/null 2>&1 || true
       fi
@@ -1148,11 +1162,11 @@ publish_commit() {
 
   assert_archive_lock_held
 
-  remote_mkdir "$archive_root" || true
-  remote_mkdir "${archive_root}/commits" || true
-  remote_mkdir "$archive_staging_root" || true
-  remote_mkdir "$staging_path" || true
-  remote_mkdir "${staging_path}/bin" || true
+  remote_mkdir "$archive_root"
+  remote_mkdir "${archive_root}/commits"
+  remote_mkdir "$archive_staging_root"
+  remote_mkdir "$staging_path"
+  remote_mkdir "${staging_path}/bin"
 
   active_remote_staging="$staging_path"
   remote_upload "${artifact_dir}/source.tar.gz" "${staging_path}/source.tar.gz"
@@ -1638,6 +1652,9 @@ prune_remote_commits() {
           warn "remote server rejected post-publish prune of ${archive_root}/commits/${sha} (expired/revoked scoped token); stopping"
           return 0
         fi
+        if [ "$mutation_uncertain" -eq 1 ]; then
+          die "ambiguous failure removing incomplete target ${archive_root}/commits/${sha}; aborting publish and retaining lock fail-closed to avoid overlapping an in-flight delete"
+        fi
         warn "failed to remove ${archive_root}/commits/${sha} (incomplete target); continuing"
         prune_failures=$((prune_failures + 1))
       fi
@@ -1716,7 +1733,7 @@ resolve_commits() {
 
 cleanup_on_exit() {
   local exit_code=$?
-  if [ -n "${active_remote_staging:-}" ] && [ "$mutation_in_flight" -eq 0 ] && [ "$aborted_by_signal" -eq 0 ] && [ "$lock_held" -eq 1 ]; then
+  if [ -n "${active_remote_staging:-}" ] && [ "$mutation_in_flight" -eq 0 ] && [ "$mutation_uncertain" -eq 0 ] && [ "$aborted_by_signal" -eq 0 ] && [ "$lock_held" -eq 1 ]; then
     remote_rm_rf "$active_remote_staging" >/dev/null 2>&1 || true
     active_remote_staging=""
   fi

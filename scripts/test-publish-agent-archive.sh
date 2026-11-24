@@ -25,6 +25,23 @@ register_release_file() {
   printf '%s\n' "$1" >>"$RELEASE_FILES_FILE"
 }
 
+pass() {
+  echo "   ok: $*"
+}
+
+fail() {
+  echo "FAIL: $*" >&2
+  exit 1
+}
+
+require_pgid_isolation() {
+  if ! command -v python3 >/dev/null 2>&1 && ! command -v setsid >/dev/null 2>&1; then
+    fail "process-group isolation requires python3 or setsid"
+  fi
+}
+
+require_pgid_isolation
+
 spawn_isolated_bg() {
   local out_file=$1
   local err_file=$2
@@ -34,7 +51,7 @@ spawn_isolated_bg() {
   elif command -v setsid >/dev/null 2>&1; then
     setsid "$@" >"$out_file" 2>"$err_file" &
   else
-    "$@" >"$out_file" 2>"$err_file" &
+    fail "process-group isolation requires python3 or setsid"
   fi
   LAST_BG_PID=$!
   register_bg_pgid "$LAST_BG_PID"
@@ -74,14 +91,19 @@ cleanup_test_harness() {
 }
 trap cleanup_test_harness EXIT INT TERM
 
-pass() {
-  echo "   ok: $*"
-}
-
-fail() {
-  echo "FAIL: $*" >&2
-  exit 1
-}
+# Self-test mode invoked by Scenario 19 to verify this harness's exact
+# spawn_isolated_bg + cleanup_test_harness EXIT path reaps nested descendants.
+if [ -n "${TEST_HARNESS_CLEANUP_SELFTEST_PID_FILE:-}" ]; then
+  spawn_isolated_bg /dev/null /dev/null \
+    bash -c 'bash -c "sleep 300 & echo \$! >\"$1\"; wait"' _ "$TEST_HARNESS_CLEANUP_SELFTEST_PID_FILE"
+  selftest_i=0
+  while [ ! -s "$TEST_HARNESS_CLEANUP_SELFTEST_PID_FILE" ]; do
+    selftest_i=$((selftest_i + 1))
+    [ "$selftest_i" -lt 100 ] || fail "timed out waiting for selftest grandchild pid"
+    sleep 0.05
+  done
+  fail "simulated early test harness failure"
+fi
 
 assert_exists() {
   [ -e "$1" ] || fail "expected path to exist: $1"
@@ -110,6 +132,7 @@ pause_signal_file="${FAKE_PAUSE_SIGNAL_FILE:-}"
 pause_release_file="${FAKE_PAUSE_RELEASE_FILE:-}"
 pause_after_auth_rm_pattern="${FAKE_PAUSE_AFTER_AUTH_RM_PATTERN:-}"
 pause_after_auth_cp_pattern="${FAKE_PAUSE_AFTER_AUTH_CP_PATTERN:-}"
+ambiguous_after_auth_rm_pattern="${FAKE_AMBIGUOUS_AFTER_AUTH_RM_PATTERN:-}"
 pause_auth_signal_file="${FAKE_PAUSE_AUTH_SIGNAL_FILE:-}"
 pause_auth_release_file="${FAKE_PAUSE_AUTH_RELEASE_FILE:-}"
 
@@ -367,6 +390,30 @@ rm)
         sleep 0.05
       done
     fi
+  fi
+  # Simulate an admitted server-side rm -r that remains paused on the server
+  # while the CLI returns an ambiguous transport EOF error without any signal
+  # to the parent publisher.
+  if [ -n "$ambiguous_after_auth_rm_pattern" ] && [[ "$rel" == *"$ambiguous_after_auth_rm_pattern"* ]]; then
+    target="${root}/${rel}"
+    (
+      exec >/dev/null 2>&1
+      if [ -n "$pause_auth_signal_file" ]; then
+        touch "$pause_auth_signal_file"
+      fi
+      if [ -n "$pause_auth_release_file" ]; then
+        while [ ! -f "$pause_auth_release_file" ] && [ -d "$(dirname "$pause_auth_release_file")" ]; do
+          sleep 0.05
+        done
+      fi
+      if [ -e "$target" ]; then
+        printf 'rm-delayed-server-commit %s\n' "$rel" >>"$ops_log"
+        rm -rf "$target"
+      fi
+    ) &
+    printf 'rm-ambiguous-eof %s\n' "$rel" >>"$ops_log"
+    echo "fs rm: unexpected EOF (connection reset by peer)" >&2
+    exit 1
   fi
   if [ -n "$fail_rm_pattern" ] && [[ "$rel" == *"$fail_rm_pattern"* ]]; then
     printf 'rm-fail %s\n' "$rel" >>"$ops_log"
@@ -806,7 +853,8 @@ assert_missing "${R10}/drive9/commits/${C2}"
 assert_exists "${R10}/drive9/commits/${C3}/manifest.json"
 assert_exists "${R10}/drive9/commits/${MAIN_NEW}/manifest.json"
 grep -q "partial failures: removed=1 failed=1" "$err10" || fail "expected partial failure summary in stderr"
-pass "continued past rm failure on C1, pruned C2, logged summary, and published MAIN_NEW"
+grep -q "retaining archive lock" "$err10" || fail "expected ambiguous 503 rm failure to retain lock fail-closed: $(cat "$err10")"
+pass "continued past rm failure on C1, pruned C2, logged summary, published MAIN_NEW, and retained lock fail-closed on ambiguous 503"
 
 echo "== 11. Transient ls/stat errors (pre-publish and post-publish) warn without failing publish"
 # 11a: Pre-publish ls 503 skips prune and still publishes.
@@ -1318,7 +1366,7 @@ wait "$PID16A"
 rc16a=$?
 set -e
 [ "$rc16a" -ne 0 ] || fail "expected SIGTERM'd Publisher A to exit non-zero"
-grep -q "interrupted while remote mutation was in flight; retaining archive lock" "${WORK}/err16a.log" || fail "expected fail-closed lock retention warning: $(cat "${WORK}/err16a.log")"
+grep -q "retaining archive lock" "${WORK}/err16a.log" || fail "expected fail-closed lock retention warning: $(cat "${WORK}/err16a.log")"
 # Lock MUST still be held by owner16a (fail-closed) while the already-admitted rm -r is still paused.
 [ "$(active_lease_owner "$R16")" = "$owner16a" ] || fail "expected lock to remain held by ${owner16a} after SIGTERM mid-mutation"
 
@@ -1479,56 +1527,136 @@ assert_exists "${R18}/drive9/commits/${MAIN_NEW}/manifest.json"
 assert_no_active_lease "$R18"
 pass "break-glass refused takeover during revocation 503, then revoked token, pruned aged .staging/, and promoted MAIN_NEW"
 
-echo "== 19. Isolated process-group cleanup reaps nested descendants on early test failure"
+echo "== 19. Harness isolated process-group cleanup reaps nested descendants on early failure and fails fast without PGID isolation"
 GRANDCHILD_PID_FILE="${WORK}/grandchild19.pid"
-SUB_HARNESS="${WORK}/sub-harness19.sh"
-cat >"$SUB_HARNESS" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-SUB_WORK="$(mktemp -d)"
-BG_PGIDS_FILE="${SUB_WORK}/.bg-pgids"
-: >"$BG_PGIDS_FILE"
-cleanup() {
-  local pgid
-  while IFS= read -r pgid; do
-    [ -n "$pgid" ] || continue
-    kill -TERM -- "-${pgid}" 2>/dev/null || kill -TERM "$pgid" 2>/dev/null || true
-  done <"$BG_PGIDS_FILE"
-  sleep 0.15
-  while IFS= read -r pgid; do
-    [ -n "$pgid" ] || continue
-    kill -KILL -- "-${pgid}" 2>/dev/null || kill -KILL "$pgid" 2>/dev/null || true
-    wait "$pgid" 2>/dev/null || true
-  done <"$BG_PGIDS_FILE"
-  rm -rf "$SUB_WORK"
-}
-trap cleanup EXIT INT TERM
-
-python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-  bash -c 'bash -c "sleep 300 & echo \$! >\"$1\"; wait"' _ "${GRANDCHILD_PID_FILE:?}" &
-printf '%s\n' "$!" >>"$BG_PGIDS_FILE"
-
-i=0
-while [ ! -s "$GRANDCHILD_PID_FILE" ]; do
-  i=$((i + 1))
-  [ "$i" -lt 100 ] || exit 2
-  sleep 0.05
-done
-# Simulate early test failure while nested grandchild is still running.
-exit 1
-EOF
-chmod +x "$SUB_HARNESS"
+err19_self="${WORK}/err19_self.log"
 set +e
-GRANDCHILD_PID_FILE="$GRANDCHILD_PID_FILE" "$SUB_HARNESS"
+TEST_HARNESS_CLEANUP_SELFTEST_PID_FILE="$GRANDCHILD_PID_FILE" "$0" >/dev/null 2>"$err19_self"
 sub_rc=$?
 set -e
-[ "$sub_rc" -eq 1 ] || fail "expected sub-harness early failure exit 1, got ${sub_rc}"
+[ "$sub_rc" -ne 0 ] || fail "expected harness selftest early failure to exit non-zero"
+grep -q "simulated early test harness failure" "$err19_self" || fail "expected selftest failure message, got: $(cat "$err19_self")"
 grandchild_pid="$(cat "$GRANDCHILD_PID_FILE" 2>/dev/null || true)"
 [ -n "$grandchild_pid" ] || fail "expected grandchild PID to be recorded"
 if kill -0 "$grandchild_pid" 2>/dev/null; then
   kill -KILL "$grandchild_pid" 2>/dev/null || true
-  fail "grandchild process ${grandchild_pid} survived isolated PGID cleanup"
+  fail "grandchild process ${grandchild_pid} survived harness isolated PGID cleanup"
 fi
-pass "isolated process-group cleanup terminated and reaped nested descendants on early failure"
+
+# Verify fail-fast when neither python3 nor setsid is available on PATH.
+NO_PGID_BIN="${WORK}/no-pgid-bin"
+mkdir -p "$NO_PGID_BIN"
+for tool in mktemp rm dirname pwd; do
+  tool_path="$(command -v "$tool")"
+  ln -s "$tool_path" "${NO_PGID_BIN}/${tool}"
+done
+err19_nopgid="${WORK}/err19_nopgid.log"
+set +e
+PATH="$NO_PGID_BIN" "$(command -v bash)" "$0" >/dev/null 2>"$err19_nopgid"
+nopgid_rc=$?
+set -e
+[ "$nopgid_rc" -ne 0 ] || fail "expected harness to fail fast when neither python3 nor setsid is available"
+grep -q "process-group isolation requires python3 or setsid" "$err19_nopgid" || fail "expected PGID isolation requirement message, got: $(cat "$err19_nopgid")"
+pass "harness PGID cleanup reaped nested descendants on early failure and failed fast without PGID isolation"
+
+echo "== 20. Post-auth / pre-rm ambiguous CLI transport EOF (without SIGTERM): aborts without publishing, retains lock fail-closed, excludes overlap until drained"
+R20="${WORK}/remote20"
+L20A="${WORK}/ops20a.log"
+L20B1="${WORK}/ops20b1.log"
+L20B2="${WORK}/ops20b2.log"
+CLK20="${WORK}/clock20.epoch"
+mkdir -p "${R20}/drive9/commits/${MAIN_NEW}/bin"
+printf 'stale\n' >"${R20}/drive9/commits/${MAIN_NEW}/source.tar.gz"
+: >"$L20A"
+: >"$L20B1"
+: >"$L20B2"
+printf '1700000000\n' >"$CLK20"
+SIG20="${WORK}/pause20.signal"
+REL20="${WORK}/pause20.release"
+register_release_file "$REL20"
+
+# Publisher A invokes `rm -r commits/${MAIN_NEW}`; FAKE_CLI passes verify_fs_auth, leaves the
+# simulated server delete paused on SIG20/REL20, and returns an ambiguous transport EOF error
+# with NO signal sent to Publisher A.
+run_with_watchdog_expect_fail 15 "${WORK}/err20a.log" \
+  bash -c 'cd "$1" && shift && exec "$@"' _ "$RUNNER_A_REPO" \
+  env \
+    DRIVE9_SERVER="https://api.example.test" \
+    DRIVE9_API_KEY="test-key" \
+    DRIVE9_PUBLISHER="$FAKE_CLI" \
+    DRIVE9_ARCHIVE_CLI_TARGETS="linux/amd64" \
+    DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY="0" \
+    FAKE_REMOTE_ROOT="$R20" \
+    FAKE_OPS_LOG="$L20A" \
+    RUNNER_TEMP="${WORK}/tmp20a" \
+    DRIVE9_ARCHIVE_NOW_FILE="$CLK20" \
+    DRIVE9_ARCHIVE_RETAIN_COMMITS=5 \
+    DRIVE9_ARCHIVE_LOCK_TOKEN_TTL_SECONDS=30 \
+    FAKE_AMBIGUOUS_AFTER_AUTH_RM_PATTERN="commits/${MAIN_NEW}" \
+    FAKE_PAUSE_AUTH_SIGNAL_FILE="$SIG20" \
+    FAKE_PAUSE_AUTH_RELEASE_FILE="$REL20" \
+    "$SCRIPT" "$MAIN_NEW"
+
+wait_for_file "$SIG20" 150
+grep -q "ambiguous failure removing incomplete target" "${WORK}/err20a.log" || fail "expected ambiguous target-rm abort message: $(cat "${WORK}/err20a.log")"
+grep -q "retaining archive lock" "${WORK}/err20a.log" || fail "expected fail-closed lock retention on ambiguous rm EOF: $(cat "${WORK}/err20a.log")"
+if grep -q '^upload ' "$L20A"; then
+  fail "Publisher A must not continue uploading after ambiguous incomplete-target rm failure"
+fi
+owner20a="$(active_lease_owner "$R20")" || fail "expected lock to remain held fail-closed after ambiguous CLI EOF"
+a20_tid="$(awk '$1 == "token-issue" { tid = $2 } END { print tid }' "$L20A")"
+[ -n "$a20_tid" ] || fail "expected Publisher A to have issued a scoped token"
+
+# Advance clock +2 hours; normal Publisher B MUST fail closed and not overlap the paused server delete.
+printf '1700007200\n' >"$CLK20"
+run_with_watchdog_expect_fail 15 "${WORK}/err20b1.log" \
+  bash -c 'cd "$1" && shift && exec "$@"' _ "$RUNNER_B_REPO" \
+  env \
+    DRIVE9_SERVER="https://api.example.test" \
+    DRIVE9_API_KEY="test-key" \
+    DRIVE9_PUBLISHER="$FAKE_CLI" \
+    DRIVE9_ARCHIVE_CLI_TARGETS="linux/amd64" \
+    DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY="0" \
+    FAKE_REMOTE_ROOT="$R20" \
+    FAKE_OPS_LOG="$L20B1" \
+    RUNNER_TEMP="${WORK}/tmp20b1" \
+    DRIVE9_ARCHIVE_NOW_FILE="$CLK20" \
+    DRIVE9_ARCHIVE_RETAIN_COMMITS=5 \
+    DRIVE9_ARCHIVE_LOCK_WAIT_SECONDS=2 \
+    DRIVE9_ARCHIVE_LOCK_POLL_SECONDS=1 \
+    "$SCRIPT" "$MAIN_NEW"
+grep -q "DRIVE9_ARCHIVE_LOCK_BREAK_OWNER=${owner20a}" "${WORK}/err20b1.log" || fail "expected break_lock_owner guidance naming ${owner20a}"
+if grep -qE '^(upload|rm) ' "$L20B1"; then
+  fail "Publisher B must not mutate archive while A's ambiguous server delete is still paused"
+fi
+
+# Drain the paused server-side delete in isolation before operator-confirmed recovery.
+touch "$REL20"
+wait_for_missing "${R20}/drive9/commits/${MAIN_NEW}" 150
+wait_for_log_match "$L20A" "^rm-delayed-server-commit drive9/commits/${MAIN_NEW}$" 150
+
+# Explicit owner-pinned break-glass now recovers cleanly and publishes MAIN_NEW.
+run_with_watchdog 20 "${WORK}/err20b2.log" \
+  bash -c 'cd "$1" && shift && exec "$@"' _ "$RUNNER_B_REPO" \
+  env \
+    DRIVE9_SERVER="https://api.example.test" \
+    DRIVE9_API_KEY="test-key" \
+    DRIVE9_PUBLISHER="$FAKE_CLI" \
+    DRIVE9_ARCHIVE_CLI_TARGETS="linux/amd64" \
+    DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY="0" \
+    FAKE_REMOTE_ROOT="$R20" \
+    FAKE_OPS_LOG="$L20B2" \
+    RUNNER_TEMP="${WORK}/tmp20b2" \
+    DRIVE9_ARCHIVE_NOW_FILE="$CLK20" \
+    DRIVE9_ARCHIVE_RETAIN_COMMITS=5 \
+    DRIVE9_ARCHIVE_LOCK_WAIT_SECONDS=10 \
+    DRIVE9_ARCHIVE_LOCK_POLL_SECONDS=1 \
+    DRIVE9_ARCHIVE_LOCK_BREAK_OWNER="$owner20a" \
+    "$SCRIPT" "$MAIN_NEW"
+assert_exists "${R20}/drive9/commits/${MAIN_NEW}/manifest.json"
+assert_exists "${R20}/drive9/commits/${MAIN_NEW}/bin/drive9-linux-amd64"
+[ "$(jq -r '.commit_sha' "${R20}/drive9/latest.json")" = "$MAIN_NEW" ] || fail "B did not publish latest.json"
+assert_no_active_lease "$R20"
+pass "ambiguous CLI transport EOF (without SIGTERM) aborted without overlap, retained lock fail-closed, drained old rm, and recovered via owner-pinned break-glass"
 
 echo "ALL TESTS PASSED"
