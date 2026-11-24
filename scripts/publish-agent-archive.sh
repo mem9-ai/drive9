@@ -76,6 +76,10 @@ current_epoch() {
   date -u '+%s'
 }
 
+wall_epoch() {
+  date -u '+%s'
+}
+
 lock_owner_host="$(hostname -s 2>/dev/null | tr -cd 'A-Za-z0-9_-' | cut -c1-24 || true)"
 lock_owner_id="${lock_owner_host:-publisher}-$$-$(current_epoch)-${RANDOM:-0}"
 
@@ -371,26 +375,6 @@ lock_mv() {
   return 1
 }
 
-lock_rm_leaf() {
-  local path=$1
-  local err="${lock_state_dir}/rm-leaf.$$.stderr"
-  if remote_owner fs rm "$(remote_ref "$path")" >/dev/null 2>"$err"; then
-    rm -f "$err"
-    return 0
-  fi
-  if grep -qiE '(^|[^[:alnum:]])(not found|HTTP 404)([^[:alnum:]]|$)' "$err"; then
-    rm -f "$err"
-    return 0
-  fi
-  if grep -qiE '(not empty|HTTP 409)' "$err"; then
-    rm -f "$err"
-    return "$remote_conflict_status"
-  fi
-  cat "$err" >&2
-  rm -f "$err"
-  return 1
-}
-
 issue_scoped_archive_token() {
   local out_file="${lock_state_dir}/issued-token.$$.json"
   local err_file="${out_file}.stderr"
@@ -480,9 +464,10 @@ parse_lease_entry() {
       tid="${rest2%%.*}"
       owner="${rest2#*.}"
     else
-      tid=""
+      tid="-"
       owner="$rest2"
     fi
+    [ -n "$tid" ] || tid="-"
     [ -n "$owner" ] || return 1
     printf '%s\t%s\t%s\n' "$exp" "$tid" "$owner"
     return 0
@@ -491,6 +476,11 @@ parse_lease_entry() {
     return 1
     ;;
   esac
+}
+
+is_revocable_token_id() {
+  local tok_id=$1
+  [ -n "$tok_id" ] && [ "$tok_id" != "free" ] && [ "$tok_id" != "none" ] && [ "$tok_id" != "-" ]
 }
 
 acquire_local_lock_mutex() {
@@ -570,19 +560,59 @@ start_archive_lock_heartbeat() {
       fi
 
       # Ambiguous move or transient failure: reconcile ownership of new_lease vs cur_lease.
-      if lock_stat_exists "${archive_lock_path}/${new_lease}"; then
-        commit_local_lock_state "$new_lease" "$new_tok_exp" "$new_tok"
+      # Only revoke new_tid after confirming new_lease is absent (404 / remote_missing_status);
+      # on inconclusive stat errors (e.g. 503), keep polling until confirmed or expired so we
+      # never revoke the live lease's token.
+      reconciled=""
+      while [ ! -f "$lock_stop_file" ]; do
+        stat_rc=0
+        lock_stat_exists "${archive_lock_path}/${new_lease}" || stat_rc=$?
+        if [ "$stat_rc" -eq 0 ]; then
+          commit_local_lock_state "$new_lease" "$new_tok_exp" "$new_tok"
+          release_local_lock_mutex
+          reconciled="committed"
+          break
+        elif [ "$stat_rc" -eq "$remote_missing_status" ]; then
+          reconciled="absent"
+          break
+        fi
+        now="$(current_epoch)"
+        if [ "$now" -ge "$new_tok_exp" ]; then
+          release_local_lock_mutex
+          exit 0
+        fi
         release_local_lock_mutex
+        sleep "$retry_delay" &
+        sleep_pid=$!
+        wait "$sleep_pid" 2>/dev/null
+        sleep_pid=""
+        [ -f "$lock_stop_file" ] && exit 0
+        acquire_local_lock_mutex || exit 0
+        if [ -f "$lock_stop_file" ] || [ ! -f "$lock_lease_file" ]; then
+          release_local_lock_mutex
+          exit 0
+        fi
+      done
+      if [ "$reconciled" = "committed" ]; then
         next_sleep="$lock_renew_seconds"
         continue
       fi
+      if [ "$reconciled" != "absent" ]; then
+        release_local_lock_mutex
+        exit 0
+      fi
 
+      # Confirmed new_lease does not exist on server: safe to revoke unused new_tid.
       revoke_scoped_token_id "$new_tid" >/dev/null 2>&1 || true
       now="$(current_epoch)"
-      if [ "$now" -lt "$cur_tok_exp" ] && lock_stat_exists "${archive_lock_path}/${cur_lease}"; then
-        release_local_lock_mutex
-        next_sleep="$retry_delay"
-        continue
+      if [ "$now" -lt "$cur_tok_exp" ]; then
+        cur_rc=0
+        lock_stat_exists "${archive_lock_path}/${cur_lease}" || cur_rc=$?
+        if [ "$cur_rc" -eq 0 ] || [ "$cur_rc" -ne "$remote_missing_status" ]; then
+          release_local_lock_mutex
+          next_sleep="$retry_delay"
+          continue
+        fi
       fi
 
       # Neither lease belongs to this invocation (or current token expired); stop renewing.
@@ -615,27 +645,31 @@ verify_exclusive_lock_entry() {
 }
 
 acquire_archive_lock() {
-  local deadline now rc ls_out entry name parsed exp tid owner
-  local active_found active_desc expired_entry expired_tid acquire_found
-  local mtime age issued new_tid new_tok_exp new_tok new_lease_exp lease_name
+  local wall_deadline now rc ls_out entry name parsed exp tid owner
+  local active_found active_desc candidate_entry candidate_exp candidate_tid initialized_found
+  local mtime age issued new_tid new_tok_exp new_tok new_lease_exp lease_name mv_rc stat_rc mv_confirmed
   local logged_wait=0
+  local free_lease="lease.0.free.${lock_owner_id}"
 
   mkdir -p "$lock_state_dir"
   rm -f "$lock_stop_file" "$lock_lease_file" "$lock_token_file" "$lock_token_exp_file" "$lock_issued_tokens_file"
-  deadline=$(( $(current_epoch) + lock_wait_seconds ))
+  wall_deadline=$(( $(wall_epoch) + lock_wait_seconds ))
   ls_out="${lock_state_dir}/lock-ls.txt"
 
   # Permanent lock container directory: never deleted on release so DeleteEmptyDir
-  # can never race a newly committed child lease entry.
+  # can never race a newly committed child lease entry. Inside it live one permanent
+  # `initialized` bootstrap marker and one circulating generation-unique `lease.*`
+  # entry (no fixed-name mutable acquire marker, eliminating ABA races).
   remote_owner fs mkdir "$(remote_ref "$archive_root")" >/dev/null 2>&1 || true
   remote_owner fs mkdir "$(remote_ref "$archive_lock_path")" >/dev/null 2>&1 || true
 
   while true; do
     active_found=0
     active_desc=""
-    expired_entry=""
-    expired_tid=""
-    acquire_found=0
+    candidate_entry=""
+    candidate_exp=0
+    candidate_tid=""
+    initialized_found=0
 
     if lock_ls "$archive_lock_path" "$ls_out"; then
       now="$(current_epoch)"
@@ -643,83 +677,122 @@ acquire_archive_lock() {
         entry="${entry%$'\r'}"
         [ -n "$entry" ] || continue
         name="${entry%/}"
-        if [ "$name" = "acquire" ]; then
-          acquire_found=1
+        if [ "$name" = "initialized" ]; then
+          initialized_found=1
         elif parsed="$(parse_lease_entry "$name")"; then
           IFS=$'\t' read -r exp tid owner <<<"$parsed"
           if [ "$now" -lt "$exp" ]; then
             active_found=1
             active_desc="owner=${owner} expires=${exp}"
-          elif [ -z "$expired_entry" ]; then
-            expired_entry="$name"
-            expired_tid="$tid"
+          elif [ -z "$candidate_entry" ]; then
+            candidate_entry="$name"
+            candidate_exp="$exp"
+            candidate_tid="$tid"
           fi
         fi
       done <"$ls_out"
       rm -f "$ls_out"
 
-      if [ "$active_found" -eq 0 ] && [ -n "$expired_entry" ]; then
-        if issued="$(issue_scoped_archive_token)"; then
-          IFS=$'\t' read -r new_tid new_tok_exp new_tok <<<"$issued"
-          record_issued_token_id "$new_tid"
-          lock_cleanup_needed=1
-          new_lease_exp=$((new_tok_exp + lock_skew_margin_seconds))
-          lease_name="lease.${new_lease_exp}.${new_tid}.${lock_owner_id}"
-          info "reclaiming expired archive lock entry ${expired_entry}"
-          if lock_mv "${archive_lock_path}/${expired_entry}" "${archive_lock_path}/${lease_name}"; then
-            if verify_exclusive_lock_entry "$lease_name"; then
-              if [ -n "$expired_tid" ]; then
-                revoke_scoped_token_id "$expired_tid" >/dev/null 2>&1 || true
-              fi
-              commit_local_lock_state "$lease_name" "$new_tok_exp" "$new_tok"
-              lock_held=1
-              info "acquired archive lock ${archive_lock_path} via expired lease reclaim (owner=${lock_owner_id}, ttl=${lock_ttl_seconds}s)"
-              start_archive_lock_heartbeat
-              return 0
-            fi
-            lock_rm_leaf "${archive_lock_path}/${lease_name}" >/dev/null 2>&1 || true
+      if [ "$active_found" -eq 0 ] && [ -n "$candidate_entry" ]; then
+        # Taking over an expired active lease requires confirmed revocation of its
+        # prior scoped token BEFORE committing the takeover, so clock skew cannot
+        # allow the prior token to keep authorizing writes after takeover.
+        if [ "$candidate_exp" -gt 0 ] && is_revocable_token_id "$candidate_tid"; then
+          info "reclaiming expired archive lock entry ${candidate_entry}"
+          if ! revoke_scoped_token_id "$candidate_tid"; then
+            warn "failed to revoke expired archive lock token ${candidate_tid}; retrying before takeover"
+            active_desc="revoking expired token"
+            candidate_entry=""
           fi
-          revoke_scoped_token_id "$new_tid" >/dev/null 2>&1 || true
         fi
-        active_desc="expired lease reclaim contention"
-      elif [ "$active_found" -eq 0 ] && [ "$acquire_found" -eq 0 ]; then
-        if lock_mkdir_exclusive "${archive_lock_path}/acquire"; then
-          if verify_exclusive_lock_entry "acquire"; then
-            if issued="$(issue_scoped_archive_token)"; then
-              IFS=$'\t' read -r new_tid new_tok_exp new_tok <<<"$issued"
-              record_issued_token_id "$new_tid"
-              lock_cleanup_needed=1
-              new_lease_exp=$((new_tok_exp + lock_skew_margin_seconds))
-              lease_name="lease.${new_lease_exp}.${new_tid}.${lock_owner_id}"
-              if lock_mv "${archive_lock_path}/acquire" "${archive_lock_path}/${lease_name}"; then
-                if verify_exclusive_lock_entry "$lease_name"; then
-                  commit_local_lock_state "$lease_name" "$new_tok_exp" "$new_tok"
-                  lock_held=1
-                  info "acquired archive lock ${archive_lock_path} (owner=${lock_owner_id}, ttl=${lock_ttl_seconds}s)"
-                  start_archive_lock_heartbeat
-                  return 0
-                fi
-                lock_rm_leaf "${archive_lock_path}/${lease_name}" >/dev/null 2>&1 || true
+
+        if [ -n "$candidate_entry" ]; then
+          if issued="$(issue_scoped_archive_token)"; then
+            IFS=$'\t' read -r new_tid new_tok_exp new_tok <<<"$issued"
+            record_issued_token_id "$new_tid"
+            lock_cleanup_needed=1
+            new_lease_exp=$((new_tok_exp + lock_skew_margin_seconds))
+            lease_name="lease.${new_lease_exp}.${new_tid}.${lock_owner_id}"
+            mv_rc=0
+            mv_confirmed=0
+            if lock_mv "${archive_lock_path}/${candidate_entry}" "${archive_lock_path}/${lease_name}"; then
+              mv_confirmed=1
+            else
+              mv_rc=$?
+              if [ "$mv_rc" -ne "$remote_missing_status" ] && [ "$mv_rc" -ne "$remote_conflict_status" ]; then
+                # Ambiguous mv failure (e.g. 503 after server rename): confirm before revoking new_tid.
+                while true; do
+                  stat_rc=0
+                  lock_stat_exists "${archive_lock_path}/${lease_name}" || stat_rc=$?
+                  if [ "$stat_rc" -eq 0 ]; then
+                    mv_confirmed=1
+                    break
+                  elif [ "$stat_rc" -eq "$remote_missing_status" ]; then
+                    break
+                  fi
+                  if [ "$(wall_epoch)" -ge "$wall_deadline" ]; then
+                    break
+                  fi
+                  sleep "$lock_poll_seconds"
+                done
               fi
-              revoke_scoped_token_id "$new_tid" >/dev/null 2>&1 || true
+            fi
+
+            if [ "$mv_confirmed" -eq 1 ]; then
+              if verify_exclusive_lock_entry "$lease_name"; then
+                commit_local_lock_state "$lease_name" "$new_tok_exp" "$new_tok"
+                lock_held=1
+                if [ "$candidate_exp" -gt 0 ]; then
+                  info "acquired archive lock ${archive_lock_path} via expired lease reclaim (owner=${lock_owner_id}, ttl=${lock_ttl_seconds}s)"
+                else
+                  info "acquired archive lock ${archive_lock_path} (owner=${lock_owner_id}, ttl=${lock_ttl_seconds}s)"
+                fi
+                start_archive_lock_heartbeat
+                return 0
+              fi
+              # Relinquish back to free sentinel rather than deleting the circulating token.
+              lock_mv "${archive_lock_path}/${lease_name}" "${archive_lock_path}/${free_lease}" >/dev/null 2>&1 || true
+            fi
+            revoke_scoped_token_id "$new_tid" >/dev/null 2>&1 || true
+          fi
+          if [ "$candidate_exp" -gt 0 ]; then
+            active_desc="expired lease reclaim contention"
+          else
+            active_desc="lock acquisition contention"
+          fi
+        fi
+      elif [ "$active_found" -eq 0 ] && [ "$initialized_found" -eq 0 ]; then
+        # One-time bootstrap: race atomic mkdir on permanent `initialized` marker;
+        # the single winner creates the initial circulating sentinel `lease.0.none.init`.
+        if lock_mkdir_exclusive "${archive_lock_path}/initialized"; then
+          if ! lock_mkdir_exclusive "${archive_lock_path}/lease.0.none.init"; then
+            rc=$?
+            if [ "$rc" -ne "$remote_conflict_status" ]; then
+              die "failed to initialize archive lock token under ${archive_lock_path}"
             fi
           fi
-          lock_rm_leaf "${archive_lock_path}/acquire" >/dev/null 2>&1 || true
+          continue
         else
           rc=$?
           if [ "$rc" -ne "$remote_conflict_status" ]; then
-            die "failed to acquire archive lock ${archive_lock_path}"
+            die "failed to bootstrap archive lock ${archive_lock_path}"
           fi
         fi
         active_desc="initializing"
-      elif [ "$active_found" -eq 0 ] && [ "$acquire_found" -eq 1 ]; then
-        if mtime="$(lock_stat_mtime "${archive_lock_path}/acquire")"; then
-          age=$((now - mtime))
+      elif [ "$active_found" -eq 0 ] && [ "$initialized_found" -eq 1 ]; then
+        # Crash recovery only if the initial bootstrapper died between creating
+        # `initialized` and creating `lease.0.none.init`.
+        if mtime="$(lock_stat_mtime "${archive_lock_path}/initialized")"; then
+          age=$(( $(wall_epoch) - mtime ))
           if [ "$age" -ge "$lock_ttl_seconds" ]; then
-            info "reclaiming stale acquire marker under ${archive_lock_path} (age=${age}s)"
-            if lock_mv "${archive_lock_path}/acquire" "${archive_lock_path}/stale-acquire.${lock_owner_id}"; then
-              lock_rm_leaf "${archive_lock_path}/stale-acquire.${lock_owner_id}" >/dev/null 2>&1 || true
+            info "recovering incomplete archive lock bootstrap under ${archive_lock_path} (age=${age}s)"
+            if ! lock_mkdir_exclusive "${archive_lock_path}/lease.0.none.init"; then
+              rc=$?
+              if [ "$rc" -ne "$remote_conflict_status" ]; then
+                die "failed to recover archive lock token under ${archive_lock_path}"
+              fi
             fi
+            continue
           fi
         fi
         active_desc="initializing"
@@ -735,9 +808,9 @@ acquire_archive_lock() {
       fi
     fi
 
-    # Route every unsuccessful attempt through one unified deadline + backoff block.
-    now="$(current_epoch)"
-    if [ "$now" -ge "$deadline" ]; then
+    # Route every unsuccessful attempt through one unified wall-clock deadline + backoff block
+    # so frozen test clocks (DRIVE9_ARCHIVE_NOW_FILE) still honor DRIVE9_ARCHIVE_LOCK_WAIT_SECONDS.
+    if [ "$(wall_epoch)" -ge "$wall_deadline" ]; then
       die "archive lock ${archive_lock_path} is held by another active publisher (${active_desc:-busy}); timed out after ${lock_wait_seconds}s"
     fi
 
@@ -789,7 +862,8 @@ assert_archive_lock_held() {
 }
 
 release_archive_lock() {
-  local cur_lease ls_out entry name tok_id
+  local cur_lease ls_out entry name parsed exp tid owner tok_id
+  local free_lease="lease.0.free.${lock_owner_id}"
 
   if [ -n "${lock_heartbeat_pid:-}" ]; then
     touch "$lock_stop_file" 2>/dev/null || true
@@ -802,11 +876,13 @@ release_archive_lock() {
   fi
 
   # Track cleanup eligibility separately from lock_held so a transient stat failure
-  # still cleans up surviving lease entries owned by this exact lock_owner_id.
+  # still releases surviving active lease entries owned by this exact lock_owner_id.
+  # Release moves our active lease to a unique free sentinel (lease.0.free.<owner>)
+  # instead of deleting it, preserving the single circulating lock token invariant.
   if [ "$lock_cleanup_needed" -eq 1 ]; then
     cur_lease="$(cat "$lock_lease_file" 2>/dev/null || true)"
-    if [ -n "$cur_lease" ]; then
-      lock_rm_leaf "${archive_lock_path}/${cur_lease}" >/dev/null 2>&1 || true
+    if [ -n "$cur_lease" ] && [ "$cur_lease" != "$free_lease" ]; then
+      lock_mv "${archive_lock_path}/${cur_lease}" "${archive_lock_path}/${free_lease}" >/dev/null 2>&1 || true
     fi
     ls_out="${lock_state_dir}/release-ls.txt"
     if lock_ls "$archive_lock_path" "$ls_out" >/dev/null 2>&1; then
@@ -814,11 +890,12 @@ release_archive_lock() {
         entry="${entry%$'\r'}"
         [ -n "$entry" ] || continue
         name="${entry%/}"
-        case "$name" in
-        lease.*."${lock_owner_id}")
-          lock_rm_leaf "${archive_lock_path}/${name}" >/dev/null 2>&1 || true
-          ;;
-        esac
+        if parsed="$(parse_lease_entry "$name")"; then
+          IFS=$'\t' read -r exp tid owner <<<"$parsed"
+          if [ "$owner" = "$lock_owner_id" ] && [ "$exp" -gt 0 ]; then
+            lock_mv "${archive_lock_path}/${name}" "${archive_lock_path}/${free_lease}" >/dev/null 2>&1 || true
+          fi
+        fi
       done <"$ls_out"
       rm -f "$ls_out"
     fi

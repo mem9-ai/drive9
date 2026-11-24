@@ -11,7 +11,48 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="${REPO_ROOT}/scripts/publish-agent-archive.sh"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+BG_PIDS_FILE="${WORK}/.bg-pids"
+RELEASE_FILES_FILE="${WORK}/.release-files"
+: >"$BG_PIDS_FILE"
+: >"$RELEASE_FILES_FILE"
+
+register_bg_pid() {
+  printf '%s\n' "$1" >>"$BG_PIDS_FILE"
+}
+
+register_release_file() {
+  printf '%s\n' "$1" >>"$RELEASE_FILES_FILE"
+}
+
+cleanup_test_harness() {
+  local f pid
+  if [ -f "$RELEASE_FILES_FILE" ]; then
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      touch "$f" 2>/dev/null || true
+    done <"$RELEASE_FILES_FILE"
+  fi
+  if [ -f "$BG_PIDS_FILE" ]; then
+    while IFS= read -r pid; do
+      [ -n "$pid" ] || continue
+      if kill -0 "$pid" 2>/dev/null; then
+        pkill -TERM -P "$pid" 2>/dev/null || true
+        kill -TERM "$pid" 2>/dev/null || true
+      fi
+    done <"$BG_PIDS_FILE"
+    sleep 0.1
+    while IFS= read -r pid; do
+      [ -n "$pid" ] || continue
+      if kill -0 "$pid" 2>/dev/null; then
+        pkill -KILL -P "$pid" 2>/dev/null || true
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
+      wait "$pid" 2>/dev/null || true
+    done <"$BG_PIDS_FILE"
+  fi
+  rm -rf "$WORK"
+}
+trap cleanup_test_harness EXIT INT TERM
 
 pass() {
   echo "   ok: $*"
@@ -43,6 +84,9 @@ fail_rm_pattern="${FAKE_FAIL_RM_PATTERN:-}"
 fail_stat_pattern="${FAKE_FAIL_STAT_PATTERN:-}"
 fail_ls_call="${FAKE_FAIL_LS_ON_CALL:-}"
 ls_count_file="${FAKE_LS_COUNT_FILE:-}"
+fail_revoke_pattern="${FAKE_FAIL_REVOKE_PATTERN:-}"
+fail_mv_after_commit_file="${FAKE_FAIL_MV_AFTER_COMMIT_COUNT_FILE:-}"
+fail_lock_stat_count_file="${FAKE_FAIL_LOCK_STAT_COUNT_FILE:-}"
 pause_upload_pattern="${FAKE_PAUSE_AFTER_UPLOAD_PATTERN:-}"
 pause_signal_file="${FAKE_PAUSE_SIGNAL_FILE:-}"
 pause_release_file="${FAKE_PAUSE_RELEASE_FILE:-}"
@@ -150,6 +194,11 @@ if [ "$cmd" = "token" ]; then
     ;;
   revoke)
     tok_id="${1:-}"
+    if [ -n "$fail_revoke_pattern" ] && [[ "$tok_id" == *"$fail_revoke_pattern"* ]]; then
+      printf 'token-revoke-fail %s\n' "$tok_id" >>"$ops_log"
+      echo "token revoke: HTTP 503: upstream unavailable" >&2
+      exit 1
+    fi
     rec="${root}/.tokens/${tok_id}"
     if [ ! -f "$rec" ]; then
       echo "HTTP 404: token not found or already revoked" >&2
@@ -213,6 +262,19 @@ stat)
     shift 2
   fi
   rel="$(strip_ref "$1")"
+  if [ -n "$fail_lock_stat_count_file" ] && [ -f "$fail_lock_stat_count_file" ] && [[ "$rel" == *".publish-lock/lease."* ]]; then
+    mv_armed=0
+    if [ -n "$fail_mv_after_commit_file" ] && [ -f "$fail_mv_after_commit_file" ]; then
+      mv_armed="$(cat "$fail_mv_after_commit_file")"
+    fi
+    remaining="$(cat "$fail_lock_stat_count_file")"
+    if [ "$mv_armed" -eq 0 ] && [ "$remaining" -gt 0 ]; then
+      printf '%d\n' "$((remaining - 1))" >"$fail_lock_stat_count_file"
+      printf 'stat-lock-fail %s\n' "$rel" >>"$ops_log"
+      echo "fs stat: HTTP 503: upstream unavailable" >&2
+      exit 1
+    fi
+  fi
   if [ -n "$fail_stat_pattern" ] && [[ "$rel" == *"$fail_stat_pattern"* ]]; then
     printf 'stat-fail %s\n' "$rel" >>"$ops_log"
     echo "fs stat: HTTP 503: upstream unavailable" >&2
@@ -277,6 +339,22 @@ mv)
     echo "fs mv: HTTP 404: not found" >&2
     exit 1
   fi
+  if [ -n "$fail_mv_after_commit_file" ] && [ -f "$fail_mv_after_commit_file" ] && [[ "$old_rel" == *".publish-lock/lease."* ]] && [[ "$new_rel" == *".publish-lock/lease."* ]]; then
+    if [ -z "$pause_signal_file" ] || [ -f "$pause_signal_file" ]; then
+      old_base="$(basename "$old_rel")"
+      old_rest="${old_base#lease.}"
+      old_exp="${old_rest%%.*}"
+      if [[ "$old_exp" =~ ^[0-9]+$ ]] && [ "$old_exp" -gt 0 ]; then
+        remaining="$(cat "$fail_mv_after_commit_file")"
+        if [ "$remaining" -gt 0 ]; then
+          printf '%d\n' "$((remaining - 1))" >"$fail_mv_after_commit_file"
+          printf 'mv-ambiguous %s %s\n' "$old_rel" "$new_rel" >>"$ops_log"
+          echo "fs mv: HTTP 503: upstream timeout after rename" >&2
+          exit 1
+        fi
+      fi
+    fi
+  fi
   printf 'mv %s %s\n' "$old_rel" "$new_rel" >>"$ops_log"
   ;;
 rm)
@@ -332,7 +410,7 @@ cp)
         touch "$pause_signal_file"
       fi
       if [ -n "$pause_release_file" ]; then
-        while [ ! -f "$pause_release_file" ]; do
+        while [ ! -f "$pause_release_file" ] && [ -d "$(dirname "$pause_release_file")" ]; do
           sleep 0.05
         done
       fi
@@ -586,6 +664,8 @@ fi
 assert_exists "${R1}/drive9/commits/${C7}/manifest.json"
 assert_exists "${R1}/drive9/commits/${C8}/manifest.json"
 
+err6_eq="${WORK}/err6_eq.log"
+err6_gt="${WORK}/err6_gt.log"
 set +e
 run_publisher "$R1" "$L6" env DRIVE9_ARCHIVE_RETAIN_COMMITS=invalid >/dev/null 2>&1
 bad_rc=$?
@@ -593,16 +673,18 @@ run_publisher "$R1" "$L6" env DRIVE9_ARCHIVE_RETAIN_COMMITS=99999999999999999999
 overflow_rc=$?
 run_publisher "$R1" "$L6" env DRIVE9_ARCHIVE_INCOMPLETE_GRACE_SECONDS=999999999999999999999999 >/dev/null 2>&1
 bad_grace_rc=$?
-run_publisher "$R1" "$L6" env DRIVE9_ARCHIVE_LOCK_TTL_SECONDS=30 DRIVE9_ARCHIVE_LOCK_RENEW_SECONDS=30 >/dev/null 2>&1
+run_publisher "$R1" "$L6" env DRIVE9_ARCHIVE_LOCK_TTL_SECONDS=30 DRIVE9_ARCHIVE_LOCK_RENEW_SECONDS=30 >/dev/null 2>"$err6_eq"
 bad_renew_eq_rc=$?
-run_publisher "$R1" "$L6" env DRIVE9_ARCHIVE_LOCK_TTL_SECONDS=30 DRIVE9_ARCHIVE_LOCK_RENEW_SECONDS=31 >/dev/null 2>&1
+run_publisher "$R1" "$L6" env DRIVE9_ARCHIVE_LOCK_TTL_SECONDS=30 DRIVE9_ARCHIVE_LOCK_RENEW_SECONDS=31 >/dev/null 2>"$err6_gt"
 bad_renew_gt_rc=$?
 set -e
 [ "$bad_rc" -ne 0 ] || fail "expected invalid DRIVE9_ARCHIVE_RETAIN_COMMITS to fail"
 [ "$overflow_rc" -ne 0 ] || fail "expected overflowing DRIVE9_ARCHIVE_RETAIN_COMMITS to fail"
 [ "$bad_grace_rc" -ne 0 ] || fail "expected overflowing DRIVE9_ARCHIVE_INCOMPLETE_GRACE_SECONDS to fail"
 [ "$bad_renew_eq_rc" -ne 0 ] || fail "expected lock_renew_seconds == lock_ttl_seconds to fail"
+grep -q "must be less than DRIVE9_ARCHIVE_LOCK_TTL_SECONDS" "$err6_eq" || fail "expected renew==ttl validation message, got: $(cat "$err6_eq")"
 [ "$bad_renew_gt_rc" -ne 0 ] || fail "expected lock_renew_seconds > lock_ttl_seconds to fail"
+grep -q "must be less than DRIVE9_ARCHIVE_LOCK_TTL_SECONDS" "$err6_gt" || fail "expected renew>ttl validation message, got: $(cat "$err6_gt")"
 pass "DRIVE9_ARCHIVE_RETAIN_COMMITS=0 and bounded validation (including renew < ttl) behave as expected"
 
 echo "== 7. Stale branch dispatch ranks globally, does not overwrite main's latest.json, and preserves main under retain_commits=1"
@@ -811,9 +893,52 @@ assert_no_active_lease() {
   local remote_root=$1
   local lock_dir="${remote_root}/drive9/.publish-lock"
   if [ -d "$lock_dir" ]; then
-    local leftover
-    leftover="$(find "$lock_dir" -mindepth 1 -maxdepth 1 -name 'lease.*' 2>/dev/null || true)"
-    [ -z "$leftover" ] || fail "expected no active lease entries in ${lock_dir}, found: ${leftover}"
+    local entry base rest exp lease_count=0
+    for entry in "$lock_dir"/lease.*; do
+      [ -e "$entry" ] || continue
+      lease_count=$((lease_count + 1))
+      base="$(basename "$entry")"
+      rest="${base#lease.}"
+      exp="${rest%%.*}"
+      if ! [[ "$exp" =~ ^[0-9]+$ ]] || [ "$exp" -gt 0 ]; then
+        fail "expected no active lease entries in ${lock_dir}, found: ${base}"
+      fi
+    done
+    [ "$lease_count" -le 1 ] || fail "expected at most 1 circulating lease sentinel in ${lock_dir}, found ${lease_count}"
+  fi
+}
+
+run_with_watchdog() {
+  local timeout_sec=$1
+  local err_log=$2
+  shift 2
+  local pid start now elapsed rc
+  "$@" >/dev/null 2>"$err_log" &
+  pid=$!
+  register_bg_pid "$pid"
+  start="$(date -u '+%s')"
+  while kill -0 "$pid" 2>/dev/null; do
+    now="$(date -u '+%s')"
+    elapsed=$((now - start))
+    if [ "$elapsed" -ge "$timeout_sec" ]; then
+      pkill -TERM -P "$pid" 2>/dev/null || true
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep 0.2
+      pkill -KILL -P "$pid" 2>/dev/null || true
+      kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      cat "$err_log" >&2 || true
+      fail "command timed out after ${timeout_sec}s wall clock"
+    fi
+    sleep 0.1
+  done
+  set +e
+  wait "$pid"
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    cat "$err_log" >&2 || true
+    fail "command failed with exit code ${rc}"
   fi
 }
 
@@ -826,7 +951,7 @@ set -euo pipefail
 target=$1
 if [[ "$target" == *"${HOOK_MATCH:?}"* ]]; then
   touch "${HOOK_SIGNAL:?}"
-  while [ ! -f "${HOOK_RELEASE:?}" ]; do
+  while [ ! -f "${HOOK_RELEASE:?}" ] && [ -d "$(dirname "${HOOK_RELEASE}")" ]; do
     sleep 0.05
   done
 fi
@@ -870,6 +995,7 @@ mkdir -p "$R13"
 : >"$L13B2"
 SIG13="${WORK}/pause13.signal"
 REL13="${WORK}/pause13.release"
+register_release_file "$REL13"
 OUT13B="${WORK}/out13b.log"
 : >"$OUT13B"
 
@@ -883,6 +1009,7 @@ run_publisher_in_with_arg "$RUNNER_A_REPO" "$R13" "$L13A" "$MAIN_NEW" env \
   FAKE_PAUSE_SIGNAL_FILE="$SIG13" \
   FAKE_PAUSE_RELEASE_FILE="$REL13" >/dev/null 2>"${WORK}/err13a.log" &
 PID13A=$!
+register_bg_pid "$PID13A"
 
 wait_for_file "$SIG13" 150
 assert_exists "${R13}/drive9/commits/${MAIN_NEW}/source.tar.gz"
@@ -909,6 +1036,7 @@ run_publisher_in_with_arg "$RUNNER_B_REPO" "$R13" "$L13B" "$MAIN_NEW" env \
   DRIVE9_ARCHIVE_LOCK_WAIT_SECONDS=30 \
   DRIVE9_ARCHIVE_LOCK_POLL_SECONDS=1 >"$OUT13B" 2>"${WORK}/err13b.log" &
 PID13B=$!
+register_bg_pid "$PID13B"
 
 wait_for_log_match "$OUT13B" "waiting for archive lock" 150
 assert_exists "${R13}/drive9/commits/${MAIN_NEW}/source.tar.gz"
@@ -938,6 +1066,7 @@ mkdir -p "$R14"
 printf '1700000000\n' >"$CLK14"
 SIG14="${WORK}/pause14.signal"
 REL14="${WORK}/pause14.release"
+register_release_file "$REL14"
 
 # Pause Publisher A *after* assert_archive_lock_held succeeds and *immediately before* `remote fs cp ... manifest.json`.
 run_publisher_in_with_arg "$RUNNER_A_REPO" "$R14" "$L14A" "$MAIN_NEW" env \
@@ -952,21 +1081,26 @@ run_publisher_in_with_arg "$RUNNER_A_REPO" "$R14" "$L14A" "$MAIN_NEW" env \
   HOOK_SIGNAL="$SIG14" \
   HOOK_RELEASE="$REL14" >/dev/null 2>"${WORK}/err14a.log" &
 PID14A=$!
+register_bg_pid "$PID14A"
 
 wait_for_file "$SIG14" 150
+a14_tid="$(awk '$1 == "token-issue" { tid = $2 } END { print tid }' "$L14A")"
+[ -n "$a14_tid" ] || fail "expected Publisher A to have issued a scoped token"
 
 # Advance controlled clock past A's token_exp (1700000030) and lease_exp (1700000035).
 printf '1700000040\n' >"$CLK14"
 
 # Publisher B reclaims expired lease, explicitly revokes A's token_id, cleans A's incomplete dir, and publishes MAIN_NEW + latest.json.
-run_publisher_in_with_arg "$RUNNER_B_REPO" "$R14" "$L14B" "$MAIN_NEW" env \
-  RUNNER_TEMP="${WORK}/tmp14b" \
-  DRIVE9_ARCHIVE_NOW_FILE="$CLK14" \
-  DRIVE9_ARCHIVE_RETAIN_COMMITS=5 \
-  DRIVE9_ARCHIVE_LOCK_TTL_SECONDS=30 \
-  DRIVE9_ARCHIVE_LOCK_SKEW_SECONDS=5 \
-  DRIVE9_ARCHIVE_LOCK_WAIT_SECONDS=10 \
-  DRIVE9_ARCHIVE_LOCK_POLL_SECONDS=1 >/dev/null 2>"${WORK}/err14b.log"
+run_with_watchdog 20 "${WORK}/err14b.log" \
+  run_publisher_in_with_arg "$RUNNER_B_REPO" "$R14" "$L14B" "$MAIN_NEW" env \
+    RUNNER_TEMP="${WORK}/tmp14b" \
+    DRIVE9_ARCHIVE_NOW_FILE="$CLK14" \
+    DRIVE9_ARCHIVE_RETAIN_COMMITS=5 \
+    DRIVE9_ARCHIVE_LOCK_TTL_SECONDS=30 \
+    DRIVE9_ARCHIVE_LOCK_SKEW_SECONDS=5 \
+    DRIVE9_ARCHIVE_LOCK_WAIT_SECONDS=10 \
+    DRIVE9_ARCHIVE_LOCK_POLL_SECONDS=1
+grep -q "^token-revoke ${a14_tid}$" "$L14B" || fail "expected Publisher B to explicitly revoke A's token ${a14_tid} before takeover; B ops: $(cat "$L14B")"
 assert_exists "${R14}/drive9/commits/${MAIN_NEW}/manifest.json"
 assert_no_active_lease "$R14"
 manifest_before="$(cat "${R14}/drive9/commits/${MAIN_NEW}/manifest.json")"
@@ -983,7 +1117,7 @@ grep -q "HTTP 401" "${WORK}/err14a.log" || fail "expected server-side HTTP 401 r
 [ "$(cat "${R14}/drive9/commits/${MAIN_NEW}/manifest.json")" = "$manifest_before" ] || fail "zombie Publisher A overwrote B's manifest.json"
 [ "$(cat "${R14}/drive9/latest.json")" = "$latest_before" ] || fail "zombie Publisher A overwrote B's latest.json"
 assert_no_active_lease "$R14"
-pass "post-fence / pre-upload barrier: server rejected zombie A's manifest.json cp with HTTP 401; B's archive and latest.json stayed intact"
+pass "post-fence / pre-upload barrier: B explicitly revoked A's token, server rejected zombie A with HTTP 401, and B's archive stayed intact"
 
 echo "== 15. Concurrent different-SHA publishers serialize even with grace=0 (observing B wait before releasing A)"
 R15="${WORK}/remote15"
@@ -994,6 +1128,7 @@ mkdir -p "$R15"
 : >"$L15B"
 SIG15="${WORK}/pause15.signal"
 REL15="${WORK}/pause15.release"
+register_release_file "$REL15"
 OUT15B="${WORK}/out15b.log"
 : >"$OUT15B"
 
@@ -1007,6 +1142,7 @@ run_publisher_in_with_arg "$RUNNER_A_REPO" "$R15" "$L15A" "$C3" env \
   FAKE_PAUSE_SIGNAL_FILE="$SIG15" \
   FAKE_PAUSE_RELEASE_FILE="$REL15" >/dev/null 2>"${WORK}/err15a.log" &
 PID15A=$!
+register_bg_pid "$PID15A"
 
 wait_for_file "$SIG15" 150
 assert_exists "${R15}/drive9/commits/${C3}/source.tar.gz"
@@ -1019,6 +1155,7 @@ run_publisher_in_with_arg "$RUNNER_B_REPO" "$R15" "$L15B" "$MAIN_NEW" env \
   DRIVE9_ARCHIVE_LOCK_WAIT_SECONDS=30 \
   DRIVE9_ARCHIVE_LOCK_POLL_SECONDS=1 >"$OUT15B" 2>"${WORK}/err15b.log" &
 PID15B=$!
+register_bg_pid "$PID15B"
 
 wait_for_log_match "$OUT15B" "waiting for archive lock" 150
 assert_exists "${R15}/drive9/commits/${C3}/source.tar.gz"
@@ -1043,6 +1180,7 @@ printf 'stale\n' >"${R16}/drive9/commits/${MAIN_NEW}/source.tar.gz"
 printf '1700000000\n' >"$CLK16"
 SIG16="${WORK}/pause16.signal"
 REL16="${WORK}/pause16.release"
+register_release_file "$REL16"
 
 # Pause Publisher A *after* prune_lock_fence succeeds and *immediately before* `remote_rm_rf commits/${MAIN_NEW}` executes.
 run_publisher_in_with_arg "$RUNNER_A_REPO" "$R16" "$L16A" "$MAIN_NEW" env \
@@ -1057,19 +1195,24 @@ run_publisher_in_with_arg "$RUNNER_A_REPO" "$R16" "$L16A" "$MAIN_NEW" env \
   HOOK_SIGNAL="$SIG16" \
   HOOK_RELEASE="$REL16" >/dev/null 2>"${WORK}/err16a.log" &
 PID16A=$!
+register_bg_pid "$PID16A"
 
 wait_for_file "$SIG16" 150
+a16_tid="$(awk '$1 == "token-issue" { tid = $2 } END { print tid }' "$L16A")"
+[ -n "$a16_tid" ] || fail "expected Publisher A to have issued a scoped token"
 
 # Advance clock past A's token_exp and lease_exp; Publisher B reclaims lease, revokes A's token, and publishes MAIN_NEW.
 printf '1700000040\n' >"$CLK16"
-run_publisher_in_with_arg "$RUNNER_B_REPO" "$R16" "$L16B" "$MAIN_NEW" env \
-  RUNNER_TEMP="${WORK}/tmp16b" \
-  DRIVE9_ARCHIVE_NOW_FILE="$CLK16" \
-  DRIVE9_ARCHIVE_RETAIN_COMMITS=5 \
-  DRIVE9_ARCHIVE_LOCK_TTL_SECONDS=30 \
-  DRIVE9_ARCHIVE_LOCK_SKEW_SECONDS=5 \
-  DRIVE9_ARCHIVE_LOCK_WAIT_SECONDS=10 \
-  DRIVE9_ARCHIVE_LOCK_POLL_SECONDS=1 >/dev/null 2>"${WORK}/err16b.log"
+run_with_watchdog 20 "${WORK}/err16b.log" \
+  run_publisher_in_with_arg "$RUNNER_B_REPO" "$R16" "$L16B" "$MAIN_NEW" env \
+    RUNNER_TEMP="${WORK}/tmp16b" \
+    DRIVE9_ARCHIVE_NOW_FILE="$CLK16" \
+    DRIVE9_ARCHIVE_RETAIN_COMMITS=5 \
+    DRIVE9_ARCHIVE_LOCK_TTL_SECONDS=30 \
+    DRIVE9_ARCHIVE_LOCK_SKEW_SECONDS=5 \
+    DRIVE9_ARCHIVE_LOCK_WAIT_SECONDS=10 \
+    DRIVE9_ARCHIVE_LOCK_POLL_SECONDS=1
+grep -q "^token-revoke ${a16_tid}$" "$L16B" || fail "expected Publisher B to explicitly revoke A's token ${a16_tid} before takeover; B ops: $(cat "$L16B")"
 assert_exists "${R16}/drive9/commits/${MAIN_NEW}/manifest.json"
 assert_exists "${R16}/drive9/commits/${MAIN_NEW}/bin/drive9-linux-amd64"
 [ "$(jq -r '.commit_sha' "${R16}/drive9/latest.json")" = "$MAIN_NEW" ] || fail "B did not publish latest.json"
@@ -1086,7 +1229,7 @@ assert_exists "${R16}/drive9/commits/${MAIN_NEW}/manifest.json"
 assert_exists "${R16}/drive9/commits/${MAIN_NEW}/bin/drive9-linux-amd64"
 [ "$(jq -r '.commit_sha' "${R16}/drive9/latest.json")" = "$MAIN_NEW" ] || fail "B's latest.json should remain intact"
 assert_no_active_lease "$R16"
-pass "post-fence / pre-rm barrier: server rejected zombie A's rm -r with HTTP 401; B's published archive stayed intact"
+pass "post-fence / pre-rm barrier: B explicitly revoked A's token, server rejected zombie A's rm -r with HTTP 401, and B's archive stayed intact"
 
 echo "== 17. Invocation-private work_root with unset RUNNER_TEMP cleans up without colliding"
 R17="${WORK}/remote17"
@@ -1110,5 +1253,103 @@ assert_exists "${R17}/drive9/commits/${MAIN_NEW}/manifest.json"
 leftover_tmp="$(find "${RUNNER_A_REPO}/.tmp" -mindepth 1 -maxdepth 1 -name 'drive9-agent-archive.*' 2>/dev/null || true)"
 [ -z "$leftover_tmp" ] || fail "expected invocation-private work_root to be cleaned up, found: ${leftover_tmp}"
 pass "invocation-private work_root created and removed cleanly when RUNNER_TEMP is unset"
+
+echo "== 18. Expired lease takeover refuses to commit while prior token revocation fails (503), then succeeds once revocation recovers"
+R18="${WORK}/remote18"
+L18A="${WORK}/ops18a.log"
+L18B="${WORK}/ops18b.log"
+CLK18="${WORK}/clock18.epoch"
+mkdir -p "${R18}/drive9/.publish-lock/initialized"
+mkdir -p "${R18}/drive9/.publish-lock/lease.1700000035.tok_stale_18.owner-stale"
+mkdir -p "${R18}/.tokens"
+printf '1700000030\tactive\n' >"${R18}/.tokens/tok_stale_18"
+printf '1700000040\n' >"$CLK18"
+: >"$L18A"
+: >"$L18B"
+
+set +e
+run_publisher_in_with_arg "$RUNNER_B_REPO" "$R18" "$L18A" "$MAIN_NEW" env \
+  RUNNER_TEMP="${WORK}/tmp18a" \
+  DRIVE9_ARCHIVE_NOW_FILE="$CLK18" \
+  DRIVE9_ARCHIVE_RETAIN_COMMITS=5 \
+  DRIVE9_ARCHIVE_LOCK_TTL_SECONDS=30 \
+  DRIVE9_ARCHIVE_LOCK_SKEW_SECONDS=5 \
+  DRIVE9_ARCHIVE_LOCK_WAIT_SECONDS=2 \
+  DRIVE9_ARCHIVE_LOCK_POLL_SECONDS=1 \
+  FAKE_FAIL_REVOKE_PATTERN="tok_stale_18" >/dev/null 2>"${WORK}/err18a.log"
+rc18a=$?
+set -e
+[ "$rc18a" -ne 0 ] || fail "expected takeover to refuse committing when token revocation fails with 503"
+grep -q "failed to revoke expired archive lock token tok_stale_18" "${WORK}/err18a.log" || fail "expected revocation failure warning: $(cat "${WORK}/err18a.log")"
+assert_exists "${R18}/drive9/.publish-lock/lease.1700000035.tok_stale_18.owner-stale"
+assert_missing "${R18}/drive9/commits/${MAIN_NEW}/manifest.json"
+if grep -q '^upload ' "$L18A"; then
+  fail "publisher must not upload archive data when takeover revocation failed"
+fi
+
+# Once revocation succeeds, takeover commits cleanly and publishes MAIN_NEW.
+run_with_watchdog 20 "${WORK}/err18b.log" \
+  run_publisher_in_with_arg "$RUNNER_B_REPO" "$R18" "$L18B" "$MAIN_NEW" env \
+    RUNNER_TEMP="${WORK}/tmp18b" \
+    DRIVE9_ARCHIVE_NOW_FILE="$CLK18" \
+    DRIVE9_ARCHIVE_RETAIN_COMMITS=5 \
+    DRIVE9_ARCHIVE_LOCK_TTL_SECONDS=30 \
+    DRIVE9_ARCHIVE_LOCK_SKEW_SECONDS=5 \
+    DRIVE9_ARCHIVE_LOCK_WAIT_SECONDS=10 \
+    DRIVE9_ARCHIVE_LOCK_POLL_SECONDS=1
+grep -q "^token-revoke tok_stale_18$" "$L18B" || fail "expected recovered publisher to revoke tok_stale_18"
+assert_exists "${R18}/drive9/commits/${MAIN_NEW}/manifest.json"
+assert_no_active_lease "$R18"
+pass "takeover refused to commit during revocation 503 (even under frozen clock) and succeeded cleanly once revocation recovered"
+
+echo "== 19. Heartbeat renewal reconciles ambiguous mv + transient stat 503 without revoking the live lease's token"
+R19="${WORK}/remote19"
+L19="${WORK}/ops19.log"
+MV19="${WORK}/mv19.count"
+ST19="${WORK}/stat19.count"
+SIG19="${WORK}/pause19.signal"
+REL19="${WORK}/pause19.release"
+register_release_file "$REL19"
+mkdir -p "$R19"
+: >"$L19"
+printf '1\n' >"$MV19"
+printf '1\n' >"$ST19"
+
+run_publisher_in_with_arg "$RUNNER_A_REPO" "$R19" "$L19" "$MAIN_NEW" env \
+  RUNNER_TEMP="${WORK}/tmp19" \
+  DRIVE9_ARCHIVE_RETAIN_COMMITS=5 \
+  DRIVE9_ARCHIVE_LOCK_TTL_SECONDS=30 \
+  DRIVE9_ARCHIVE_LOCK_RENEW_SECONDS=1 \
+  FAKE_FAIL_MV_AFTER_COMMIT_COUNT_FILE="$MV19" \
+  FAKE_FAIL_LOCK_STAT_COUNT_FILE="$ST19" \
+  FAKE_PAUSE_AFTER_UPLOAD_PATTERN="commits/${MAIN_NEW}/source.tar.gz" \
+  FAKE_PAUSE_SIGNAL_FILE="$SIG19" \
+  FAKE_PAUSE_RELEASE_FILE="$REL19" >/dev/null 2>"${WORK}/err19.log" &
+PID19A=$!
+register_bg_pid "$PID19A"
+
+wait_for_file "$SIG19" 150
+# Wait until heartbeat hits the ambiguous mv, endures the transient stat 503, and then reconciles with stat success.
+wait_for_log_match "$L19" "^mv-ambiguous " 150
+wait_for_log_match "$L19" "^stat-lock-fail " 150
+renewed_lease="$(awk '$1 == "mv-ambiguous" { print $3; exit }' "$L19")"
+[ -n "$renewed_lease" ] || fail "expected mv-ambiguous entry in ops19.log"
+wait_for_log_match "$L19" "^stat ${renewed_lease}$" 150
+
+# Confirm the reconciled new lease's token was NOT revoked during the transient stat 503.
+renewed_base="$(basename "$renewed_lease")"
+renewed_rest="${renewed_base#lease.}"
+renewed_rest2="${renewed_rest#*.}"
+renewed_tid="${renewed_rest2%%.*}"
+if grep -q "^token-revoke ${renewed_tid}$" "$L19"; then
+  fail "heartbeat prematurely revoked live renewed token ${renewed_tid} on transient stat 503"
+fi
+
+# Resume publisher and verify it completes with the reconciled renewed token cleanly.
+touch "$REL19"
+wait "$PID19A" || { cat "${WORK}/err19.log" >&2; fail "Publisher failed after ambiguous renewal reconciliation"; }
+assert_exists "${R19}/drive9/commits/${MAIN_NEW}/manifest.json"
+assert_no_active_lease "$R19"
+pass "heartbeat reconciled ambiguous mv across transient stat 503 without revoking the live lease's token"
 
 echo "ALL TESTS PASSED"
