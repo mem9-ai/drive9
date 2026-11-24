@@ -175,17 +175,20 @@ func (c *WriteBackCache) clearViewLossForNewStagingLocked(remotePath string) {
 func (c *WriteBackCache) clearViewLossLocked(remotePath string, gen uint64) {
 	c.mu.Lock()
 	memGen, memOK := c.lostGens[remotePath]
+	_, unkOK := c.lostUnknown[lostHash(remotePath)]
 	c.mu.Unlock()
 
 	loss, diskOK := c.readViewLoss(remotePath)
-	if diskOK && loss.Generation > gen {
-		// A newer image's loss: keep both records.
+	if (memOK && memGen > gen) || (diskOK && loss.Generation > gen) {
+		// A newer image's loss: keep it (an older durable marker may still be the
+		// only crash witness for the generation this landing covers, so it stays
+		// until a landing at or above the newer generation).
 		return
 	}
 	if !diskOK {
 		// The overwhelmingly common case: this runs on every Put, and a healthy
 		// mount has no markers at all, so it must not pay a directory fsync.
-		if memOK && memGen <= gen {
+		if (memOK && memGen <= gen) || (unkOK && gen == ^uint64(0)) {
 			c.mu.Lock()
 			c.forgetViewLossLocked(remotePath)
 			c.mu.Unlock()
@@ -308,13 +311,20 @@ func (c *WriteBackCache) rekeyViewLoss(oldPath, newPath string) {
 			return
 		}
 	}
-	// One critical section: the mirror never shows "no loss here" in between.
+	// Record the destination first: the object already moved, so it must fail
+	// closed even if the source marker cannot be removed.
 	c.mu.Lock()
-	c.forgetViewLossLocked(oldPath)
 	c.recordViewLossLocked(newPath, gen)
 	c.mu.Unlock()
 	if err := os.Remove(c.lostFile(oldPath)); err == nil {
 		_ = fsyncDir(c.dir)
+	}
+	if _, err := os.Stat(c.lostFile(oldPath)); errors.Is(err, os.ErrNotExist) {
+		// Only forget the source once its marker is gone: a surviving file would
+		// otherwise be uncounted by the mirror.
+		c.mu.Lock()
+		c.forgetViewLossLocked(oldPath)
+		c.mu.Unlock()
 	}
 }
 
@@ -416,9 +426,21 @@ func (c *WriteBackCache) LossGenerationBound(remotePath string, bound uint64) ui
 	}
 	c.mu.Lock()
 	gen, ok := c.lostGens[remotePath]
+	_, unkOK := c.lostUnknown[lostHash(remotePath)]
+	dirUnreadable := c.lostDirUnreadable
 	c.mu.Unlock()
 	if ok && gen > bound {
 		return gen
+	}
+	if unkOK || dirUnreadable {
+		// A marker that cannot be attributed may be newer than anything this
+		// landing published: do not let the landing clear it.
+		if loss, has := c.readViewLoss(remotePath); has && loss.Generation > bound {
+			return loss.Generation
+		}
+		if unkOK {
+			return ^uint64(0)
+		}
 	}
 	return bound
 }

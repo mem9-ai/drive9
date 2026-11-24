@@ -1126,9 +1126,9 @@ func (c *WriteBackCache) renamePendingLocked(oldPath, newPath string) bool {
 	if kind == PendingChmod {
 		// A chmod-only record has no .dat by design: moving "the payload" would
 		// hit ENOENT and a lost-image record would be written for a healthy
-		// entry. Drop any payload the destination carried for its replaced
-		// incarnation and move only the metadata.
-		_ = os.Remove(newDat)
+		// entry. The destination's replaced payload is dropped only after the new
+		// metadata is durable (see below), so a failed write cannot leave it
+		// without a .dat.
 	} else if err := os.Rename(c.DatFile(oldPath), newDat); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			// The payload vanished before the rename: the image is gone. Prune the
@@ -1163,20 +1163,32 @@ func (c *WriteBackCache) renamePendingLocked(oldPath, newPath string) bool {
 		return false
 	}
 
+	// The destination's replaced payload can go now that its new metadata is
+	// durable (a PendingChmod destination carries none by design).
+	if kind == PendingChmod {
+		_ = os.Remove(newDat)
+	}
+
 	// Remove old meta and update index.
 	_ = os.Remove(oldMeta)
 	c.mu.Lock()
 	c.deleteMetaLocked(oldPath)
 	cp := updated
 	c.setMetaLocked(newPath, &cp)
+	// The destination's in-memory payload belongs to the incarnation this move
+	// just replaced. It must go in every case: a PendingChmod destination has no
+	// payload (getViewStateLocked's in-memory fast path would otherwise serve it
+	// as StagedViewOK before the chmod check), and a disk-only source leaves
+	// c.data[newPath] stale for both readers and the uploader.
+	hasOldData := false
+	var oldData []byte
 	if kind != PendingChmod {
-		if data, ok := c.data[oldPath]; ok {
-			c.deleteDataLocked(oldPath)
-			c.deleteDataLocked(newPath)
-			c.cacheDataLocked(newPath, data, int64(len(data)))
-		}
-	} else {
-		c.deleteDataLocked(oldPath)
+		oldData, hasOldData = c.data[oldPath]
+	}
+	c.deleteDataLocked(newPath)
+	c.deleteDataLocked(oldPath)
+	if hasOldData {
+		c.cacheDataLocked(newPath, oldData, int64(len(oldData)))
 	}
 	c.mu.Unlock()
 

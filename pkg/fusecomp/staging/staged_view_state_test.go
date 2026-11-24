@@ -600,3 +600,53 @@ func TestRenamePendingRecordsMissingDataOnDestination(t *testing.T) {
 		t.Fatal("the orphaned source metadata survived")
 	}
 }
+
+// TestRenamePendingClearsStaleDestinationPayload pins the data-corruption case:
+// moving a record onto a destination that has a cached payload must drop that
+// payload, or readers and the uploader serve the replaced incarnation's bytes
+// under the source's metadata. It covers both a PendingChmod move (whose
+// destination payload is dropped by design) and a disk-only source.
+func TestRenamePendingClearsStaleDestinationPayload(t *testing.T) {
+	t.Run("chmod-only onto cached destination", func(t *testing.T) {
+		c, err := NewWriteBackCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The destination has a real payload cached in memory.
+		if err := c.Put("/d.txt", []byte("old destination"), 15, PendingNew); err != nil {
+			t.Fatal(err)
+		}
+		c.PublishMeta(WriteBackMeta{Path: "/s.txt", Size: 4, Kind: PendingChmod, Generation: 21})
+		if !c.RenamePending("/s.txt", "/d.txt") {
+			t.Fatal("a chmod-only record did not move")
+		}
+		if _, _, state, ferr := c.GetMetaAndViewState("/d.txt"); state != StagedViewPendingChmod {
+			t.Fatalf("state = %v (err %v), want StagedViewPendingChmod (no stale payload served)", state, ferr)
+		}
+	})
+
+	t.Run("disk-only source onto cached destination", func(t *testing.T) {
+		c, err := NewWriteBackCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Put("/dst2.txt", []byte("stale destination bytes"), 23, PendingNew); err != nil {
+			t.Fatal(err)
+		}
+		// Keep the destination payload cached while the source's is evicted.
+		if err := c.Put("/src2.txt", []byte("real source bytes"), 17, PendingNew); err != nil {
+			t.Fatal(err)
+		}
+		c.DropInMemoryPayload("/src2.txt")
+		if !c.RenamePending("/src2.txt", "/dst2.txt") {
+			t.Fatal("rename failed")
+		}
+		meta, data, state, ferr := c.GetMetaAndViewState("/dst2.txt")
+		if state != StagedViewOK || ferr != nil {
+			t.Fatalf("state = %v (err %v), want StagedViewOK", state, ferr)
+		}
+		if meta.Size != 17 || string(data) != "real source bytes" {
+			t.Fatalf("served size=%d data=%q, want the source image (17 bytes)", meta.Size, string(data))
+		}
+	})
+}

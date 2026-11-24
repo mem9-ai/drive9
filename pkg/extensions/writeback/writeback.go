@@ -2524,9 +2524,6 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// source inside this window must not read as a landed image at the
 		// destination.
 		if w.wbCache != nil {
-			// The destination's replaced incarnation loses its record; the
-			// source's obligation follows the name (an in-window prune of the
-			// source must not read as a landed image at the destination).
 			w.wbCache.ClearViewLoss(op.Path2)
 			w.wbCache.RekeyViewLoss(op.Path, op.Path2)
 		}
@@ -2560,13 +2557,13 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		if w.wbCache != nil {
 			prefix := strings.TrimSuffix(op.Path, "/") + "/"
 			// Loss records are not .meta entries, so the ListByPrefix loop below
-			// cannot see them. The source subtree's records follow the names
-			// (a descended loss must keep failing barriers at the new path); the
-			// destination subtree's records die with the incarnations it
-			// replaces.
+			// cannot see them. The destination subtree's records die with the
+			// incarnations it replaces; the source subtree's follow the names
+			// AFTER the loop, so a child pruned by a concurrent reader while the
+			// loop runs is carried over too instead of stranding its marker on the
+			// dead source name.
 			dstLossPrefix := strings.TrimSuffix(op.Path2, "/") + "/"
 			w.wbCache.ClearViewLossPrefix(dstLossPrefix)
-			w.wbCache.RekeyViewLossPrefix(prefix, dstLossPrefix)
 			for _, entry := range w.wbCache.ListByPrefix(prefix) {
 				target := op.Path2 + strings.TrimPrefix(entry.Path, op.Path)
 				moved := w.wbCache.RenamePending(entry.Path, target)
@@ -2577,6 +2574,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					w.uploader.Submit(target)
 				}
 			}
+			w.wbCache.RekeyViewLossPrefix(prefix, dstLossPrefix)
 		}
 		// Pending descendants follow the same rule as the renamed path
 		// itself: the write-cache loop above moves the .dat/.meta track,
@@ -3850,31 +3848,29 @@ func (h *bufferingHandle) DrainFlush(ctx context.Context) (err error) {
 			// "another upload consumed it" from "its only copy was pruned", and
 			// skipping on the latter would report a durable drain that never
 			// happened.
-			{
-				useCache := true
-				if dirty {
-					snapshot, stageErr := h.stageToWriteCache(ctx, stageFullDurable)
-					if errors.Is(stageErr, errWriteCacheBypass) {
-						useCache = false
-						retainBuffer = true
-					} else if stageErr != nil {
-						if _, stillOK := h.w.wbCache.GetMeta(uploadPath); stillOK {
-							h.mu.Lock()
-							if h.path == uploadPath && !h.unlinked && !h.closed && !h.releasing {
-								h.stagedToCache = true
-							}
-							h.mu.Unlock()
+			useCache := true
+			if dirty {
+				snapshot, stageErr := h.stageToWriteCache(ctx, stageFullDurable)
+				if errors.Is(stageErr, errWriteCacheBypass) {
+					useCache = false
+					retainBuffer = true
+				} else if stageErr != nil {
+					if _, stillOK := h.w.wbCache.GetMeta(uploadPath); stillOK {
+						h.mu.Lock()
+						if h.path == uploadPath && !h.unlinked && !h.closed && !h.releasing {
+							h.stagedToCache = true
 						}
-						unlockFlush()
-						return stageErr
+						h.mu.Unlock()
 					}
-					if snapshot != nil {
-						uploadGen = snapshot.wgen
-					}
+					unlockFlush()
+					return stageErr
 				}
-				if useCache {
-					return landWriteCache(uploadGen)
+				if snapshot != nil {
+					uploadGen = snapshot.wgen
 				}
+			}
+			if useCache {
+				return landWriteCache(uploadGen)
 			}
 		}
 		// Hold flushMu through commitLocked on the normal path so neither Flush nor
@@ -7095,20 +7091,21 @@ func (r *bufferReader) ReadAt(p []byte, off int64) (int, error) {
 // the image is too large for the whole-image tracks (v1's large-file
 // bypass of the .dat/.meta track).
 func (h *bufferingHandle) commitInline(ctx context.Context) error {
-	var cachePutGen uint64
+	var cachePutGen, landBoundGen uint64
 	if h.w.wbCache != nil {
 		if meta, ok := h.w.wbCache.GetMeta(h.path); ok && meta != nil {
+			// PutGen identifies the payload for RemoveIfPutGeneration; the LOSS
+			// record is stamped with Generation, which in-place metadata updates
+			// (UpdateMode, MarkChmodPending, ...) bump above it.
 			cachePutGen = meta.PutGen()
+			landBoundGen = meta.Generation
 		}
-	}
-	// The loss record this landing supersedes is bounded by the state read
-	// BEFORE the remote write: a newer image that dies while the upload is on
-	// the wire keeps its record.
-	landBoundGen := cachePutGen
-	if h.w.wbCache != nil {
+		// A newer image that dies while this upload is on the wire keeps its
+		// record: the clear is bounded by the state read BEFORE the write.
 		landBoundGen = h.w.wbCache.LossGenerationBound(h.path, landBoundGen)
 	}
 	h.mu.Lock()
+	commitPath := h.path
 	size := int64(0)
 	if h.buf != nil {
 		size = h.buf.Size()
@@ -7184,12 +7181,12 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 		// is superseded, including one left by a pruned pair (cacheGen == 0) —
 		// but only up to the generation this landing covers: a newer image that
 		// died while this upload was on the wire must keep its record.
-		h.w.wbCache.ClearViewLossIfGeneration(h.path, landBoundGen)
+		h.w.wbCache.ClearViewLossIfGeneration(commitPath, landBoundGen)
 		// A rev-less streamed success still retires a queue-recorded failure for
 		// the name; landedAt returns early without a revision, so nothing else
 		// would clear it.
 		if committedRev <= 0 && h.w.queue != nil {
-			h.w.queue.ClearPathCommitErr(h.path)
+			h.w.queue.ClearPathCommitErr(commitPath)
 		}
 		var crc uint32
 		var img []byte
@@ -7197,9 +7194,9 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 			crc = crc32.ChecksumIEEE(image)
 			img = image
 		}
-		h.w.landedAt(h.path, committedRev, size, crc, img)
+		h.w.landedAt(commitPath, committedRev, size, crc, img)
 		if h.w.commitSeeder != nil && image != nil && h.w.commitSeedAllowed(int64(len(image))) {
-			h.w.commitSeeder(h.path, image, committedRev)
+			h.w.commitSeeder(commitPath, image, committedRev)
 		}
 		h.mu.Lock()
 		h.retireDirtyLocked(commitGen)
@@ -8195,7 +8192,9 @@ func (h *bufferingHandle) commitPatched(ctx context.Context) (rev int64, attempt
 	patchBoundGen := uint64(0)
 	if h.w.wbCache != nil {
 		if meta, ok := h.w.wbCache.GetMeta(patchPath); ok && meta != nil {
-			patchBoundGen = meta.PutGen()
+			// Generation, not PutGen: in-place metadata updates bump it above the
+			// payload generation the loss record is stamped with.
+			patchBoundGen = meta.Generation
 		}
 		patchBoundGen = h.w.wbCache.LossGenerationBound(patchPath, patchBoundGen)
 	}
