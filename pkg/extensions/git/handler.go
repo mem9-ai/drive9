@@ -77,6 +77,9 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 
 	switch op.Kind {
 	case fs.OpLookup, fs.OpGetAttr:
+		if (rel == ".git" || strings.HasPrefix(rel, ".git/")) && g.localRoot != "" && !w.isRestoreLatched() {
+			_ = g.ensureWorkspaceState(ctx, w)
+		}
 		e, hit := w.lookup(rel)
 		if !hit {
 			// Fast-clone view (v1 gitEntry): clean files resolve from the
@@ -549,6 +552,9 @@ func (g *Git) renameOverlay(ctx context.Context, oldPath, newPath string) error 
 
 // listMerged overlays the workspace's children on the base listing.
 func (g *Git) listMerged(ctx context.Context, w *workspace, dir string, next fs.Next) (fs.Result, error) {
+	if dir == w.rootPath() && g.localRoot != "" && !w.isRestoreLatched() {
+		_ = g.ensureWorkspaceState(ctx, w)
+	}
 	res, err := next(ctx, &fs.Op{Kind: fs.OpList, Path: dir})
 	if err != nil && !fs.IsNotFound(err) {
 		return res, err

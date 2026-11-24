@@ -1,6 +1,11 @@
 package git
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+var errGitRuntimeStopped = errors.New("git: runtime is stopped")
 
 type gitBackgroundTask struct {
 	cancel context.CancelFunc
@@ -44,6 +49,38 @@ func (g *Git) runBackground(run func(context.Context)) bool {
 		run(ctx)
 	}()
 	return true
+}
+
+// runForeground runs synchronous directory work (such as an on-demand .git
+// restore triggered by a foreground lookup) under the same Stop barrier as
+// background tasks: Stop cancels its context and waits for it to exit before
+// final checkpointing or releasing local-root ownership.
+func (g *Git) runForeground(ctx context.Context, run func(context.Context) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	g.backgroundMu.Lock()
+	if g.stopping {
+		g.backgroundMu.Unlock()
+		return errGitRuntimeStopped
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	task := &gitBackgroundTask{cancel: cancel}
+	if g.background == nil {
+		g.background = make(map[*gitBackgroundTask]struct{})
+	}
+	g.background[task] = struct{}{}
+	g.backgroundWG.Add(1)
+	g.backgroundMu.Unlock()
+
+	defer g.backgroundWG.Done()
+	defer func() {
+		cancel()
+		g.backgroundMu.Lock()
+		delete(g.background, task)
+		g.backgroundMu.Unlock()
+	}()
+	return run(runCtx)
 }
 
 // Stop closes task admission, cancels and joins all discovery/restore tasks,

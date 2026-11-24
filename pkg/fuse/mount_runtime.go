@@ -297,7 +297,7 @@ func buildViewRuntime(
 			ApplyBuiltinDefaults:        !localCfg.DisableBuiltinOverlayDefaults,
 		}
 		if gitExt != nil {
-			localizeOpts.DeclarativeLocal = gitExt.RoutesLocal
+			localizeOpts.DeclarativeLocal = gitExt.RoutesLocalCtx
 		}
 		if cacheBase != "" && !localCfg.ReadOnly {
 			transientRoot := transientOverlayRoot(cacheBase, readCacheHash)

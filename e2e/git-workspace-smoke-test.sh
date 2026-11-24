@@ -129,6 +129,10 @@ is_mounted() {
   local mount_point="$1"
   local physical_mount_point
   physical_mount_point="$(cd "$(dirname "$mount_point")" 2>/dev/null && pwd -P)/$(basename "$mount_point")"
+  if [ -r /proc/self/mountinfo ]; then
+    awk -v mp="$mount_point" -v pmp="$physical_mount_point" '$5 == mp || $5 == pmp { found=1 } END { exit !found }' /proc/self/mountinfo
+    return
+  fi
   if command -v mountpoint >/dev/null 2>&1; then
     mountpoint -q "$mount_point"
     return
@@ -308,6 +312,13 @@ stop_mount() {
 }
 
 dump_mount_log() {
+  if [ -n "${RUN_ROOT:-}" ] && [ -d "$RUN_ROOT" ]; then
+    find "$RUN_ROOT" -type f -name 'mount*.log' | sort | while IFS= read -r log_file; do
+      echo "=== drive9 mount log: $log_file ==="
+      cat "$log_file"
+    done
+    return
+  fi
   if [ -n "${MOUNT_LOG:-}" ] && [ -f "$MOUNT_LOG" ]; then
     echo "=== drive9 mount log: $MOUNT_LOG ==="
     cat "$MOUNT_LOG"
@@ -434,9 +445,13 @@ setup_ignored_local_only_probe() {
   local repo="$1"
   local marker="$2"
   # The coding-agent overlay only routes a Rust `target/` directory to the local
-  # overlay, and only when a .gitignore in the same directory ignores it. The
-  # fixture's committed root .gitignore carries `target/`, so the probe lives
-  # directly under the repo root.
+  # overlay, and only when a .gitignore in the same directory ignores it. Ensure
+  # the repository root's .gitignore carries `target/` before writing the probe.
+  if ! git_cmd -C "$repo" check-ignore -q target/local-only/cache.txt; then
+    printf '\ntarget/\n' >> "$repo/.gitignore" || return
+    git_cmd -C "$repo" add .gitignore || return
+    git_cmd -C "$repo" commit --no-verify -m "drive9 e2e ignore target" >/dev/null || return
+  fi
   mkdir -p "$repo/target/local-only" || return
   printf 'ignored local-only %s\n' "$marker" > "$repo/target/local-only/cache.txt" || return
   git_cmd -C "$repo" check-ignore -q target/local-only/cache.txt

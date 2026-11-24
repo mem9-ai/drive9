@@ -84,14 +84,52 @@ type workspace struct {
 	overlay    map[string]overlayEntry // rel path (no leading slash) → entry
 	tree       map[string]client.GitTreeNode
 	treeLoaded string // head commit the tree was loaded for
-	// stateRestoreMu serializes the lazy local .git restore. An attempt
-	// that fails (or finds the checkpoint not uploaded yet) leaves the
-	// gate open — the next entry point retries — while restoreLatched
-	// makes every later call a no-op once a restore has succeeded. A
-	// sync.Once here consumed the attempt on failure and never retried
-	// (review).
-	stateRestoreMu sync.Mutex
+	// restoreWait serializes the lazy local .git restore while remaining
+	// cancelable by caller/Stop contexts. An attempt that fails (or finds
+	// the checkpoint not uploaded yet) leaves restoreLatched false so the
+	// next entry point retries; once latched, later calls no-op.
+	restoreWait    chan struct{}
 	restoreLatched bool
+}
+
+func (w *workspace) isRestoreLatched() bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.restoreLatched
+}
+
+func (w *workspace) markRestoreLatched() {
+	w.mu.Lock()
+	w.restoreLatched = true
+	w.mu.Unlock()
+}
+
+func (w *workspace) acquireRestore(ctx context.Context) bool {
+	for {
+		w.mu.Lock()
+		if w.restoreWait == nil {
+			w.restoreWait = make(chan struct{})
+			w.mu.Unlock()
+			return true
+		}
+		wait := w.restoreWait
+		w.mu.Unlock()
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			return false
+		}
+	}
+}
+
+func (w *workspace) releaseRestore() {
+	w.mu.Lock()
+	wait := w.restoreWait
+	w.restoreWait = nil
+	w.mu.Unlock()
+	if wait != nil {
+		close(wait)
+	}
 }
 
 // noteTreeSize records a blob size learned by materializing it (v1
@@ -422,6 +460,16 @@ func (g *Git) ReexecRefusal() (string, int) { return "git_workspace", 1 }
 // the clone (uploading the object database) and flips to an EMPTY overlay
 // on discovery, shadowing the .git the checkpoint is about to read.
 func (g *Git) RoutesLocal(viewPath string) bool {
+	return g.RoutesLocalCtx(context.Background(), viewPath)
+}
+
+// RoutesLocalCtx reports view paths the git plane declares local, ensuring a
+// fresh-LocalRoot mount discovers any indexed workspace and finishes restoring
+// its local .git before the outer overlay stats or opens it.
+func (g *Git) RoutesLocalCtx(ctx context.Context, viewPath string) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// Cheap necessary condition: only a path with a `.git` segment can
 	// match (segment-exact — `.gitignore` must not).
 	if !pathHasGitDirSegment(viewPath) {
@@ -431,17 +479,37 @@ func (g *Git) RoutesLocal(viewPath string) bool {
 	if !ok {
 		return false
 	}
-	if g.localRoot != "" && gitcache.WorkspacePending(context.Background(), g.localRoot, root) {
+	if g.localRoot != "" && gitcache.WorkspacePending(ctx, g.localRoot, root) {
 		return true
 	}
-	// In-memory workspace list only — this must not trigger workspace
-	// routing (a throttled refresh from every `.git` access during a
-	// clone).
+	g.ensureLoadedForGitDir(ctx)
 	w, rel, ok := g.workspaceFor(viewPath)
 	if !ok || w == nil {
 		return false
 	}
-	return rel == ".git" || strings.HasPrefix(rel, ".git/")
+	if rel != ".git" && !strings.HasPrefix(rel, ".git/") {
+		return false
+	}
+	if g.localRoot != "" && !w.isRestoreLatched() {
+		_ = g.ensureWorkspaceState(ctx, w)
+	}
+	return true
+}
+
+// ensureLoadedForGitDir loads indexed workspaces once on a cold mount while
+// keeping dormant roots at zero ListGitWorkspaces refreshes and avoiding
+// repeated refreshes for non-workspace `.git` paths once loaded.
+func (g *Git) ensureLoadedForGitDir(ctx context.Context) {
+	g.tryArmFromLocalSignals()
+	g.mu.RLock()
+	loaded := g.loaded
+	armed := g.armed
+	confirmed := g.dormantConfirmed
+	g.mu.RUnlock()
+	if loaded || (!armed && confirmed) {
+		return
+	}
+	g.ensure(ctx)
 }
 
 // pathHasGitDirSegment reports whether viewPath contains a path segment
@@ -511,35 +579,42 @@ func New(opts Options) (*Git, error) {
 // checkpoint upload (git clone --fast registers the workspace BEFORE the
 // state lands). Sync per workspace, bounded by the hydrate budget.
 func (g *Git) ensureWorkspaceState(ctx context.Context, w *workspace) error {
-	if g.localRoot == "" {
+	if g.localRoot == "" || w == nil || w.isRestoreLatched() {
 		return nil
 	}
-	w.stateRestoreMu.Lock()
-	defer w.stateRestoreMu.Unlock()
-	if w.restoreLatched {
-		return nil
-	}
-	rctx, cancel := context.WithTimeout(ctx, gitWorkspaceHydrateTimeout)
-	defer cancel()
-	if err := g.restoreWorkspaceState(rctx, w); err != nil {
-		// Not latched: a transient failure (or a checkpoint the CLI
-		// has not uploaded yet — discovery races the upload) retries
-		// at the next entry point. A not-yet-uploaded checkpoint is
-		// quiet; real failures surface for diagnosis.
-		if !errors.Is(err, errGitStateNotReady) {
-			fmt.Fprintf(os.Stderr, "drive9: git state restore failed for workspace %s: %v\n", w.id, err)
+	return g.runForeground(ctx, func(workCtx context.Context) error {
+		if !w.acquireRestore(workCtx) {
+			return workCtx.Err()
 		}
-		return nil
-	}
-	if w.blobless() {
-		// A blobless restore prefetches the HEAD tree's blobs
-		// before serving.
-		if err := g.MaterializeHeadTree(rctx, g.gitDirFor(w.rootPath())); err != nil {
-			fmt.Fprintf(os.Stderr, "drive9: git head tree materialize failed for workspace %s: %v\n", w.id, err)
+		defer w.releaseRestore()
+		if w.isRestoreLatched() {
+			return nil
 		}
-	}
-	w.restoreLatched = true
-	return nil
+		rctx, cancel := context.WithTimeout(workCtx, gitWorkspaceHydrateTimeout)
+		defer cancel()
+		if err := g.restoreWorkspaceState(rctx, w); err != nil {
+			// Not latched: a transient failure (or a checkpoint the CLI
+			// has not uploaded yet — discovery races the upload) retries
+			// at the next entry point. A not-yet-uploaded checkpoint or
+			// intentional cancellation is quiet; real failures surface.
+			if !errors.Is(err, errGitStateNotReady) && !errors.Is(err, context.Canceled) && !errors.Is(err, errGitRuntimeStopped) {
+				fmt.Fprintf(os.Stderr, "drive9: git state restore failed for workspace %s: %v\n", w.id, err)
+			}
+			return nil
+		}
+		if w.blobless() {
+			// A blobless restore prefetches the HEAD tree's blobs before
+			// serving. Linked worktrees resolve objects through their admin
+			// dir under the common repository rather than the root .git file.
+			if gitDir, ok := g.checkpointGitDir(w); ok {
+				if err := g.MaterializeHeadTree(rctx, gitDir); err != nil && !errors.Is(err, context.Canceled) {
+					fmt.Fprintf(os.Stderr, "drive9: git head tree materialize failed for workspace %s: %v\n", w.id, err)
+				}
+			}
+		}
+		w.markRestoreLatched()
+		return nil
+	})
 }
 
 // gitWorkspaceDiscoveryWindow bounds how often a miss re-lists workspaces.
@@ -703,15 +778,23 @@ func (g *Git) ensure(ctx context.Context) {
 	forced := g.forceNext
 	armed := g.armed
 	g.mu.RUnlock()
-	if loaded || !armed {
-		if !armed {
-			// Dormant: no ListGitWorkspaces (v1 G0/AC5). One index probe
-			// decides: entries under this mount's root arm the plane (a
-			// fresh-LocalRoot remount still discovers, G2); an empty or
-			// absent index confirms dormant until a local arm signal.
-			g.maybeArmFromIndex(ctx)
-		}
+	if loaded {
 		return
+	}
+	if !armed {
+		// Dormant: no ListGitWorkspaces (v1 G0/AC5). One index probe
+		// decides: entries under this mount's root arm the plane (a
+		// fresh-LocalRoot remount still discovers, G2); an empty or
+		// absent index confirms dormant until a local arm signal.
+		g.maybeArmFromIndex(ctx)
+		g.mu.RLock()
+		loaded = g.loaded
+		forced = g.forceNext
+		armed = g.armed
+		g.mu.RUnlock()
+		if loaded || !armed {
+			return
+		}
 	}
 	if g.onRefresh != nil {
 		g.onRefresh(forced)
@@ -853,7 +936,7 @@ func (g *Git) Start(ctx context.Context) error {
 	g.backgroundMu.Lock()
 	if g.stopping {
 		g.backgroundMu.Unlock()
-		return fmt.Errorf("git: runtime is stopped")
+		return errGitRuntimeStopped
 	}
 	if g.started {
 		g.backgroundMu.Unlock()
@@ -879,7 +962,7 @@ func (g *Git) Start(ctx context.Context) error {
 		}
 		if armed {
 			reloadCtx, cancel := context.WithTimeout(startCtx, 15*time.Second)
-			g.Reload(reloadCtx)
+			g.ensure(reloadCtx)
 			cancel()
 		}
 		if g.localRoot != "" {
