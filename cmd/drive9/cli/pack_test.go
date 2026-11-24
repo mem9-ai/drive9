@@ -1747,6 +1747,8 @@ func TestSupervisedLayerPinsResolvedArchiveIdentity(t *testing.T) {
 	t.Cleanup(func() { runSuperviseForeground = old })
 	base := t.TempDir()
 	for _, flags := range [][]string{{"--layer", "task=auth"}, {"--layer=task=auth"}} {
+		t.Setenv(EnvMountLocalOnlyPatterns, "**/.agent-cache/**")
+		t.Setenv(EnvMountRemoteOnlyPatterns, "**/results/**")
 		var got mountSuperviseStartRequest
 		runSuperviseForeground = func(req mountSuperviseStartRequest) error { got = req; return nil }
 		args := []string{"--supervise-foreground", "--mode=fuse", "--auth=local", "--read-only", "--profile=coding-agent", "--local-root", base, "--server", srv.URL, "--api-key", "test"}
@@ -1757,8 +1759,18 @@ func TestSupervisedLayerPinsResolvedArchiveIdentity(t *testing.T) {
 		if got.LayerID != id || !got.LayerReadOnly || got.LocalRoot != base || got.RemoteRoot != "/repo" {
 			t.Fatalf("incorrect supervisor layer metadata")
 		}
-		if strings.Contains(strings.Join(got.OriginalArgs, " "), "task=auth") || !strings.Contains(strings.Join(got.OriginalArgs, " "), id) {
-			t.Fatal("worker layer not pinned")
+		worker := workerArgsForSupervise(got.OriginalArgs)
+		wantLayer := []string{"--layer", id}
+		if len(flags) == 1 {
+			wantLayer = []string{"--layer=" + id}
+		}
+		wantFlags := []string{"--foreground", "--supervised", "--local-only=**/.agent-cache/**", "--remote-only=**/results/**", "--auth=local", "--mode=fuse", "--read-only", "--profile=coding-agent", "--local-root", base, "--server", srv.URL}
+		// sanitize drops credentials; the target mountpoint remains the last argument.
+		want := append([]string{"mount"}, wantFlags...)
+		want = append(want, wantLayer...)
+		want = append(want, got.MountPoint)
+		if !reflect.DeepEqual(worker, want) {
+			t.Errorf("worker args differ: got %q, want %q", worker, want)
 		}
 	}
 }

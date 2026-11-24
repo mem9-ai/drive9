@@ -447,10 +447,6 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	for _, pattern := range envRemoteOnlyPatterns {
 		policyEnvArgs = append(policyEnvArgs, "--remote-only="+pattern)
 	}
-	// Snapshot environment-derived policy in argv so supervised restarts and
-	// later adoption keep the original mount contract without re-reading env.
-	originalArgs = append(policyEnvArgs, originalArgs...)
-
 	remoteRoot, err = mountpath.NormalizeRoot(remoteRoot)
 	if err != nil {
 		return fmt.Errorf("drive9 mount: %w", err)
@@ -813,10 +809,12 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	if *noPersistCredentials && (*superviseForeground || background && !*foreground && wantSupervise) {
 		return fmt.Errorf("drive9 mount: --no-persist-credentials requires --foreground or --no-supervise")
 	}
+	// Add the environment snapshot only after pinning the layer in the parsed arguments.
+	replayArgs := append(policyEnvArgs, originalArgs...)
 	if *superviseForeground {
 		// This process becomes the supervisor (blocks).
 		return runSuperviseForeground(mountSuperviseStartRequest{
-			OriginalArgs:      append([]string(nil), originalArgs...),
+			OriginalArgs:      append([]string(nil), replayArgs...),
 			MountPoint:        mountPoint,
 			Server:            serverVal,
 			APIKey:            apiKeyVal,
@@ -841,7 +839,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	if background && !*foreground {
 		if wantSupervise && resolved == MountModeFUSE && runtime.GOOS != "windows" {
 			return startMountSupervisedBackground(mountSuperviseStartRequest{
-				OriginalArgs:      append([]string(nil), originalArgs...),
+				OriginalArgs:      append([]string(nil), replayArgs...),
 				MountPoint:        mountPoint,
 				Server:            serverVal,
 				APIKey:            apiKeyVal,
@@ -864,7 +862,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 			})
 		}
 		return startMountBackground(mountBackgroundRequest{
-			Args:       append([]string(nil), originalArgs...),
+			Args:       append([]string(nil), replayArgs...),
 			MountPoint: mountPoint,
 			Server:     serverVal,
 			APIKey:     apiKeyVal,
