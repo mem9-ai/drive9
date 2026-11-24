@@ -745,9 +745,11 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 			archiveClient = client.New(serverVal, apiKeyVal)
 		}
 		if layerRef != "" {
-			info, err := archiveClient.GetLayer(context.Background(), layerRef)
+			lookupCtx, cancelLookup := context.WithTimeout(context.Background(), defaultMountBackgroundReadyTimeout)
+			info, err := archiveClient.GetLayer(lookupCtx, layerRef)
+			cancelLookup()
 			if err != nil {
-				return err
+				return classifyMountLayerLookupError(layerRef, err)
 			}
 			archiveClient, err = archiveClient.WithView(client.ViewBinding{LayerID: info.LayerID})
 			if err != nil {
@@ -1280,8 +1282,10 @@ func waitForSupervisedMountReady(mountPoint string, supervisorPID int, waitCh <-
 		// (PID+creation) and its worker is identity-alive — never accept a
 		// stale pidfile from a previous generation.
 		if st, _, err := mountstate.ReadSupervisorState(mountPoint); err == nil {
-			if supervisorStateMatchesGeneration(st, supervisorPID, supCreation) && st.LayerLeaseRecoveryUntil.After(deadline) {
-				deadline = st.LayerLeaseRecoveryUntil.Add(timeout)
+			if supervisorStateMatchesGeneration(st, supervisorPID, supCreation) && !st.LayerLeaseRecoveryUntil.IsZero() {
+				if until := st.LayerLeaseRecoveryUntil.Add(timeout); until.After(deadline) {
+					deadline = until
+				}
 			}
 			if supervisedReadyStateMatches(st, supervisorPID, supCreation) && probeMountReadyForCLI(mountPoint) {
 				return nil

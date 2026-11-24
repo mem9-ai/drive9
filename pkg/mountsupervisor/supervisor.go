@@ -23,6 +23,8 @@ import (
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
 
+const workerReadyTimeout = 30 * time.Second
+
 // Config configures a mount supervisor.
 type Config struct {
 	MountPoint     string
@@ -152,6 +154,11 @@ func newSupervisor(cfg Config) (*supervisor, error) {
 			RemoteRoot:   cfg.RemoteRoot,
 			Profile:      cfg.Profile,
 		},
+	}
+	if cfg.LayerID != "" && !cfg.LayerReadOnly {
+		// A worker can bind the lease before its first readiness probe succeeds.
+		// Allow its probe, termination and first replacement to report a busy lease.
+		s.state.LayerLeaseRecoveryUntil = now.Add(workerReadyTimeout + cfg.StopTimeout + cfg.BackoffMax)
 	}
 	if s.adopted {
 		s.state.WorkerPID = cfg.AdoptWorkerPID
@@ -705,7 +712,7 @@ func (s *supervisor) waitForLayerLease(sigCh <-chan os.Signal, delay time.Durati
 }
 
 func (s *supervisor) waitWorkerReady(sigCh <-chan os.Signal) error {
-	deadline := s.cfg.Now().Add(30 * time.Second)
+	deadline := s.cfg.Now().Add(workerReadyTimeout)
 	for s.cfg.Now().Before(deadline) {
 		select {
 		case <-sigCh:

@@ -139,7 +139,7 @@ func resolveLayerMountView(
 
 	info, err := baseClient.GetLayer(ctx, ref)
 	if err != nil {
-		return nil, classifyLayerStartupError(fmt.Sprintf("resolve layer %q", ref), err)
+		return nil, ClassifyLayerStartupError(fmt.Sprintf("resolve layer %q", ref), err)
 	}
 	if err := viewprotocol.ValidateLayerID(info.LayerID); err != nil {
 		return nil, ExitStartupPermanentErr("invalid layer identity returned by server", err)
@@ -179,7 +179,7 @@ func resolveLayerMountView(
 			Kind:    "expire",
 		})
 		if uerr != nil {
-			return nil, classifyLayerStartupError(fmt.Sprintf("expire stale mount lease on layer %s", info.LayerID), uerr)
+			return nil, ClassifyLayerStartupError(fmt.Sprintf("expire stale mount lease on layer %s", info.LayerID), uerr)
 		}
 		if unb == nil || unb.Fence < 0 || unb.Fence%2 != 0 {
 			return nil, ExitStartupTransientErr(
@@ -204,7 +204,7 @@ func resolveLayerMountView(
 		ExpectedFence: expectedFence,
 	})
 	if err != nil {
-		return nil, classifyLayerStartupError(fmt.Sprintf("bind exclusive mount lease on layer %s", info.LayerID), err)
+		return nil, ClassifyLayerStartupError(fmt.Sprintf("bind exclusive mount lease on layer %s", info.LayerID), err)
 	}
 
 	binding := &layerMountBinding{
@@ -354,7 +354,8 @@ func isTerminalLayerRenewError(err error) bool {
 	return false
 }
 
-func classifyLayerStartupError(action string, err error) *MountExitError {
+// ClassifyLayerStartupError preserves the worker exit code for Layer control-plane failures.
+func ClassifyLayerStartupError(action string, err error) *MountExitError {
 	if isTerminalLayerRenewError(err) {
 		return ExitStartupPermanentErr(action, err)
 	}
