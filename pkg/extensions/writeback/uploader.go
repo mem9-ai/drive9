@@ -362,6 +362,22 @@ func (u *WriteBackUploader) WaitPath(localPath string) {
 	}
 }
 
+// IsQueuedOrActive reports whether localPath is currently queued, held by an
+// active worker/path gate, or in flight in the background uploader.
+func (u *WriteBackUploader) IsQueuedOrActive(localPath string) bool {
+	if u == nil {
+		return false
+	}
+	u.queueMu.Lock()
+	_, queued := u.queuedSet[localPath]
+	active := u.activePaths[localPath] > 0
+	u.queueMu.Unlock()
+	if queued || active {
+		return true
+	}
+	return u.InFlight(localPath)
+}
+
 // WaitQueuedOrActive blocks until localPath is neither queued in the
 // background uploader nor held by an active worker or path gate.
 func (u *WriteBackUploader) WaitQueuedOrActive(localPath string) {

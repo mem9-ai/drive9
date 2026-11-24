@@ -1683,11 +1683,32 @@ mod proxy_tests {
                 let mut sock = stream.unwrap();
                 std::thread::spawn(move || {
                     let mut buf = Vec::new();
-                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let hdr_end = loop {
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
                         let mut c = [0u8; 1024];
                         let Ok(n) = sock.read(&mut c) else { return };
                         if n == 0 {
                             return;
+                        }
+                        buf.extend_from_slice(&c[..n]);
+                    };
+                    let hdr_str = String::from_utf8_lossy(&buf[..hdr_end]);
+                    let clen: usize = hdr_str
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < hdr_end + clen {
+                        let mut c = [0u8; 1024];
+                        let Ok(n) = sock.read(&mut c) else { break };
+                        if n == 0 {
+                            break;
                         }
                         buf.extend_from_slice(&c[..n]);
                     }
@@ -1706,6 +1727,7 @@ mod proxy_tests {
                     let _ = sock.write_all(resp.as_bytes());
                     let _ = sock.write_all(&body);
                     let _ = sock.write_all(b"\r\n0\r\n\r\n");
+                    let _ = sock.shutdown(std::net::Shutdown::Write);
                 });
             }
         });
