@@ -650,3 +650,51 @@ func TestRenamePendingClearsStaleDestinationPayload(t *testing.T) {
 		}
 	})
 }
+
+// TestLossGenerationBoundNeverReturnsTheClearSentinel pins the inverted-sentinel
+// bug: an unattributable marker must keep the landing from clearing it, which is
+// a bound of 0 — returning ^uint64(0) would be read as "clear unconditionally".
+func TestLossGenerationBoundNeverReturnsTheClearSentinel(t *testing.T) {
+	dir := t.TempDir()
+	c, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const path = "/unattributable.txt"
+	if got := c.LossGenerationBound(path, 5); got != 5 {
+		t.Fatalf("bound without a marker = %d, want the caller's 5", got)
+	}
+	// An unreadable marker for the path: the bound must refuse to clear. It is
+	// only attributed at load, so reopen the cache over the same directory.
+	if err := os.WriteFile(c.lostFile(path), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reopened.LossGenerationBound(path, 5); got != 0 {
+		t.Fatalf("bound over an unreadable marker = %d, want 0 (never the unconditional-clear sentinel)", got)
+	}
+	reopened.ClearViewLossIfGeneration(path, reopened.LossGenerationBound(path, 5))
+	if err := reopened.ViewLoss(path); err == nil {
+		t.Fatal("a landing cleared an unattributable marker")
+	}
+}
+
+// TestGenerationCounterIgnoresTheSentinel pins the overflow guard: the
+// unreadable-marker sentinel must never advance the counter (Add(1) would wrap to
+// zero and violate the "generation != 0" invariant).
+func TestGenerationCounterIgnoresTheSentinel(t *testing.T) {
+	c, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.advanceNextGen(^uint64(0))
+	if got := c.nextGen.Load(); got == ^uint64(0) {
+		t.Fatalf("counter advanced to the sentinel: %d", got)
+	}
+	if gen := c.nextGen.Add(1); gen == 0 {
+		t.Fatal("the counter wrapped to zero after an advance to the sentinel")
+	}
+}

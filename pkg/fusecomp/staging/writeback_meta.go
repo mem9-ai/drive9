@@ -1572,6 +1572,11 @@ func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data
 // advanceNextGen raises the cache generation counter to at least gen, never
 // lowering it (a concurrent put may already be past it).
 func (c *WriteBackCache) advanceNextGen(gen uint64) {
+	if gen == ^uint64(0) || gen == 0 {
+		// Zero is "no generation"; ^uint64(0) is the unreadable-marker sentinel.
+		// Advancing to either would make the next Add(1) wrap to 0.
+		return
+	}
 	for {
 		cur := c.nextGen.Load()
 		if gen <= cur || c.nextGen.CompareAndSwap(cur, gen) {

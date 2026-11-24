@@ -7091,19 +7091,6 @@ func (r *bufferReader) ReadAt(p []byte, off int64) (int, error) {
 // the image is too large for the whole-image tracks (v1's large-file
 // bypass of the .dat/.meta track).
 func (h *bufferingHandle) commitInline(ctx context.Context) error {
-	var cachePutGen, landBoundGen uint64
-	if h.w.wbCache != nil {
-		if meta, ok := h.w.wbCache.GetMeta(h.path); ok && meta != nil {
-			// PutGen identifies the payload for RemoveIfPutGeneration; the LOSS
-			// record is stamped with Generation, which in-place metadata updates
-			// (UpdateMode, MarkChmodPending, ...) bump above it.
-			cachePutGen = meta.PutGen()
-			landBoundGen = meta.Generation
-		}
-		// A newer image that dies while this upload is on the wire keeps its
-		// record: the clear is bounded by the state read BEFORE the write.
-		landBoundGen = h.w.wbCache.LossGenerationBound(h.path, landBoundGen)
-	}
 	h.mu.Lock()
 	commitPath := h.path
 	size := int64(0)
@@ -7126,6 +7113,21 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 		newReader = func() io.Reader { return bytes.NewReader(image) }
 	}
 	h.mu.Unlock()
+
+	// The write-cache state this landing supersedes is read under the path name
+	// snapshot, before the remote write: a newer image that dies while the upload
+	// is on the wire keeps its loss record.
+	var cachePutGen, landBoundGen uint64
+	if h.w.wbCache != nil {
+		if meta, ok := h.w.wbCache.GetMeta(commitPath); ok && meta != nil {
+			// PutGen identifies the payload for RemoveIfPutGeneration; the LOSS
+			// record is stamped with Generation, which in-place metadata updates
+			// (UpdateMode, MarkChmodPending, ...) bump above it.
+			cachePutGen = meta.PutGen()
+			landBoundGen = meta.Generation
+		}
+		landBoundGen = h.w.wbCache.LossGenerationBound(commitPath, landBoundGen)
+	}
 
 	// Streamed commits report no revision (the protocol carries none and a
 	// bare re-read cannot be attributed): digest the exact bytes via a
@@ -7152,7 +7154,7 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 			copy(streamSum[:], d.Sum(nil))
 		}
 	}
-	committedRev, err := h.w.commitReaderOpt(ctx, h.path, newReader, size, isNew && size == 0, baseRev)
+	committedRev, err := h.w.commitReaderOpt(ctx, commitPath, newReader, size, isNew && size == 0, baseRev)
 	if isStatusEAGAIN(err) {
 		// The conflict path could not attribute the row. If this handle
 		// streamed a previous image the server still holds byte-exactly,
@@ -7162,20 +7164,20 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 			selfSize, selfSum := h.selfLandSize, h.selfLandSum
 			h.mu.Unlock()
 			if selfSize > 0 {
-				if adopted, aerr := h.w.verifySelfLanding(ctx, h.path, selfSize, selfSum); aerr == nil && adopted.rev > baseRev {
+				if adopted, aerr := h.w.verifySelfLanding(ctx, commitPath, selfSize, selfSum); aerr == nil && adopted.rev > baseRev {
 					h.mu.Lock()
 					h.baseRev = adopted.rev
 					h.selfLandSize, h.selfLandSum = 0, [sha256.Size]byte{}
 					h.mu.Unlock()
 					baseRev = adopted.rev
-					committedRev, err = h.w.commitReaderOpt(ctx, h.path, newReader, size, false, baseRev)
+					committedRev, err = h.w.commitReaderOpt(ctx, commitPath, newReader, size, false, baseRev)
 				}
 			}
 		}
 	}
 	if err == nil {
 		if cachePutGen != 0 {
-			h.w.wbCache.RemoveIfPutGeneration(h.path, cachePutGen)
+			h.w.wbCache.RemoveIfPutGeneration(commitPath, cachePutGen)
 		}
 		// An inline commit published this image: any recorded loss for the name
 		// is superseded, including one left by a pruned pair (cacheGen == 0) —
@@ -7213,9 +7215,9 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 		}
 		h.mu.Unlock()
 		if h.w.opts.Policy == PolicyWriteSync || h.w.opts.Policy == PolicyCloseSync {
-			h.w.armBypass(h.path, 0, size, "sync-commit")
+			h.w.armBypass(commitPath, 0, size, "sync-commit")
 		}
-		h.w.invalidateRev(h.path, committedRev, size)
+		h.w.invalidateRev(commitPath, committedRev, size)
 		err = h.applyPendingMode(ctx)
 	}
 	return err
@@ -8189,15 +8191,6 @@ func (h *bufferingHandle) commitPatched(ctx context.Context) (rev int64, attempt
 	var snapshots map[int][]byte
 	var partSize int64
 	patchPath := h.path
-	patchBoundGen := uint64(0)
-	if h.w.wbCache != nil {
-		if meta, ok := h.w.wbCache.GetMeta(patchPath); ok && meta != nil {
-			// Generation, not PutGen: in-place metadata updates bump it above the
-			// payload generation the loss record is stamped with.
-			patchBoundGen = meta.Generation
-		}
-		patchBoundGen = h.w.wbCache.LossGenerationBound(patchPath, patchBoundGen)
-	}
 	if applicable {
 		dirty = h.buf.DirtyPartNumbers()
 		if len(dirty) > 0 {
@@ -8219,7 +8212,18 @@ func (h *bufferingHandle) commitPatched(ctx context.Context) (rev int64, attempt
 	if !applicable {
 		return 0, false, nil
 	}
-	rp := h.w.remotePath(h.path)
+	// Read after the applicability gate and outside h.mu: the loss bound may hit
+	// the disk, and a non-applicable write must not pay for it.
+	patchBoundGen := uint64(0)
+	if h.w.wbCache != nil {
+		if meta, ok := h.w.wbCache.GetMeta(patchPath); ok && meta != nil {
+			// Generation, not PutGen: in-place metadata updates bump it above the
+			// payload generation the loss record is stamped with.
+			patchBoundGen = meta.Generation
+		}
+		patchBoundGen = h.w.wbCache.LossGenerationBound(patchPath, patchBoundGen)
+	}
+	rp := h.w.remotePath(patchPath)
 	expected := int64(0)
 	if st, serr := h.w.opts.Client.StatCtx(ctx, rp); serr == nil {
 		expected = st.Revision

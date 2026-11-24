@@ -298,6 +298,15 @@ func (c *WriteBackCache) rekeyViewLoss(oldPath, newPath string) {
 		if !has {
 			return
 		}
+		if loss.Generation == ^uint64(0) {
+			// An unattributable marker: it cannot be re-keyed to a generation, so
+			// the destination keeps failing closed instead of persisting the
+			// sentinel as a real value.
+			c.mu.Lock()
+			c.markLostUnknownLocked(lostHash(newPath))
+			c.mu.Unlock()
+			return
+		}
 		gen = loss.Generation
 	}
 	if raw, merr := json.Marshal(&ViewLoss{Path: newPath, Generation: gen}); merr == nil {
@@ -400,7 +409,7 @@ func (c *WriteBackCache) loadViewLossFromDisk() {
 			continue
 		}
 		var loss ViewLoss
-		if jerr := json.Unmarshal(raw, &loss); jerr != nil || loss.Path == "" || loss.Generation == 0 {
+		if jerr := json.Unmarshal(raw, &loss); jerr != nil || loss.Path == "" || loss.Generation == 0 || loss.Generation == ^uint64(0) {
 			c.mu.Lock()
 			c.markLostUnknownLocked(hash)
 			c.mu.Unlock()
@@ -432,14 +441,23 @@ func (c *WriteBackCache) LossGenerationBound(remotePath string, bound uint64) ui
 	if ok && gen > bound {
 		return gen
 	}
-	if unkOK || dirUnreadable {
-		// A marker that cannot be attributed may be newer than anything this
-		// landing published: do not let the landing clear it.
-		if loss, has := c.readViewLoss(remotePath); has && loss.Generation > bound {
-			return loss.Generation
-		}
-		if unkOK {
-			return ^uint64(0)
+	// A marker that cannot be attributed may be newer than anything this landing
+	// published, so the landing must NOT be allowed to clear it. That is
+	// expressed as a bound of 0 — the value clearViewLossLocked already refuses
+	// to clear at — never as ^uint64(0), which is the unconditional-clear
+	// sentinel: returning that would delete the unattributable marker and any
+	// newer loss recorded while the upload was on the wire.
+	if unkOK {
+		return 0
+	}
+	if dirUnreadable {
+		if loss, has := c.readViewLoss(remotePath); has {
+			if loss.Generation == ^uint64(0) {
+				return 0
+			}
+			if loss.Generation > bound {
+				return loss.Generation
+			}
 		}
 	}
 	return bound
