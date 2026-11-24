@@ -2215,26 +2215,10 @@ func runUmount(args []string, deps umountDeps) error {
 		}
 	}
 
-	if packStateOK && deps.goos != "windows" && deps.requestStatus != nil {
-		if (strings.TrimSpace(packState.MountKind) == "" || packState.MountKind == mountstate.MountKindFUSE) &&
-			strings.TrimSpace(packState.ControlSocket) != "" {
-			stCtx, stCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			st, serr := deps.requestStatus(stCtx, strings.TrimSpace(packState.ControlSocket), 5*time.Second)
-			stCancel()
-			if serr == nil && st != nil && st.OK {
-				if strings.TrimSpace(st.RemoteRoot) != "" {
-					packState.RemoteRoot = st.RemoteRoot
-				}
-				if st.Binding != nil {
-					packState.LayerID = st.Binding.LayerID
-					packState.LayerReadOnly = st.Binding.LayerID != "" && st.Binding.ReadOnly
-				} else if st.Layer != nil {
-					packState.LayerID = *st.Layer
-					if packState.LayerID == "" {
-						packState.LayerReadOnly = false
-					}
-				}
-			}
+	archiveRequested := len(packArchives) > 0 || len(packPaths) > 0 || (!*noAutoPack && len(packState.PackPaths) > 0)
+	if archiveRequested && packStateOK && deps.goos != "windows" && deps.requestStatus != nil {
+		if err := refreshMountedPackView(&packState, deps.requestStatus, 5*time.Second); err != nil {
+			return fmt.Errorf("drive9 umount: %w", err)
 		}
 	}
 

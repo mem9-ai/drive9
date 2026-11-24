@@ -5,7 +5,6 @@ package cli
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,7 +13,6 @@ import (
 	"github.com/mem9-ai/drive9/pkg/mountcontrol"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 	"github.com/mem9-ai/drive9/pkg/mountsupervisor"
-	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 // readMountStatusView queries the live control socket for the mount's current
@@ -38,41 +36,6 @@ func readMountStatusView(point string) (*mountstate.SwitchSnapshot, error) {
 		return nil, err
 	}
 	return fixedMountStatus(status)
-}
-
-func fixedMountStatus(status *mountcontrol.StatusResponse) (*mountstate.SwitchSnapshot, error) {
-	if status == nil {
-		return nil, errors.New("mount view status unavailable")
-	}
-	if !status.OK {
-		if status.Error != "" {
-			return nil, errors.New(status.Error)
-		}
-		return nil, errors.New("mount view status unavailable")
-	}
-	if status.MountID == "" && status.Generation == 0 && status.Binding == nil {
-		return nil, nil
-	}
-	if viewprotocol.ValidateOperationID(status.MountID) != nil || status.Generation == 0 || status.Binding == nil || status.Binding.Validate() != nil {
-		return nil, errors.New("invalid mount view identity")
-	}
-	out := &mountstate.SwitchSnapshot{
-		MountID:    status.MountID,
-		Generation: status.Generation,
-		Binding:    *status.Binding,
-		Recovering: status.Recovering,
-	}
-	if p := status.Pending; p != nil {
-		if viewprotocol.ValidateOperationID(p.OperationID) != nil ||
-			(p.State != mountstate.SwitchRecovering && p.State != mountstate.SwitchTargetRevoked) ||
-			p.Generation != status.Generation || p.FromGeneration == 0 ||
-			p.FromGeneration+1 != p.Generation || p.From.Validate() != nil || p.Target != *status.Binding {
-			return nil, errors.New("invalid pending mount view decision")
-		}
-		cp := *p
-		out.Pending = &cp
-	}
-	return out, nil
 }
 
 func writeMountStatusJSON(w io.Writer, status mountsupervisor.StatusSnapshot, view *mountstate.SwitchSnapshot, viewErr error) error {

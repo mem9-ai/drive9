@@ -1791,25 +1791,9 @@ func resolveMountedPackTarget(target string) (mountedPackTarget, error) {
 	for {
 		state, _, err := mountstate.ReadProcessState(candidate)
 		if err == nil {
-			if runtime.GOOS != "windows" &&
-				(strings.TrimSpace(state.MountKind) == "" || state.MountKind == mountstate.MountKindFUSE) &&
-				strings.TrimSpace(state.ControlSocket) != "" {
-				stCtx, stCancel := context.WithTimeout(context.Background(), time.Second)
-				st, serr := mountcontrol.RequestStatus(stCtx, strings.TrimSpace(state.ControlSocket), time.Second)
-				stCancel()
-				if serr == nil && st != nil && st.OK {
-					if strings.TrimSpace(st.RemoteRoot) != "" {
-						state.RemoteRoot = st.RemoteRoot
-					}
-					if st.Binding != nil {
-						state.LayerID = st.Binding.LayerID
-						state.LayerReadOnly = st.Binding.LayerID != "" && st.Binding.ReadOnly
-					} else if st.Layer != nil {
-						state.LayerID = *st.Layer
-						if state.LayerID == "" {
-							state.LayerReadOnly = false
-						}
-					}
+			if runtime.GOOS != "windows" {
+				if err := refreshMountedPackView(&state, mountcontrol.RequestStatus, time.Second); err != nil {
+					return mountedPackTarget{}, err
 				}
 			}
 			if strings.TrimSpace(state.LocalRoot) == "" {

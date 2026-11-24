@@ -242,3 +242,35 @@ func TestMountSwitchCLIPlainTextOutputWhenJSONFalse(t *testing.T) {
 	require.Contains(t, text, "state: DONE")
 	require.Contains(t, text, "view: layer_01j00000000000000000000001")
 }
+
+func TestArchiveCommandsRequireAConfirmedMountView(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", root)
+	t.Setenv("HOME", root)
+	for _, tc := range []struct {
+		name   string
+		status mountcontrol.StatusResponse
+		want   string
+	}{
+		{"uncertain", mountcontrol.StatusResponse{Error: "journal uncertain"}, "journal uncertain"},
+		{"recovering", mountcontrol.StatusResponse{OK: true, Recovering: true}, "recovering"},
+		{"missing_binding", mountcontrol.StatusResponse{OK: true, ViewSwitch: true}, "cannot identify"},
+		{"unavailable", mountcontrol.StatusResponse{}, "read mount view"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mp := t.TempDir()
+			socket := filepath.Join(root, "missing.sock")
+			if tc.name != "unavailable" {
+				socket = startFakeMountStatusSocket(t, func() mountcontrol.StatusResponse { return tc.status })
+			}
+			state := mountstate.ProcessState{PID: os.Getpid(), MountKind: mountstate.MountKindFUSE, MountPoint: mp, RemoteRoot: "/", LocalRoot: root, ControlSocket: socket, PackPaths: []string{"dist"}}
+			_, err := mountstate.WriteProcessState(mp, state)
+			require.NoError(t, err)
+			c := client.New("http://127.0.0.1:1", "unused")
+			require.ErrorContains(t, Pack(c, []string{"--mount", mp, ":/file.pack", "dist"}), tc.want)
+			require.ErrorContains(t, Unpack(c, []string{"--mount", mp, ":/file.pack"}), tc.want)
+			deps := umountDeps{goos: "linux", readProcessState: mountstate.ReadProcessState, requestStatus: mountcontrol.RequestStatus}
+			require.ErrorContains(t, runUmount([]string{mp}, deps), tc.want)
+		})
+	}
+}
