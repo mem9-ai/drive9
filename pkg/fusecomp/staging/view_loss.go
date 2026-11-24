@@ -242,9 +242,11 @@ func (c *WriteBackCache) clearViewLossLocked(remotePath string, gen uint64) {
 	}
 	if err := os.Remove(c.lostFile(remotePath)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		// The marker survives; keep the in-process record so this process still
-		// fails closed (unless a newer one is already installed).
+		// fails closed — but never lower a newer generation installed meanwhile.
 		c.mu.Lock()
-		if liveGen, liveOK := c.lostGens[remotePath]; !liveOK || liveGen <= gen {
+		liveGen, liveOK := c.lostGens[remotePath]
+		_, liveUnkOK := c.lostUnknown[lostHash(remotePath)]
+		if (!liveOK || (loss.Generation != ^uint64(0) && liveGen < loss.Generation)) && (!liveUnkOK || gen == ^uint64(0)) {
 			c.recordViewLossLocked(remotePath, loss.Generation)
 		}
 		c.mu.Unlock()

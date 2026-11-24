@@ -1235,9 +1235,10 @@ func (u *WriteBackUploader) applyPendingChmod(ctx context.Context, localPath str
 
 // stagedViewLost reports a staged image this process could not publish and
 // returns the error the caller should report. Recording is NOT done here: the
-// write cache is the single recorder for pruned pairs (WriteBackCache.OnViewLost
-// fires under the path lock), and recording again would double the event and
-// stamp a permanent failure on transient read errors it kept the entry for.
+// write cache's durable <hash>.lost marker owns failure persistence (a barrier
+// reads it through ViewLoss), and WriteBackCache.OnViewLost is only an optional
+// observer — so recording again would double the event and stamp a permanent
+// failure on transient read errors the cache kept the entry for.
 func (u *WriteBackUploader) stagedViewLost(localPath string, err error) error {
 	if err == nil {
 		err = errStagedViewUnavailable

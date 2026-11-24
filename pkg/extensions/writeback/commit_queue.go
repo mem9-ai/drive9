@@ -1024,12 +1024,15 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 	}
 	// One fsync for the whole subtree: the markers are only a fence once they
 	// are on disk, and a cancel usually arrives as one rename/rmdir of a tree.
+	markerDurable := false
 	if cq.journal != nil && len(cancelled) > 0 {
+		appended := true
 		for _, p := range cancelled {
 			if err := cq.journal.Append(staging.JournalEntry{
 				Op:   staging.JournalCommit,
 				Path: p,
 			}); err != nil {
+				appended = false
 				safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", p, err)
 			}
 		}
@@ -1039,11 +1042,24 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 		// descendants and bring the deleted names back.
 		if err := cq.journal.FsyncShared(); err != nil {
 			safeLogPrintf("commit queue: journal cancel markers not durable: %v", err)
+			appended = false
 		}
+		markerDurable = appended
 	}
 	for _, p := range cancelled {
 		if cq.shadows != nil {
-			cq.shadows.Remove(p)
+			if markerDurable {
+				// The fence is on disk: the page-cache unlink is enough (and the
+				// subtree pays no directory fsync for it).
+				cq.shadows.Remove(p)
+			} else {
+				// No durable cancel marker, so the unlink itself is the only
+				// authority: a page-cache-only removal can revert on power loss
+				// and resurrect the cancelled subtree.
+				if _, err := cq.shadows.RemoveIfGenerationDurable(p, 0); err != nil {
+					safeLogPrintf("commit queue: subtree shadow removal for %s was not durable: %v", p, err)
+				}
+			}
 		}
 		if cq.index != nil {
 			cq.index.Remove(p)

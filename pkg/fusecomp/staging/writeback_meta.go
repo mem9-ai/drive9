@@ -96,9 +96,10 @@ type WriteBackCache struct {
 	// whose records cannot be read.
 	lostUnknown       map[string]struct{}
 	lostDirUnreadable bool
-	// OnViewLost reports a pruned staged pair to the owner (the write-back
-	// engine records it as a terminal failure so a barrier on the path fails
-	// instead of reading "nothing staged" as success). It is the ONLY recorder
+	// OnViewLost reports a pruned staged pair to the owner. It is an optional
+	// observer hook: the durable <hash>.lost marker owns failure persistence (a
+	// barrier reads it through ViewLoss), so the engine no longer records the
+	// loss here and a nil hook is fine. It is the ONLY recorder
 	// for pruned pairs: callers invoke it with c.mu released but the per-path
 	// lock still held, so the record exists before another same-path operation
 	// can observe the pruned pair as "nothing staged". It must stay

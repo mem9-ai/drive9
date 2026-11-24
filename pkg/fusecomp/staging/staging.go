@@ -95,6 +95,12 @@ func (s *Staging) Close() {
 	if s == nil {
 		return
 	}
+	// Close the index first: it fences every remaining writer (a worker finishing
+	// a commit) before the journal and shadow below make their own writes fail
+	// halfway, so teardown never leaves new files in the pending directory.
+	if s.Pending != nil {
+		s.Pending.Close()
+	}
 	if s.Journal != nil {
 		_ = s.Journal.Close()
 	}
