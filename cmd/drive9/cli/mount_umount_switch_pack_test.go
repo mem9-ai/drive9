@@ -124,7 +124,12 @@ func TestUmountAndPackUnpackFollowPostSwitchControlStatus(t *testing.T) {
 
 	baseClient := client.New(srv.URL, "test-key-placeholder")
 	baseClient.Warm(context.Background())
-	require.NoError(t, Pack(baseClient, []string{"--mount", mp, ":/repo/layer.pack", "dist"}))
+	_, err = resolveMountedGitTarget(mp)
+	require.ErrorContains(t, err, "main-view mount")
+	require.ErrorContains(t, Pack(baseClient, []string{"--mount", mp, ":/repo/layer.pack", "dist"}), "active fence")
+	fencedClient, err := baseClient.WithView(client.ViewBinding{LayerID: layerID, Fence: 1})
+	require.NoError(t, err)
+	require.NoError(t, Pack(fencedClient, []string{"--mount", mp, ":/repo/layer.pack", "dist"}))
 	srvMu.Lock()
 	require.Equal(t, []string{"/v1/views/" + layerID + "/v1/fs/repo/layer.pack"}, uploadPaths)
 	srvMu.Unlock()
@@ -173,6 +178,9 @@ func TestUmountAndPackUnpackFollowPostSwitchControlStatus(t *testing.T) {
 	srvMu.Lock()
 	uploadPaths = nil
 	srvMu.Unlock()
+	gitTarget, err := resolveMountedGitTarget(mp)
+	require.NoError(t, err)
+	require.Equal(t, "/", gitTarget.RemoteRoot)
 	require.NoError(t, Pack(baseClient, []string{"--mount", mp, ":/main.pack", "dist"}))
 	srvMu.Lock()
 	require.Equal(t, []string{"/v1/fs/main.pack"}, uploadPaths)
@@ -241,6 +249,8 @@ func TestArchiveCommandsRequireAConfirmedMountView(t *testing.T) {
 			c := client.New("http://127.0.0.1:1", "unused")
 			require.ErrorContains(t, Pack(c, []string{"--mount", mp, ":/file.pack", "dist"}), tc.want)
 			require.ErrorContains(t, Unpack(c, []string{"--mount", mp, ":/file.pack"}), tc.want)
+			_, gitErr := resolveMountedGitTarget(mp)
+			require.ErrorContains(t, gitErr, tc.want)
 			deps := umountDeps{goos: "linux", readProcessState: mountstate.ReadProcessState, requestStatus: mountcontrol.RequestStatus}
 			require.ErrorContains(t, runUmount([]string{mp}, deps), tc.want)
 		})

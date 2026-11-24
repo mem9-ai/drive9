@@ -12,12 +12,12 @@ import (
 	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
-func refreshMountedPackView(state *mountstate.ProcessState, request func(context.Context, string, time.Duration) (*mountcontrol.StatusResponse, error), timeout time.Duration) error {
+func refreshMountedView(state *mountstate.ProcessState, request func(context.Context, string, time.Duration) (*mountcontrol.StatusResponse, error), timeout time.Duration) error {
 	if state.MountKind != "" && state.MountKind != mountstate.MountKindFUSE {
 		return nil
 	}
 	if strings.TrimSpace(state.ControlSocket) == "" {
-		return errors.New("mount control socket is missing; cannot confirm archive view")
+		return errors.New("mount control socket is missing; cannot confirm active view")
 	}
 	if request == nil {
 		request = mountcontrol.RequestStatus
@@ -26,20 +26,20 @@ func refreshMountedPackView(state *mountstate.ProcessState, request func(context
 	defer cancel()
 	status, err := request(ctx, state.ControlSocket, timeout)
 	if err != nil {
-		return fmt.Errorf("read mount view for archive: %w", err)
+		return fmt.Errorf("read mount view: %w", err)
 	}
 	snap, err := fixedMountStatus(status)
 	if err != nil {
-		return fmt.Errorf("read mount view for archive: %w", err)
+		return fmt.Errorf("read mount view: %w", err)
 	}
 	if status.Pending != nil || status.Recovering {
-		return errors.New("mount view is recovering; retry the archive operation after recovery")
+		return errors.New("mount view is recovering; retry after recovery")
 	}
 	if snap != nil {
 		state.LayerID = snap.Binding.LayerID
 		state.LayerReadOnly = snap.Binding.LayerID != "" && snap.Binding.ReadOnly
 	} else if status.ViewSwitch || status.Layer == nil || *status.Layer != state.LayerID {
-		return errors.New("cannot identify the active mount view for the archive")
+		return errors.New("cannot identify the active mount view")
 	}
 	if strings.TrimSpace(status.RemoteRoot) != "" {
 		state.RemoteRoot = status.RemoteRoot

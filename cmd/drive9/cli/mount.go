@@ -2234,7 +2234,7 @@ func runUmount(args []string, deps umountDeps) error {
 
 	archiveRequested := len(packArchives) > 0 || len(packPaths) > 0 || (!*noAutoPack && len(packState.PackPaths) > 0)
 	if archiveRequested && packStateOK && deps.goos != "windows" {
-		if err := refreshMountedPackView(&packState, deps.requestStatus, 5*time.Second); err != nil {
+		if err := refreshMountedView(&packState, deps.requestStatus, 5*time.Second); err != nil {
 			return fmt.Errorf("drive9 umount: %w", err)
 		}
 	}

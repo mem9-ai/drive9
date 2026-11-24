@@ -1795,7 +1795,7 @@ func resolveMountedPackTarget(target string) (mountedPackTarget, error) {
 		state, _, err := mountstate.ReadProcessState(candidate)
 		if err == nil {
 			if runtime.GOOS != "windows" {
-				if err := refreshMountedPackView(&state, mountcontrol.RequestStatus, time.Second); err != nil {
+				if err := refreshMountedView(&state, mountcontrol.RequestStatus, time.Second); err != nil {
 					return mountedPackTarget{}, err
 				}
 			}

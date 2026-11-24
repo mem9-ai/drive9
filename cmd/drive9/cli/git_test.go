@@ -628,11 +628,12 @@ func TestResolveMountedGitTargetUsesMountMetadata(t *testing.T) {
 	mountPoint := t.TempDir()
 	localRoot := t.TempDir()
 	pidPath, err := mountstate.WriteProcessState(mountPoint, mountstate.ProcessState{
-		PID:        os.Getpid(),
-		MountPoint: mountPoint,
-		RemoteRoot: "/remote",
-		Profile:    "coding-agent",
-		LocalRoot:  localRoot,
+		PID:           os.Getpid(),
+		ControlSocket: fixedArchiveSocket(t, ""),
+		MountPoint:    mountPoint,
+		RemoteRoot:    "/remote",
+		Profile:       "coding-agent",
+		LocalRoot:     localRoot,
 	})
 	if err != nil {
 		t.Fatalf("WriteProcessState: %v", err)
@@ -815,7 +816,7 @@ func TestMountedLayerRejectsMainOnlyGitAndUnfencedPack(t *testing.T) {
 	id := "layer_01j8z4r9w3m5n7p9q2s4t6v8xz"
 	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Error("unexpected network request") }))
 	t.Cleanup(srv.Close)
-	p, err := mountstate.WriteProcessState(mp, mountstate.ProcessState{PID: os.Getpid(), MountPoint: mp, RemoteRoot: "/", LocalRoot: local, LayerID: id, Server: srv.URL})
+	p, err := mountstate.WriteProcessState(mp, mountstate.ProcessState{PID: os.Getpid(), MountPoint: mp, RemoteRoot: "/", LocalRoot: local, LayerID: id, Server: srv.URL, ControlSocket: fixedArchiveSocket(t, id)})
 	if err != nil {
 		t.Fatal(err)
 	}
