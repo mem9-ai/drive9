@@ -225,15 +225,18 @@ func TestMountLeaseFailureClassChangeLogsEachTransition(t *testing.T) {
 	})
 	defer reporter.Close()
 
-	waitFor(t, 3*time.Second, func() bool { return h.sleepCount() >= 4 })
+	// Gate on the log line the test asserts, not on the sleep that precedes the
+	// heartbeat: the fourth sleep is recorded before the heartbeat is sent, so a
+	// sleep-based gate can read the log inside that round trip.
+	want := []string{"registration rejected", "registration unavailable", "registration rejected", "heartbeat recovered"}
+	waitFor(t, 3*time.Second, func() bool {
+		_, logs := h.snapshot()
+		return len(logs) >= len(want)
+	})
 	if regs := calls.registerCount(); regs < 4 {
 		t.Fatalf("registrations = %d, want the four scripted attempts", regs)
 	}
 	_, logs := h.snapshot()
-	want := []string{"registration rejected", "registration unavailable", "registration rejected", "heartbeat recovered"}
-	if len(logs) < len(want) {
-		t.Fatalf("logs = %#v, want at least %d lines", logs, len(want))
-	}
 	for i, fragment := range want {
 		if !strings.Contains(logs[i], fragment) {
 			t.Fatalf("logs[%d] = %q, want %q", i, logs[i], fragment)

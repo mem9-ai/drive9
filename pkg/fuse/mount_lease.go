@@ -22,8 +22,10 @@ const (
 	mountLeaseTimeout  = 5 * time.Second
 )
 
-// mountLeaseFailure classifies one lease call result so both call sites share
-// one terminal set instead of two hand-rolled status checks.
+// mountLeaseFailure classifies one lease call result so both call sites use the
+// same vocabulary instead of two hand-rolled status checks. The class is only a
+// name for the failure: run() decides what it means at each call site, and the
+// same class can be terminal on one path and recoverable on the other.
 type mountLeaseFailure int
 
 const (
@@ -44,12 +46,15 @@ const (
 	// registration after a growing delay): the same key is refused until its
 	// server-side state changes (key re-enabled, tenant restored, scope widened).
 	leaseFailureRejected
-	// leaseFailureTransient is every other error: retry at the base interval.
+	// leaseFailureTransient is every other error (dial error, timeout, 5xx, 429).
+	// Registration retries at the base interval; a heartbeat retries at the next
+	// heartbeat interval, which is the lease's normal cadence anyway.
 	leaseFailureTransient
 )
 
-// classifyMountLeaseFailure is the single place that decides which failures are
-// terminal, which re-register, and which only retry.
+// classifyMountLeaseFailure names a lease call result. It is the only place that
+// maps status codes and transport errors to a class; what the caller does with
+// the class (stop, re-register, retry) is decided at that call site.
 func classifyMountLeaseFailure(ctx context.Context, err error) mountLeaseFailure {
 	switch {
 	case ctx.Err() != nil:
@@ -206,11 +211,13 @@ func (l *mountLeaseReporter) run(ctx context.Context) {
 			// The server refuses this mount identity or key. Exiting here used to
 			// lose the lease silently: `mount health` only reads local state, so
 			// nothing surfaced the loss while the migration controller could move
-			// the region out from under a live mount. Re-register with backoff
-			// instead: the same key recovers when its server-side state does
-			// (re-enabled key, restored tenant, widened scope). A rotated
-			// credential is NOT picked up - the client's key is fixed at mount
-			// time - so the message says "rejected", not "recovered".
+			// the region out from under a live mount. Re-register instead: the
+			// same key recovers when its server-side state does (re-enabled key,
+			// restored tenant, widened scope); the backoff belongs to that
+			// re-registration, so a still-refused key costs one attempt per five
+			// minutes. A rotated credential is NOT picked up - the client's key
+			// is fixed at mount time - so the message says "rejected", not
+			// "recovered".
 			reportFailure(class, "drive9: mount lease heartbeat rejected (%v); re-registering\n", err)
 			registered = false
 			continue
