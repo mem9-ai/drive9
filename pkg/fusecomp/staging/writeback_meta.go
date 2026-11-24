@@ -1304,10 +1304,10 @@ func (c *WriteBackCache) ListPending() []PendingEntry {
 			// path now, and stamping the stale loss over it would fail barriers
 			// on a healthy (or deliberately removed) name.
 			c.mu.Lock()
-			_, stillPruned := c.metas[p.path]
+			_, stillStaged := c.metas[p.path]
 			recGen, stillRecorded := c.lostGens[p.path]
 			c.mu.Unlock()
-			if !stillPruned && stillRecorded && recGen == p.gen {
+			if !stillStaged && stillRecorded && recGen == p.gen {
 				c.reportViewLoss(p.path, p.gen, p.err)
 			}
 			c.ReleasePathLock(p.path, pl)

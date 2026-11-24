@@ -1178,6 +1178,11 @@ func (idx *PendingIndex) MarkCommittedIfGeneration(remotePath string, expectedGe
 	idx.mu.Lock()
 	if m, exists := idx.items[remotePath]; exists && m.Generation == expectedGen {
 		delete(idx.items, remotePath)
+		// This fence replaces whatever an earlier (unreadable) file described for
+		// the hash, so the mask must not survive it.
+		if idx.fenceMask != nil {
+			delete(idx.fenceMask, HashPath(remotePath))
+		}
 		idx.fences[remotePath] = fence
 		idx.mu.Unlock()
 		// The entry is gone from memory under the same path lock the fence

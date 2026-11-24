@@ -2436,6 +2436,12 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			for p, putGen := range dstPreCacheDescendants {
 				w.wbCache.RemoveIfPutGeneration(p, putGen)
 			}
+			// The destination's replaced incarnations lose their loss records
+			// here — with the rest of the incumbent cleanup, BEFORE the handles are
+			// retargeted — so a loss recorded by a retargeted writer afterwards is
+			// never cleared by this rename.
+			w.wbCache.ClearViewLoss(op.Path2)
+			w.wbCache.ClearViewLossPrefix(strings.TrimSuffix(op.Path2, "/") + "/")
 		}
 		// The instant the rename RESPONSE arrived: pending state published
 		// at either name after this belongs to the NEW incarnation (the
@@ -2519,12 +2525,11 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			w.queue.RenameTerminalFailure(op.Path, op.Path2, dstLandedSnaps)
 		}
 		w.retarget(op.Path, op.Path2)
-		// The object moved: the destination's replaced incarnation loses its
-		// record, and the source's obligation follows the name — a prune of the
-		// source inside this window must not read as a landed image at the
-		// destination.
+		// The object moved: the source's obligation follows the name — a prune of
+		// the source inside this window must not read as a landed image at the
+		// destination. (The replaced destination's records were cleared with the
+		// rest of the incumbent cleanup, before the handles moved.)
 		if w.wbCache != nil {
-			w.wbCache.ClearViewLoss(op.Path2)
 			w.wbCache.RekeyViewLoss(op.Path, op.Path2)
 		}
 		// The final publication fence: between the transition above and the
@@ -2563,7 +2568,6 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			// loop runs is carried over too instead of stranding its marker on the
 			// dead source name.
 			dstLossPrefix := strings.TrimSuffix(op.Path2, "/") + "/"
-			w.wbCache.ClearViewLossPrefix(dstLossPrefix)
 			for _, entry := range w.wbCache.ListByPrefix(prefix) {
 				target := op.Path2 + strings.TrimPrefix(entry.Path, op.Path)
 				moved := w.wbCache.RenamePending(entry.Path, target)

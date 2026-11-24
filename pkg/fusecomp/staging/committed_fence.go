@@ -193,18 +193,28 @@ func (idx *PendingIndex) ClearCommittedFence(remotePath string) {
 	idx.releasePathLock(remotePath, pl)
 }
 
-// clearCommittedFenceLocked drops the in-memory fence and reports whether a
-// file must be unlinked. It performs no file I/O, so it is safe to call with
-// idx.mu held; the caller removes the file after unlocking.
+// clearCommittedFenceLocked drops the in-memory fence (and any undecodable-mask
+// entry for the path) and reports whether a file must be unlinked. It performs no
+// file I/O, so it is safe to call with idx.mu held; the caller removes the file
+// after unlocking.
 func (idx *PendingIndex) clearCommittedFenceLocked(remotePath string) bool {
-	if idx.fences == nil {
-		return false
+	had := false
+	if idx.fences != nil {
+		if _, ok := idx.fences[remotePath]; ok {
+			delete(idx.fences, remotePath)
+			had = true
+		}
 	}
-	if _, had := idx.fences[remotePath]; !had {
-		return false
+	// An undecodable fence masks every frame for its path, and an explicit
+	// supersession (a fresh staging, a removal, a rename destination, a published
+	// conflict marker) replaces the incarnation it described — so it goes too.
+	if idx.fenceMask != nil {
+		if _, ok := idx.fenceMask[HashPath(remotePath)]; ok {
+			delete(idx.fenceMask, HashPath(remotePath))
+			had = true
+		}
 	}
-	delete(idx.fences, remotePath)
-	return true
+	return had
 }
 
 // clearCommittedFencesLocked drops the in-memory fences for the given paths and

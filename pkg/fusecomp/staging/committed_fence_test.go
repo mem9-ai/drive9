@@ -542,3 +542,29 @@ func TestUnreadableFenceMasksOnlyItsOwnPath(t *testing.T) {
 		t.Fatal("an unrelated path was masked by one corrupt fence")
 	}
 }
+
+// TestExplicitSupersessionClearsAnUndecodableFence pins the mask rule: an
+// undecodable fence masks every frame for its path, so an explicit supersession
+// (a fresh staging, a removal, a rename destination, a published conflict marker)
+// must be able to replace it — while settle still leaves it alone.
+func TestExplicitSupersessionClearsAnUndecodableFence(t *testing.T) {
+	idx, dir := newFenceTestIndex(t)
+	const path = "/masked.txt"
+	if err := os.WriteFile(filepath.Join(dir, HashPath(path)+".fence"), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The load adopts the mask.
+	if _, ok := idx.CommittedFence(path); !ok {
+		t.Fatal("the undecodable fence was not adopted as a mask")
+	}
+	// A fresh staging replaces the incarnation: the mask (and the file) go.
+	if _, err := idx.Put(path, 4, PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := idx.CommittedFence(path); ok {
+		t.Fatal("an explicit supersession kept the undecodable fence mask")
+	}
+	if _, err := os.Stat(filepath.Join(dir, HashPath(path)+".fence")); !os.IsNotExist(err) {
+		t.Fatalf("the undecodable fence file survived the supersession: %v", err)
+	}
+}
