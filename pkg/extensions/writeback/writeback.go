@@ -7528,8 +7528,7 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 				h.mu.Unlock()
 				return nil
 			}
-			cur := append([]byte(nil), h.buf.Bytes()...)
-			if !h.unlinked && (!bytes.Equal(image, cur) || landedRev > h.baseRev) {
+			if !h.unlinked && (landedRev > h.baseRev || !bytes.Equal(image, h.buf.Bytes())) {
 				if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
 					h.mu.Unlock()
 					return err
@@ -7864,8 +7863,7 @@ func (h *bufferingHandle) commitLocked(ctx context.Context) error {
 				h.mu.Unlock()
 				return nil
 			}
-			cur := append([]byte(nil), h.buf.Bytes()...)
-			if !h.unlinked && (!bytes.Equal(image, cur) || landedRev > h.baseRev) {
+			if !h.unlinked && (landedRev > h.baseRev || !bytes.Equal(image, h.buf.Bytes())) {
 				if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
 					h.mu.Unlock()
 					return err
@@ -8271,9 +8269,9 @@ func (h *bufferingHandle) lockStagePath() (string, func()) {
 
 func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurability) (*writeCacheSnapshot, error) {
 	h.mu.Lock()
-	closed := h.closed
+	anonymousOrClosed := h.unlinked || h.closed
 	h.mu.Unlock()
-	if closed {
+	if anonymousOrClosed {
 		return nil, nil
 	}
 	// The #1023 fence for the writeback-cache track (close-sync and the
@@ -8288,12 +8286,11 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 		}
 		if image != nil {
 			h.mu.Lock()
-			if h.closed || h.buf == nil {
+			if h.unlinked || h.closed || h.buf == nil {
 				h.mu.Unlock()
 				return nil, nil
 			}
-			cur := append([]byte(nil), h.buf.Bytes()...)
-			if !h.unlinked && (!bytes.Equal(image, cur) || landedRev > h.baseRev) {
+			if landedRev > h.baseRev || !bytes.Equal(image, h.buf.Bytes()) {
 				if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
 					h.mu.Unlock()
 					return nil, err
@@ -8304,13 +8301,16 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 	}
 	path, unlock := h.lockStagePath()
 	defer unlock()
-	if h.w.opts.Staging != nil && h.w.opts.Staging.Pending.HasPending(path) {
-		return nil, errWriteCacheBypass
-	}
+	hasPending := h.w.opts.Staging != nil && h.w.opts.Staging.Pending.HasPending(path)
 	h.mu.Lock()
 	if h.unlinked || h.closed {
 		h.mu.Unlock()
 		return nil, nil
+	}
+	// A pending upload for a reused name belongs to its new handle.
+	if hasPending {
+		h.mu.Unlock()
+		return nil, errWriteCacheBypass
 	}
 	if dur == stageV1Ladder && !h.dirty {
 		h.mu.Unlock()
