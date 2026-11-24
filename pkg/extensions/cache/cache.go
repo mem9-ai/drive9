@@ -339,7 +339,11 @@ func (c *Cache) invalidatePathTiers(path string) {
 			if _, aliased := aliases[p]; aliased || p == path || strings.HasPrefix(p, prefix) {
 				h.mu.Lock()
 				if h.prefetch != nil {
-					h.prefetch.Invalidate()
+					// Reset without a size (h.size/h.rev are zeroed below): an
+					// in-flight Read that already passed revalidationDue can
+					// still call OnRead/Get against the old smaller fileSize
+					// and serve a short block as EOF.
+					h.prefetch.InvalidateUnknownSize()
 				}
 				// The SSE change replaced this file's remote image: the
 				// handle's open-time size/rev describe the OLD one, and a
@@ -422,6 +426,14 @@ func (c *Cache) markUnverified() {
 			if h, ok := key.(*cachingHandle); ok {
 				h.mu.Lock()
 				if h.prefetch != nil {
+					// Keep the open-time size: this reset always pairs with a
+					// revalidation (the flag set below), and revalidateRevision
+					// republishes st.Size only when the identity moved. Dropping
+					// the size here would leave an unchanged file at "unknown"
+					// for good and quietly disable readahead on every open
+					// descriptor after a routine stream disconnect. Sizes that
+					// no revalidation follows use InvalidateUnknownSize instead
+					// (invalidateAllTiers).
 					h.prefetch.Invalidate()
 				}
 				h.revalidate = true
@@ -460,7 +472,10 @@ func (c *Cache) invalidateAllTiers() {
 			if h, ok := key.(*cachingHandle); ok {
 				h.mu.Lock()
 				if h.prefetch != nil {
-					h.prefetch.Invalidate()
+					// Drop the size with the blocks: the prefetcher clips its
+					// last block to the size it holds, and the open-time size
+					// belongs to the OLD view (see InvalidateUnknownSize).
+					h.prefetch.InvalidateUnknownSize()
 				}
 				// The open-time size/revision describe the OLD view: keeping
 				// them made a whole-file read re-cache the stale prefix as the

@@ -35,6 +35,10 @@ func newStagedStack(t *testing.T, policy Policy, b *testbackend.Backend) (*fs.Ch
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Drain the worker goroutines before the ledger's directory is removed:
+	// a commit still finishing would otherwise create files in pending/ while
+	// t.TempDir's cleanup removes it.
+	t.Cleanup(func() { _ = wb.Stop(context.Background()) })
 	terminal, err := core.New(cl, core.Options{})
 	if err != nil {
 		t.Fatal(err)

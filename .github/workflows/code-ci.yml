@@ -45,6 +45,9 @@ jobs:
       - name: Gitleaks regressions
         run: make test-gitleaks-fail-closed test-gitleaks-scan-coverage
 
+      - name: Archive publisher regressions
+        run: make test-publish-agent-archive
+
       - name: Test
         run: make test TEST_TIMEOUT=25m
 

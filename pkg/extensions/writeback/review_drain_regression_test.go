@@ -3,6 +3,7 @@ package writeback
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -398,4 +399,127 @@ func TestDrainCacheLookupPreservesLaterWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertReviewDrainRemote(t, backend, append(first, tail...))
+}
+
+// TestDrainFailsWhenAStagedPairWasPruned pins the drain contract: the only
+// production caller of DrainFlush is Writeback.Drain (syncfs(2) / mount drain),
+// and it used to discard the error. A pruned pair has no work left in the
+// uploader or the queue, so without the propagated error the drain certified a
+// file whose image never landed.
+func TestDrainFailsWhenAStagedPairWasPruned(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	backend := testbackend.NewBackend()
+	cache, err := staging.NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain, wb := newReviewDrainStack(t, http.HandlerFunc(backend.ServeHTTP), cache)
+	h, _ := stageReviewDrainFile(t, ctx, chain)
+	// The close snapshot left a staged pair in the write cache. Corrupt it the
+	// way a torn write would, then prune it with a plain read so only the loss
+	// record remains.
+	cache.DropInMemoryPayload("/f")
+	if err := os.WriteFile(cache.DatFile("/f"), []byte("different bytes!"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cache.Get("/f"); ok {
+		t.Fatal("read served a torn pair")
+	}
+	if err := cache.ViewLoss("/f"); err == nil {
+		t.Fatal("the prune recorded no loss")
+	}
+	h.mu.Lock()
+	staged := h.stagedToCache
+	h.mu.Unlock()
+	if !staged {
+		t.Fatal("the handle no longer owns the staged image; the scenario needs the drain to look at it")
+	}
+	if err := wb.Drain(ctx); err == nil {
+		t.Fatal("drain reported success after the staged pair was pruned")
+	}
+}
+
+// TestDrainPendingReportsLostImageAfterClose pins the gap the drain counters
+// had: a pruned pair whose path has no open handle (closed, or a fresh process
+// after a restart) has no dirty buffer and no queue entry, so only the durable
+// view-loss marker is left to report that the bytes never landed.
+func TestDrainPendingReportsLostImageAfterClose(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	backend := testbackend.NewBackend()
+	cache, err := staging.NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, wb := newReviewDrainStack(t, http.HandlerFunc(backend.ServeHTTP), cache)
+	// A staged pair with no handle behind it: this is what a restart, or a
+	// closed writer whose pair was pruned by a later read, looks like.
+	if err := cache.Put("/closed.bin", []byte("staged image"), 12, staging.PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	cache.DropInMemoryPayload("/closed.bin")
+	if err := os.WriteFile(cache.DatFile("/closed.bin"), []byte("different bytes!"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cache.Get("/closed.bin"); ok {
+		t.Fatal("read served a torn pair")
+	}
+	// Drain itself must not certify the mount: nothing holds the work, but the
+	// bytes never landed.
+	if err := wb.Drain(ctx); !errors.Is(err, staging.ErrStagedViewLost) {
+		t.Fatalf("drain error = %v, want ErrStagedViewLost", err)
+	}
+	kind, n := wb.DrainPending()
+	if kind != "lost_staged_images" || n == 0 {
+		t.Fatalf("DrainPending = %q, %d; want the lost staged image", kind, n)
+	}
+}
+
+// TestStageToWriteCacheSkipsEmptyImageAfterLanding pins the guard against the
+// nodefs drain flake: a handle whose image already landed (a streamed inline
+// commit, or a queue landing) with no buffer left must not materialize a
+// zero-byte image. If that image landed it would truncate the file; if it did
+// not, it stranded a bogus pending entry that failed the unmount drain.
+func TestStageToWriteCacheSkipsEmptyImageAfterLanding(t *testing.T) {
+	for _, landed := range []bool{true, false} {
+		t.Run(map[bool]string{true: "landed", false: "never landed"}[landed], func(t *testing.T) {
+			backend := testbackend.NewBackend()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			cache, err := staging.NewWriteBackCache(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			chain, _ := newReviewDrainStack(t, http.HandlerFunc(backend.ServeHTTP), cache)
+			h := writebackHandleOf(dispatchOpen(t, chain, "/empty.bin", uint32(syscall.O_CREAT|syscall.O_EXCL|syscall.O_RDWR)))
+			h.mu.Lock()
+			h.isNew = true
+			h.landed = landed
+			h.buf = nil
+			h.mu.Unlock()
+
+			snap, err := h.stageToWriteCache(ctx, stageFullDurable)
+			if err != nil {
+				t.Fatalf("stageToWriteCache: %v", err)
+			}
+			if landed {
+				if snap != nil {
+					t.Fatal("a landed handle materialized an empty image")
+				}
+				if _, ok := cache.GetMeta("/empty.bin"); ok {
+					t.Fatal("a landed handle staged a zero-byte image over its content")
+				}
+				return
+			}
+			// The create-only claim still has to publish its (empty) existence.
+			if snap == nil {
+				t.Fatal("an unlanded create-only handle did not stage its empty image")
+			}
+			meta, ok := cache.GetMeta("/empty.bin")
+			if !ok || meta.Size != 0 {
+				t.Fatalf("staged meta = %+v, %v; want a zero-byte image", meta, ok)
+			}
+		})
+	}
 }

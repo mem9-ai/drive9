@@ -176,10 +176,10 @@ type CommitQueue struct {
 	// path (onCommitSuccessWithOptions), mirroring landed's lifecycle.
 	terminalFailures map[string]pathCommitFailure
 	failureClock     uint64
-	maxPending int
-	client     *client.Client
-	remoteRoot string
-	shadows    *staging.ShadowStore
+	maxPending       int
+	client           *client.Client
+	remoteRoot       string
+	shadows          *staging.ShadowStore
 	// retainedShadows marks a path whose landed entry must NOT have its
 	// shadow reclaimed: the staging handle refused certification (its
 	// buffer moved on), but the shadow is still the only restore source for
@@ -1013,9 +1013,44 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 	for _, cancel := range cancels {
 		cancel()
 	}
+	// One fsync for the whole subtree: the markers are only a fence once they
+	// are on disk, and a cancel usually arrives as one rename/rmdir of a tree.
+	markerDurable := false
+	if cq.journal != nil && len(cancelled) > 0 {
+		appended := true
+		for _, p := range cancelled {
+			if err := cq.journal.Append(staging.JournalEntry{
+				Op:   staging.JournalCommit,
+				Path: p,
+			}); err != nil {
+				appended = false
+				safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", p, err)
+			}
+		}
+		// Unconditional: one failed append must not leave the other subtree
+		// markers in the page cache while their shadows are dropped below. A
+		// crash before the background sync window would then replay the
+		// descendants and bring the deleted names back.
+		if err := cq.journal.FsyncShared(); err != nil {
+			safeLogPrintf("commit queue: journal cancel markers not durable: %v", err)
+			appended = false
+		}
+		markerDurable = appended
+	}
 	for _, p := range cancelled {
 		if cq.shadows != nil {
-			cq.shadows.Remove(p)
+			if markerDurable {
+				// The fence is on disk: the page-cache unlink is enough (and the
+				// subtree pays no directory fsync for it).
+				cq.shadows.Remove(p)
+			} else {
+				// No durable cancel marker, so the unlink itself is the only
+				// authority: a page-cache-only removal can revert on power loss
+				// and resurrect the cancelled subtree.
+				if _, err := cq.shadows.RemoveIfGenerationDurable(p, 0); err != nil {
+					safeLogPrintf("commit queue: subtree shadow removal for %s was not durable: %v", p, err)
+				}
+			}
 		}
 		if cq.index != nil {
 			cq.index.Remove(p)
@@ -1023,14 +1058,6 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 		// Same pathname-incarnation rule as cancelPath: the subtree's names
 		// are gone, so their terminal failures must not poison a recreator.
 		cq.clearTerminalFailure(p)
-		if cq.journal != nil {
-			if err := cq.journal.Append(staging.JournalEntry{
-				Op:   staging.JournalCommit,
-				Path: p,
-			}); err != nil {
-				safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", p, err)
-			}
-		}
 	}
 }
 
@@ -1488,11 +1515,17 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 		cancel()
 	}
 	hadLocal := false
-	if cq.shadows != nil && cq.shadows.Has(path) {
+	var removalErr error
+	hadShadow := cq.shadows != nil && cq.shadows.Has(path)
+	if cq.shadows != nil && (hadShadow || cq.shadows.VerifyRemoved(path) != nil) {
+		// Has() reports false on a stat error (EACCES/EIO); the verifier proves
+		// absence instead, so a failing cache filesystem cannot take the
+		// "nothing staged" fast path.
 		hadLocal = true
-		if !preserveLocal {
-			cq.shadows.Remove(path)
-		}
+		// The actual removal is deferred below: while the WAL marker is still
+		// unwritten, the shadow is the only recovery source, and removing it
+		// first would both lose the image and (worse) leave the name replayable
+		// from frames that nothing fences.
 	}
 	// The pending entry dies only once the recovery source is CONFIRMED
 	// gone: it is the overlay lookups serve from, and a failed unlink must
@@ -1518,35 +1551,57 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 	// No WAL (or nothing staged): without frames there is nothing to fence,
 	// and a journal-less queue keeps the preserve-local contract verbatim.
 	if cq.journal == nil || !hadLocal {
+		if !preserveLocal && hadShadow {
+			// No frames to fence: the unlink itself is the only authority, so it
+			// must be durable. There is no replay source without a WAL, so a
+			// failure is logged rather than failing the unlink (which would keep
+			// a name the caller was allowed to drop).
+			if _, rerr := cq.shadows.RemoveIfGenerationDurable(path, 0); rerr != nil {
+				safeLogPrintf("commit queue: shadow removal for %s was not durable: %v", path, rerr)
+			}
+		}
 		dropPending()
 		cq.clearTerminalFailure(path)
 		return nil
 	}
-	appendErr := cq.journal.Append(staging.JournalEntry{
+	// AppendSync, not Append: the marker is what fences the frames of this
+	// name after a power loss, so it has to be on disk before the local state
+	// it protects is dropped.
+	appendErr := cq.journal.AppendSync(staging.JournalEntry{
 		Op:   staging.JournalUnlink,
 		Path: path,
 	})
 	if appendErr == nil {
-		// The marker fences every frame published before it — the path
-		// cannot replay even if the removal above silently failed.
+		// The marker fences every frame published before it, so the local image
+		// can go. A non-preserving cancel removes it durably here, after the
+		// fence exists.
+		if !preserveLocal && hadShadow {
+			_, _ = cq.shadows.RemoveIfGenerationDurable(path, 0)
+		}
 		dropPending()
 		cq.clearTerminalFailure(path)
 		return nil
 	}
 	safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", path, appendErr)
-	if preserveLocal {
-		// The retained shadow/index are safe only while the marker fences
-		// their WAL frames: without it a crash replays them. Fall back to
-		// the non-preserving cleanup below.
-		if cq.shadows != nil {
-			cq.shadows.Remove(path)
-		}
+	// A marker that could not be fsynced fences nothing, so BOTH policies must
+	// fall back to the durable unlink: the shadow cannot stay (a crash would
+	// replay it) and it cannot be removed with a page-cache unlink alone (power
+	// loss would revert that).
+	removed := false
+	if cq.shadows != nil {
+		// Durable removal: this path is the fallback for a marker that could not
+		// be fsynced, so the unlink itself must survive a power loss or replay
+		// resurrects the deleted name.
+		removed, removalErr = cq.shadows.RemoveIfGenerationDurable(path, 0)
 	}
-	// ShadowStore.Remove and PendingIndex.Remove discard their disk errors,
-	// so verify with evidence instead of assuming: a read-only or failing
-	// cache filesystem can reject the marker AND leave the durable shadow
-	// behind, and replay would then upload the deleted name after a restart.
-	if cq.shadows == nil || cq.shadows.VerifyRemoved(path) == nil {
+	// Absence is only proven by the durable removal plus a verifier that cannot
+	// mistake "stat failed" for "file is gone" (EACCES/EIO on an unwritable
+	// directory).
+	absent := cq.shadows == nil
+	if cq.shadows != nil && removalErr == nil && (removed || cq.shadows.VerifyRemoved(path) == nil) {
+		absent = true
+	}
+	if absent {
 		// Confirmed gone — finish the degrade-to-non-preserving cleanup
 		// (the anonymous fd loses its staged image on a failing WAL, but
 		// the unlink cannot resurrect).
@@ -1561,7 +1616,7 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 	// when the shadow is still stat-able so the fsynced publication is
 	// retryable without a restart, and report the unlink as failed — the
 	// caller must not acknowledge a deletion a restart would undo.
-	if cq.shadows.Has(path) {
+	if cq.index != nil && cq.shadows.Has(path) {
 		if entry := cq.recoveredEntry(path); entry != nil {
 			if enqErr := cq.Enqueue(entry); enqErr != nil {
 				safeLogPrintf("commit queue: re-driving %s after the failed unlink rollback failed: %v", path, enqErr)
@@ -2677,14 +2732,22 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 
 	// Write durable commit record BEFORE cleaning up local state so that
 	// crash recovery never re-uploads an already committed entry.
+	var markerErr error
 	if cq.journal != nil {
-		if err := cq.journal.Append(staging.JournalEntry{
+		// Durable before cleanup: recovery reads the WAL as written, and a
+		// marker still in the page cache after a power loss is not there —
+		// the pending frames it was meant to override would replay and
+		// re-upload the pre-commit image over the committed one.
+		if err := cq.journal.AppendSync(staging.JournalEntry{
 			Op:   staging.JournalCommit,
 			Path: entry.Path,
 		}); err != nil {
-			safeLogPrintf("commit queue: journal commit marker failed for %s: %v (keeping local state)", entry.Path, err)
-			cq.removeFromQueue(entry)
-			return nil
+			// The upload landed and the cleanup below removes this path's
+			// shadow/pending state, so replay finds no bytes to resurrect.
+			// Report the durability fault and keep going: bailing out here
+			// would leave exactly the local state a replay needs.
+			markerErr = err
+			safeLogPrintf("commit queue: journal commit marker not durable for %s: %v (continuing cleanup)", entry.Path, err)
 		}
 	}
 
@@ -2694,20 +2757,70 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 		cq.OnSuccess(entry, committedRev)
 	}
 
-	// Clean up shadow and pending index.
+	// Clean up shadow and pending index. The cleanup is only safe when the local image can no longer be a replay
+	// source. Two cases keep it: a staging handle that retained newer bytes,
+	// and a removal that failed while the commit marker is not durable. Both
+	// must be detected BEFORE the pending entry is deleted, because that
+	// deletion is what makes a later landed fence a silent no-op.
+	retained := false
+	removalFailed := false
 	if cq.shadows != nil {
 		if keep, ok := cq.retainedShadows.LoadAndDelete(entry.Path); ok && keep == entry.ShadowGen {
-			// The staging handle kept newer local bytes: the shadow stays
-			// as the restore source for this landing's evicted parts.
-			cq.index.RemoveIfGeneration(entry.Path, entry.PendingIndexGen)
-			cq.removeFromQueue(entry)
-			return nil
+			// The staging handle kept newer local bytes: the shadow stays as
+			// the restore source for this landing's evicted parts.
+			retained = true
 		}
-		if entry.ShadowGen != 0 {
-			cq.shadows.RemoveIfGeneration(entry.Path, entry.ShadowGen)
+		if !retained && entry.ShadowGen != 0 {
+			if markerErr != nil {
+				// The crash reasoning depends on this shadow staying gone, so
+				// the removal must be durable: an unsynced unlink can revert on
+				// a crash and leave the shadow as the replay source for an image
+				// whose pending entry is about to be deleted. Only a removal
+				// this entry performed counts — a newer generation that already
+				// replaced entry.ShadowGen owns the file.
+				// The durable removal reports its own verdict (under the shadow
+				// path lock). VerifyRemoved used to check from outside that lock
+				// and raced a concurrent spill, reporting a false failure.
+				removed, derr := cq.shadows.RemoveIfGenerationDurable(entry.Path, entry.ShadowGen)
+				if removed && derr != nil {
+					removalFailed = true
+					safeLogPrintf("commit queue: shadow removal for %s was not made durable: %v", entry.Path, derr)
+				}
+			} else {
+				cq.shadows.RemoveIfGeneration(entry.Path, entry.ShadowGen)
+			}
 		}
 	}
-	if cq.index != nil {
+	keepPending := false
+	if markerErr != nil && cq.index != nil && entry.PendingIndexGen != 0 {
+		// The marker is not durable and the local image survived the cleanup:
+		// record a landed replay fence. The fence is a separate durable record,
+		// so the pending entry is retired (readers see the path as clean) while
+		// recovery still refuses to re-upload the landed image from the
+		// surviving shadow. Generation-scoped on both sides: a newer staging
+		// that already replaced this one is never suppressed by it.
+		// Fence whenever the marker is not durable, even when the removal
+		// reported "not removed": a concurrent shadow write may have replaced
+		// the generation, and an unfenced WAL frame beside a live shadow is
+		// exactly what recovery must not resurrect. No-op if a newer Put
+		// already advanced the generation.
+		fenceShadowGen := entry.ShadowGen
+		if !retained && !removalFailed {
+			// The shadow is durably gone, so settle has nothing to remove.
+			fenceShadowGen = 0
+		}
+		marked, err := cq.index.MarkCommittedIfGeneration(entry.Path, entry.PendingIndexGen, fenceShadowGen)
+		switch {
+		case err != nil:
+			// No durable fence was established, so the pending entry must not be
+			// deleted while its shadow can still replay: keep it for retry.
+			keepPending = true
+			safeLogPrintf("commit queue: replay fence for %s failed: %v (pending entry kept)", entry.Path, err)
+		case marked:
+			safeLogPrintf("commit queue: shadow survived the cleanup for %s after a non-durable commit marker; replay fenced as committed", entry.Path)
+		}
+	}
+	if cq.index != nil && !keepPending {
 		if entry.PendingIndexGen != 0 {
 			cq.index.RemoveIfGeneration(entry.Path, entry.PendingIndexGen)
 		}
@@ -3178,7 +3291,9 @@ func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry, lastErr error
 		}
 	}
 	if cq.journal != nil {
-		if err := cq.journal.Append(staging.JournalEntry{
+		// "Done" is also a fence: unsynced, a restart re-enqueues the entry
+		// this terminal failure just settled.
+		if err := cq.journal.AppendSync(staging.JournalEntry{
 			Op:   staging.JournalCommit, // treated as "done" so recovery won't re-enqueue
 			Path: entry.Path,
 		}); err != nil {
@@ -3330,7 +3445,7 @@ func (cq *CommitQueue) CancelQueuedForRename(path string) error {
 	if cq.journal == nil {
 		return nil
 	}
-	if err := cq.journal.Append(staging.JournalEntry{Op: staging.JournalUnlink, Path: path}); err != nil {
+	if err := cq.journal.AppendSync(staging.JournalEntry{Op: staging.JournalUnlink, Path: path}); err != nil {
 		return fmt.Errorf("journal rename marker for %s: %w", path, err)
 	}
 	return nil
