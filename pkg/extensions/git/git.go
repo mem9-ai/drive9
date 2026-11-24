@@ -88,8 +88,21 @@ type workspace struct {
 	// cancelable by caller/Stop contexts. An attempt that fails (or finds
 	// the checkpoint not uploaded yet) leaves restoreLatched false so the
 	// next entry point retries; once latched, later calls no-op.
-	restoreWait    chan struct{}
-	restoreLatched bool
+	restoreWait      chan struct{}
+	restoreLatched   bool
+	baselineStateSum string
+}
+
+func (w *workspace) baselineStateSHA256() string {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.baselineStateSum
+}
+
+func (w *workspace) setBaselineStateSHA256(sum string) {
+	w.mu.Lock()
+	w.baselineStateSum = sum
+	w.mu.Unlock()
 }
 
 func (w *workspace) isRestoreLatched() bool {
@@ -411,6 +424,14 @@ type Git struct {
 	// workspace's own checkpoint (its staged-object pack). A live local
 	// checkout is never listed here.
 	freshRestored map[string]bool
+
+	// bgRestoreSem bounds concurrent background workspace restores so a
+	// multi-workspace tenant does not fan out unbounded clones/fetches at
+	// mount start while foreground lookups still bypass the queue.
+	bgRestoreSem chan struct{}
+
+	batchMu      sync.Mutex
+	batchReaders map[string]*catFileBatch
 }
 
 // trackWorkspace maintains the claimed-handle index.
@@ -546,8 +567,9 @@ func New(opts Options) (*Git, error) {
 		return nil, fmt.Errorf("git: client is required")
 	}
 	g := &Git{cl: opts.Client, bus: opts.Events, localRoot: opts.LocalRoot, syncPolicy: opts.SyncPolicy,
-		remoteRoot: strings.TrimSuffix(strings.TrimSpace(opts.RemoteRoot), "/"),
-		onRefresh:  opts.OnWorkspaceRefresh}
+		remoteRoot:   strings.TrimSuffix(strings.TrimSpace(opts.RemoteRoot), "/"),
+		onRefresh:    opts.OnWorkspaceRefresh,
+		bgRestoreSem: make(chan struct{}, 2)}
 	if g.localRoot != "" {
 		g.checkpoints = debounce.NewFlushDebouncer(gitCheckpointDebounce)
 	}
@@ -606,11 +628,23 @@ func (g *Git) ensureWorkspaceState(ctx context.Context, w *workspace) error {
 			// A blobless restore prefetches the HEAD tree's blobs before
 			// serving. Linked worktrees resolve objects through their admin
 			// dir under the common repository rather than the root .git file.
-			if gitDir, ok := g.checkpointGitDir(w); ok {
-				if err := g.MaterializeHeadTree(rctx, gitDir); err != nil && !errors.Is(err, context.Canceled) {
+			// Do not latch restore completion until blob hydration succeeds.
+			gitDir, ok := g.checkpointGitDir(w)
+			if !ok {
+				return errGitStateNotReady
+			}
+			if err := g.MaterializeHeadTree(rctx, gitDir); err != nil {
+				if workCtx.Err() != nil {
+					return workCtx.Err()
+				}
+				if !errors.Is(err, context.Canceled) && !errors.Is(err, errGitRuntimeStopped) {
 					fmt.Fprintf(os.Stderr, "drive9: git head tree materialize failed for workspace %s: %v\n", w.id, err)
 				}
+				return err
 			}
+		}
+		if workCtx.Err() != nil {
+			return workCtx.Err()
 		}
 		w.markRestoreLatched()
 		return nil
@@ -868,7 +902,16 @@ func (g *Git) ensure(ctx context.Context) {
 		// checkpoint raced the discovery) retries on the next reload —
 		// the success latch makes repeat attempts a no-op.
 		if g.localRoot != "" {
+			w := w
 			g.runBackground(func(restoreCtx context.Context) {
+				if g.bgRestoreSem != nil {
+					select {
+					case g.bgRestoreSem <- struct{}{}:
+						defer func() { <-g.bgRestoreSem }()
+					case <-restoreCtx.Done():
+						return
+					}
+				}
 				_ = g.ensureWorkspaceState(restoreCtx, w)
 			})
 		}
@@ -964,21 +1007,6 @@ func (g *Git) Start(ctx context.Context) error {
 			reloadCtx, cancel := context.WithTimeout(startCtx, 15*time.Second)
 			g.ensure(reloadCtx)
 			cancel()
-		}
-		if g.localRoot != "" {
-			g.mu.RLock()
-			workspaces := make([]*workspace, len(g.workspaces))
-			copy(workspaces, g.workspaces)
-			g.mu.RUnlock()
-			restoreCtx, restoreCancel := context.WithTimeout(startCtx, gitWorkspaceHydrateTimeout)
-			defer restoreCancel()
-			for _, w := range workspaces {
-				// All restore entry points (mount start, discovery, lazy
-				// blob reads) serialize on the workspace's restore gate:
-				// two concurrent restores race their RemoveAll+Rename
-				// swap and can leave a half-deleted .git behind.
-				_ = g.ensureWorkspaceState(restoreCtx, w)
-			}
 		}
 	})
 	g.runBackground(func(rescanCtx context.Context) {

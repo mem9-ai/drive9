@@ -70,11 +70,11 @@ func TestFreshLocalRootDotGitLookupWaitsForAsyncRestore(t *testing.T) {
 	run(t, src, "clone", "-q", "--bare", "--no-local", src, bare)
 	run(t, bare, "config", "uploadpack.allowFilter", "true")
 
-	//Mount A builds a dirty staged index and uploads the workspace checkpoint + index.
+	// Mount A builds a blobless checkout + dirty staged index and uploads the workspace checkpoint + index.
 	localRootA := t.TempDir()
 	repoA := filepath.Join(localRootA, "overlay", "repo")
 	require.NoError(t, os.MkdirAll(filepath.Dir(repoA), 0o755))
-	run(t, filepath.Dir(repoA), "clone", "-q", "file://"+bare, repoA)
+	run(t, filepath.Dir(repoA), "clone", "-q", "--filter=blob:none", "file://"+bare, repoA)
 	require.NoError(t, os.WriteFile(filepath.Join(repoA, "staged.txt"), []byte("staged-change\n"), 0o644))
 	run(t, repoA, "add", "staged.txt")
 
@@ -201,7 +201,7 @@ func TestFreshLocalRootLinkedWorktreeDotGitLookupWaitsForRestore(t *testing.T) {
 	baseRepoA := filepath.Join(localRootA, "overlay", "base")
 	linkedRepoA := filepath.Join(localRootA, "overlay", "linked")
 	require.NoError(t, os.MkdirAll(filepath.Dir(baseRepoA), 0o755))
-	run(t, filepath.Dir(baseRepoA), "clone", "-q", "file://"+bare, baseRepoA)
+	run(t, filepath.Dir(baseRepoA), "clone", "-q", "--filter=blob:none", "file://"+bare, baseRepoA)
 	run(t, baseRepoA, "worktree", "add", "-q", linkedRepoA, "-b", "wt-branch")
 	wtAdminA := filepath.Join(baseRepoA, ".git", "worktrees", "linked")
 

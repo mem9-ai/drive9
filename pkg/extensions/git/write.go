@@ -104,7 +104,7 @@ func (h *gitHandle) Attr() fs.Attr {
 		if n, tok := h.w.treeLookup(h.rel); tok {
 			size = n.SizeBytes
 			if size < 0 {
-				size = h.g.blobSize(h.w, h.treeSHA)
+				size = h.g.resolveTreeNodeSize(context.Background(), h.w, h.rel, h.treeSHA)
 				h.w.noteTreeSize(h.rel, size)
 			}
 		}
@@ -117,13 +117,13 @@ func (h *gitHandle) Read(ctx context.Context, off int64, dest []byte) (int, erro
 	defer h.mu.Unlock()
 	if h.buf == nil && h.treeSHA != "" {
 		if _, hit := h.w.lookup(h.rel); !hit {
-			data, err := h.g.materializeBlob(h.w, h.treeSHA)
+			data, err := h.g.materializeTreeEntry(ctx, h.w, h.rel, h.treeSHA)
 			if err != nil {
 				// The blob's local .git may simply not be here yet: the
 				// discovery-time restore ran before the CLI uploaded its
 				// checkpoint. Pull the state once, then retry.
 				if rerr := h.g.ensureWorkspaceState(ctx, h.w); rerr == nil {
-					data, err = h.g.materializeBlob(h.w, h.treeSHA)
+					data, err = h.g.materializeTreeEntry(ctx, h.w, h.rel, h.treeSHA)
 				}
 			}
 			if err != nil {
@@ -375,10 +375,10 @@ func (h *gitHandle) ensureBufferLocked(ctx context.Context) (err error) {
 		return nil
 	}
 	if n, ok := h.w.treeLookup(h.rel); ok && n.Kind == "file" && n.ObjectSHA != "" {
-		data, err := h.g.materializeBlob(h.w, n.ObjectSHA)
+		data, err := h.g.materializeTreeEntry(ctx, h.w, h.rel, n.ObjectSHA)
 		if err != nil {
 			if rerr := h.g.ensureWorkspaceState(ctx, h.w); rerr == nil {
-				data, err = h.g.materializeBlob(h.w, n.ObjectSHA)
+				data, err = h.g.materializeTreeEntry(ctx, h.w, h.rel, n.ObjectSHA)
 			}
 		}
 		if err == nil {

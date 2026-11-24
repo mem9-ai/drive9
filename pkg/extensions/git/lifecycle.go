@@ -95,8 +95,10 @@ func (g *Git) Stop(ctx context.Context) error {
 		for task := range g.background {
 			task.cancel()
 		}
+		g.closeBatchReaders()
 		go func() {
 			g.backgroundWG.Wait()
+			g.closeBatchReaders()
 			if g.checkpoints != nil {
 				g.checkpoints.FlushAll()
 			}

@@ -92,7 +92,7 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 					// single failed exec flap the served size and pin git
 					// status entries as modified.
 					if n.SizeBytes < 0 && (n.Kind == "file" || n.Kind == "symlink") && n.ObjectSHA != "" {
-						attr.Size = g.blobSize(w, n.ObjectSHA)
+						attr.Size = g.resolveTreeNodeSize(ctx, w, rel, n.ObjectSHA)
 						w.noteTreeSize(rel, attr.Size)
 					}
 					return fs.Result{Attr: &attr}, nil
@@ -129,7 +129,7 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 				return fs.Result{Data: e.Content}, nil
 			}
 		} else if n, tok := w.treeLookup(rel); tok && n.Kind == "symlink" {
-			if data, err := g.materializeBlob(w, n.ObjectSHA); err == nil {
+			if data, err := g.materializeTreeEntry(ctx, w, rel, n.ObjectSHA); err == nil {
 				return fs.Result{Data: data}, nil
 			}
 		}
@@ -168,7 +168,7 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 		// Fast-clone view: materialize the blob from the restored local
 		// .git (v1 materializeGitBlob).
 		if n, tok := w.treeLookup(rel); tok && n.Kind == "file" && n.ObjectSHA != "" {
-			if data, err := g.materializeBlob(w, n.ObjectSHA); err == nil {
+			if data, err := g.materializeTreeEntry(ctx, w, rel, n.ObjectSHA); err == nil {
 				if op.Offset > 0 || op.Limit > 0 {
 					off := op.Offset
 					if off < 0 {

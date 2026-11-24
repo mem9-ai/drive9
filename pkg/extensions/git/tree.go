@@ -5,16 +5,21 @@
 package git
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/gitcache"
 )
 
 // gitWorkspaceRescanInterval bounds the on-demand discovery loop (v1
@@ -228,8 +233,254 @@ func cachedBlob(key string) ([]byte, bool) {
 	return d, ok
 }
 
+type catFileBatch struct {
+	mu         sync.Mutex
+	gitDir     string
+	closed     bool
+	contentCmd *exec.Cmd
+	contentIn  io.WriteCloser
+	contentOut *bufio.Reader
+	checkCmd   *exec.Cmd
+	checkIn    io.WriteCloser
+	checkOut   *bufio.Reader
+}
+
+func startCatFileProc(gitDir string, args ...string) (*exec.Cmd, io.WriteCloser, *bufio.Reader, error) {
+	full := append([]string{"--git-dir", gitDir, "cat-file"}, args...)
+	cmd := exec.Command("git", full...)
+	configureGitCommandGroup(cmd, false)
+	allowProtocols := gitcache.GitAllowedProtocols
+	if gitcache.GitAllowLocalRepos() {
+		allowProtocols = gitcache.GitLocalAllowedProtocols
+	}
+	cmd.Env = append(gitSafeEnv(os.Environ()),
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_NO_LAZY_FETCH=1",
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ALLOW_PROTOCOL="+allowProtocols,
+	)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = stdin.Close()
+		return nil, nil, nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		_ = stdout.Close()
+		return nil, nil, nil, err
+	}
+	return cmd, stdin, bufio.NewReaderSize(stdout, 64*1024), nil
+}
+
+func stopCatFileProc(cmd *exec.Cmd, stdin io.WriteCloser) {
+	if stdin != nil {
+		_ = stdin.Close()
+	}
+	if cmd != nil && cmd.Process != nil {
+		_ = killGitCommandGroup(cmd)
+		_ = cmd.Wait()
+	}
+}
+
+func (b *catFileBatch) closeContentLocked() {
+	stopCatFileProc(b.contentCmd, b.contentIn)
+	b.contentCmd, b.contentIn, b.contentOut = nil, nil, nil
+}
+
+func (b *catFileBatch) closeCheckLocked() {
+	stopCatFileProc(b.checkCmd, b.checkIn)
+	b.checkCmd, b.checkIn, b.checkOut = nil, nil, nil
+}
+
+func (b *catFileBatch) close() {
+	b.mu.Lock()
+	b.closed = true
+	b.closeContentLocked()
+	b.closeCheckLocked()
+	b.mu.Unlock()
+}
+
+func (b *catFileBatch) readBlob(sha string) ([]byte, bool, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return nil, false, errGitRuntimeStopped
+	}
+	if b.contentCmd == nil {
+		cmd, in, out, err := startCatFileProc(b.gitDir, "--batch")
+		if err != nil {
+			return nil, false, err
+		}
+		b.contentCmd, b.contentIn, b.contentOut = cmd, in, out
+	}
+	if _, err := io.WriteString(b.contentIn, sha+"\n"); err != nil {
+		b.closeContentLocked()
+		return nil, false, err
+	}
+	hdr, err := b.contentOut.ReadString('\n')
+	if err != nil {
+		b.closeContentLocked()
+		return nil, false, err
+	}
+	fields := strings.Fields(hdr)
+	if len(fields) == 2 && fields[1] == "missing" {
+		return nil, false, nil
+	}
+	if len(fields) < 3 {
+		b.closeContentLocked()
+		return nil, false, fmt.Errorf("unexpected cat-file header %q", strings.TrimSpace(hdr))
+	}
+	sz, err := strconv.ParseInt(fields[2], 10, 64)
+	if err != nil || sz < 0 {
+		b.closeContentLocked()
+		return nil, false, fmt.Errorf("invalid cat-file size in %q", strings.TrimSpace(hdr))
+	}
+	buf := make([]byte, sz)
+	if _, err := io.ReadFull(b.contentOut, buf); err != nil {
+		b.closeContentLocked()
+		return nil, false, err
+	}
+	if _, err := b.contentOut.ReadByte(); err != nil {
+		b.closeContentLocked()
+		return nil, false, err
+	}
+	return buf, true, nil
+}
+
+func (b *catFileBatch) sizeBlob(sha string) (int64, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return 0, false
+	}
+	if b.checkCmd == nil {
+		cmd, in, out, err := startCatFileProc(b.gitDir, "--batch-check=%(objectname) %(objecttype) %(objectsize)")
+		if err != nil {
+			return 0, false
+		}
+		b.checkCmd, b.checkIn, b.checkOut = cmd, in, out
+	}
+	if _, err := io.WriteString(b.checkIn, sha+"\n"); err != nil {
+		b.closeCheckLocked()
+		return 0, false
+	}
+	hdr, err := b.checkOut.ReadString('\n')
+	if err != nil {
+		b.closeCheckLocked()
+		return 0, false
+	}
+	fields := strings.Fields(hdr)
+	if len(fields) == 2 && fields[1] == "missing" {
+		return 0, false
+	}
+	if len(fields) < 3 {
+		b.closeCheckLocked()
+		return 0, false
+	}
+	sz, err := strconv.ParseInt(fields[2], 10, 64)
+	if err != nil || sz < 0 {
+		return 0, false
+	}
+	return sz, true
+}
+
+func (g *Git) batchReaderFor(gitDir string) *catFileBatch {
+	if g == nil || gitDir == "" {
+		return nil
+	}
+	g.backgroundMu.Lock()
+	stopping := g.stopping
+	g.backgroundMu.Unlock()
+	if stopping {
+		return nil
+	}
+	g.batchMu.Lock()
+	defer g.batchMu.Unlock()
+	if g.batchReaders == nil {
+		g.batchReaders = make(map[string]*catFileBatch)
+	}
+	if b, ok := g.batchReaders[gitDir]; ok {
+		return b
+	}
+	b := &catFileBatch{gitDir: gitDir}
+	g.batchReaders[gitDir] = b
+	return b
+}
+
+func (g *Git) evictBatchReader(gitDir string) {
+	if g == nil || gitDir == "" {
+		return
+	}
+	g.batchMu.Lock()
+	var b *catFileBatch
+	if g.batchReaders != nil {
+		b = g.batchReaders[gitDir]
+		delete(g.batchReaders, gitDir)
+	}
+	g.batchMu.Unlock()
+	if b != nil {
+		b.close()
+	}
+}
+
+func (g *Git) closeBatchReaders() {
+	if g == nil {
+		return
+	}
+	g.batchMu.Lock()
+	readers := g.batchReaders
+	g.batchReaders = nil
+	g.batchMu.Unlock()
+	for _, b := range readers {
+		b.close()
+	}
+}
+
+func (g *Git) resolveWorkspaceGitDir(w *workspace) string {
+	if dir, ok := g.checkpointGitDir(w); ok {
+		return dir
+	}
+	return g.gitDirFor(w.rootPath())
+}
+
+// materializeTreeEntry reads a clean tree file or symlink using the local
+// hydrate tree/blob cache first (`gitcache`), then the workspace's persistent
+// `git cat-file --batch` reader, falling back to one-shot `git cat-file blob`
+// when a partial clone needs an on-demand lazy fetch (`--hydrate=off`).
+func (g *Git) materializeTreeEntry(ctx context.Context, w *workspace, rel, sha string) ([]byte, error) {
+	if sha == "" {
+		return nil, fmt.Errorf("git: tree node without object sha")
+	}
+	if d, ok := cachedBlob(w.id + ":" + sha); ok {
+		return d, nil
+	}
+	if g.localRoot != "" {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if head := w.head(); head != "" {
+			if rel != "" {
+				if data, ok, err := gitcache.ReadTreeFile(ctx, g.localRoot, w.id, head, rel, 0, -1); err == nil && ok {
+					cacheBlob(w.id+":"+sha, data)
+					return data, nil
+				}
+			}
+			if data, ok, err := gitcache.ReadBlob(ctx, g.localRoot, w.id, head, sha, 0, -1); err == nil && ok {
+				cacheBlob(w.id+":"+sha, data)
+				return data, nil
+			}
+		}
+	}
+	return g.materializeBlob(w, sha)
+}
+
 // materializeBlob reads one blob out of the workspace's restored local
-// .git (v1 gitCatFileBlob): `git cat-file blob <sha>`.
+// .git (v1 gitCatFileBlob): persistent `git cat-file --batch` first, then
+// one-shot `git cat-file blob <sha>` fallback.
 func (g *Git) materializeBlob(w *workspace, sha string) ([]byte, error) {
 	if sha == "" {
 		return nil, fmt.Errorf("git: tree node without object sha")
@@ -237,11 +488,23 @@ func (g *Git) materializeBlob(w *workspace, sha string) ([]byte, error) {
 	if d, ok := cachedBlob(w.id + ":" + sha); ok {
 		return d, nil
 	}
-	gitDir := g.gitDirFor(w.rootPath())
+	gitDir := g.resolveWorkspaceGitDir(w)
 	data, err := blobOnce.do(w.id+":"+sha, func() ([]byte, error) {
+		if info, statErr := os.Stat(gitDir); statErr == nil && info.IsDir() {
+			if b := g.batchReaderFor(gitDir); b != nil {
+				if data, found, berr := b.readBlob(sha); berr == nil && found {
+					return data, nil
+				}
+			}
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "cat-file", "blob", sha)
+		allowProtocols := gitcache.GitAllowedProtocols
+		if gitcache.GitAllowLocalRepos() {
+			allowProtocols = gitcache.GitLocalAllowedProtocols
+		}
+		cmd := newGitCommandContext(ctx, "--git-dir", gitDir, "cat-file", "blob", sha)
+		cmd.Env = append(gitSafeEnv(os.Environ()), "GIT_TERMINAL_PROMPT=0", "GIT_ALLOW_PROTOCOL="+allowProtocols)
 		var stdout bytes.Buffer
 		cmd.Stdout = &stdout
 		if err := cmd.Run(); err != nil {
@@ -255,12 +518,46 @@ func (g *Git) materializeBlob(w *workspace, sha string) ([]byte, error) {
 	return data, err
 }
 
+// resolveTreeNodeSize resolves an unknown tree-node size (blobless -1) from
+// the local hydrate cache first, then the local object store.
+func (g *Git) resolveTreeNodeSize(ctx context.Context, w *workspace, rel, sha string) int64 {
+	if g.localRoot != "" {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if head := w.head(); head != "" {
+			if rel != "" {
+				if sz, ok, err := gitcache.StatTreeFile(ctx, g.localRoot, w.id, head, rel); err == nil && ok {
+					return sz
+				}
+			}
+			if sz, ok, err := gitcache.StatBlob(ctx, g.localRoot, w.id, head, sha); err == nil && ok {
+				return sz
+			}
+		}
+	}
+	return g.blobSize(w, sha)
+}
+
 // blobSize resolves an unknown tree-node size (blobless -1) from the
 // local object store.
 func (g *Git) blobSize(w *workspace, sha string) int64 {
+	gitDir := g.resolveWorkspaceGitDir(w)
+	if info, statErr := os.Stat(gitDir); statErr == nil && info.IsDir() {
+		if b := g.batchReaderFor(gitDir); b != nil {
+			if sz, ok := b.sizeBlob(sha); ok {
+				return sz
+			}
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "--git-dir", g.gitDirFor(w.rootPath()), "cat-file", "-s", sha)
+	allowProtocols := gitcache.GitAllowedProtocols
+	if gitcache.GitAllowLocalRepos() {
+		allowProtocols = gitcache.GitLocalAllowedProtocols
+	}
+	cmd := newGitCommandContext(ctx, "--git-dir", gitDir, "cat-file", "-s", sha)
+	cmd.Env = append(gitSafeEnv(os.Environ()), "GIT_TERMINAL_PROMPT=0", "GIT_ALLOW_PROTOCOL="+allowProtocols)
 	out, err := cmd.Output()
 	if err != nil {
 		return 0

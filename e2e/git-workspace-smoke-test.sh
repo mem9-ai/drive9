@@ -286,38 +286,52 @@ start_mount() {
     args+=(--allow-other)
   fi
   args+=( :/ "$MOUNT_POINT" )
-  drive9 "${args[@]}" >>"$MOUNT_LOG" 2>&1 &
+  DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" "${args[@]}" >>"$MOUNT_LOG" 2>&1 &
   MOUNT_PID="$!"
   wait_mount_state mounted
   wait_mount_log_ready "$MOUNT_LOG"
 }
 
 stop_mount() {
-  set +e
+  local rc=0 forced=0 worker_rc=0
   if [ -n "${MOUNT_POINT:-}" ] && is_mounted "$MOUNT_POINT"; then
-    drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$MOUNT_POINT" >/dev/null 2>&1 || true
+    drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$MOUNT_POINT" || rc=$?
     wait_mount_state unmounted >/dev/null 2>&1 || true
     if is_mounted "$MOUNT_POINT"; then
-      force_unmount "$MOUNT_POINT"
+      forced=1
+      force_unmount "$MOUNT_POINT" || true
       wait_mount_state unmounted >/dev/null 2>&1 || true
     fi
   fi
-  if [ -n "${MOUNT_PID:-}" ] && kill -0 "$MOUNT_PID" >/dev/null 2>&1; then
-    kill "$MOUNT_PID" >/dev/null 2>&1 || true
-    wait "$MOUNT_PID" >/dev/null 2>&1 || true
+  if [ -n "${MOUNT_PID:-}" ]; then
+    # Kernel detach precedes the foreground worker's final Git checkpoints.
+    # Let normal shutdown finish before using a new local root.
+    if [ "$rc" -ne 0 ] || [ "$forced" -ne 0 ]; then
+      kill "$MOUNT_PID" >/dev/null 2>&1 || true
+    fi
+    wait "$MOUNT_PID" || worker_rc=$?
+    echo "umount: rc=$rc forced=$forced worker_rc=$worker_rc"
   fi
   MOUNT_PID=""
   MOUNT_POINT=""
-  set -e
+  [ "$rc" -eq 0 ] && [ "$forced" -eq 0 ] && [ "$worker_rc" -eq 0 ]
 }
 
 dump_mount_log() {
+  local dumped=0
   if [ -n "${RUN_ROOT:-}" ] && [ -d "$RUN_ROOT" ]; then
-    find "$RUN_ROOT" -type f -name 'mount*.log' | sort | while IFS= read -r log_file; do
+    # Never traverse into live or residual FUSE mount trees ($RUN_ROOT/*/mount):
+    # match only known top-level and per-case mount*.log files.
+    local log_file
+    for log_file in "$RUN_ROOT"/*/mount*.log "$RUN_ROOT"/mount*.log; do
+      [ -f "$log_file" ] || continue
       echo "=== drive9 mount log: $log_file ==="
       cat "$log_file"
+      dumped=1
     done
-    return
+    if [ "$dumped" -eq 1 ]; then
+      return
+    fi
   fi
   if [ -n "${MOUNT_LOG:-}" ] && [ -f "$MOUNT_LOG" ]; then
     echo "=== drive9 mount log: $MOUNT_LOG ==="
@@ -572,7 +586,7 @@ run_sandbox_restore() {
   check_cmd "$slug $scenario second mount starts" start_mount "$mount_point" "$local_root_b" "$log_b"
   check_cmd "$slug $scenario .git restored" test -d "$repo/.git"
   git_cmd -C "$repo" status --porcelain=v1 > "$status_after"
-  check_cmd "$slug $scenario status restored after remount" test -s "$status_after"
+  check_cmd "$slug $scenario status restored after remount" cmp -s "$status_before" "$status_after"
   check_cmd "$slug $scenario restored status contains generated files" grep -q "agent-bench/generated/file-0000.md" "$status_after"
   while IFS= read -r rel; do
     [ -z "$rel" ] && continue
@@ -677,6 +691,7 @@ cleanup() {
 
 on_exit() {
   local rc=$?
+  stop_mount || rc=1
   if [ "$rc" -ne 0 ] || [ "${FAIL:-0}" -ne 0 ]; then
     dump_mount_log
   fi
