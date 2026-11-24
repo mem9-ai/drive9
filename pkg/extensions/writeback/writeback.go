@@ -4242,15 +4242,6 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 		h.snapshotFile = nil
 	}
 	h.mu.Unlock()
-	if h.w.opts.Policy == PolicyWriteBack && h.w.uploader != nil && h.w.wbCache != nil {
-		// Fence any in-flight local-only Flush snapshot on this descriptor
-		// without waiting on CommitQueue uploads holding pathLocks: h.releasing
-		// is already set, so a Flush already inside stageCacheMu finishes
-		// publishing stagedToCache before we inspect it, and any Flush entering
-		// stageCacheMu afterwards sees h.releasing and declines to stage.
-		h.stageCacheMu.Lock()
-		h.stageCacheMu.Unlock()
-	}
 	// An O_CREAT claim that never landed must still materialize as a remote
 	// file (stages it in pendingIndex at Create): git probes the
 	// filesystem by creating and unlinking `.git/ä` with no writes, and a
@@ -4258,12 +4249,25 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 	// landed, not dirty: write-sync commits mid-stream and clears dirty,
 	// and re-materializing then would clobber the committed image with an
 	// empty buffer.
+	fenceLocalStage := h.w.opts.Policy == PolicyWriteBack && h.w.uploader != nil && h.w.wbCache != nil
+	if fenceLocalStage {
+		// Fence any in-flight local-only Flush snapshot on this descriptor
+		// without waiting on CommitQueue uploads holding pathLocks: h.releasing
+		// is already set, so a Flush already inside stageCacheMu finishes
+		// publishing stagedToCache before we inspect and clear it below, and
+		// any Flush entering stageCacheMu afterwards sees h.releasing and
+		// declines to stage.
+		h.stageCacheMu.Lock()
+	}
 	h.mu.Lock()
 	materialize := h.isNew && !h.landed && !h.unlinked
 	staged, unlinked := h.stagedToCache, h.unlinked
 	dirty := h.dirty
 	h.stagedToCache = false
 	h.mu.Unlock()
+	if fenceLocalStage {
+		h.stageCacheMu.Unlock()
+	}
 	if staged && !unlinked && h.w.uploader != nil && h.w.wbCache != nil {
 		if _, ok := h.w.wbCache.GetMeta(path); ok {
 			useCache := true
@@ -5081,17 +5085,10 @@ func (w *Writeback) untrack(h *bufferingHandle) {
 	w.retireLocked(h)
 }
 
-// retireDirty clears the handle's dirty state only when the write
-// generation still matches the image the completion carried: a mutation
-// acknowledged after that snapshot keeps its own dirty flag for the next
-// durability barrier (Drain flushes without the per-FH write lock).
-func (h *bufferingHandle) retireDirty(stagedGen uint64) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.retireDirtyLocked(stagedGen)
-}
-
-// retireDirtyLocked is retireDirty with h.mu already held.
+// retireDirtyLocked clears the handle's dirty state with h.mu held only when
+// the write generation still matches the image the completion carried: a
+// mutation acknowledged after that snapshot keeps its own dirty flag for the
+// next durability barrier (Drain flushes without the per-FH write lock).
 func (h *bufferingHandle) retireDirtyLocked(stagedGen uint64) {
 	if h.wgen == stagedGen {
 		h.dirty = false

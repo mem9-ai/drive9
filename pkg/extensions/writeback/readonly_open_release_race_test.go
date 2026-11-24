@@ -55,15 +55,22 @@ func TestReadOnlyOpenFlushRacingCreateReleaseDoesNotStrandWriteCache(t *testing.
 		var gateFirstPut atomic.Bool
 		putEntered := make(chan struct{})
 		allowPut := make(chan struct{})
+		testDone := make(chan struct{})
 
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodPut && r.URL.Path == reqPath && gateFirstPut.CompareAndSwap(true, false) {
 				close(putEntered)
-				<-allowPut
+				select {
+				case <-allowPut:
+				case <-testDone:
+					http.Error(w, "test abort", http.StatusServiceUnavailable)
+					return
+				}
 			}
 			backend.ServeHTTP(w, r)
 		}))
-		defer srv.Close()
+		t.Cleanup(srv.Close)
+		t.Cleanup(func() { close(testDone) })
 
 		st, err := staging.NewStagingWithQuota(t.TempDir(), -1, 0)
 		require.NoError(t, err)
@@ -178,11 +185,17 @@ func TestReadOnlyOpenFlushRacingCreateReleaseDoesNotStrandWriteCache(t *testing.
 			var gateFirstPut atomic.Bool
 			putEntered := make(chan struct{})
 			allowPut := make(chan struct{})
+			testDone := make(chan struct{})
 
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == http.MethodHead && r.URL.Path == reqPath && gateFirstHead.CompareAndSwap(true, false) {
 					close(headEntered)
-					<-allowHead
+					select {
+					case <-allowHead:
+					case <-testDone:
+						http.Error(w, "test abort", http.StatusServiceUnavailable)
+						return
+					}
 					if tc.headSeesPrePutAbsent {
 						http.NotFound(w, r)
 						return
@@ -190,11 +203,17 @@ func TestReadOnlyOpenFlushRacingCreateReleaseDoesNotStrandWriteCache(t *testing.
 				}
 				if r.Method == http.MethodPut && r.URL.Path == reqPath && gateFirstPut.CompareAndSwap(true, false) {
 					close(putEntered)
-					<-allowPut
+					select {
+					case <-allowPut:
+					case <-testDone:
+						http.Error(w, "test abort", http.StatusServiceUnavailable)
+						return
+					}
 				}
 				backend.ServeHTTP(w, r)
 			}))
-			defer srv.Close()
+			t.Cleanup(srv.Close)
+			t.Cleanup(func() { close(testDone) })
 
 			st, err := staging.NewStagingWithQuota(t.TempDir(), -1, 0)
 			require.NoError(t, err)
