@@ -1733,16 +1733,23 @@ func TestReadOpenFlushRacesWriterCloseDoesNotStrandZeroByteCache(t *testing.T) {
 			flushDone <- openRes.Handle.Flush(ctx)
 		}()
 		waitFlushMuHeld(t, bh)
-		releaseEntered := make(chan struct{})
+		releaseAtGate := make(chan struct{})
+		readFlushAtGate := make(chan struct{})
+		var releaseGateOnce, readGateOnce sync.Once
+		installTestGateHook(t, wb, func(gate string) {
+			switch gate {
+			case "release:flushMu":
+				releaseGateOnce.Do(func() { close(releaseAtGate) })
+			case "flush:flushMu":
+				readGateOnce.Do(func() { close(readFlushAtGate) })
+			}
+		})
 		releaseDone := make(chan error, 1)
 		go func() {
-			close(releaseEntered)
 			releaseDone <- openRes.Handle.Release(ctx)
 		}()
-		readEntered := make(chan struct{})
 		readDone := make(chan error, 1)
 		go func() {
-			close(readEntered)
 			rdRes, rerr := chain.Dispatch(ctx, &fs.Op{
 				Kind:  fs.OpCreate,
 				Path:  barrierPath,
@@ -1766,16 +1773,16 @@ func TestReadOpenFlushRacesWriterCloseDoesNotStrandZeroByteCache(t *testing.T) {
 			readDone <- nil
 		}()
 		select {
-		case <-releaseEntered:
+		case <-releaseAtGate:
 		case <-ctx.Done():
-			t.Fatal("Release contender did not start")
+			t.Fatal("Release contender did not reach flushMu gate")
 		}
 		select {
-		case <-readEntered:
+		case <-readFlushAtGate:
 		case <-ctx.Done():
-			t.Fatal("reader contender did not start")
+			t.Fatal("reader contender did not reach flushMu gate")
 		}
-		runtime.Gosched()
+		wb.testGateHook.Store(nil)
 		releaseBarrier()
 		if err := <-flushDone; err != nil {
 			t.Fatalf("barrier writer Flush: %v", err)
@@ -2079,29 +2086,36 @@ func TestReleaseCommitLockedBlocksConcurrentFlushAndDrainFlush(t *testing.T) {
 		t.Fatal("Release did not enter inline PUT")
 	}
 
-	flushEntered := make(chan struct{})
+	flushAtGate := make(chan struct{})
+	drainAtGate := make(chan struct{})
+	var flushGateOnce, drainGateOnce sync.Once
+	installTestGateHook(t, wb, func(gate string) {
+		switch gate {
+		case "flush:flushMu":
+			flushGateOnce.Do(func() { close(flushAtGate) })
+		case "drain:flushMu":
+			drainGateOnce.Do(func() { close(drainAtGate) })
+		}
+	})
 	flushDone := make(chan error, 1)
 	go func() {
-		close(flushEntered)
 		flushDone <- h.Flush(ctx)
 	}()
-	drainEntered := make(chan struct{})
 	drainDone := make(chan error, 1)
 	go func() {
-		close(drainEntered)
 		drainDone <- h.DrainFlush(ctx)
 	}()
 	select {
-	case <-flushEntered:
+	case <-flushAtGate:
 	case <-ctx.Done():
-		t.Fatal("Flush contender did not start")
+		t.Fatal("Flush contender did not reach flushMu gate")
 	}
 	select {
-	case <-drainEntered:
+	case <-drainAtGate:
 	case <-ctx.Done():
-		t.Fatal("DrainFlush contender did not start")
+		t.Fatal("DrainFlush contender did not reach flushMu gate")
 	}
-	runtime.Gosched()
+	waitFlushMuHeld(t, h)
 
 	select {
 	case err := <-flushDone:
@@ -2162,18 +2176,22 @@ func TestDrainFlushSynchronizesWithConcurrentWritebackFlushAndDebounce(t *testin
 			flushDone <- h.Flush(ctx)
 		}()
 		waitFlushMuHeld(t, h)
-		drainEntered := make(chan struct{})
+		drainAtGate := make(chan struct{})
+		var drainGateOnce sync.Once
+		installTestGateHook(t, wb, func(gate string) {
+			if gate == "drain:flushMu" {
+				drainGateOnce.Do(func() { close(drainAtGate) })
+			}
+		})
 		drainDone := make(chan error, 1)
 		go func() {
-			close(drainEntered)
 			drainDone <- wb.Drain(ctx)
 		}()
 		select {
-		case <-drainEntered:
+		case <-drainAtGate:
 		case <-ctx.Done():
-			t.Fatal("Drain contender did not start")
+			t.Fatal("Drain contender did not reach flushMu gate")
 		}
-		runtime.Gosched()
 		releaseCacheLock()
 
 		if err := <-flushDone; err != nil {
@@ -2234,18 +2252,22 @@ func TestDrainFlushSynchronizesWithConcurrentWritebackFlushAndDebounce(t *testin
 			releaseDone <- h.Release(ctx)
 		}()
 		waitFlushMuHeld(t, h)
-		drainEntered := make(chan struct{})
+		drainAtGate := make(chan struct{})
+		var drainGateOnce sync.Once
+		installTestGateHook(t, wb, func(gate string) {
+			if gate == "drain:flushMu" {
+				drainGateOnce.Do(func() { close(drainAtGate) })
+			}
+		})
 		drainFlushDone := make(chan error, 1)
 		go func() {
-			close(drainEntered)
 			drainFlushDone <- h.DrainFlush(ctx)
 		}()
 		select {
-		case <-drainEntered:
+		case <-drainAtGate:
 		case <-ctx.Done():
-			t.Fatal("DrainFlush contender did not start")
+			t.Fatal("DrainFlush contender did not reach flushMu gate")
 		}
-		runtime.Gosched()
 		select {
 		case err := <-drainFlushDone:
 			t.Fatalf("DrainFlush returned (%v) while Release held flushMu", err)
@@ -2377,7 +2399,7 @@ func TestMigratedHandleNeverFlushesAfterReleaseAndPreservesCallerContext(t *test
 		defer cancel()
 
 		b := testbackend.NewBackend()
-		chain, _ := newReviewDrainStack(t, b, nil)
+		chain, wb := newReviewDrainStack(t, b, nil)
 		res, err := chain.Dispatch(ctx, &fs.Op{
 			Kind:  fs.OpCreate,
 			Path:  "/migrated.bin",
@@ -2419,18 +2441,22 @@ func TestMigratedHandleNeverFlushesAfterReleaseAndPreservesCallerContext(t *test
 			t.Fatal("migrated Flush did not reach the extent handle")
 		}
 
-		releaseEntered := make(chan struct{})
+		releaseAtIdleGate := make(chan struct{})
+		var idleGateOnce sync.Once
+		installTestGateHook(t, wb, func(gate string) {
+			if gate == "migrated:flushIdle" {
+				idleGateOnce.Do(func() { close(releaseAtIdleGate) })
+			}
+		})
 		releaseDone := make(chan error, 1)
 		go func() {
-			close(releaseEntered)
 			releaseDone <- h.Release(ctx)
 		}()
 		select {
-		case <-releaseEntered:
+		case <-releaseAtIdleGate:
 		case <-ctx.Done():
-			t.Fatal("migrated Release contender did not start")
+			t.Fatal("migrated Release did not reach migratedFlushIdle gate")
 		}
-		runtime.Gosched()
 		select {
 		case err := <-releaseDone:
 			t.Fatalf("Release completed (%v) while migrated Flush was still active", err)
@@ -2643,6 +2669,12 @@ func TestHardlinkUnlinkSurvivorPropagatesUploadSyncFailure(t *testing.T) {
 	}
 }
 
+func installTestGateHook(t *testing.T, wb *Writeback, fn func(string)) {
+	t.Helper()
+	wb.testGateHook.Store(&fn)
+	t.Cleanup(func() { wb.testGateHook.Store(nil) })
+}
+
 func waitFlushMuHeld(t *testing.T, h *bufferingHandle) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -2747,18 +2779,22 @@ func TestConcurrentDrainFlushWaitsForInFlightCacheUploadOutcome(t *testing.T) {
 				t.Fatal("DrainFlush A did not enter synchronous PUT")
 			}
 
-			drainBEntered := make(chan struct{})
+			drainBAtFlight := make(chan struct{})
+			var flightGateOnce sync.Once
+			installTestGateHook(t, wb, func(gate string) {
+				if gate == "drain:flight" {
+					flightGateOnce.Do(func() { close(drainBAtFlight) })
+				}
+			})
 			drainBDone := make(chan error, 1)
 			go func() {
-				close(drainBEntered)
 				drainBDone <- h.DrainFlush(ctx)
 			}()
 			select {
-			case <-drainBEntered:
+			case <-drainBAtFlight:
 			case <-ctx.Done():
-				t.Fatal("DrainFlush B did not start")
+				t.Fatal("DrainFlush B did not reach drainFlight gate")
 			}
-			runtime.Gosched()
 
 			select {
 			case berr := <-drainBDone:
@@ -2904,6 +2940,277 @@ func TestHardlinkUnlinkSurvivorPreservesNewerFlushDuringUpload(t *testing.T) {
 		node2, ok := b.Node("/link2")
 		if !ok || string(node2.Data) != "v2-newer-after-flush" {
 			t.Fatalf("remote /link2 = %q (ok=%v), want %q", node2.Data, ok, "v2-newer-after-flush")
+		}
+	})
+
+	t.Run("newer-write-flush-at-final-retarget-boundary", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		b := testbackend.NewBackend()
+		b.Seed("/link1", []byte("orig"))
+
+		chain, wb := newReviewDrainStack(t, b, nil)
+		if _, err := chain.Dispatch(ctx, &fs.Op{
+			Kind:  fs.OpLink,
+			Path:  "/link1",
+			Path2: "/link2",
+		}); err != nil {
+			t.Fatalf("OpLink(/link1 -> /link2): %v", err)
+		}
+		wb.SetSurvivorLookup(func(path string) (string, bool) {
+			if path == "/link1" {
+				return "/link2", true
+			}
+			return "", false
+		})
+
+		res, err := chain.Dispatch(ctx, &fs.Op{
+			Kind:  fs.OpCreate,
+			Path:  "/link1",
+			Flags: uint32(syscall.O_WRONLY),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := writebackHandleOf(res.Handle)
+		if err := h.Write(ctx, 0, []byte("v1-initial")); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		// Pause survivor OpUnlink right after the old image uploaded AND after
+		// the final wbCache lookup/RenamePending, immediately before w.retarget.
+		atBeforeRetarget := make(chan struct{})
+		allowRetarget := make(chan struct{})
+		stageAtPathLock := make(chan struct{})
+		var beforeOnce, allowOnce, stageOnce sync.Once
+		releaseRetarget := func() { allowOnce.Do(func() { close(allowRetarget) }) }
+		defer releaseRetarget()
+
+		var armStageGate atomic.Bool
+		installTestGateHook(t, wb, func(gate string) {
+			switch gate {
+			case "survivor:beforeRetarget":
+				beforeOnce.Do(func() {
+					armStageGate.Store(true)
+					close(atBeforeRetarget)
+					<-allowRetarget
+				})
+			case "stage:pathLock":
+				if armStageGate.Load() {
+					stageOnce.Do(func() { close(stageAtPathLock) })
+				}
+			}
+		})
+
+		unlinkDone := make(chan error, 1)
+		go func() {
+			_, uerr := chain.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/link1"})
+			unlinkDone <- uerr
+		}()
+		select {
+		case <-atBeforeRetarget:
+		case <-ctx.Done():
+			t.Fatal("survivor OpUnlink did not reach beforeRetarget boundary")
+		}
+
+		// While OpUnlink is paused between the final cache check and w.retarget,
+		// the live writer writes newer bytes and calls Flush. Flush must block
+		// on lockRenamePaths via lockStagePath, then re-bind onto /link2 rather
+		// than stranding or uploading a cache entry under /link1.
+		if err := h.Write(ctx, 0, []byte("v3-at-retarget-boundary")); err != nil {
+			t.Fatalf("Write at retarget boundary: %v", err)
+		}
+		flushDone := make(chan error, 1)
+		go func() {
+			flushDone <- h.Flush(ctx)
+		}()
+		select {
+		case <-stageAtPathLock:
+		case <-ctx.Done():
+			t.Fatal("concurrent Flush did not reach lockStagePath gate")
+		}
+		select {
+		case ferr := <-flushDone:
+			t.Fatalf("Flush completed (%v) before survivor handoff released lockRenamePaths", ferr)
+		default:
+		}
+
+		releaseRetarget()
+		if err := <-flushDone; err != nil {
+			t.Fatalf("Flush after survivor handoff: %v", err)
+		}
+		if err := <-unlinkDone; err != nil {
+			t.Fatalf("OpUnlink(/link1): %v", err)
+		}
+		if wb.wbCache.HasMeta("/link1") {
+			t.Fatal("wbCache[/link1] must not hold a stranded entry after survivor handoff")
+		}
+		if !wb.wbCache.HasMeta("/link2") {
+			t.Fatal("expected newer Flush to stage directly under /link2")
+		}
+		if err := h.Release(ctx); err != nil {
+			t.Fatalf("Release: %v", err)
+		}
+		if err := wb.Drain(ctx); err != nil {
+			t.Fatalf("Drain: %v", err)
+		}
+		if reason, count := wb.DrainPending(); count != 0 {
+			t.Fatalf("DrainPending = (%q, %d), want empty", reason, count)
+		}
+		if _, exists := b.Node("/link1"); exists {
+			t.Fatal("/link1 resurrected remotely after survivor handoff")
+		}
+		node2, ok := b.Node("/link2")
+		if !ok || string(node2.Data) != "v3-at-retarget-boundary" {
+			t.Fatalf("remote /link2 = %q (ok=%v), want %q", node2.Data, ok, "v3-at-retarget-boundary")
+		}
+	})
+
+	t.Run("release-at-final-retarget-boundary", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		b := testbackend.NewBackend()
+		b.Seed("/link1", []byte("orig"))
+
+		putEntered := make(chan struct{})
+		allowPut := make(chan struct{})
+		var putOnce, allowPutOnce sync.Once
+		releasePut := func() { allowPutOnce.Do(func() { close(allowPut) }) }
+		defer releasePut()
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPut && r.URL.Path == "/v1/fs/link1" {
+				putOnce.Do(func() {
+					close(putEntered)
+					<-allowPut
+				})
+			}
+			b.ServeHTTP(w, r)
+		})
+
+		chain, wb := newReviewDrainStack(t, handler, nil)
+		if _, err := chain.Dispatch(ctx, &fs.Op{
+			Kind:  fs.OpLink,
+			Path:  "/link1",
+			Path2: "/link2",
+		}); err != nil {
+			t.Fatalf("OpLink(/link1 -> /link2): %v", err)
+		}
+		wb.SetSurvivorLookup(func(path string) (string, bool) {
+			if path == "/link1" {
+				return "/link2", true
+			}
+			return "", false
+		})
+
+		res, err := chain.Dispatch(ctx, &fs.Op{
+			Kind:  fs.OpCreate,
+			Path:  "/link1",
+			Flags: uint32(syscall.O_WRONLY),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := writebackHandleOf(res.Handle)
+		if err := h.Write(ctx, 0, []byte("v1-initial")); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		// Pause the initial survivor upload so the writer can stage v2 into
+		// wbCache[/link1] before OpUnlink reaches the final handoff, then pause
+		// OpUnlink at survivor:beforeRetarget while Release runs with dirty v3.
+		atBeforeRetarget := make(chan struct{})
+		allowRetarget := make(chan struct{})
+		stageAtPathLock := make(chan struct{})
+		var beforeOnce, allowRetargetOnce, stageOnce sync.Once
+		releaseRetarget := func() { allowRetargetOnce.Do(func() { close(allowRetarget) }) }
+		defer releaseRetarget()
+		var armStageGate atomic.Bool
+		installTestGateHook(t, wb, func(gate string) {
+			switch gate {
+			case "survivor:beforeRetarget":
+				beforeOnce.Do(func() {
+					armStageGate.Store(true)
+					close(atBeforeRetarget)
+					<-allowRetarget
+				})
+			case "stage:pathLock":
+				if armStageGate.Load() {
+					stageOnce.Do(func() { close(stageAtPathLock) })
+				}
+			}
+		})
+
+		unlinkDone := make(chan error, 1)
+		go func() {
+			_, uerr := chain.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/link1"})
+			unlinkDone <- uerr
+		}()
+		select {
+		case <-putEntered:
+		case <-ctx.Done():
+			t.Fatal("initial survivor PUT did not start")
+		}
+		if err := h.Write(ctx, 0, []byte("v2-during-upload")); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		releasePut()
+
+		select {
+		case <-atBeforeRetarget:
+		case <-ctx.Done():
+			t.Fatal("survivor OpUnlink did not reach beforeRetarget boundary")
+		}
+		if err := h.Write(ctx, 0, []byte("v3-release-at-boundary")); err != nil {
+			t.Fatal(err)
+		}
+		releaseDone := make(chan error, 1)
+		go func() {
+			releaseDone <- h.Release(ctx)
+		}()
+		select {
+		case <-stageAtPathLock:
+		case <-ctx.Done():
+			t.Fatal("Release did not reach lockStagePath gate")
+		}
+		select {
+		case rerr := <-releaseDone:
+			t.Fatalf("Release completed (%v) before survivor handoff released lockRenamePaths", rerr)
+		default:
+		}
+
+		releaseRetarget()
+		if err := <-releaseDone; err != nil {
+			t.Fatalf("Release after survivor handoff: %v", err)
+		}
+		if err := <-unlinkDone; err != nil {
+			t.Fatalf("OpUnlink(/link1): %v", err)
+		}
+		if err := wb.Drain(ctx); err != nil {
+			t.Fatalf("Drain: %v", err)
+		}
+		if reason, count := wb.DrainPending(); count != 0 {
+			t.Fatalf("DrainPending = (%q, %d), want empty", reason, count)
+		}
+		if wb.wbCache.HasMeta("/link1") || wb.wbCache.HasMeta("/link2") {
+			t.Fatalf("wbCache stranded entries: /link1=%v /link2=%v", wb.wbCache.HasMeta("/link1"), wb.wbCache.HasMeta("/link2"))
+		}
+		if _, exists := b.Node("/link1"); exists {
+			t.Fatal("/link1 resurrected remotely after Release at survivor boundary")
+		}
+		node2, ok := b.Node("/link2")
+		if !ok || string(node2.Data) != "v3-release-at-boundary" {
+			t.Fatalf("remote /link2 = %q (ok=%v), want %q", node2.Data, ok, "v3-release-at-boundary")
 		}
 	})
 
