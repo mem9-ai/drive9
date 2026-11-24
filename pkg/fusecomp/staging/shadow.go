@@ -1142,11 +1142,11 @@ func (s *ShadowStore) RemoveIfGenerationDurable(remotePath string, expectedGen C
 	// The unlink/retire verdict comes back under the path lock the removal
 	// took: checking for the file afterwards would race a concurrent spill that
 	// legitimately created a fresher shadow.
-	removedSomething := cleanup.retire || cleanup.immediatePath != ""
-	if rerr := s.runRemoveCleanupChecked(cleanup); rerr != nil {
+	removedOnDisk, rerr := s.runRemoveCleanupChecked(cleanup)
+	if rerr != nil {
 		return true, fmt.Errorf("remove shadow %s: %w", remotePath, rerr)
 	}
-	if !removedSomething {
+	if !removedOnDisk {
 		// Nothing was on disk: a clean path (or a wbCache-only staged image)
 		// must not pay a shadow-directory fsync.
 		return true, nil
@@ -2063,36 +2063,46 @@ func shadowDataExtentsFD(fd int, size int64, total *int64) error {
 func (s *ShadowStore) runRemoveCleanup(cleanup shadowRemoveCleanup) {
 	// The legacy callers only need the bookkeeping; the on-disk verdict is
 	// discarded here by design (Remove/RemoveIfGeneration are best effort).
-	_ = s.runRemoveCleanupChecked(cleanup)
+	_, _ = s.runRemoveCleanupChecked(cleanup)
 }
 
 // runRemoveCleanupChecked is runRemoveCleanup with the on-disk verdict: it
 // reports why the bytes may still be there, for callers whose crash reasoning
 // depends on the removal actually having happened.
-func (s *ShadowStore) runRemoveCleanupChecked(cleanup shadowRemoveCleanup) error {
+func (s *ShadowStore) runRemoveCleanupChecked(cleanup shadowRemoveCleanup) (removedOnDisk bool, err error) {
 	if cleanup.removedSize > 0 {
 		s.pendingBytes.Add(-cleanup.removedSize)
 	}
 	if cleanup.retire {
-		if err := os.Rename(cleanup.srcDiskPath, cleanup.retiredPath); err != nil {
-			if rerr := os.Remove(cleanup.srcDiskPath); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+		if rerr := os.Rename(cleanup.srcDiskPath, cleanup.retiredPath); rerr != nil {
+			if rmErr := os.Remove(cleanup.srcDiskPath); rmErr != nil {
 				if cleanup.retired != nil {
 					close(cleanup.retired.cleanupDone)
 				}
-				return rerr
+				if errors.Is(rmErr, os.ErrNotExist) {
+					return false, nil
+				}
+				return false, rmErr
 			}
+			removedOnDisk = true
+		} else {
+			removedOnDisk = true
 		}
 		if cleanup.retired != nil {
 			close(cleanup.retired.cleanupDone)
 		}
-		return nil
+		return removedOnDisk, nil
 	}
 	if cleanup.immediatePath != "" {
-		if err := os.Remove(cleanup.immediatePath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
+		if rerr := os.Remove(cleanup.immediatePath); rerr != nil {
+			if errors.Is(rerr, os.ErrNotExist) {
+				return false, nil
+			}
+			return false, rerr
 		}
+		return true, nil
 	}
-	return nil
+	return false, nil
 }
 
 func (s *ShadowStore) remove(remotePath string, expectedGen ContentGen, reason shadowRetirementReason) bool {

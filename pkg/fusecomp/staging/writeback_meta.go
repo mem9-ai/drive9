@@ -87,12 +87,15 @@ type WriteBackCache struct {
 	// unsynced tracks entries written with wbSyncNone whose .dat/.meta files
 	// have not yet been covered by SyncPending.
 	unsynced map[string]uint64
-	// lostGens mirrors the durable view-loss markers this process wrote, so the
-	// common barrier miss does not need a file read.
+	// lostGens mirrors the durable view-loss markers (path -> lost generation),
+	// so the common barrier miss does not need a file read.
 	lostGens map[string]uint64
-	// lostUnreadable counts markers that could not be decoded when the cache was
-	// opened: a drain must not certify a mount whose records it cannot read.
-	lostUnreadable int
+	// lostUnknown holds the hashes of markers that could not be decoded, and
+	// lostDirUnreadable records that the one-time scan itself failed: both keep
+	// the drain (and prefix queries) failing closed instead of certifying a mount
+	// whose records cannot be read.
+	lostUnknown       map[string]struct{}
+	lostDirUnreadable bool
 	// OnViewLost reports a pruned staged pair to the owner (the write-back
 	// engine records it as a terminal failure so a barrier on the path fails
 	// instead of reading "nothing staged" as success). It is the ONLY recorder
@@ -246,6 +249,8 @@ func NewWriteBackCache(dir string) (*WriteBackCache, error) {
 		dataElems:    make(map[string]*list.Element),
 		dataMaxBytes: defaultWriteBackDataCacheMaxSize,
 		pathLocks:    make(map[string]*PathLockEntry),
+		lostGens:     make(map[string]uint64),
+		lostUnknown:  make(map[string]struct{}),
 	}
 	// A view-loss marker left by a previous process must be honored from the
 	// start: it also advances the generation counter, so a fresh staging can
@@ -1084,38 +1089,10 @@ func (c *WriteBackCache) RenamePending(oldPath, newPath string) bool {
 	if oldPath == newPath {
 		return false // no-op rename
 	}
-	ok, missing := c.renamePendingLocal(oldPath, newPath)
-	if !ok {
-		if missing {
-			// The .dat vanished before this rename: the image is gone. Prune the
-			// orphaned metadata and record the loss on the source name, which the
-			// caller's rekey carries to the destination.
-			pl := c.AcquirePathLock(oldPath)
-			c.mu.Lock()
-			gen := uint64(0)
-			if meta, found := c.metas[oldPath]; found && meta != nil {
-				gen = meta.Generation
-			}
-			c.pruneEntryLocked(oldPath, false)
-			c.mu.Unlock()
-			c.ReleasePathLock(oldPath, pl)
-			c.reportViewLoss(oldPath, gen, os.ErrNotExist)
-		}
-		return false
-	}
-	// The destination's previous incarnation is gone: its stale marker must not
-	// keep failing barriers on the image that now lives there.
-	c.ClearViewLoss(newPath)
-	// The obligation moves with the name.
-	c.RekeyViewLoss(oldPath, newPath)
-	return true
-}
-
-// renamePendingLocal moves the .dat/.meta pair and the in-memory entry. The
-// second result reports that the payload file was already missing (ENOENT),
-// which is a lost image rather than an unexpected failure.
-func (c *WriteBackCache) renamePendingLocal(oldPath, newPath string) (bool, bool) {
-	// Acquire path locks in sorted order to avoid deadlock.
+	// One lock scope for the whole move, including the view-loss bookkeeping: the
+	// loss record must never be reported or rekeyed outside the pair's path locks
+	// (reportViewLoss requires them), and a ClearViewLoss(newPath) taken in a gap
+	// could wipe a loss recorded by a concurrent staging.
 	first, second := oldPath, newPath
 	if second < first {
 		first, second = second, first
@@ -1126,23 +1103,44 @@ func (c *WriteBackCache) renamePendingLocal(oldPath, newPath string) (bool, bool
 		c.ReleasePathLock(second, pl2)
 		c.ReleasePathLock(first, pl1)
 	}()
+	return c.renamePendingLocked(oldPath, newPath)
+}
+
+// renamePendingLocked moves the .dat/.meta pair, the in-memory entry and the
+// view-loss record. The caller holds both endpoints' path locks.
+func (c *WriteBackCache) renamePendingLocked(oldPath, newPath string) bool {
+	oldMeta := c.MetaFile(oldPath)
+	newDat := c.DatFile(newPath)
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	oldDat := c.DatFile(oldPath)
-	oldMeta := c.MetaFile(oldPath)
-
 	meta, ok := c.metas[oldPath]
 	if !ok {
-		return false, false
+		c.mu.Unlock()
+		return false
 	}
 	updated := cloneWriteBackMeta(meta)
+	kind := meta.Kind
+	srcGen := meta.Generation
+	c.mu.Unlock()
 
-	// Rename .dat file directly — same directory, no data copy needed.
-	newDat := c.DatFile(newPath)
-	if err := os.Rename(oldDat, newDat); err != nil {
-		return false, errors.Is(err, os.ErrNotExist)
+	if kind == PendingChmod {
+		// A chmod-only record has no .dat by design: moving "the payload" would
+		// hit ENOENT and a lost-image record would be written for a healthy
+		// entry. Drop any payload the destination carried for its replaced
+		// incarnation and move only the metadata.
+		_ = os.Remove(newDat)
+	} else if err := os.Rename(c.DatFile(oldPath), newDat); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// The payload vanished before the rename: the image is gone. Prune the
+			// orphaned metadata and record the loss on the DESTINATION, where the
+			// object is moving; the source name dies with the rename.
+			c.mu.Lock()
+			c.pruneEntryLocked(oldPath, false)
+			c.mu.Unlock()
+			c.clearViewLossLocked(oldPath, ^uint64(0))
+			c.reportViewLoss(newPath, srcGen, os.ErrNotExist)
+		}
+		return false
 	}
 
 	// Write new .meta with updated path and fresh generation.
@@ -1152,27 +1150,42 @@ func (c *WriteBackCache) renamePendingLocal(oldPath, newPath string) (bool, bool
 	updated.PutGeneration = newGen
 	metaBytes, err := json.Marshal(updated)
 	if err != nil {
-		_ = os.Rename(newDat, oldDat)
-		return false, false
+		if kind != PendingChmod {
+			_ = os.Rename(newDat, c.DatFile(oldPath))
+		}
+		return false
 	}
-	newMeta := c.MetaFile(newPath)
-	if err := atomicWrite(newMeta, metaBytes); err != nil {
+	if err := atomicWrite(c.MetaFile(newPath), metaBytes); err != nil {
 		// Restore .dat to old location on meta-write failure.
-		_ = os.Rename(newDat, oldDat)
-		return false, false
+		if kind != PendingChmod {
+			_ = os.Rename(newDat, c.DatFile(oldPath))
+		}
+		return false
 	}
 
 	// Remove old meta and update index.
 	_ = os.Remove(oldMeta)
+	c.mu.Lock()
 	c.deleteMetaLocked(oldPath)
 	cp := updated
 	c.setMetaLocked(newPath, &cp)
-	if data, ok := c.data[oldPath]; ok {
+	if kind != PendingChmod {
+		if data, ok := c.data[oldPath]; ok {
+			c.deleteDataLocked(oldPath)
+			c.deleteDataLocked(newPath)
+			c.cacheDataLocked(newPath, data, int64(len(data)))
+		}
+	} else {
 		c.deleteDataLocked(oldPath)
-		c.deleteDataLocked(newPath)
-		c.cacheDataLocked(newPath, data, int64(len(data)))
 	}
-	return true, false
+	c.mu.Unlock()
+
+	// The destination's previous incarnation is gone: its stale marker must not
+	// keep failing barriers on the image that now lives there. Then the source's
+	// obligation moves with the name.
+	c.clearViewLossLocked(newPath, ^uint64(0))
+	c.rekeyViewLoss(oldPath, newPath)
+	return true
 }
 
 // ListPendingPaths returns the set of remote paths that have pending entries.
@@ -1699,9 +1712,10 @@ func (c *WriteBackCache) reportViewLoss(remotePath string, prunedGen uint64, err
 // payloads skip the check: they were either written by a put (bound by
 // construction) or admitted through this validated load.
 //
-// pruned says the record was dropped by this read (torn pair or missing .dat):
-// a transient read error keeps the entry and reports false, so the owner is
-// never told an image is lost while a retry can still publish it.
+// prunedGen is the generation of the record this read dropped (torn pair or
+// missing .dat), or 0 when nothing was pruned: a transient read error keeps the
+// entry and reports 0, so the owner is never told an image is lost while a retry
+// can still publish it.
 func (c *WriteBackCache) getViewStateLocked(remotePath string) ([]byte, StagedViewState, uint64, error) {
 	if data, ok := c.data[remotePath]; ok {
 		c.touchDataLocked(remotePath)

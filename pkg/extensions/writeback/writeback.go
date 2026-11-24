@@ -1042,10 +1042,11 @@ func (w *Writeback) Start(ctx context.Context) error {
 	return nil
 }
 
-// pathTerminalFailure reports the recorded terminal failure for a path. With a
-// commit queue that is its failure map; without one (write-sync / close-sync
-// stacks) it is the write cache's durable view-loss marker, so a barrier can
-// never read a pruned image as a completed upload.
+// pathTerminalFailure reports the recorded terminal failure for a path. The
+// write cache's durable view-loss marker answers first (it outlives the process,
+// and a queue-recorded error must not mask a lost image); the commit queue's
+// failure map is consulted next, so queue-only stacks and transfer records still
+// answer.
 func (w *Writeback) pathTerminalFailure(path string) error {
 	if w == nil {
 		return nil
@@ -1122,11 +1123,13 @@ func (w *Writeback) Drain(ctx context.Context) error {
 			firstErr = err
 		}
 	}
-	if firstErr == nil && w.wbCache != nil && w.wbCache.ViewLossCount() > 0 {
-		// Nothing holds the work any more, but a pruned pair left a durable
-		// loss: the drain must not certify it (FS.Drain reports the same state
-		// through DrainPending).
-		firstErr = fmt.Errorf("writeback: %d staged image(s) were lost before they landed: %w", w.wbCache.ViewLossCount(), staging.ErrStagedViewLost)
+	if firstErr == nil && w.wbCache != nil {
+		if n := w.wbCache.ViewLossCount(); n > 0 {
+			// Nothing holds the work any more, but a pruned pair left a durable
+			// loss: the drain must not certify it (FS.Drain reports the same
+			// state through DrainPending).
+			firstErr = fmt.Errorf("writeback: %d staged image(s) were lost before they landed: %w", n, staging.ErrStagedViewLost)
+		}
 	}
 	return firstErr
 }
@@ -1915,10 +1918,8 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 									if !w.waitPathCommit(op.Path) {
 										return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
 									}
-									if w.queue != nil {
-										if qerr := w.queue.PathTerminalFailure(op.Path); qerr != nil {
-											return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EIO))
-										}
+									if ferr := w.pathTerminalFailure(op.Path); ferr != nil {
+										return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 									}
 									if w.opts.Staging == nil || !w.opts.Staging.Pending.HasPending(op.Path) {
 										w.wbCache.RemoveIfPutGeneration(op.Path, putGen)
@@ -1972,21 +1973,17 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 							}
 						}
 						w.waitUploaderPath(op.Path)
-						if w.queue != nil {
-							if qerr := w.queue.PathTerminalFailure(op.Path); qerr != nil {
-								return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EIO))
-							}
+						if ferr := w.pathTerminalFailure(op.Path); ferr != nil {
+							return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 						}
 						handoffUnlock = w.lockRenamePaths(op.Path, survivor)
 						if (w.queue != nil && w.queue.HasPath(op.Path)) || w.hasUploaderActivity(op.Path) {
 							handoffUnlock()
 							continue
 						}
-						if w.queue != nil {
-							if qerr := w.queue.PathTerminalFailure(op.Path); qerr != nil {
-								handoffUnlock()
-								return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EIO))
-							}
+						if ferr := w.pathTerminalFailure(op.Path); ferr != nil {
+							handoffUnlock()
+							return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 						}
 						break
 					}
@@ -2522,9 +2519,10 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			w.queue.RenameTerminalFailure(op.Path, op.Path2, dstLandedSnaps)
 		}
 		w.retarget(op.Path, op.Path2)
-		// The object moved: the loss record follows neither name — the source
-		// name is gone and the destination now holds a landed object, so a
-		// record at either would fail a barrier on a name whose image is fine.
+		// The object moved: the destination's replaced incarnation loses its
+		// record, and the source's obligation follows the name — a prune of the
+		// source inside this window must not read as a landed image at the
+		// destination.
 		if w.wbCache != nil {
 			// The destination's replaced incarnation loses its record; the
 			// source's obligation follows the name (an in-window prune of the
@@ -3847,14 +3845,13 @@ func (h *bufferingHandle) DrainFlush(ctx context.Context) (err error) {
 		}
 
 		retainBuffer := false
-		useCache := true
 		if staged && !unlinked && h.w.uploader != nil && h.w.wbCache != nil {
 			// No GetMeta pre-gate: the uploader's state lookup distinguishes
 			// "another upload consumed it" from "its only copy was pruned", and
 			// skipping on the latter would report a durable drain that never
 			// happened.
 			{
-				// (scope kept so the hoisted useCache cannot leak past this block)
+				useCache := true
 				if dirty {
 					snapshot, stageErr := h.stageToWriteCache(ctx, stageFullDurable)
 					if errors.Is(stageErr, errWriteCacheBypass) {
@@ -7104,6 +7101,13 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 			cachePutGen = meta.PutGen()
 		}
 	}
+	// The loss record this landing supersedes is bounded by the state read
+	// BEFORE the remote write: a newer image that dies while the upload is on
+	// the wire keeps its record.
+	landBoundGen := cachePutGen
+	if h.w.wbCache != nil {
+		landBoundGen = h.w.wbCache.LossGenerationBound(h.path, landBoundGen)
+	}
 	h.mu.Lock()
 	size := int64(0)
 	if h.buf != nil {
@@ -7177,8 +7181,10 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 			h.w.wbCache.RemoveIfPutGeneration(h.path, cachePutGen)
 		}
 		// An inline commit published this image: any recorded loss for the name
-		// is superseded, including one left by a pruned pair (cacheGen == 0).
-		h.w.wbCache.ClearViewLoss(h.path)
+		// is superseded, including one left by a pruned pair (cacheGen == 0) —
+		// but only up to the generation this landing covers: a newer image that
+		// died while this upload was on the wire must keep its record.
+		h.w.wbCache.ClearViewLossIfGeneration(h.path, landBoundGen)
 		// A rev-less streamed success still retires a queue-recorded failure for
 		// the name; landedAt returns early without a revision, so nothing else
 		// would clear it.
@@ -7855,7 +7861,7 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 		}); err != nil {
 			// The mode stays armed (it is consumed after Enqueue), so the retry
 			// this error provokes restages with the chmod still attached.
-			return fmt.Errorf("journal fsync fence for %s: %w", h.path, err)
+			return fmt.Errorf("journal fsync fence for %s: %w", stagePath, err)
 		}
 	}
 	// The queue now owns this image: drop a same-image .dat/.meta snapshot
@@ -7868,7 +7874,7 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 	// This staging publishes the path's newest image, so a loss record from an
 	// earlier pruned pair is superseded — cacheGen == 0 means exactly that the
 	// pruned pair had no .meta left to gate the clear.
-	w.wbCache.ClearViewLoss(h.path)
+	w.wbCache.ClearViewLoss(stagePath)
 	entry := &CommitEntry{
 		Path:             stagePath,
 		Size:             size,
@@ -8185,6 +8191,14 @@ func (h *bufferingHandle) commitPatched(ctx context.Context) (rev int64, attempt
 	var dirty []int
 	var snapshots map[int][]byte
 	var partSize int64
+	patchPath := h.path
+	patchBoundGen := uint64(0)
+	if h.w.wbCache != nil {
+		if meta, ok := h.w.wbCache.GetMeta(patchPath); ok && meta != nil {
+			patchBoundGen = meta.PutGen()
+		}
+		patchBoundGen = h.w.wbCache.LossGenerationBound(patchPath, patchBoundGen)
+	}
 	if applicable {
 		dirty = h.buf.DirtyPartNumbers()
 		if len(dirty) > 0 {
@@ -8250,8 +8264,9 @@ func (h *bufferingHandle) commitPatched(ctx context.Context) (rev int64, attempt
 	h.mu.Lock()
 	h.storageClass = client.StorageTypeS3
 	h.mu.Unlock()
-	// The patched image is published: a loss record for the name is superseded.
-	h.w.wbCache.ClearViewLoss(h.path)
+	// The patched image is published: a loss record for the name is superseded
+	// up to the generation this patch covers (a newer loss survives).
+	h.w.wbCache.ClearViewLossIfGeneration(patchPath, patchBoundGen)
 	return 0, true, nil
 }
 
@@ -8500,32 +8515,41 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 		h.mu.Unlock()
 		return nil, nil
 	}
-	isNew, landed := h.isNew, h.landed
+	// Captured under h.mu, and re-checked after the materialization below: the
+	// create-only path must see the state the publish callbacks would have set.
+	isNew := h.isNew
 	if h.buf == nil {
-		h.mu.Unlock()
-		if !isNew {
+		if !h.isNew {
+			h.mu.Unlock()
 			return nil, nil
 		}
-		if landed {
+		if h.landed {
 			// The handle's image already landed (a streamed inline commit, or a
 			// queue landing that published it). Materializing the empty buffer
 			// now would stage a zero-byte image over the real content — the same
 			// reason Release keys its empty materialization on landed — and if it
 			// landed it would truncate the file; if it did not, it stranded a
 			// bogus pending entry that failed the unmount drain.
+			h.mu.Unlock()
 			return nil, nil
 		}
 		// An O_CREAT claim that never wrote stages as a zero-byte image
 		// (v1 createEmptyHandleRemote): its existence must land at the
 		// durability boundary, not only at Release.
-		if err := h.ensureBuffer(ctx); err != nil {
+		//
+		// Materialize under h.mu: MarkPublished, acknowledgeUploadedCreate and
+		// completeStagedLanding retire an empty create using only h.mu, so
+		// dropping it across ensureBuffer would let one of them publish this
+		// handle's image and then have a 0-byte PendingNew staged over it.
+		if err := h.ensureBufferLocked(ctx); err != nil {
+			h.mu.Unlock()
 			return nil, err
 		}
-		h.mu.Lock()
-		if h.unlinked || h.closed || h.buf == nil {
+		if h.unlinked || h.closed || h.buf == nil || h.landed {
 			h.mu.Unlock()
 			return nil, nil
 		}
+		isNew = h.isNew
 	}
 	// A promotion-sized EXTENT image must bypass the small-file write-cache
 	// track at whatever cutoff the extent rules name — not only at the fixed

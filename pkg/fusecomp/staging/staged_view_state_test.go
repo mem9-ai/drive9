@@ -471,19 +471,32 @@ func TestRenamePendingCarriesTheLossRecord(t *testing.T) {
 // TestHasViewLossPrefixFailsClosed pins the read-side rule: an unreadable marker
 // must report a loss (true) so a directory rename cannot move over it.
 func TestHasViewLossPrefixFailsClosed(t *testing.T) {
-	c, err := NewWriteBackCache(t.TempDir())
+	dir := t.TempDir()
+	first, err := NewWriteBackCache(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(c.lostFile("/corrupt.txt"), []byte("{not json"), 0o600); err != nil {
+	if err := os.WriteFile(first.lostFile("/corrupt.txt"), []byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	c.writeViewLoss("/tree/lost.txt", 4, os.ErrNotExist)
+	first.writeViewLoss("/tree/lost.txt", 4, os.ErrNotExist)
+
+	// Reopen: the prefix helpers answer from the in-process mirror, which the
+	// load builds from disk — including the marker it could not decode.
+	c, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !c.HasViewLossPrefix("/tree/") {
 		t.Fatal("a recorded loss under the prefix was not reported")
 	}
 	if !c.HasViewLossPrefix("/corrupt.txt") {
 		t.Fatal("an unreadable marker did not fail closed")
+	}
+	// Removing the attributable loss must not silence the unreadable one.
+	c.ClearViewLossPrefix("/tree/")
+	if !c.HasViewLossPrefix("/corrupt.txt") {
+		t.Fatal("clearing a subtree dropped the unreadable marker's fail-closed answer")
 	}
 }
 
@@ -514,5 +527,76 @@ func TestViewLossCountIsCheapAndFailsClosed(t *testing.T) {
 	restarted.ClearViewLoss(path)
 	if got := restarted.ViewLossCount(); got != 1 {
 		t.Fatalf("ViewLossCount after clearing = %d, want 1 (the unreadable marker)", got)
+	}
+	// A fresh staging over the corrupt marker's own hash clears the unknown
+	// bookkeeping: the marker is replaced by a readable one.
+	if err := restarted.Put("/corrupt.txt", []byte("x"), 1, PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	if got := restarted.ViewLossCount(); got != 0 {
+		t.Fatalf("ViewLossCount after restaging over the corrupt marker = %d, want 0", got)
+	}
+}
+
+// TestRenamePendingMovesChmodOnlyEntry pins the blocker the review found: a
+// chmod-only record has no .dat by design, so the rename must move the metadata
+// without treating the missing payload as a lost image (which would drop the
+// pending mode and wedge every later drain).
+func TestRenamePendingMovesChmodOnlyEntry(t *testing.T) {
+	const (
+		src = "/chmod-src.txt"
+		dst = "/chmod-dst.txt"
+	)
+	c, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.PublishMeta(WriteBackMeta{Path: src, Size: 7, Kind: PendingChmod, Generation: 11})
+	if !c.RenamePending(src, dst) {
+		t.Fatal("a chmod-only record did not move")
+	}
+	meta, ok := c.GetMeta(dst)
+	if !ok || meta == nil || meta.Kind != PendingChmod {
+		t.Fatalf("destination meta = %+v, %v; want the PendingChmod record", meta, ok)
+	}
+	if _, ok := c.GetMeta(src); ok {
+		t.Fatal("the source record survived the rename")
+	}
+	if err := c.ViewLoss(dst); err != nil {
+		t.Fatalf("a healthy chmod-only rename recorded a loss: %v", err)
+	}
+	if err := c.ViewLoss(src); err != nil {
+		t.Fatalf("a healthy chmod-only rename recorded a loss on the source: %v", err)
+	}
+}
+
+// TestRenamePendingRecordsMissingDataOnDestination pins the destination rule: the
+// object is moving, so a payload that vanished before the rename must leave the
+// loss on the destination (the callers rekey extents before this call, so a
+// record on the dead source name would be stranded).
+func TestRenamePendingRecordsMissingDataOnDestination(t *testing.T) {
+	const (
+		src = "/gone-src.txt"
+		dst = "/gone-dst.txt"
+	)
+	c, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Put(src, []byte("payload"), 7, PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	// Remove the payload behind the cache's back: the metadata still describes it.
+	if err := os.Remove(c.DatFile(src)); err != nil {
+		t.Fatal(err)
+	}
+	if c.RenamePending(src, dst) {
+		t.Fatal("rename reported success over a missing payload")
+	}
+	if err := c.ViewLoss(dst); err == nil {
+		t.Fatal("the missing payload was not recorded on the destination")
+	}
+	if _, ok := c.GetMeta(src); ok {
+		t.Fatal("the orphaned source metadata survived")
 	}
 }
