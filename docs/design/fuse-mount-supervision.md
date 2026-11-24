@@ -130,7 +130,7 @@ Implemented as a typed error with `ExitCode() int` (honored by `cmd/drive9/main.
 | **5** | Permanent startup failure | **No** (after ≤3 attempts) |
 | **6** | Transient startup failure | **Yes** |
 | **7** | Unmounted, but the shutdown drain left write-side work behind (`drain_failed`) | **Yes** without stop token (an intentional umount always carries one) |
-| **8** | Layer still has an exclusive mount lease | On worker recovery, wait one lease lifetime and retry once. A fresh mount reports the conflict immediately. |
+| **8** | Layer still has an exclusive mount lease | After a worker crash, retry with backoff until the server reports lease expiry or the restart window ends. A fresh mount reports the conflict immediately. |
 | signal death | Kill / OOM observed by supervisor | **Yes** |
 
 Supervisor final exit codes:

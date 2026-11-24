@@ -377,52 +377,84 @@ func TestSupervisorReplacesStoredLayerMetadata(t *testing.T) {
 }
 
 func TestSupervisorRecoversAfterOldWorkerLeaseExpires(t *testing.T) {
-	dir := t.TempDir()
-	mountPoint := filepath.Join(dir, "mount")
-	if err := os.Mkdir(mountPoint, 0700); err != nil {
-		t.Fatal(err)
-	}
-	worker := filepath.Join(dir, "worker")
-	script := `#!/bin/sh
+	for _, stage := range []string{"adopt", "startup", "running", "first-busy", "deadline"} {
+		t.Run(stage, func(t *testing.T) {
+			dir := t.TempDir()
+			mountPoint := filepath.Join(dir, "mount")
+			if err := os.Mkdir(mountPoint, 0700); err != nil {
+				t.Fatal(err)
+			}
+			worker := filepath.Join(dir, "worker")
+			script := `#!/bin/sh
 echo attempt >> "$1/attempts"
+if [ ! -e "$1/started" ]; then
+  touch "$1/started"
+  case "$2" in
+    startup) exit 137 ;;
+    running) while [ ! -e "$1/ready" ]; do sleep 0.02; done; exit 137 ;;
+  esac
+fi
 if [ ! -f "$1/expired" ]; then exit 8; fi
 trap 'exit 0' TERM INT
 touch "$1/recovered"
-sleep 1
+sleep 2
 `
-	if err := os.WriteFile(worker, []byte(script), 0700); err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now()
-	start := now
-	cfg := Config{
-		MountPoint: mountPoint, Executable: worker, WorkerArgs: []string{dir}, Adopt: true,
-		AdoptWorkerPID: 1 << 30, AdoptWorkerCreation: 1,
-		Now: func() time.Time { return now },
-		Sleep: func(d time.Duration) {
-			if d == time.Second {
-				now = now.Add(d)
-				if now.Sub(start) >= drive9fuse.LayerMountLeaseTTL {
-					if err := os.WriteFile(filepath.Join(dir, "expired"), nil, 0600); err != nil {
-						t.Fatal(err)
-					}
-				}
-			} else {
-				time.Sleep(d)
+			if err := os.WriteFile(worker, []byte(script), 0700); err != nil {
+				t.Fatal(err)
 			}
-			if _, err := os.Stat(filepath.Join(dir, "recovered")); err == nil {
-				if err := mountstate.WriteStopToken(mountPoint, "test complete"); err != nil {
+			now := time.Now()
+			start := now
+			write := func(name string) {
+				if err := os.WriteFile(filepath.Join(dir, name), nil, 0600); err != nil {
 					t.Fatal(err)
 				}
 			}
-		},
-	}
-	if err := Run(cfg); err != nil {
-		t.Fatal(err)
-	}
-	attempts, err := os.ReadFile(filepath.Join(dir, "attempts"))
-	if err != nil || string(attempts) != "attempt\nattempt\n" {
-		t.Fatalf("attempts %q, %v", attempts, err)
+			exists := func(name string) bool { _, err := os.Stat(filepath.Join(dir, name)); return err == nil }
+			cfg := Config{MountPoint: mountPoint, Executable: worker, WorkerArgs: []string{dir, stage}, LayerID: "layer-test",
+				Adopt: stage == "adopt" || stage == "deadline", AdoptWorkerPID: 1 << 30, AdoptWorkerCreation: 1, RestartWindow: 2 * time.Minute,
+				Now: func() time.Time { return now },
+				Sleep: func(d time.Duration) {
+					if d == 200*time.Millisecond {
+						time.Sleep(20 * time.Millisecond)
+					} else {
+						now = now.Add(d)
+					}
+					if now.Sub(start) >= 65*time.Second && stage != "deadline" {
+						write("expired")
+					}
+					if exists("recovered") {
+						if err := mountstate.WriteStopToken(mountPoint, "test complete"); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}}
+			s, err := newSupervisor(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.unlock()
+			s.probeReady = func(string) error {
+				if stage == "running" && exists("started") && !exists("ready") {
+					write("ready")
+					return nil
+				}
+				return errors.New("worker not mounted")
+			}
+			err = s.loop()
+			if stage == "first-busy" || stage == "deadline" {
+				if err == nil || s.state.State != mountstate.SupervisorStateFailed {
+					t.Fatalf("expected failure: %v, %v", err, s.state.State)
+				}
+				if stage == "first-busy" && now != start {
+					t.Fatal("initial conflict waited for another mount")
+				}
+				if stage == "deadline" && now.Sub(start) < cfg.RestartWindow {
+					t.Fatal("gave up before restart window elapsed")
+				}
+			} else if err != nil || !exists("recovered") {
+				t.Fatalf("old worker lease recovery: %v", err)
+			}
+		})
 	}
 }
 
@@ -430,7 +462,7 @@ func TestLayerLeaseWaitHonorsStop(t *testing.T) {
 	stop := make(chan os.Signal, 1)
 	stop <- syscall.SIGTERM
 	s := &supervisor{cfg: applyDefaults(Config{MountPoint: t.TempDir()})}
-	if s.waitForLayerLease(stop) || !s.isStopRequested() {
+	if s.waitForLayerLease(stop, time.Minute) || !s.isStopRequested() {
 		t.Fatal("lease recovery ignored stop")
 	}
 }

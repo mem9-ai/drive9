@@ -74,7 +74,8 @@ func Run(cfg Config) error {
 }
 
 type supervisor struct {
-	cfg Config
+	cfg        Config
+	probeReady func(string) error
 
 	mu             sync.Mutex
 	state          mountstate.SupervisorState
@@ -133,11 +134,12 @@ func newSupervisor(cfg Config) (*supervisor, error) {
 	creation, _ := mountstate.ProcessCreationTime(os.Getpid())
 	now := cfg.Now()
 	s := &supervisor{
-		cfg:       cfg,
-		lockFile:  lock,
-		backoff:   time.Second,
-		startedAt: startedAt,
-		adopted:   cfg.Adopt && cfg.AdoptWorkerPID > 0,
+		cfg:        cfg,
+		probeReady: drive9fuse.ProbeMountPointReady,
+		lockFile:   lock,
+		backoff:    time.Second,
+		startedAt:  startedAt,
+		adopted:    cfg.Adopt && cfg.AdoptWorkerPID > 0,
 		state: mountstate.SupervisorState{
 			PID:          os.Getpid(),
 			CreationTime: creation,
@@ -236,6 +238,7 @@ func (s *supervisor) loop() error {
 	}
 
 	recoverLayerLease := s.adopted
+	var leaseDeadline time.Time
 	// Adopt-by-monitor: do not force-clean a live healthy orphan worker.
 	if s.adopted {
 		if !processAlive(s.state.WorkerPID, s.state.WorkerCreation) {
@@ -327,15 +330,24 @@ func (s *supervisor) loop() error {
 				return s.shutdownClean()
 			}
 			if code == drive9fuse.ExitLayerLeaseBusy {
-				if !recoverLayerLease {
-					s.setState(mountstate.SupervisorStateFailed)
-					return giveUpError("layer already has an active exclusive mount lease")
+				if recoverLayerLease && leaseDeadline.IsZero() {
+					leaseDeadline = s.cfg.Now().Add(s.cfg.RestartWindow)
+					s.mu.Lock()
+					s.state.LayerLeaseRecoveryUntil = leaseDeadline
+					s.mu.Unlock()
+					_ = s.persist()
 				}
-				// A killed worker cannot release its lease. Give it one TTL
-				// before trying again with a fresh worker and mount identity.
-				recoverLayerLease = false
-				s.logf("waiting for previous worker layer lease to expire")
-				if !s.waitForLayerLease(sigCh) {
+				if !recoverLayerLease || !s.cfg.Now().Before(leaseDeadline) {
+					reason = "layer already has an active exclusive mount lease"
+					s.setState(mountstate.SupervisorStateFailed)
+					s.alert("mount_gave_up", reason)
+					_, _ = drive9fuse.EnsureCleanMountpoint(s.cfg.MountPoint)
+					return giveUpError(reason)
+				}
+				// A dying worker can finish a renewal after the supervisor
+				// observes its exit. Only the server can confirm expiry.
+				s.logf("layer lease still active; retrying until %s", leaseDeadline)
+				if !s.waitForLayerLease(sigCh, min(s.nextBackoff(), leaseDeadline.Sub(s.cfg.Now()))) {
 					return s.shutdownClean()
 				}
 				continue
@@ -354,6 +366,8 @@ func (s *supervisor) loop() error {
 				s.cfg.Sleep(s.nextBackoff())
 				continue
 			}
+			// A worker may have bound the layer before it became ready.
+			recoverLayerLease = true
 			// Transient / abnormal / unknown (including bare exit 1) → restart.
 			s.noteRestart(reason)
 			s.alert("mount_restart", reason)
@@ -366,6 +380,10 @@ func (s *supervisor) loop() error {
 		s.backoff = time.Second
 		s.healthFails = 0
 		s.workerReady = true
+		leaseDeadline = time.Time{}
+		s.mu.Lock()
+		s.state.LayerLeaseRecoveryUntil = time.Time{}
+		s.mu.Unlock()
 		recoverLayerLease = true
 		s.setState(mountstate.SupervisorStateRunning)
 		notifyReady()
@@ -666,8 +684,8 @@ func (s *supervisor) spawnWorker() error {
 	return nil
 }
 
-func (s *supervisor) waitForLayerLease(sigCh <-chan os.Signal) bool {
-	deadline := s.cfg.Now().Add(drive9fuse.LayerMountLeaseTTL)
+func (s *supervisor) waitForLayerLease(sigCh <-chan os.Signal, delay time.Duration) bool {
+	deadline := s.cfg.Now().Add(delay)
 	for {
 		select {
 		case <-sigCh:
@@ -707,7 +725,7 @@ func (s *supervisor) waitWorkerReady(sigCh <-chan os.Signal) error {
 			s.stopWorker()
 			return errors.New("stop during ready")
 		}
-		if err := drive9fuse.ProbeMountPointReady(s.cfg.MountPoint); err == nil {
+		if err := s.probeReady(s.cfg.MountPoint); err == nil {
 			// Probe passed: publish supervisor-owned process state and treat as ready.
 			_ = s.writeAuthoritativeProcessState()
 			return nil

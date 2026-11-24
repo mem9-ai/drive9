@@ -1276,20 +1276,23 @@ func waitForSupervisedMountReady(mountPoint string, supervisorPID int, waitCh <-
 			return fmt.Errorf("drive9 mount: supervised mount exited before becoming ready (log: %s)", logPath)
 		default:
 		}
+		// Ready only when SupervisorState matches the child we just spawned
+		// (PID+creation) and its worker is identity-alive — never accept a
+		// stale pidfile from a previous generation.
+		if st, _, err := mountstate.ReadSupervisorState(mountPoint); err == nil {
+			if supervisorStateMatchesGeneration(st, supervisorPID, supCreation) && st.LayerLeaseRecoveryUntil.After(deadline) {
+				deadline = st.LayerLeaseRecoveryUntil.Add(timeout)
+			}
+			if supervisedReadyStateMatches(st, supervisorPID, supCreation) && probeMountReadyForCLI(mountPoint) {
+				return nil
+			}
+		}
 		if time.Now().After(deadline) {
 			// Stop only the supervisor we just spawned. Worker kill is gated on
 			// SupervisorState matching this generation (PID+creation); never
 			// act on stale state or PID-only liveness (fail closed).
 			cleanupSupervisedReadyTimeout(mountPoint, supervisorPID, supCreation)
 			return fmt.Errorf("drive9 mount: timed out waiting for supervised mount to become ready after %s (log: %s)", timeout, logPath)
-		}
-		// Ready only when SupervisorState matches the child we just spawned
-		// (PID+creation) and its worker is identity-alive — never accept a
-		// stale pidfile from a previous generation.
-		if st, _, err := mountstate.ReadSupervisorState(mountPoint); err == nil {
-			if supervisedReadyStateMatches(st, supervisorPID, supCreation) && probeMountReadyForCLI(mountPoint) {
-				return nil
-			}
 		}
 		time.Sleep(200 * time.Millisecond)
 	}

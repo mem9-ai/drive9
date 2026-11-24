@@ -49,6 +49,9 @@ type SupervisorState struct {
 	Profile         string    `json:"profile,omitempty"`
 	LocalRoot       string    `json:"local_root,omitempty"`
 	PackPaths       []string  `json:"pack_paths,omitempty"`
+
+	// The CLI parent uses the recovery deadline only for its own supervisor generation.
+	LayerLeaseRecoveryUntil time.Time `json:"layer_lease_recovery_until,omitzero"`
 }
 
 func SupervisorStatePath(mountPoint string) string {
