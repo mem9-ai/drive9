@@ -490,6 +490,7 @@ type bufferingHandle struct {
 	lastStageSize int64
 	stagedHist    uint64
 	stagedToCache bool
+	stageCacheMu  sync.Mutex
 	// unlinked marks the handle anonymous (fh.Unlinked): the buffer
 	// keeps serving the fd, commits are discarded.
 	unlinked bool
@@ -4066,9 +4067,9 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 		// .dat/.meta image on disk and the uploader lands it async; the
 		// commit queue keeps serving the large-file/shadow track.
 		h.mu.Lock()
-		dirty, unlinked := h.dirty, h.unlinked
+		dirty, unlinked, releasing := h.dirty, h.unlinked, h.releasing
 		h.mu.Unlock()
-		if !dirty || unlinked {
+		if !dirty || unlinked || releasing {
 			return nil
 		}
 		snapshot, err := h.stageToWriteCache(ctx, stageV1Ladder)
@@ -4085,11 +4086,9 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			// delivers OPEN + SETATTR(size=0) + FLUSH before the first
 			// WRITE: the empty image landed first and the final image's CAS
 			// at the open-time base revision then conflicts forever —
-			// fuse-smoke's overwrite step). Release submits the final
-			// snapshot exactly once.
-			h.mu.Lock()
-			h.stagedToCache = true
-			h.mu.Unlock()
+			// fuse-smoke's overwrite step). stageToWriteCache records
+			// h.stagedToCache under pathLocks so Release submits the final
+			// snapshot exactly once without racing a closing handle.
 			return nil
 		}
 		// v1 writeBackThreshold: large images skip the whole-image .dat/.meta
@@ -4243,6 +4242,15 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 		h.snapshotFile = nil
 	}
 	h.mu.Unlock()
+	if h.w.opts.Policy == PolicyWriteBack && h.w.uploader != nil && h.w.wbCache != nil {
+		// Fence any in-flight local-only Flush snapshot on this descriptor
+		// without waiting on CommitQueue uploads holding pathLocks: h.releasing
+		// is already set, so a Flush already inside stageCacheMu finishes
+		// publishing stagedToCache before we inspect it, and any Flush entering
+		// stageCacheMu afterwards sees h.releasing and declines to stage.
+		h.stageCacheMu.Lock()
+		h.stageCacheMu.Unlock()
+	}
 	// An O_CREAT claim that never landed must still materialize as a remote
 	// file (stages it in pendingIndex at Create): git probes the
 	// filesystem by creating and unlinking `.git/ä` with no writes, and a
@@ -6685,11 +6693,13 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 		}
 		if image != nil {
 			h.mu.Lock()
-			cur := append([]byte(nil), h.buf.Bytes()...)
-			if !bytes.Equal(image, cur) || landedRev > h.baseRev {
-				if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
-					h.mu.Unlock()
-					return err
+			if !h.unlinked && h.buf != nil {
+				cur := append([]byte(nil), h.buf.Bytes()...)
+				if !bytes.Equal(image, cur) || landedRev > h.baseRev {
+					if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
+						h.mu.Unlock()
+						return err
+					}
 				}
 			}
 			h.mu.Unlock()
@@ -7006,11 +7016,13 @@ func (h *bufferingHandle) commitLocked(ctx context.Context) error {
 		}
 		if image != nil {
 			h.mu.Lock()
-			cur := append([]byte(nil), h.buf.Bytes()...)
-			if !bytes.Equal(image, cur) || landedRev > h.baseRev {
-				if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
-					h.mu.Unlock()
-					return err
+			if !h.unlinked && h.buf != nil {
+				cur := append([]byte(nil), h.buf.Bytes()...)
+				if !bytes.Equal(image, cur) || landedRev > h.baseRev {
+					if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
+						h.mu.Unlock()
+						return err
+					}
 				}
 			}
 			h.mu.Unlock()
@@ -7392,11 +7404,13 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 		}
 		if image != nil {
 			h.mu.Lock()
-			cur := append([]byte(nil), h.buf.Bytes()...)
-			if !bytes.Equal(image, cur) || landedRev > h.baseRev {
-				if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
-					h.mu.Unlock()
-					return nil, err
+			if !h.unlinked && h.buf != nil {
+				cur := append([]byte(nil), h.buf.Bytes()...)
+				if !bytes.Equal(image, cur) || landedRev > h.baseRev {
+					if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
+						h.mu.Unlock()
+						return nil, err
+					}
 				}
 			}
 			h.mu.Unlock()
@@ -7404,14 +7418,31 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 	}
 	unlock := h.w.pathLocks.lock(h.path)
 	defer unlock()
+	if dur == stageV1Ladder {
+		h.stageCacheMu.Lock()
+		defer h.stageCacheMu.Unlock()
+	}
 	if h.w.opts.Staging != nil && h.w.opts.Staging.Pending.HasPending(h.path) {
 		return nil, errWriteCacheBypass
 	}
 	h.mu.Lock()
+	if h.unlinked {
+		h.mu.Unlock()
+		return nil, nil
+	}
+	if dur == stageV1Ladder && (h.releasing || !h.dirty) {
+		// Local-only write-back Flush snapshot: Release is the sole submitter
+		// of stageV1Ladder entries, so once Release has claimed teardown or an
+		// earlier boundary retired dirty while we waited for pathLocks, staging
+		// here would leave an unowned .dat/.meta entry stranded in wbCache.
+		h.mu.Unlock()
+		return nil, nil
+	}
 	isNew := h.isNew
 	if h.buf == nil {
+		landed, releasing := h.landed, h.releasing
 		h.mu.Unlock()
-		if !isNew {
+		if !isNew || landed || releasing {
 			return nil, nil
 		}
 		// An O_CREAT claim that never wrote stages as a zero-byte image
@@ -7421,7 +7452,7 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 			return nil, err
 		}
 		h.mu.Lock()
-		if h.buf == nil {
+		if h.unlinked || h.buf == nil {
 			h.mu.Unlock()
 			return nil, nil
 		}
@@ -7518,6 +7549,12 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 	if isNew {
 		kind = staging.PendingNew
 	}
+	h.mu.Lock()
+	if h.unlinked {
+		h.mu.Unlock()
+		return nil, nil
+	}
+	h.mu.Unlock()
 	// supersedesGen was read under the image-capture lock above: the staged
 	// image composed over every pending generation this handle's content
 	// actually includes — recorded when the handle staged through the queue
@@ -7573,7 +7610,12 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 	if h.w.pendingSeeder != nil {
 		h.w.pendingSeeder(h.path, image)
 	}
-	h.retireDirty(snapshot.wgen)
+	h.mu.Lock()
+	if dur == stageV1Ladder && !h.unlinked {
+		h.stagedToCache = true
+	}
+	h.retireDirtyLocked(snapshot.wgen)
+	h.mu.Unlock()
 	return snapshot, nil
 }
 
