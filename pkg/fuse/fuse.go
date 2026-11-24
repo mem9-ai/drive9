@@ -405,36 +405,54 @@ func (f *FS) onLocalMutation(e fs.Event) {
 		return
 	}
 	f.inodes.UpdateSize(ino, e.Size)
+	entry, hasEntry := f.inodes.GetEntry(ino)
+	if e.Kind == fs.EventLanded && e.Rev > 0 && (!hasEntry || e.Rev >= entry.Revision) {
+		f.inodes.UpdateRevision(ino, e.Rev)
+	}
 	if f.Ctx.DirCache != nil {
-		item := fs.DirEntryInfo{Name: pathutil.BaseName(e.Path), Size: e.Size, Rev: e.Rev, Mtime: time.Now(), LocalMutation: true}
-		if entry, ok := f.inodes.GetEntry(ino); ok {
-			if entry.HasMode {
-				item.Mode = entry.Mode
-				item.HasMode = true
+		upsertAlias := func(p string) {
+			item := fs.DirEntryInfo{Name: pathutil.BaseName(p), Size: e.Size, Rev: e.Rev, Mtime: time.Now(), LocalMutation: true}
+			if hasEntry {
+				if entry.HasMode {
+					item.Mode = entry.Mode
+					item.HasMode = true
+				}
+				// Ownership is mount-local (v1: the backend has no chown verb):
+				// a settled row without it makes class checks (renameguard's
+				// sticky ownership test) read the remote default owner and
+				// EACCES a rename the local view allows (rename/09).
+				if entry.HasUID {
+					item.Uid = entry.Uid
+					item.HasUID = true
+				}
+				if entry.HasGID {
+					item.Gid = entry.Gid
+					item.HasGID = true
+				}
+				if entry.Nlink > item.Nlink {
+					// The settle row keeps the tracked link count — a
+					// listing rebuilt from it must not flatten hardlinks
+					// to nlink 1.
+					item.Nlink = entry.Nlink
+				}
+				if entry.ResourceID != "" {
+					item.ResourceID = entry.ResourceID
+				}
 			}
-			// Ownership is mount-local (v1: the backend has no chown verb):
-			// a settled row without it makes class checks (renameguard's
-			// sticky ownership test) read the remote default owner and
-			// EACCES a rename the local view allows (rename/09).
-			if entry.HasUID {
-				item.Uid = entry.Uid
-				item.HasUID = true
-			}
-			if entry.HasGID {
-				item.Gid = entry.Gid
-				item.HasGID = true
-			}
-			if entry.Nlink > item.Nlink {
-				// The settle row keeps the tracked link count — a
-				// listing rebuilt from it must not flatten hardlinks
-				// to nlink 1.
-				item.Nlink = entry.Nlink
-			}
-			if entry.ResourceID != "" {
-				item.ResourceID = entry.ResourceID
+			f.Ctx.DirCache.Upsert(parentDirOf(p), item)
+		}
+		seenEventPath := false
+		if hasEntry {
+			for p := range entry.Paths {
+				if p == e.Path {
+					seenEventPath = true
+				}
+				upsertAlias(p)
 			}
 		}
-		f.Ctx.DirCache.Upsert(parentDirOf(e.Path), item)
+		if !seenEventPath {
+			upsertAlias(e.Path)
+		}
 	}
 }
 
@@ -854,6 +872,24 @@ func (f *FS) populateNativeSyncFSSupport(resp *mountcontrol.DrainResponse) {
 // snapshotDrainPending reports undrained work (v1 snapshotDrainPending).
 func (f *FS) snapshotDrainPending(resp *mountcontrol.DrainResponse) {
 	resp.Pending.OpenHandles = f.handles.len()
+	for _, h := range f.chain.Handlers() {
+		if ds, is := h.(interface {
+			DrainSnapshot() (int, int, int, int, int, int64, int, int, int, int64)
+		}); is {
+			dirty, qPending, qInFlight, qDelayed, qConflicts, qBytes, uQueued, uInFlight, uCached, uCachedBytes := ds.DrainSnapshot()
+			resp.Pending.DirtyHandles = dirty
+			resp.Pending.CommitQueuePending = qPending
+			resp.Pending.CommitQueueBytes = qBytes
+			resp.Pending.CommitQueueInFlight = qInFlight
+			resp.Pending.CommitQueueDelayed = qDelayed
+			resp.Pending.CommitQueueConflicts = qConflicts
+			resp.Pending.UploaderQueued = uQueued
+			resp.Pending.UploaderInFlight = uInFlight
+			resp.Pending.UploaderCached = uCached
+			resp.Pending.UploaderCachedBytes = uCachedBytes
+			return
+		}
+	}
 	if pending, bytes, ok := f.chainPendingStats(); ok {
 		resp.Pending.CommitQueuePending = pending
 		resp.Pending.CommitQueueBytes = bytes
@@ -3165,10 +3201,16 @@ func (f *FS) CopyFileRange(cancel <-chan struct{}, input *gofuse.CopyFileRangeIn
 	if st != gofuse.OK {
 		return 0, st
 	}
-	if res.Written != 0 {
-		return res.Written, gofuse.OK
+	written := res.Written
+	if written > 0 {
+		f.inodes.MarkDataMutation(input.NodeIdOut)
+		f.publishWriteLength(input.NodeIdOut, int64(input.OffOut)+int64(written))
+		if hnd, ok := f.handles.get(input.FhOut); ok && hnd.direct {
+			f.InvalidateRange(input.NodeIdOut, int64(input.OffOut), int64(written))
+		}
+		f.mutated(fs.EventWrite, dstPath)
 	}
-	return uint32(input.Len), gofuse.OK
+	return written, gofuse.OK
 }
 
 // ---------------------------------------------------------------------------

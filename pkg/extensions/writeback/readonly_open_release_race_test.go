@@ -18,31 +18,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestReadOnlyOpenFlushRacingCreateReleaseDoesNotStrandWriteCache reproduces
-// the nodefs unmount failure where an O_RDONLY open arrives right as the
-// creating writer closes:
-//
-//  1. O_RDONLY Open sees no staged pending state yet, resolves the live writer
-//     via w.handleFor(path), and calls h.Flush(ctx) (Writeback.Do).
-//  2. Both O_RDONLY's Flush and the writer's own close Flush observe
-//     h.dirty == true before entering stageToWriteCache's path lock.
-//  3. In "large_queue_create", the writer's Flush bypasses wbCache into
-//     stageAndEnqueue (setting h.dirty=false, h.landed=true,
-//     supersededPendingSource=pendingGenQueue while h.isNew remains true until
-//     queue upload ack), FUSE_RELEASE runs immediately (setting
-//     h.releasing=true, untracking h so queue ack skips it, and discarding
-//     h.buf=nil), and the CommitQueue finishes uploading so
-//     Pending.HasPending(path) becomes false. When O_RDONLY's parked
-//     stageToWriteCache then acquires pathLocks, it must NOT mistake
-//     h.buf==nil && h.isNew for an unwritten empty create and write a 0-byte
-//     PendingNew entry into wbCache with no Release left to submit it.
-//  4. In "append_refresh_after_release", O_RDONLY's fenceRefreshAppendBase
-//     observes the newly landed remote revision after Release already discarded
-//     h.buf=nil; stageToWriteCache must not dereference a nil h.buf or stage
-//     onto wbCache.
-//  5. In "small_writeback_create", the writer's Release completes while
-//     O_RDONLY's Flush is still entering stageToWriteCache(stageV1Ladder),
-//     which must not leave an unsubmitted snapshot behind in wbCache.
+// A read-only open borrows the live writer to flush its image. Exercise a
+// reader queued behind close and a close queued behind the reader's flush,
+// then verify the final bytes and that neither upload track is stranded.
 func TestReadOnlyOpenFlushRacingCreateReleaseDoesNotStrandWriteCache(t *testing.T) {
 	t.Run("non_append_stage_after_queue_release", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -143,28 +121,28 @@ func TestReadOnlyOpenFlushRacingCreateReleaseDoesNotStrandWriteCache(t *testing.
 	})
 
 	for _, tc := range []struct {
-		name                 string
-		payloadSize          int
-		extentRoute          bool
-		headSeesPrePutAbsent bool
+		name             string
+		payloadSize      int
+		extentRoute      bool
+		readerFlushFirst bool
 	}{
 		{
-			name:                 "large_queue_create",
-			payloadSize:          128 << 10,
-			extentRoute:          true,
-			headSeesPrePutAbsent: true,
+			name:             "large_queue_create",
+			payloadSize:      128 << 10,
+			extentRoute:      true,
+			readerFlushFirst: true,
 		},
 		{
-			name:                 "append_refresh_after_release",
-			payloadSize:          128 << 10,
-			extentRoute:          true,
-			headSeesPrePutAbsent: false,
+			name:             "append_refresh_after_release",
+			payloadSize:      128 << 10,
+			extentRoute:      true,
+			readerFlushFirst: false,
 		},
 		{
-			name:                 "small_writeback_create",
-			payloadSize:          4 << 10,
-			extentRoute:          false,
-			headSeesPrePutAbsent: true,
+			name:             "small_writeback_create",
+			payloadSize:      4 << 10,
+			extentRoute:      false,
+			readerFlushFirst: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -194,10 +172,8 @@ func TestReadOnlyOpenFlushRacingCreateReleaseDoesNotStrandWriteCache(t *testing.
 						http.NotFound(w, r)
 						return
 					}
-					if tc.headSeesPrePutAbsent {
-						http.NotFound(w, r)
-						return
-					}
+					http.NotFound(w, r)
+					return
 				}
 				if r.Method == http.MethodPut && r.URL.Path == reqPath && gateFirstPut.CompareAndSwap(true, false) {
 					close(putEntered)
@@ -254,8 +230,22 @@ func TestReadOnlyOpenFlushRacingCreateReleaseDoesNotStrandWriteCache(t *testing.
 			payload := bytes.Repeat([]byte("z"), tc.payloadSize)
 			require.NoError(t, writer.Write(ctx, 0, payload))
 
-			gateFirstHead.Store(true)
+			gateFirstHead.Store(tc.readerFlushFirst)
 			gateFirstPut.Store(true)
+			readerWaiting := make(chan struct{})
+			resumeReader := make(chan struct{})
+			if !tc.readerFlushFirst {
+				var first atomic.Bool
+				installTestGateHook(t, wb, func(gate string) {
+					if gate == "flush:flushMu" && first.CompareAndSwap(false, true) {
+						close(readerWaiting)
+						select {
+						case <-resumeReader:
+						case <-testDone:
+						}
+					}
+				})
+			}
 
 			type roResult struct {
 				res fs.Result
@@ -271,26 +261,56 @@ func TestReadOnlyOpenFlushRacingCreateReleaseDoesNotStrandWriteCache(t *testing.
 				roDone <- roResult{res: res, err: derr}
 			}()
 
-			select {
-			case <-headEntered:
-			case <-ctx.Done():
-				t.Fatal("timed out waiting for O_RDONLY Flush to enter stageToWriteCache")
+			writerWaiting := make(chan struct{}, 1)
+			if tc.readerFlushFirst {
+				select {
+				case <-headEntered:
+				case <-ctx.Done():
+					t.Fatal("reader did not enter the append refresh")
+				}
+				installTestGateHook(t, wb, func(gate string) {
+					if gate == "flush:flushMu" {
+						select {
+						case writerWaiting <- struct{}{}:
+						default:
+						}
+					}
+				})
+			} else {
+				select {
+				case <-readerWaiting:
+				case <-ctx.Done():
+					t.Fatal("reader did not reach the flush lock")
+				}
 			}
-
-			// Writer closes (FUSE_FLUSH followed by FUSE_RELEASE) while upload
-			// ack is held until Release untracks the handle and discards h.buf.
-			require.NoError(t, writer.Flush(ctx))
-			require.NoError(t, writer.Release(ctx))
-
-			// Release the in-flight upload and wait for remote landing so
-			// Pending.HasPending(targetPath) is false before O_RDONLY acquires
-			// pathLocks inside stageToWriteCache.
+			writerDone := make(chan error, 1)
+			go func() {
+				err := writer.Flush(ctx)
+				if err == nil {
+					err = writer.Release(ctx)
+				}
+				writerDone <- err
+			}()
+			if tc.readerFlushFirst {
+				select {
+				case <-writerWaiting:
+				case <-ctx.Done():
+					t.Fatal("writer did not reach the flush lock")
+				}
+				close(allowHead)
+			}
 			select {
 			case <-putEntered:
 			case <-ctx.Done():
-				t.Fatal("timed out waiting for writer upload PUT")
+				t.Fatal("timed out waiting for upload PUT")
 			}
 			close(allowPut)
+			select {
+			case err := <-writerDone:
+				require.NoError(t, err)
+			case <-ctx.Done():
+				t.Fatal("writer close did not complete")
+			}
 			if tc.extentRoute {
 				require.True(t, wb.queue.WaitPathDeadline(targetPath, 5*time.Second))
 				require.False(t, st.Pending.HasPending(targetPath))
@@ -301,8 +321,9 @@ func TestReadOnlyOpenFlushRacingCreateReleaseDoesNotStrandWriteCache(t *testing.
 				}, 5*time.Second, 5*time.Millisecond)
 			}
 
-			// Let O_RDONLY's parked stageToWriteCache proceed into pathLocks.
-			close(allowHead)
+			if !tc.readerFlushFirst {
+				close(resumeReader)
+			}
 			var ro roResult
 			select {
 			case ro = <-roDone:

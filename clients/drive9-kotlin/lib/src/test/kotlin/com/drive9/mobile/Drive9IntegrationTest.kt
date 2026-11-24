@@ -23,8 +23,9 @@ import kotlin.test.assertTrue
  *
  * When the server is unreachable every test is skipped via [assumeTrue], so the
  * default `gradle test` (which also runs the in-process mock suite in
- * Drive9Test.kt) is unaffected. The cross-SDK runner
- * (scripts/sdk-integration-tests.sh) exports the env vars and invokes:
+ * Drive9Test.kt) is unaffected. The cross-SDK scenario
+ * (`make sdk-integration-tests` / `tests/cases/drive9/api/sdk-integration.t`)
+ * exports the env vars and invokes:
  *
  *   gradle test --tests "com.drive9.mobile.Drive9IntegrationTest" --no-daemon
  */

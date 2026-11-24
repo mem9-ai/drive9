@@ -3,12 +3,16 @@ package main
 import (
 	"bytes"
 	"io"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/server"
 )
 
 func TestVersionStringUsesDrive9Component(t *testing.T) {
@@ -399,6 +403,37 @@ func captureDispatchOutput(t *testing.T, cmd string, args []string) (string, str
 	_ = stdoutW.Close()
 	_ = stderrW.Close()
 	return <-stdoutDone, <-stderrDone, exitCodes
+}
+
+func TestLayerListReportsEmbeddedServerUnsupported(t *testing.T) {
+	// The CLI resolves its server and credentials once per invocation.
+	if os.Getenv("GO_WANT_LAYER_LIST_HELPER") == "1" {
+		dispatch("fs", []string{"layer", "ls"})
+		return
+	}
+
+	embedded := server.New(nil)
+	t.Cleanup(embedded.Close)
+	endpoint := httptest.NewServer(embedded)
+	t.Cleanup(endpoint.Close)
+
+	home := t.TempDir()
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestLayerListReportsEmbeddedServerUnsupported$")
+	cmd.Env = []string{
+		"GO_WANT_LAYER_LIST_HELPER=1",
+		"HOME=" + home,
+		"USERPROFILE=" + home,
+		"DRIVE9_SERVER=" + endpoint.URL,
+		"DRIVE9_API_KEY=test-key",
+	}
+	_, err := cmd.Output()
+	exit, ok := err.(*exec.ExitError)
+	if !ok || exit.ExitCode() != 1 {
+		t.Fatalf("fs layer ls returned %v, want exit status 1", err)
+	}
+	if !strings.Contains(string(exit.Stderr), "TiDB server runtime") {
+		t.Fatalf("fs layer ls stderr = %q, want TiDB server requirement", exit.Stderr)
+	}
 }
 
 func TestDispatchSubcommandHelpShowsUsageWithoutFatalPrefix(t *testing.T) {

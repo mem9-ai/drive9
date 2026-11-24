@@ -340,9 +340,9 @@ npm run build
 ```
 
 The integration suite (`tests/integration.test.ts`) runs against a live
-local `drive9-server` (`DRIVE9_TENANT_PROVIDER=local`) and is gated by the `DRIVE9_INTEGRATION` env var; see
-[`scripts/sdk-integration-tests.sh`](../../scripts/sdk-integration-tests.sh)
-for the one-click cross-SDK runner.
+`drive9-server` (or the simulator's built-in contract server) and is gated by the `DRIVE9_INTEGRATION` env var; run
+`make sdk-integration-tests` (see [`tests/cases/drive9/api/sdk-integration.t`](../../tests/cases/drive9/api/sdk-integration.t))
+for the cross-SDK runner.
 
 ## License
 

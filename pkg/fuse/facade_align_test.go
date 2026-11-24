@@ -17,6 +17,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/extensions/specials"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/dircache"
 )
 
 const direntSize = 24 // ino(8) + off(8) + namelen(4) + type(4)
@@ -594,5 +595,168 @@ func TestSetAttrRefreshesCachedViews(t *testing.T) {
 	}
 	if st := f.GetAttr(nil, gi, &gout); st != gofuse.OK || gout.Size != 3 {
 		t.Fatalf("getattr size after truncate = %d (%v)", gout.Size, st)
+	}
+}
+
+func TestChmodThenRenamePreservesSize(t *testing.T) {
+	core := newMemCore()
+	payload := []byte("payload-100-abcdef\n")
+	core.writeAt("/c/tmp.txt", 0, payload)
+	core.mu.Lock()
+	core.paths["/c"] = &memEntry{isDir: true, mode: 0o755}
+	core.mu.Unlock()
+	f := newTestFS(t, core)
+	dirIno := openTestDir(t, f, "c")
+	if ents := readdirWalk(t, f, dirIno, false); len(ents) == 0 {
+		t.Fatal("no entries")
+	}
+
+	var tmpOut gofuse.EntryOut
+	if st := f.Lookup(nil, &gofuse.InHeader{NodeId: dirIno}, "tmp.txt", &tmpOut); st != gofuse.OK {
+		t.Fatalf("lookup tmp.txt: %v", st)
+	}
+	if tmpOut.Size != uint64(len(payload)) {
+		t.Fatalf("initial size = %d, want %d", tmpOut.Size, len(payload))
+	}
+
+	si := &gofuse.SetAttrIn{}
+	si.NodeId = tmpOut.NodeId
+	si.Valid = gofuse.FATTR_MODE
+	si.Mode = 0o644
+	var sout gofuse.AttrOut
+	if st := f.SetAttr(nil, si, &sout); st != gofuse.OK {
+		t.Fatalf("setattr chmod: %v", st)
+	}
+	if sout.Size != uint64(len(payload)) {
+		t.Fatalf("setattr reply size = %d, want %d", sout.Size, len(payload))
+	}
+
+	ri := &gofuse.RenameIn{}
+	ri.NodeId = dirIno
+	ri.Newdir = dirIno
+	if st := f.Rename(nil, ri, "tmp.txt", "dst.txt"); st != gofuse.OK {
+		t.Fatalf("rename: %v", st)
+	}
+
+	if e, ok := f.inodes.GetEntry(tmpOut.NodeId); !ok || e.Size != int64(len(payload)) {
+		t.Fatalf("inode dst.txt size after chmod+rename = %d (ok=%v), want %d", e.Size, ok, len(payload))
+	}
+	dc := f.Ctx.DirCache.(*dircache.DirCache)
+	item, kind := dc.LookupNamespace("/c", "dst.txt")
+	if kind != fs.LookupPositive {
+		t.Fatalf("LookupNamespace(/c, dst.txt) kind = %v, want LookupPositive", kind)
+	}
+	if item.Size != int64(len(payload)) {
+		t.Fatalf("dircache dst.txt size after chmod+rename = %d, want %d", item.Size, len(payload))
+	}
+}
+
+func TestCopyFileRangePublishesGrownLengthAndZeroCopyEOF(t *testing.T) {
+	core := newMemCore()
+	core.writeAt("/c/fsx.bin", 0, make([]byte, 0x1428d))
+	core.mu.Lock()
+	core.paths["/c"] = &memEntry{isDir: true, mode: 0o755}
+	core.mu.Unlock()
+
+	var mockWritten uint32
+	cfrPlane := fs.HandlerFunc(func(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
+		if op.Kind == fs.OpCopyFileRange {
+			return fs.Result{Written: mockWritten}, nil
+		}
+		return next(ctx, op)
+	})
+
+	f := newTestFS(t, core, cfrPlane)
+	dirIno := openTestDir(t, f, "c")
+	if ents := readdirWalk(t, f, dirIno, false); len(ents) == 0 {
+		t.Fatal("no entries")
+	}
+
+	var eout gofuse.EntryOut
+	if st := f.Lookup(nil, &gofuse.InHeader{NodeId: dirIno}, "fsx.bin", &eout); st != gofuse.OK {
+		t.Fatalf("lookup fsx.bin: %v", st)
+	}
+	if eout.Size != 0x1428d {
+		t.Fatalf("initial size = 0x%x, want 0x1428d", eout.Size)
+	}
+
+	// Zero-byte copy (e.g. OffIn at/past EOF) must return 0 rather than input.Len
+	// and keep the cached size intact.
+	mockWritten = 0
+	in := &gofuse.CopyFileRangeIn{OffIn: 0x1428d, OffOut: 0x1f000, Len: 0x2000}
+	in.NodeId = eout.NodeId
+	in.NodeIdOut = eout.NodeId
+	n, st := f.CopyFileRange(nil, in)
+	if st != gofuse.OK || n != 0 {
+		t.Fatalf("zero-copy CopyFileRange = (%d, %v), want (0, OK)", n, st)
+	}
+	if e, ok := f.inodes.GetEntry(eout.NodeId); !ok || e.Size != 0x1428d {
+		t.Fatalf("inode size after zero-copy = 0x%x, want 0x1428d", e.Size)
+	}
+
+	// Growing copy_file_range (`copy_range 0x6000 0x2000 0x1f000` -> 0x21000) must
+	// immediately publish the grown size to both the inode table and DirCache so a
+	// subsequent close+open Lookup cannot serve the pre-copy 0x1428d size.
+	mockWritten = 0x2000
+	in.OffIn = 0x6000
+	n, st = f.CopyFileRange(nil, in)
+	if st != gofuse.OK || n != 0x2000 {
+		t.Fatalf("growing CopyFileRange = (0x%x, %v), want (0x2000, OK)", n, st)
+	}
+	if e, ok := f.inodes.GetEntry(eout.NodeId); !ok || e.Size != 0x21000 {
+		t.Fatalf("inode size after CopyFileRange = 0x%x, want 0x21000", e.Size)
+	}
+	dc := f.Ctx.DirCache.(*dircache.DirCache)
+	item, kind := dc.LookupNamespace("/c", "fsx.bin")
+	if kind != fs.LookupPositive || item.Size != 0x21000 {
+		t.Fatalf("DirCache LookupNamespace(/c, fsx.bin) = (%v, 0x%x), want (LookupPositive, 0x21000)", kind, item.Size)
+	}
+}
+
+func TestEventLandedUpdatesRevisionAndAllHardlinkAliasesInDirCache(t *testing.T) {
+	core := newMemCore()
+	core.writeAt("/c/text.txt", 0, []byte("seed"))
+	core.mu.Lock()
+	core.paths["/c"] = &memEntry{isDir: true, mode: 0o755}
+	core.mu.Unlock()
+
+	linkPlane := fs.HandlerFunc(func(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
+		if op.Kind == fs.OpLink {
+			return fs.Result{Attr: &fs.Attr{
+				Kind: fs.KindFile, Mode: 0o644, Size: 4, Rev: 3, Nlink: 2, ResourceID: "res-hard-1",
+			}}, nil
+		}
+		return next(ctx, op)
+	})
+
+	f := newTestFS(t, core, linkPlane)
+	dirIno := openTestDir(t, f, "c")
+	if ents := readdirWalk(t, f, dirIno, false); len(ents) == 0 {
+		t.Fatal("no entries")
+	}
+	var outText, outHard gofuse.EntryOut
+	if st := f.Lookup(nil, &gofuse.InHeader{NodeId: dirIno}, "text.txt", &outText); st != gofuse.OK {
+		t.Fatalf("lookup text.txt: %v", st)
+	}
+	f.inodes.UpdateRevision(outText.NodeId, 3)
+	if st := f.Link(nil, &gofuse.LinkIn{InHeader: gofuse.InHeader{NodeId: dirIno}, Oldnodeid: outText.NodeId}, "hard.txt", &outHard); st != gofuse.OK {
+		t.Fatalf("link hard.txt: %v", st)
+	}
+	if outText.NodeId != outHard.NodeId {
+		t.Fatalf("hardlink nodeids differ: %d vs %d", outText.NodeId, outHard.NodeId)
+	}
+
+	f.events.Emit(fs.Event{Kind: fs.EventLanded, Path: "/c/hard.txt", Rev: 4, Size: 26, HasSize: true})
+
+	entry, ok := f.inodes.GetEntry(outText.NodeId)
+	if !ok || entry.Revision != 4 || entry.Size != 26 {
+		t.Fatalf("inode after EventLanded = (ok=%v, rev=%d, size=%d), want (true, 4, 26)", ok, entry.Revision, entry.Size)
+	}
+	dc := f.Ctx.DirCache.(*dircache.DirCache)
+	for _, name := range []string{"text.txt", "hard.txt"} {
+		item, kind := dc.LookupNamespace("/c", name)
+		if kind != fs.LookupPositive || item.Rev != 4 || item.Size != 26 {
+			t.Fatalf("DirCache %s = (kind=%v, rev=%d, size=%d), want (LookupPositive, 4, 26)", name, kind, item.Rev, item.Size)
+		}
 	}
 }

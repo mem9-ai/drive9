@@ -284,6 +284,18 @@ type Writeback struct {
 	// preloaded through the read-cache path): a just-committed image answers
 	// locally instead of racing backend replica lag with a remote GET.
 	baseReader func(path string) ([]byte, bool)
+	// testGateHook notifies deterministic unit tests when a goroutine reaches a
+	// synchronization gate (nil in production).
+	testGateHook atomic.Pointer[func(string)]
+}
+
+func (w *Writeback) notifyTestGate(gate string) {
+	if w == nil {
+		return
+	}
+	if fn := w.testGateHook.Load(); fn != nil && *fn != nil {
+		(*fn)(gate)
+	}
 }
 
 type stripedLocks struct {
@@ -458,6 +470,25 @@ type bufferingHandle struct {
 	// releasing marks a descriptor whose teardown has begun. Migration must
 	// not adopt it: the engine handle it opened would then have no releaser.
 	releasing bool
+	// closed marks a descriptor whose Release commit/submit phase (or migrated
+	// engine release) has completed; late internal Flush/DrainFlush/commit
+	// callers must treat the handle as settled.
+	closed bool
+	// migratedFlushing counts in-flight migrated Flush/DrainFlush calls so
+	// releaseMigrated waits for active engine flushes before e.Release(ctx);
+	// migratedFlushIdle closes when migratedFlushing drops to zero, and
+	// migratedReleaseDone closes once releaseMigrated finishes e.Release(ctx).
+	migratedFlushing    int
+	migratedFlushIdle   chan struct{}
+	migratedReleaseDone chan struct{}
+	// flushMu serializes classic Flush against Release's full commit/submit
+	// phase and DrainFlush's cache-staging inspection across internal handle
+	// lookups (O_RDONLY open, Link, Rename, Drain) that do not hold the kernel
+	// per-FH lock.
+	flushMu sync.Mutex
+	// inlineCommitMu serializes non-queued inline commits (commitPatched /
+	// commitInline) when DrainFlush and Release overlap without a commit queue.
+	inlineCommitMu sync.Mutex
 
 	mu    sync.Mutex
 	buf   *writebuffer.WriteBuffer
@@ -468,7 +499,13 @@ type bufferingHandle struct {
 	// stagedToCache records that Flush snapshotted the image into the
 	// .dat/.meta track; Release owes the uploader a Submit for it (v1: the
 	// write-back cache fast path — Flush persists locally, the upload is
-	// enqueued once, at the close boundary).
+	// enqueued once, at the close boundary). stagedCacheGen identifies the
+	// exact wbCache generation this handle most recently staged.
+	stagedCacheGen uint64
+	// drainFlight tracks an in-flight synchronous wbCache upload started by
+	// DrainFlush so concurrent DrainFlush callers await the same landing and
+	// observe its outcome instead of returning early while the upload is running.
+	drainFlight *drainUploadFlight
 	// selfLandSize/selfLandSum remember THIS handle's last streamed inline
 	// commit when the stream protocol reported no revision: the next write
 	// on the same descriptor needs a continuation base, and only a verified
@@ -490,7 +527,7 @@ type bufferingHandle struct {
 	lastStageSize int64
 	stagedHist    uint64
 	stagedToCache bool
-	stageCacheMu  sync.Mutex
+	submitDone    chan struct{}
 	// unlinked marks the handle anonymous (fh.Unlinked): the buffer
 	// keeps serving the fd, commits are discarded.
 	unlinked bool
@@ -812,8 +849,8 @@ func New(opts Options) (*Writeback, error) {
 			// after its successor landed. Generation-guarded against any
 			// flush staged after the snapshot.
 			if w.recoveryCacheGens != nil && w.wbCache != nil {
-				if gen, ok := w.recoveryCacheGens[entry.Path]; ok {
-					w.wbCache.RemoveIfGeneration(entry.Path, gen)
+				if putGen, ok := w.recoveryCacheGens[entry.Path]; ok {
+					w.wbCache.RemoveIfPutGeneration(entry.Path, putGen)
 				}
 			}
 			// Queue entries carry PendingIndexGen, a generation space separate from
@@ -969,7 +1006,7 @@ func (w *Writeback) Start(ctx context.Context) error {
 		if w.wbCache != nil && len(ledgerOwned) > 0 {
 			w.recoveryCacheGens = make(map[string]uint64, len(ledgerOwned))
 			for _, m := range w.wbCache.ListPendingMetas() {
-				w.recoveryCacheGens[m.Path] = m.Generation
+				w.recoveryCacheGens[m.Path] = m.PutGen()
 			}
 		}
 		w.queue.RecoverPending()
@@ -1053,6 +1090,7 @@ func (w *Writeback) Stop(ctx context.Context) error {
 // would undo. The anonymous marking is rolled back on that path.
 func (w *Writeback) MarkPathUnlinked(p string) error {
 	marked, _ := w.markUnlinkedSnapshot(p, false)
+	w.waitUploaderPath(p)
 	// The name is going away NOW (the facade invokes this before FS.Unlink
 	// replies OK): the pending overlays must stop answering lookups for it,
 	// or a re-creator racing the deferred remote DELETE reads the old entry
@@ -1085,10 +1123,13 @@ func (w *Writeback) MarkPathUnlinked(p string) error {
 			// staging survived — the replayable frames now correctly
 			// describe a file that was never unlinked.
 			restoreMarked(marked)
+			w.submitOrphanedCacheForRollback(p, false)
 			return err
 		}
 	}
 	if w.wbCache != nil {
+		pUnlock := w.pathLocks.lock(p)
+		pUnlock()
 		w.wbCache.Remove(p)
 	}
 	// The landed table's rescue window must not resurrect it either.
@@ -1214,6 +1255,30 @@ func (w *Writeback) UploaderSnapshot() (queued, inFlight int) {
 		return snap.Queued, snap.InFlight
 	}
 	return 0, 0
+}
+
+// DrainSnapshot reports write-plane depths across handles, commit queue, and
+// the write-back cache uploader for `drive9 mount drain` observability.
+func (w *Writeback) DrainSnapshot() (dirtyHandles, queuePending, queueInFlight, queueDelayed, queueConflicts int, queueBytes int64, uploaderQueued, uploaderInFlight, uploaderCached int, uploaderCachedBytes int64) {
+	dirtyHandles = w.DirtyHandleCount()
+	if w.queue != nil {
+		qs := w.queue.Snapshot()
+		queuePending = qs.Pending
+		queueBytes = qs.Bytes
+		queueInFlight = qs.InFlight
+		queueDelayed = qs.Delayed
+		queueConflicts = qs.Conflicts
+	}
+	if w.uploader != nil {
+		us := w.uploader.Snapshot()
+		uploaderQueued = us.Queued
+		uploaderInFlight = us.InFlight
+		uploaderCached = us.Cached
+		uploaderCachedBytes = us.CachedBytes
+	} else if w.wbCache != nil {
+		uploaderCached, uploaderCachedBytes, _ = w.wbCache.PendingSummary()
+	}
+	return
 }
 
 // DirtyHandleCount reports open buffering handles with uncommitted images
@@ -1387,6 +1452,8 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			res.Handle = h
 			return res, nil
 		}
+		isWritableOpen := flags&(uint32(syscall.O_WRONLY)|uint32(syscall.O_RDWR)) != 0 ||
+			flags&uint32(syscall.O_TRUNC) != 0
 		if !op.KernelCreate() && flags&uint32(syscall.O_CREAT) == 0 && flags&uint32(syscall.O_APPEND) != 0 &&
 			w.uploader != nil && w.wbCache != nil {
 			// The fast path declined a PendingOverwrite. Do not let the
@@ -1400,6 +1467,23 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				}
 			}
 		}
+		if isWritableOpen {
+			// Settle any active overwrite staged under a sibling hardlink
+			// alias (different localPath key) before probing this path's base
+			// revision; same-path active overwrites bind cache lineage below
+			// without blocking open(2).
+			fileIno := w.fileInoOf(op.Path, op.Ino, !op.KernelCreate() && flags&uint32(syscall.O_CREAT) == 0)
+			landedAlias, err := w.landSiblingAliasOverwriteForWrite(ctx, fileIno, op.Path)
+			if err != nil {
+				return fs.Result{}, err
+			}
+			if landedAlias && op.OpenAttr != nil {
+				cp := *op
+				cp.OpenAttr = nil
+				op = &cp
+			}
+		}
+		preOverwrite := w.snapshotPendingOverwrite(op.Path, isWritableOpen)
 		if flags&uint32(syscall.O_CREAT) == 0 {
 			// v1 close-to-open: a read-only re-open of a path whose image
 			// has not landed serves the pending bytes — the kernel's LOOKUP
@@ -1559,7 +1643,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					h.baseRev = pb
 				}
 			}
-			w.track(h)
+			w.registerExistingOpenHandle(h, isWritableOpen, preOverwrite)
 			res.Handle = h
 			if w.openDirectIO(op.Path, flags, h.baseSize) {
 				// v1 remoteOpenFlagsForHandle: shadow-backed/sqlite paths and
@@ -1598,7 +1682,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			// An outer plane (e.g. extent.Handler on a pattern-matched kernel
 			// CREATE) already probed the remote and observed a live classic or
 			// multipart occupant; reuse its authoritative attributes directly.
-			w.invalidate(op.Path, 0)
+			w.invalidateRev(op.Path, op.OpenAttr.Rev, op.OpenAttr.Size)
 			st, statErr = *op.OpenAttr, nil
 		} else {
 			if w.opts.ExtentOpener != nil && w.queue != nil && w.queue.HasPath(op.Path) {
@@ -1612,7 +1696,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			if op.KernelCreate() && flags&uint32(syscall.O_EXCL) == 0 && flags&uint32(syscall.O_TRUNC) == 0 &&
 				statErr != nil && fs.IsNotFound(statErr) {
 				if rst, rerr := w.probeRemoteAuthoritative(ctx, op.Path); rerr == nil {
-					w.invalidate(op.Path, 0)
+					w.invalidateRev(op.Path, rst.Rev, rst.Size)
 					st, statErr = rst, nil
 				} else if !fs.IsNotFound(rerr) {
 					statErr = rerr
@@ -1678,7 +1762,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					h.baseRev = pb
 				}
 			}
-			w.track(h)
+			w.registerExistingOpenHandle(h, isWritableOpen, preOverwrite)
 			res.Handle = h
 			if w.openDirectIO(op.Path, flags, h.baseSize) {
 				res.OpenFlags |= gofuse.FOPEN_DIRECT_IO
@@ -1723,18 +1807,173 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		if op.Kind == fs.OpUnlink && w.opts.Policy == PolicyWriteBack && w.survivorOf != nil {
 			if survivor, ok := w.survivorOf(op.Path); ok && survivor != "" {
 				if h := w.handleFor(op.Path); h != nil {
-					// Synchronous publish (flushPendingWriteBack): the
-					// debounced Flush path would leave the image unsent
-					// when the preferred path flips.
-					_ = h.commitLocked(ctx)
-					if w.queue != nil {
-						w.waitPathCommit(op.Path)
+					// Synchronous publish (flushPendingWriteBack): every live
+					// writer at op.Path must publish its buffered/staged image
+					// BEFORE the alias is deleted remotely and handles move to
+					// survivor — swallowing an upload error would delete the
+					// name while leaving stale bytes on survivor and stranding
+					// wbCache[op.Path].
+					w.regMu.Lock()
+					writers := make([]*bufferingHandle, 0, len(w.liveByPath[op.Path]))
+					for cand := range w.liveByPath[op.Path] {
+						writers = append(writers, cand)
 					}
+					w.regMu.Unlock()
+					if len(writers) == 0 {
+						writers = []*bufferingHandle{h}
+					}
+					for _, wr := range writers {
+						if cerr := wr.commitLocked(ctx); cerr != nil {
+							return fs.Result{}, cerr
+						}
+					}
+					if w.queue != nil {
+						if !w.waitPathCommit(op.Path) {
+							return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
+						}
+					}
+					w.waitUploaderPath(op.Path)
+					if w.wbCache != nil && w.uploader != nil {
+						if m, ok := w.wbCache.GetMeta(op.Path); ok && m != nil {
+							putGen := m.PutGen()
+							initialGen := m.Generation
+							supersedesGen := m.SupersedesPendingGen
+							failureSeq := uint64(0)
+							if w.queue != nil {
+								failureSeq = w.queue.PathTerminalFailureSeq(op.Path)
+							}
+							rev, meta, uerr := w.uploader.uploadSyncWithMetadata(ctx, op.Path)
+							if uerr != nil {
+								if w.uploader.IsLedgerOwnedError(uerr) {
+									if !w.waitPathCommit(op.Path) {
+										return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
+									}
+									if w.queue != nil {
+										if qerr := w.queue.PathTerminalFailure(op.Path); qerr != nil {
+											return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EIO))
+										}
+									}
+									if w.opts.Staging == nil || !w.opts.Staging.Pending.HasPending(op.Path) {
+										w.wbCache.RemoveIfPutGeneration(op.Path, putGen)
+									}
+								} else {
+									return fs.Result{}, mapErr(uerr)
+								}
+							} else {
+								w.uploader.WaitPath(op.Path)
+								landedGen := initialGen
+								if meta != nil {
+									landedGen = meta.Generation
+								}
+								if meta != nil || !w.wbCache.HasMeta(op.Path) {
+									for _, wr := range writers {
+										wr.mu.Lock()
+										if wr.path == op.Path {
+											if !wr.dirty && wr.stagedCacheGen == landedGen {
+												wr.stagedToCache = false
+											}
+											if meta != nil {
+												wr.landed = true
+												wr.isNew = false
+												if rev > 0 && rev > wr.baseRev {
+													wr.baseRev = rev
+												}
+											}
+										}
+										wr.mu.Unlock()
+									}
+								}
+								if meta != nil {
+									w.resolveLandedStaging(op.Path, rev, supersedesGen, failureSeq)
+								}
+							}
+						}
+					}
+					// Check sticky terminal failure AFTER landing any staged wbCache
+					// replacement above (matching strict Sync): a newer replacement
+					// retires superseded failures via resolveLandedStaging.
+					// Hold lockRenamePaths(op.Path, survivor) across the final pending /
+					// wbCache inspection, RenamePending, and w.retarget so no live writer
+					// can stage a new snapshot under op.Path between the cache move and
+					// the handle retarget (lockStagePath re-checks h.path under the path
+					// lock and re-targets its staging onto survivor).
+					var handoffUnlock func()
+					for {
+						if w.queue != nil && w.queue.HasPath(op.Path) {
+							if !w.waitPathCommit(op.Path) {
+								return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
+							}
+						}
+						w.waitUploaderPath(op.Path)
+						if w.queue != nil {
+							if qerr := w.queue.PathTerminalFailure(op.Path); qerr != nil {
+								return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EIO))
+							}
+						}
+						handoffUnlock = w.lockRenamePaths(op.Path, survivor)
+						if (w.queue != nil && w.queue.HasPath(op.Path)) || w.hasUploaderActivity(op.Path) {
+							handoffUnlock()
+							continue
+						}
+						if w.queue != nil {
+							if qerr := w.queue.PathTerminalFailure(op.Path); qerr != nil {
+								handoffUnlock()
+								return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EIO))
+							}
+						}
+						break
+					}
+					rebindCacheGen := func(path string, fromGen, toGen uint64) {
+						if fromGen == 0 || toGen == 0 {
+							return
+						}
+						w.regMu.Lock()
+						cands := make([]*bufferingHandle, 0, len(w.liveByPath[path]))
+						for cand := range w.liveByPath[path] {
+							cands = append(cands, cand)
+						}
+						w.regMu.Unlock()
+						for _, cand := range cands {
+							cand.mu.Lock()
+							if cand.path == path && cand.stagedCacheGen == fromGen {
+								cand.stagedCacheGen = toGen
+							}
+							cand.mu.Unlock()
+						}
+					}
+					var movedCache bool
+					var oldCacheGen, newCacheGen uint64
+					if w.wbCache != nil {
+						if remMeta, ok := w.wbCache.GetMeta(op.Path); ok && remMeta != nil {
+							oldCacheGen = remMeta.Generation
+							movedCache = w.wbCache.RenamePending(op.Path, survivor)
+							if movedCache {
+								if survMeta, sok := w.wbCache.GetMeta(survivor); sok && survMeta != nil {
+									newCacheGen = survMeta.Generation
+								}
+							}
+						}
+					}
+					w.notifyTestGate("survivor:beforeRetarget")
 					w.retarget(op.Path, survivor)
+					if movedCache {
+						rebindCacheGen(survivor, oldCacheGen, newCacheGen)
+					}
+					handoffUnlock()
 					if _, err := next(ctx, op); err != nil {
-						// DELETE failed: bind back so nothing is lost.
+						// DELETE failed: bind back atomically so nothing is lost.
+						rbUnlock := w.lockRenamePaths(op.Path, survivor)
 						w.retarget(survivor, op.Path)
+						if movedCache && w.wbCache.RenamePending(survivor, op.Path) {
+							if backMeta, bok := w.wbCache.GetMeta(op.Path); bok && backMeta != nil {
+								rebindCacheGen(op.Path, newCacheGen, backMeta.Generation)
+							}
+						}
+						rbUnlock()
 						return fs.Result{}, err
+					}
+					if movedCache && w.uploader != nil && !w.hasUnclosedStagedCacheOwner(survivor) {
+						w.uploader.Submit(survivor)
 					}
 					return fs.Result{}, nil
 				}
@@ -1748,11 +1987,14 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				w.queue.WaitPrefixTimeout(prefix, 10*time.Second)
 			}
 		}
-		// An in-flight .dat/.meta upload must land before the DELETE: it
-		// would otherwise resurrect the path after the unlink (unlink/14:
+		// An in-flight or queued .dat/.meta upload must land before the DELETE:
+		// it would otherwise resurrect the path after the unlink (unlink/14:
 		// re-create hits EEXIST against the resurrected name).
-		if w.uploader != nil {
-			w.uploader.WaitPath(op.Path)
+		w.waitUploaderPath(op.Path)
+		if under && w.wbCache != nil {
+			for _, entry := range w.wbCache.ListByPrefix(prefix) {
+				w.waitUploaderPath(entry.Path)
+			}
 		}
 		// Staged entries die with their path — but only AFTER the remote
 		// delete succeeds: wbCache/queue cleanup is irreversible, and a
@@ -1761,14 +2003,6 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// The queue cancel (when it runs) precedes the survivor snapshot:
 		// CancelPath also removes the shadow an anonymous clean fd reads.
 		purgeStaging := func() error {
-			if w.wbCache != nil {
-				if under {
-					for _, entry := range w.wbCache.ListByPrefix(prefix) {
-						w.wbCache.Remove(entry.Path)
-					}
-				}
-				w.wbCache.Remove(op.Path)
-			}
 			if w.queue != nil {
 				// Preserve-local: the anonymous fd's unlink snapshot lives
 				// in the shadow and must survive the cancel (plain
@@ -1784,12 +2018,31 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					w.queue.CancelPrefix(prefix)
 				}
 			}
+			if w.wbCache != nil {
+				uUnlock := w.pathLocks.lock(op.Path)
+				uUnlock()
+				if under {
+					for _, entry := range w.wbCache.ListByPrefix(prefix) {
+						cUnlock := w.pathLocks.lock(entry.Path)
+						cUnlock()
+						w.wbCache.Remove(entry.Path)
+					}
+				}
+				w.wbCache.Remove(op.Path)
+			}
 			return nil
 		}
 		w.markUnlinked(op.Path, under)
+		w.waitUploaderPath(op.Path)
+		if under && w.wbCache != nil {
+			for _, entry := range w.wbCache.ListByPrefix(prefix) {
+				w.waitUploaderPath(entry.Path)
+			}
+		}
 		rollback := func() {
 			w.markLinked(op.Path, under)
 			w.dropUnlinkedShadow(op.Path)
+			w.submitOrphanedCacheForRollback(op.Path, under)
 		}
 		_, statErr := w.opts.Client.StatCtx(ctx, w.remotePath(op.Path))
 		if statErr != nil && !client.IsNotFound(statErr) {
@@ -1821,6 +2074,8 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				}
 			}
 			if w.wbCache != nil {
+				uUnlock := w.pathLocks.lock(op.Path)
+				uUnlock()
 				w.wbCache.Remove(op.Path)
 			}
 			w.forgetLanded(op.Path)
@@ -1841,17 +2096,26 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// first — flush a live writer, wait the queued commit, land a staged
 		// .dat/.meta image — otherwise the remote link ENOENTs against a
 		// path the server has not seen yet (link/00: create, write, close,
-		// link).
-		if h := w.handleFor(op.Path); h != nil {
-			_ = h.Flush(ctx)
+		// link). Walk all existing hardlink aliases of the source inode too.
+		srcAliases := w.inodeAliasPaths(w.fileInoOf(op.Path, op.Ino2, true), op.Path)
+		for _, p := range srcAliases {
+			if h := w.handleFor(p); h != nil {
+				_ = h.Flush(ctx)
+			}
 		}
 		if w.queue != nil {
-			w.waitPathCommit(op.Path)
+			for _, p := range srcAliases {
+				w.waitPathCommit(p)
+			}
 			w.waitPathCommit(op.Path2)
 		}
 		if w.wbCache != nil && w.uploader != nil {
-			if _, ok := w.wbCache.GetMeta(op.Path); ok {
-				_ = w.uploader.UploadSync(ctx, op.Path)
+			for _, p := range srcAliases {
+				if _, ok := w.wbCache.GetMeta(p); ok {
+					_ = w.uploader.UploadSync(ctx, p)
+				} else if w.uploader.InFlight(p) {
+					w.uploader.WaitPath(p)
+				}
 			}
 		}
 		return next(ctx, op)
@@ -1898,10 +2162,8 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			w.resolveLandedStaging(p, rev, supersedesGen, failureSeq)
 			return nil
 		}
-		if w.uploader != nil {
-			w.uploader.WaitPath(op.Path)
-			w.uploader.WaitPath(op.Path2)
-		}
+		w.waitUploaderPath(op.Path)
+		w.waitUploaderPath(op.Path2)
 		if err := land(op.Path); err != nil {
 			// The staged image is the acknowledged content of the old name;
 			// losing it to a failed upload and letting the rename move the
@@ -2040,19 +2302,51 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// were reading: mark them anonymous BEFORE the remote rename (their
 		// clean images are snapshotted for post-overwrite reads), or they
 		// keep reading /b and silently see the source's bytes.
-		marked, serr := w.markUnlinkedSnapshot(op.Path2, false)
+		marked, serr := w.markUnlinkedSnapshot(op.Path2, true)
 		if serr != nil {
 			// The overwritten target's descriptors have no read source:
 			// abort instead of switching them to the source's bytes.
 			restoreMarked(marked)
+			w.submitOrphanedCacheForRollback(op.Path2, true)
 			return fs.Result{}, serr
+		}
+		w.waitUploaderPath(op.Path2)
+		var dstPreCachePutGen uint64
+		var dstPreCacheDescendants map[string]uint64
+		if w.wbCache != nil {
+			p2Unlock := w.pathLocks.lock(op.Path2)
+			if m, ok := w.wbCache.GetMeta(op.Path2); ok && m != nil {
+				dstPreCachePutGen = m.PutGen()
+			}
+			p2Unlock()
+			dstPrefix := strings.TrimSuffix(op.Path2, "/") + "/"
+			for _, entry := range w.wbCache.ListByPrefix(dstPrefix) {
+				w.waitUploaderPath(entry.Path)
+				dUnlock := w.pathLocks.lock(entry.Path)
+				if m, ok := w.wbCache.GetMeta(entry.Path); ok && m != nil {
+					if dstPreCacheDescendants == nil {
+						dstPreCacheDescendants = make(map[string]uint64)
+					}
+					dstPreCacheDescendants[entry.Path] = m.PutGen()
+				}
+				dUnlock()
+			}
 		}
 		res, err := next(ctx, op)
 		if err != nil {
 			// The rename failed: the target's descriptors are still bound
 			// to its object, so restore their writable/visible state.
 			restoreMarked(marked)
+			w.submitOrphanedCacheForRollback(op.Path2, true)
 			return res, err
+		}
+		if w.wbCache != nil {
+			if dstPreCachePutGen != 0 {
+				w.wbCache.RemoveIfPutGeneration(op.Path2, dstPreCachePutGen)
+			}
+			for p, putGen := range dstPreCacheDescendants {
+				w.wbCache.RemoveIfPutGeneration(p, putGen)
+			}
 		}
 		// The instant the rename RESPONSE arrived: pending state published
 		// at either name after this belongs to the NEW incarnation (the
@@ -2167,9 +2461,12 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			prefix := strings.TrimSuffix(op.Path, "/") + "/"
 			for _, entry := range w.wbCache.ListByPrefix(prefix) {
 				target := op.Path2 + strings.TrimPrefix(entry.Path, op.Path)
-				_ = w.wbCache.RenamePending(entry.Path, target)
+				moved := w.wbCache.RenamePending(entry.Path, target)
 				if w.opts.Staging != nil {
 					_ = w.opts.Staging.Shadow.Rename(entry.Path, target)
+				}
+				if moved && w.uploader != nil && !w.hasUnclosedStagedCacheOwner(target) {
+					w.uploader.Submit(target)
 				}
 			}
 		}
@@ -2279,8 +2576,9 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					if err := h.applyExplicitMigratedMode(ctx, op.Mode&0o7777, mySeq); err != nil {
 						return fs.Result{}, err
 					}
-					w.invalidate(op.Path, 0)
-					return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: op.Mode & 0o7777, Size: h.sizeForAttr()}}, nil
+					sz := h.sizeForAttr()
+					w.invalidate(op.Path, sz)
+					return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: op.Mode & 0o7777, Size: sz}}, nil
 				}
 				// v1 setPendingMetadataMode: journal the mode onto the staged
 				// ledger meta too — the queue entry snapshotted its mode at
@@ -2289,6 +2587,18 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				// (chmod/12: 0777 vs the create-mode 04777).
 				if w.opts.Staging != nil && !anonymous {
 					_ = w.opts.Staging.Pending.UpdateMode(op.Path, op.Mode&0o7777)
+				}
+				if w.wbCache != nil && !anonymous {
+					var rel func()
+					if w.uploader != nil {
+						rel = w.uploader.acquirePath(op.Path)
+					}
+					if _, ok := w.wbCache.GetMeta(op.Path); ok {
+						_ = w.wbCache.UpdateMode(op.Path, op.Mode&0o7777)
+					}
+					if rel != nil {
+						rel()
+					}
 				}
 				return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: op.Mode & 0o7777, Size: size}}, nil
 			}
@@ -2341,7 +2651,11 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				}
 			}
 			if err == nil {
-				w.invalidate(op.Path, 0)
+				if res.Attr != nil && !res.Attr.IsDir() {
+					w.invalidateRev(op.Path, res.Attr.Rev, res.Attr.Size)
+				} else if w.opts.Events != nil {
+					w.opts.Events.Emit(fs.Event{Kind: fs.EventWrite, Path: op.Path})
+				}
 			}
 			return res, err
 		}
@@ -2414,29 +2728,39 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					}
 				}
 			}
-			// A clean-path truncate must not race the path's own pending
-			// landings: a queued commit or a staged .dat/.meta image landing
-			// mid-truncate 409s the conditional write (EIO) or resurrects the
-			// pre-truncation size after it. Land everything first, then let
-			// the terminal truncate a settled base.
-			if w.queue != nil && w.queue.HasPath(op.Path) {
-				if !w.waitPathCommit(op.Path) {
-					return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
+			// A clean-path truncate must not race the path's (or any hardlink
+			// alias's) pending landings: a queued commit or a staged .dat/.meta
+			// image landing mid-truncate 409s the conditional write (EIO) or
+			// resurrects the pre-truncation size after it. Land everything
+			// first, then let the terminal truncate a settled base.
+			truncAliases := w.inodeAliasPaths(w.fileInoOf(op.Path, op.Ino, true), op.Path)
+			if w.queue != nil {
+				for _, p := range truncAliases {
+					if w.queue.HasPath(p) && !w.waitPathCommit(p) {
+						return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
+					}
 				}
 			}
 			if w.wbCache != nil && w.uploader != nil {
-				if _, ok := w.wbCache.GetMeta(op.Path); ok {
-					if err := w.uploader.UploadSync(ctx, op.Path); err != nil {
-						if w.uploader.IsLedgerOwnedError(err) {
-							// The ledger owns this image; its queue entry
-							// lands it. Truncating below would race the
-							// landing — wait it out first.
-							if !w.waitPathCommit(op.Path) {
-								return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
+				for _, p := range truncAliases {
+					if p != op.Path && !w.uploader.QueuedOrActive(p) {
+						continue
+					}
+					if _, ok := w.wbCache.GetMeta(p); ok {
+						if err := w.uploader.UploadSync(ctx, p); err != nil {
+							if w.uploader.IsLedgerOwnedError(err) {
+								// The ledger owns this image; its queue entry
+								// lands it. Truncating below would race the
+								// landing — wait it out first.
+								if !w.waitPathCommit(p) {
+									return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
+								}
+							} else {
+								return fs.Result{}, mapErr(err)
 							}
-						} else {
-							return fs.Result{}, mapErr(err)
 						}
+					} else if w.uploader.InFlight(p) {
+						w.uploader.WaitPath(p)
 					}
 				}
 			}
@@ -3236,77 +3560,227 @@ func (h *bufferingHandle) Write(ctx context.Context, off int64, data []byte) err
 // which only snapshots locally and lets Release own the upload — no close
 // boundary is coming, so the image stages into the ledger now and the
 // facade's chain drain waits for the landing.
-func (h *bufferingHandle) DrainFlush(ctx context.Context) (err error) {
-	retainBuffer := false
+// flushLiveExtent flushes h's migrated engine handle when h has migrated and
+// has not yet entered/completed Release. It tracks migratedFlushing so
+// releaseMigrated waits for active engine flushes before calling e.Release,
+// preventing post-release e.Flush calls across late/deferred Flush or
+// DrainFlush boundaries.
+func (h *bufferingHandle) flushLiveExtent(ctx context.Context, waitReleasing bool) (bool, error) {
 	h.mu.Lock()
-	staged, unlinked := h.stagedToCache, h.unlinked
-	dirty, uploadGen := h.dirty, h.wgen
-	h.stagedToCache = false
-	h.mu.Unlock()
-	if staged && !unlinked && h.w.uploader != nil && h.w.wbCache != nil {
-		if _, ok := h.w.wbCache.GetMeta(h.path); ok {
-			// A failed drain keeps the staged image available to Release or retry.
-			defer func() {
-				if err != nil {
-					if _, ok := h.w.wbCache.GetMeta(h.path); ok {
-						h.mu.Lock()
-						h.stagedToCache = !h.unlinked
-						h.mu.Unlock()
-					}
-				}
-			}()
-			useCache := true
-			if dirty {
-				snapshot, stageErr := h.stageToWriteCache(ctx, stageFullDurable)
-				if errors.Is(stageErr, errWriteCacheBypass) {
-					useCache = false
-					retainBuffer = true
-				} else if stageErr != nil {
-					return stageErr
-				}
-				if snapshot != nil {
-					uploadGen = snapshot.wgen
-				}
+	if h.extent == nil {
+		h.mu.Unlock()
+		return false, nil
+	}
+	if h.closed {
+		h.mu.Unlock()
+		return true, nil
+	}
+	if h.releasing {
+		done := h.migratedReleaseDone
+		h.mu.Unlock()
+		if waitReleasing && done != nil {
+			select {
+			case <-done:
+			case <-ctx.Done():
+				return true, ctx.Err()
 			}
-			if useCache {
-				// v1 FlushAll over the write-cache track: the Flush snapshot
-				// owns the upload — land it synchronously, exactly once. A
-				// commitLocked here would publish a second image that races
-				// the uploader's CAS on the same base. The landing fence is
-				// captured before the upload so the landing can retire the
-				// failure state of exactly the generations it contains.
-				supersedesGen, failureSeq := h.stagedLandingFence()
-				rev, meta, uploadErr := h.w.uploader.uploadSyncWithMetadata(ctx, h.path)
-				if uploadErr != nil {
-					return uploadErr
-				}
-				if meta != nil {
-					h.mu.Lock()
-					h.retireDirtyLocked(uploadGen)
-					h.mu.Unlock()
-					h.markLanded(rev)
-					// The landed watermark itself is recorded by the
-					// uploader's RecordLanding callback with byte-exact
-					// identity; this side only retires the failure state of
-					// exactly the generations the landed image contains.
-					h.w.resolveLandedStaging(h.path, rev, supersedesGen, failureSeq)
+		}
+		return true, nil
+	}
+	e := h.extent
+	h.migratedFlushing++
+	h.mu.Unlock()
+	defer func() {
+		h.mu.Lock()
+		h.migratedFlushing--
+		if h.migratedFlushing == 0 && h.migratedFlushIdle != nil {
+			close(h.migratedFlushIdle)
+			h.migratedFlushIdle = nil
+		}
+		h.mu.Unlock()
+	}()
+	if err := e.Flush(ctx); err != nil {
+		return true, err
+	}
+	return true, h.flushMigratedMode(ctx)
+}
+
+type drainUploadFlight struct {
+	done chan struct{}
+	gen  uint64
+	err  error
+}
+
+func (h *bufferingHandle) DrainFlush(ctx context.Context) (err error) {
+	if handled, ferr := h.flushLiveExtent(ctx, true); handled {
+		return ferr
+	}
+	callerCtx := ctx
+	defer func() {
+		if err != nil {
+			return
+		}
+		if handled, ferr := h.flushLiveExtent(callerCtx, true); handled {
+			err = ferr
+		}
+	}()
+	for {
+		h.w.notifyTestGate("drain:flushMu")
+		h.flushMu.Lock()
+		flushUnlocked := false
+		unlockFlush := func() {
+			if !flushUnlocked {
+				flushUnlocked = true
+				h.flushMu.Unlock()
+			}
+		}
+		if handled, ferr := h.flushLiveExtent(ctx, true); handled {
+			unlockFlush()
+			return ferr
+		}
+		h.mu.Lock()
+		flight := h.drainFlight
+		curPath := h.path
+		curDirty, curGen := h.dirty, h.wgen
+		if flight != nil {
+			h.mu.Unlock()
+			unlockFlush()
+			h.w.notifyTestGate("drain:flight")
+			select {
+			case <-flight.done:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			if flight.err != nil {
+				return flight.err
+			}
+			if !curDirty && curGen <= flight.gen {
+				if !h.w.waitPathCommit(curPath) {
+					return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
 				}
 				return nil
 			}
+			continue
 		}
+		if h.closed {
+			h.mu.Unlock()
+			unlockFlush()
+			if !h.w.waitPathCommit(curPath) {
+				return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
+			}
+			return nil
+		}
+		staged, unlinked := h.stagedToCache, h.unlinked
+		dirty, uploadGen := h.dirty, h.wgen
+		uploadPath := h.path
+		h.stagedToCache = false
+		h.mu.Unlock()
+
+		landWriteCache := func(stageGen uint64) error {
+			myFlight := &drainUploadFlight{
+				done: make(chan struct{}),
+				gen:  stageGen,
+			}
+			h.mu.Lock()
+			h.drainFlight = myFlight
+			h.mu.Unlock()
+			var landErr error
+			defer func() {
+				if landErr != nil && h.w.wbCache != nil {
+					if _, ok := h.w.wbCache.GetMeta(uploadPath); ok {
+						submit := false
+						h.mu.Lock()
+						if h.path == uploadPath && !h.unlinked {
+							if !h.closed && !h.releasing {
+								h.stagedToCache = true
+							} else {
+								submit = true
+							}
+						}
+						h.mu.Unlock()
+						if submit && h.w.uploader != nil {
+							h.w.uploader.Submit(uploadPath)
+						}
+					}
+				}
+				h.mu.Lock()
+				myFlight.err = landErr
+				if h.drainFlight == myFlight {
+					h.drainFlight = nil
+				}
+				h.mu.Unlock()
+				close(myFlight.done)
+			}()
+			supersedesGen, failureSeq := h.stagedLandingFence(uploadPath)
+			unlockFlush()
+			rev, meta, uploadErr := h.w.uploader.uploadSyncWithMetadata(ctx, uploadPath)
+			if uploadErr != nil {
+				landErr = uploadErr
+				return uploadErr
+			}
+			if meta != nil {
+				h.mu.Lock()
+				if h.path == uploadPath {
+					h.retireDirtyLocked(stageGen)
+					h.markLandedLocked(rev)
+				}
+				h.mu.Unlock()
+				h.w.resolveLandedStaging(uploadPath, rev, supersedesGen, failureSeq)
+			}
+			return nil
+		}
+
+		retainBuffer := false
+		if staged && !unlinked && h.w.uploader != nil && h.w.wbCache != nil {
+			if _, ok := h.w.wbCache.GetMeta(uploadPath); ok {
+				useCache := true
+				if dirty {
+					snapshot, stageErr := h.stageToWriteCache(ctx, stageFullDurable)
+					if errors.Is(stageErr, errWriteCacheBypass) {
+						useCache = false
+						retainBuffer = true
+					} else if stageErr != nil {
+						if _, stillOK := h.w.wbCache.GetMeta(uploadPath); stillOK {
+							h.mu.Lock()
+							if h.path == uploadPath && !h.unlinked && !h.closed && !h.releasing {
+								h.stagedToCache = true
+							}
+							h.mu.Unlock()
+						}
+						unlockFlush()
+						return stageErr
+					}
+					if snapshot != nil {
+						uploadGen = snapshot.wgen
+					}
+				}
+				if useCache {
+					return landWriteCache(uploadGen)
+				}
+			}
+		}
+		// Hold flushMu through commitLocked on the normal path so neither Flush nor
+		// Release can slip in between the stagedToCache check above and commitLocked.
+		// On the sparse-growth bypass path (retainBuffer == true, buffer >= stream
+		// threshold), unlock before stageAndEnqueueOpt so a concurrent truncate+Flush
+		// triggered from EventStaged can queue on pathLocks ahead of the async upload;
+		// pathLocks serializes any concurrent Release's stageAndEnqueue on the same
+		// generation.
+		if retainBuffer && h.w.queue != nil && h.w.opts.Staging != nil {
+			unlockFlush()
+			err = h.stageAndEnqueueOpt(ctx, !h.w.lazy, false, true)
+		} else {
+			err = h.commitLocked(ctx)
+			unlockFlush()
+		}
+		if err != nil {
+			return err
+		}
+		if !h.w.waitPathCommit(uploadPath) {
+			return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
+		}
+		return nil
 	}
-	if retainBuffer && h.w.queue != nil && h.w.opts.Staging != nil {
-		err = h.stageAndEnqueueOpt(ctx, !h.w.lazy, false, true)
-	} else {
-		err = h.commitLocked(ctx)
-	}
-	if err != nil {
-		return err
-	}
-	if !h.w.waitPathCommit(h.path) {
-		return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
-	}
-	return nil
 }
 
 // syncWaitDeadlineSizeLocked reports the image a strict Sync may have to wait
@@ -3886,21 +4360,25 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 	// must run before the sticky-failure check below, or a rewritten file
 	// could never fsync successfully again.
 	h.mu.Lock()
-	staged := h.stagedToCache
+	staged, syncPath := h.stagedToCache, h.path
 	h.mu.Unlock()
 	if staged && h.w.uploader != nil {
-		supersedesGen, failureSeq := h.stagedLandingFence()
-		rev, meta, err := h.w.uploader.uploadSyncWithMetadata(ctx, h.path)
+		supersedesGen, failureSeq := h.stagedLandingFence(syncPath)
+		rev, meta, err := h.w.uploader.uploadSyncWithMetadata(ctx, syncPath)
 		if err != nil {
 			return err
 		}
 		h.mu.Lock()
-		h.stagedToCache = false
-		h.mu.Unlock()
-		if meta != nil {
-			h.markLanded(rev)
+		if h.path == syncPath {
+			if meta == nil || h.stagedCacheGen == meta.Generation {
+				h.stagedToCache = false
+			}
+			if meta != nil {
+				h.markLandedLocked(rev)
+			}
 		}
-		h.w.resolveLandedStaging(h.path, rev, supersedesGen, failureSeq)
+		h.mu.Unlock()
+		h.w.resolveLandedStaging(syncPath, rev, supersedesGen, failureSeq)
 	}
 	// The wait above also ends when the commit terminally failed and was
 	// dropped with local state preserved: an idle path is then
@@ -3909,7 +4387,7 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 	// data that exists only locally. Anything a landing above already
 	// retired has been cleared (or generation-fenced out) by then.
 	if h.w.queue != nil {
-		if err := h.w.queue.PathTerminalFailure(h.path); err != nil {
+		if err := h.w.queue.PathTerminalFailure(syncPath); err != nil {
 			return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 		}
 	}
@@ -3927,29 +4405,51 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 
 // stagedLandingFence snapshots the fence state a synchronous staged landing
 // needs before it starts: the staged image's superseded pending generation
-// and the currently recorded terminal-failure stamp.
-func (h *bufferingHandle) stagedLandingFence() (supersedesGen, failureSeq uint64) {
+// and the currently recorded terminal-failure stamp for path.
+func (h *bufferingHandle) stagedLandingFence(path string) (supersedesGen, failureSeq uint64) {
 	if h.w.wbCache != nil {
-		if meta, ok := h.w.wbCache.GetMeta(h.path); ok && meta != nil {
+		if meta, ok := h.w.wbCache.GetMeta(path); ok && meta != nil {
 			supersedesGen = meta.SupersedesPendingGen
 		}
 	}
 	if h.w.queue != nil {
-		failureSeq = h.w.queue.PathTerminalFailureSeq(h.path)
+		failureSeq = h.w.queue.PathTerminalFailureSeq(path)
 	}
 	return supersedesGen, failureSeq
 }
 
 // Flush implements fs.Handle.
-func (h *bufferingHandle) Flush(ctx context.Context) error {
+func (h *bufferingHandle) Flush(ctx context.Context) (err error) {
 	// Migrated: a flush is the engine's flush, which publishes the slices
 	// the community writer has frozen. Reimplementing the close-to-open
-	// boundary here would upload the image a second time.
-	if e := h.extentHandle(); e != nil {
-		if err := e.Flush(ctx); err != nil {
-			return err
+	// boundary here would upload the image a second time. If adoption installs
+	// h.extent while the classic path runs (which requires the classic buffer
+	// to be clean and landed), the deferred recheck flushes any write that
+	// entered the engine handle during that window without touching a released
+	// engine handle.
+	if handled, ferr := h.flushLiveExtent(ctx, false); handled {
+		return ferr
+	}
+	callerCtx := ctx
+	defer func() {
+		if err != nil {
+			return
 		}
-		return h.flushMigratedMode(ctx)
+		if handled, ferr := h.flushLiveExtent(callerCtx, false); handled {
+			err = ferr
+		}
+	}()
+	h.w.notifyTestGate("flush:flushMu")
+	h.flushMu.Lock()
+	defer h.flushMu.Unlock()
+	if handled, ferr := h.flushLiveExtent(ctx, false); handled {
+		return ferr
+	}
+	h.mu.Lock()
+	closed := h.closed
+	h.mu.Unlock()
+	if closed {
+		return nil
 	}
 	// Inline-path writeback coalesces rapid flushes of one path into one
 	// upload (flushHandleDebounced): without a staging ledger every
@@ -4018,10 +4518,11 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 				return nil
 			}
 			h.mu.Lock()
+			flushPath := h.path
 			h.stagedToCache = true
 			h.mu.Unlock()
-			supersedesGen, failureSeq := h.stagedLandingFence()
-			rev, meta, err := h.w.uploader.uploadSyncWithMetadata(ctx, h.path)
+			supersedesGen, failureSeq := h.stagedLandingFence(flushPath)
+			rev, meta, err := h.w.uploader.uploadSyncWithMetadata(ctx, flushPath)
 			if err != nil {
 				return err
 			}
@@ -4029,25 +4530,18 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			// its landed record was written at the upload's success point
 			// (the uploader's RecordLanding callback). This side retires
 			// exactly the failure state the image superseded.
-			_ = meta
-			h.w.resolveLandedStaging(h.path, rev, supersedesGen, failureSeq)
+			h.w.resolveLandedStaging(flushPath, rev, supersedesGen, failureSeq)
 			h.mu.Lock()
-			h.stagedToCache = false
-			// The image is on the remote now — for every create shape, not
-			// only the empty one: Release's materialize path keys on
-			// landed, and re-materializing a published image would PUT a
-			// second copy at the open-time base (close-sync double-upload).
-			// Only the staged generation may retire dirty: a write
-			// acknowledged while the upload was in flight (Drain flushes
-			// without the per-FH write lock) keeps its own dirty flag and
-			// the next durability barrier commits it.
-			h.retireDirtyLocked(snapshot.wgen)
-			h.mu.Unlock()
-			// The landed revision also retires isNew: a later write on
-			// this handle must stage as an overwrite of that revision.
-			if meta != nil {
-				h.markLanded(rev)
+			if h.path == flushPath {
+				if meta == nil || h.stagedCacheGen == meta.Generation {
+					h.stagedToCache = false
+				}
+				h.retireDirtyLocked(snapshot.wgen)
+				if meta != nil {
+					h.markLandedLocked(rev)
+				}
 			}
+			h.mu.Unlock()
 			return nil
 		}
 		if emptyCreate {
@@ -4067,9 +4561,9 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 		// .dat/.meta image on disk and the uploader lands it async; the
 		// commit queue keeps serving the large-file/shadow track.
 		h.mu.Lock()
-		dirty, unlinked, releasing := h.dirty, h.unlinked, h.releasing
+		dirty, unlinked, closed := h.dirty, h.unlinked, h.closed
 		h.mu.Unlock()
-		if !dirty || unlinked || releasing {
+		if !dirty || unlinked || closed {
 			return nil
 		}
 		snapshot, err := h.stageToWriteCache(ctx, stageV1Ladder)
@@ -4086,9 +4580,11 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			// delivers OPEN + SETATTR(size=0) + FLUSH before the first
 			// WRITE: the empty image landed first and the final image's CAS
 			// at the open-time base revision then conflicts forever —
-			// fuse-smoke's overwrite step). stageToWriteCache records
-			// h.stagedToCache under pathLocks so Release submits the final
-			// snapshot exactly once without racing a closing handle.
+			// fuse-smoke's overwrite step). Release submits the final
+			// snapshot exactly once.
+			h.mu.Lock()
+			h.stagedToCache = true
+			h.mu.Unlock()
 			return nil
 		}
 		// v1 writeBackThreshold: large images skip the whole-image .dat/.meta
@@ -4110,11 +4606,12 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 		// see nothing (or race backend replica lag with 404s).
 		h.mu.Lock()
 		dirty, unlinked := h.dirty, h.unlinked
+		schedPath := h.path
 		h.mu.Unlock()
 		if !dirty || unlinked {
 			return nil
 		}
-		h.w.debounce.ScheduleWithOwner(h.path, h, func() {
+		h.w.debounce.ScheduleWithOwner(schedPath, h, func() {
 			bgctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
 			defer cancel()
 			_ = h.commitLocked(bgctx)
@@ -4164,7 +4661,37 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 	// releaser at all. adoptExtentHandle refuses while `releasing` is set.
 	h.mu.Lock()
 	if e := h.extent; e != nil {
+		h.releasing = true
+		if h.migratedReleaseDone == nil {
+			h.migratedReleaseDone = make(chan struct{})
+		}
 		h.mu.Unlock()
+		return h.releaseMigrated(ctx, e)
+	}
+	h.mu.Unlock()
+	h.w.notifyTestGate("release:flushMu")
+	h.flushMu.Lock()
+	flushUnlocked := false
+	finishWritebackClose := func() {
+		if flushUnlocked {
+			return
+		}
+		h.mu.Lock()
+		h.closed = true
+		h.mu.Unlock()
+		flushUnlocked = true
+		h.flushMu.Unlock()
+	}
+	defer finishWritebackClose()
+	h.mu.Lock()
+	if e := h.extent; e != nil {
+		h.releasing = true
+		if h.migratedReleaseDone == nil {
+			h.migratedReleaseDone = make(chan struct{})
+		}
+		h.mu.Unlock()
+		flushUnlocked = true
+		h.flushMu.Unlock()
 		return h.releaseMigrated(ctx, e)
 	}
 	h.releasing = true
@@ -4249,27 +4776,17 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 	// landed, not dirty: write-sync commits mid-stream and clears dirty,
 	// and re-materializing then would clobber the committed image with an
 	// empty buffer.
-	fenceLocalStage := h.w.opts.Policy == PolicyWriteBack && h.w.uploader != nil && h.w.wbCache != nil
-	if fenceLocalStage {
-		// Fence any in-flight local-only Flush snapshot on this descriptor
-		// without waiting on CommitQueue uploads holding pathLocks: h.releasing
-		// is already set, so a Flush already inside stageCacheMu finishes
-		// publishing stagedToCache before we inspect and clear it below, and
-		// any Flush entering stageCacheMu afterwards sees h.releasing and
-		// declines to stage.
-		h.stageCacheMu.Lock()
-	}
 	h.mu.Lock()
 	materialize := h.isNew && !h.landed && !h.unlinked
 	staged, unlinked := h.stagedToCache, h.unlinked
 	dirty := h.dirty
 	h.stagedToCache = false
 	h.mu.Unlock()
-	if fenceLocalStage {
-		h.stageCacheMu.Unlock()
-	}
 	if staged && !unlinked && h.w.uploader != nil && h.w.wbCache != nil {
-		if _, ok := h.w.wbCache.GetMeta(path); ok {
+		checkPath, checkUnlock := h.lockStagePath()
+		_, hasStagedMeta := h.w.wbCache.GetMeta(checkPath)
+		checkUnlock()
+		if hasStagedMeta {
 			useCache := true
 			if dirty {
 				// A write landed between Flush and Release: the staged
@@ -4292,8 +4809,19 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 					uploadUnlock()
 					uploadUnlock = nil
 				}
-				h.w.uploader.Submit(path)
+				submitPath, submitPathUnlock := h.lockStagePath()
 				h.mu.Lock()
+				if h.unlinked {
+					h.mu.Unlock()
+					submitPathUnlock()
+					finishWritebackClose()
+					if h.inner != nil {
+						_ = h.inner.Release(ctx)
+					}
+					return nil
+				}
+				submitDone := make(chan struct{})
+				h.submitDone = submitDone
 				h.dirty = false
 				h.visTrunc = false
 				if h.buf != nil {
@@ -4301,6 +4829,13 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 				}
 				h.landed = true
 				h.mu.Unlock()
+				submitPathUnlock()
+				h.w.uploader.Submit(submitPath)
+				h.mu.Lock()
+				h.submitDone = nil
+				h.mu.Unlock()
+				close(submitDone)
+				finishWritebackClose()
 				if h.inner != nil {
 					_ = h.inner.Release(ctx)
 				}
@@ -4308,14 +4843,70 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 			}
 		}
 	}
-	if materialize {
-		if err := h.ensureBuffer(ctx); err == nil {
+	h.mu.Lock()
+	lazyWritebackTrunc := !unlinked && h.trunc && h.buf == nil && !h.landed && h.stagedHist == 0 &&
+		h.w.opts.Policy == PolicyWriteBack && h.w.uploader != nil && h.w.wbCache != nil
+	h.mu.Unlock()
+	if lazyWritebackTrunc {
+		if err := h.ensureBuffer(ctx); err != nil {
+			return err
+		}
+		if snap, err := h.stageToWriteCache(ctx, stageFullDurable); err == nil && snap != nil {
+			if uploadUnlock != nil {
+				uploadUnlock()
+				uploadUnlock = nil
+			}
+			submitPath, submitPathUnlock := h.lockStagePath()
 			h.mu.Lock()
-			h.dirty = true
+			if h.unlinked {
+				h.mu.Unlock()
+				submitPathUnlock()
+				finishWritebackClose()
+				if h.inner != nil {
+					_ = h.inner.Release(ctx)
+				}
+				return nil
+			}
+			submitDone := make(chan struct{})
+			h.submitDone = submitDone
+			h.dirty = false
+			h.visTrunc = false
+			if h.buf != nil {
+				h.buf.ClearDirty()
+			}
+			h.landed = true
 			h.mu.Unlock()
+			submitPathUnlock()
+			h.w.uploader.Submit(submitPath)
+			h.mu.Lock()
+			h.submitDone = nil
+			h.mu.Unlock()
+			close(submitDone)
+			finishWritebackClose()
+			if h.inner != nil {
+				_ = h.inner.Release(ctx)
+			}
+			return nil
+		} else if err != nil && !errors.Is(err, errWriteCacheBypass) {
+			return err
+		}
+	}
+	if materialize {
+		h.mu.Lock()
+		stillMaterialize := h.isNew && !h.landed && !h.unlinked
+		h.mu.Unlock()
+		if stillMaterialize {
+			if err := h.ensureBuffer(ctx); err == nil {
+				h.mu.Lock()
+				if !h.landed && !h.unlinked {
+					h.dirty = true
+				}
+				h.mu.Unlock()
+			}
 		}
 	}
 	err := h.commitLocked(ctx)
+	finishWritebackClose()
 	if h.inner != nil {
 		if relErr := h.inner.Release(ctx); err == nil {
 			err = relErr
@@ -4329,6 +4920,27 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 // never a replacement: this plane created the core terminal handle and owns
 // the registry entry, so both must still be retired here.
 func (h *bufferingHandle) releaseMigrated(ctx context.Context, e fs.Handle) error {
+	defer func() {
+		h.mu.Lock()
+		h.closed = true
+		if h.migratedReleaseDone != nil {
+			close(h.migratedReleaseDone)
+			h.migratedReleaseDone = nil
+		}
+		h.mu.Unlock()
+	}()
+	h.mu.Lock()
+	if h.migratedFlushing > 0 {
+		if h.migratedFlushIdle == nil {
+			h.migratedFlushIdle = make(chan struct{})
+		}
+		idle := h.migratedFlushIdle
+		h.mu.Unlock()
+		h.w.notifyTestGate("migrated:flushIdle")
+		<-idle
+	} else {
+		h.mu.Unlock()
+	}
 	path := h.infoSnapshot().path
 	modeErr := h.flushMigratedMode(ctx)
 	err := e.Release(ctx)
@@ -4540,7 +5152,7 @@ func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64, generation
 			// published (possibly through several staged descendants). Its
 			// next append/overwrite is derived from that revision, not the
 			// pre-upload base.
-			if rev > 0 {
+			if rev > h.baseRev {
 				h.baseRev = rev
 			}
 			h.cacheAncestorGens = removeCacheAncestorGen(h.cacheAncestorGens, cacheGeneration)
@@ -4572,14 +5184,12 @@ func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64, generation
 	}
 }
 
-func (h *bufferingHandle) markLanded(rev int64) {
-	h.mu.Lock()
+func (h *bufferingHandle) markLandedLocked(rev int64) {
 	h.landed = true
 	h.isNew = false
 	if rev > 0 {
 		h.baseRev = rev
 	}
-	h.mu.Unlock()
 }
 
 func attrSize(res fs.Result) int64 {
@@ -4993,9 +5603,20 @@ func (w *Writeback) track(h *bufferingHandle) {
 	w.trackLocked(h)
 }
 
-// trackLocked registers a handle under a held regMu.
+func (h *bufferingHandle) isWritableCapableLocked() bool {
+	return h.isNew || h.trunc || h.flags&(uint32(syscall.O_WRONLY)|uint32(syscall.O_RDWR)|uint32(syscall.O_TRUNC)) != 0
+}
+
+// trackLocked registers a handle under a held regMu. Read-only descriptors
+// join liveSet/liveByPath for unlink snapshotting and sibling truncation
+// sweeps, while w.live maps each path strictly to its newest writable owner.
 func (w *Writeback) trackLocked(h *bufferingHandle) {
-	w.live.Store(h.path, h)
+	h.mu.Lock()
+	writable := h.isWritableCapableLocked()
+	h.mu.Unlock()
+	if writable {
+		w.live.Store(h.path, h)
+	}
 	w.liveSet.Store(h, h.infoSnapshot())
 	set := w.liveByPath[h.path]
 	if set == nil {
@@ -5061,7 +5682,7 @@ func (w *Writeback) retireLocked(h *bufferingHandle) {
 	if w.live.CompareAndDelete(path, h) {
 		for other := range set {
 			other.mu.Lock()
-			eligible := !other.unlinked
+			eligible := !other.unlinked && !other.closed && other.isWritableCapableLocked()
 			other.mu.Unlock()
 			if eligible {
 				w.live.Store(path, other)
@@ -5085,10 +5706,11 @@ func (w *Writeback) untrack(h *bufferingHandle) {
 	w.retireLocked(h)
 }
 
-// retireDirtyLocked clears the handle's dirty state with h.mu held only when
-// the write generation still matches the image the completion carried: a
-// mutation acknowledged after that snapshot keeps its own dirty flag for the
-// next durability barrier (Drain flushes without the per-FH write lock).
+// retireDirtyLocked clears the handle's dirty state only when the write
+// generation still matches the image the completion carried: a mutation
+// acknowledged after that snapshot keeps its own dirty flag for the next
+// durability barrier (Drain flushes without the per-FH write lock).
+// h.mu must be held.
 func (h *bufferingHandle) retireDirtyLocked(stagedGen uint64) {
 	if h.wgen == stagedGen {
 		h.dirty = false
@@ -5142,13 +5764,18 @@ func restoreMarked(marked []*bufferingHandle) {
 func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHandle, error) {
 	prefix := strings.TrimSuffix(p, "/") + "/"
 	var clean, marked []*bufferingHandle
+	var submitting []chan struct{}
 	w.liveSet.Range(func(key, _ any) bool {
 		h := key.(*bufferingHandle)
 		h.mu.Lock()
+		match := h.path == p || (under && strings.HasPrefix(h.path, prefix))
+		if match && h.submitDone != nil {
+			submitting = append(submitting, h.submitDone)
+		}
 		// A descriptor that is ALREADY anonymous serves another object's
 		// snapshot: it must not be re-marked (and its stale, shorter
 		// snapshot must not make this operation's target look read-only).
-		if (h.path == p || (under && strings.HasPrefix(h.path, prefix))) && !h.unlinked {
+		if match && !h.unlinked {
 			h.unlinked = true
 			marked = append(marked, h)
 			if h.buf == nil && !h.isNew && !h.dirty {
@@ -5158,6 +5785,9 @@ func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHand
 		h.mu.Unlock()
 		return true
 	})
+	for _, ch := range submitting {
+		<-ch
+	}
 	var firstErr error
 	for _, h := range clean {
 		var err error
@@ -5176,6 +5806,99 @@ func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHand
 		}
 	}
 	return marked, firstErr
+}
+
+// hasUploaderActivity reports whether any live handle at path is currently in
+// its Release->Submit handoff or the background uploader has path queued,
+// active, or in flight.
+func (w *Writeback) hasUploaderActivity(path string) bool {
+	if w == nil || w.uploader == nil {
+		return false
+	}
+	w.regMu.Lock()
+	submitting := false
+	for h := range w.liveByPath[path] {
+		h.mu.Lock()
+		if h.path == path && h.submitDone != nil {
+			submitting = true
+		}
+		h.mu.Unlock()
+		if submitting {
+			break
+		}
+	}
+	w.regMu.Unlock()
+	if submitting {
+		return true
+	}
+	return w.uploader.IsQueuedOrActive(path)
+}
+
+// waitUploaderPath waits for any in-progress Release->Submit handoff on path
+// and then blocks until path is neither queued nor active in the uploader.
+func (w *Writeback) waitUploaderPath(path string) {
+	if w == nil || w.uploader == nil {
+		return
+	}
+	w.regMu.Lock()
+	var submitting []chan struct{}
+	for h := range w.liveByPath[path] {
+		h.mu.Lock()
+		if h.path == path && h.submitDone != nil {
+			submitting = append(submitting, h.submitDone)
+		}
+		h.mu.Unlock()
+	}
+	w.regMu.Unlock()
+	for _, ch := range submitting {
+		<-ch
+	}
+	w.uploader.WaitQueuedOrActive(path)
+}
+
+// hasUnclosedStagedCacheOwner reports whether an open (non-releasing,
+// non-unlinked) handle at path holds a Flush-staged wbCache snapshot that its
+// future Release will submit. Read-only handles and handles already inside
+// Release do not own future submissions.
+func (w *Writeback) hasUnclosedStagedCacheOwner(path string) bool {
+	if w == nil {
+		return false
+	}
+	w.regMu.Lock()
+	handles := make([]*bufferingHandle, 0, len(w.liveByPath[path]))
+	for h := range w.liveByPath[path] {
+		handles = append(handles, h)
+	}
+	w.regMu.Unlock()
+	for _, h := range handles {
+		h.mu.Lock()
+		owns := h.path == path && !h.unlinked && !h.releasing && h.stagedToCache
+		h.mu.Unlock()
+		if owns {
+			return true
+		}
+	}
+	return false
+}
+
+// submitOrphanedCacheForRollback re-submits any wbCache snapshot at path (or
+// under path+"/" when under is true) whose staging writer closed while marked
+// anonymous during a failed namespace operation.
+func (w *Writeback) submitOrphanedCacheForRollback(path string, under bool) {
+	if w == nil || w.wbCache == nil || w.uploader == nil {
+		return
+	}
+	if w.wbCache.HasMeta(path) && !w.hasUnclosedStagedCacheOwner(path) {
+		w.uploader.Submit(path)
+	}
+	if under {
+		prefix := strings.TrimSuffix(path, "/") + "/"
+		for _, entry := range w.wbCache.ListByPrefix(prefix) {
+			if !w.hasUnclosedStagedCacheOwner(entry.Path) {
+				w.uploader.Submit(entry.Path)
+			}
+		}
+	}
 }
 
 // liveObjectSize is the size the snapshot must capture: the staged image
@@ -5471,6 +6194,12 @@ func (w *Writeback) DrainPending() (string, int) {
 	}
 	if w.uploader != nil {
 		if snap := w.uploader.Snapshot(); snap.Cached > 0 {
+			if w.wbCache != nil {
+				for _, m := range w.wbCache.ListPendingMetas() {
+					safeLogPrintf("writeback: drain pending uploader_cached entry: path=%s kind=%v size=%d base_rev=%d gen=%d put_gen=%d has_mode=%v",
+						m.Path, m.Kind, m.Size, m.BaseRev, m.Generation, m.PutGen(), m.HasMode)
+				}
+			}
 			return "uploader_cached", snap.Cached
 		}
 	}
@@ -5793,6 +6522,103 @@ func (w *Writeback) hasPendingLocalState(path string) bool {
 		}
 	}
 	return w.opts.Staging != nil && w.opts.Staging.Pending.HasPending(path)
+}
+
+// fileInoOf resolves a regular file's inode from the facade table first (safe
+// even on kernel CREATE ops whose op.Ino names the parent directory), falling
+// back to hintIno only when the caller guarantees hintIno is the file's inode.
+func (w *Writeback) fileInoOf(path string, hintIno uint64, hintIsFile bool) uint64 {
+	if w != nil && w.inodes != nil {
+		if resolved, ok := w.inodes.Ino(path); ok && resolved != 0 {
+			return resolved
+		}
+	}
+	if hintIsFile {
+		return hintIno
+	}
+	return 0
+}
+
+type pendingOverwriteSnap struct {
+	valid    bool
+	metaGen  uint64
+	inFlight bool
+}
+
+func (w *Writeback) snapshotPendingOverwrite(path string, writable bool) pendingOverwriteSnap {
+	if !writable || w == nil || w.wbCache == nil {
+		return pendingOverwriteSnap{}
+	}
+	if meta, ok := w.wbCache.GetMeta(path); ok && meta != nil && meta.Kind != staging.PendingNew {
+		return pendingOverwriteSnap{
+			valid:    true,
+			metaGen:  meta.Generation,
+			inFlight: w.uploader != nil && w.uploader.QueuedOrActive(path),
+		}
+	}
+	if w.uploader != nil && w.uploader.InFlight(path) {
+		return pendingOverwriteSnap{valid: true, inFlight: true}
+	}
+	return pendingOverwriteSnap{}
+}
+
+func (w *Writeback) registerExistingOpenHandle(h *bufferingHandle, writable bool, pre pendingOverwriteSnap) {
+	if !writable || w == nil || w.wbCache == nil {
+		w.track(h)
+		return
+	}
+	ledgerOwned := w.opts.Staging != nil && w.opts.Staging.Pending.HasPending(h.path)
+	unlock := w.pathLocks.lock(h.path)
+	defer unlock()
+	if !ledgerOwned {
+		curMeta, curOK := w.wbCache.GetMeta(h.path)
+		if pre.valid && pre.inFlight && (!curOK || (pre.metaGen != 0 && curMeta.Generation != pre.metaGen)) && !w.unverified.Load() {
+			if rev, _, _, lok := w.landedRecord(h.path); lok && rev > h.baseRev {
+				h.baseRev = rev
+			}
+		}
+		if curOK && curMeta != nil && curMeta.Kind != staging.PendingNew &&
+			(curMeta.BaseRev == 0 || h.baseRev <= curMeta.BaseRev) {
+			if curMeta.BaseRev == 0 || w.uploader == nil || w.uploader.QueuedOrActive(h.path) {
+				h.supersededPendingGen = curMeta.Generation
+				h.supersededPendingSource = pendingGenCache
+				h.cacheLineageGen = curMeta.CacheLineageGen
+				if h.cacheLineageGen == 0 {
+					h.cacheLineageGen = curMeta.Generation
+				}
+				h.cacheAncestorGens = mergeCacheAncestorGens(curMeta.CacheAncestorGens, curMeta.Generation)
+				if h.baseRev == 0 && curMeta.BaseRev > 0 {
+					h.baseRev = curMeta.BaseRev
+				}
+			}
+		}
+	}
+	w.track(h)
+}
+
+// landSiblingAliasOverwriteForWrite settles any active overwrite queued or in
+// flight under a DIFFERENT hardlink alias pathname of fileIno so path-keyed
+// staging on path does not race an earlier write through its sibling alias.
+func (w *Writeback) landSiblingAliasOverwriteForWrite(ctx context.Context, fileIno uint64, path string) (bool, error) {
+	if w == nil || w.uploader == nil || w.wbCache == nil || fileIno == 0 {
+		return false, nil
+	}
+	landed := false
+	for _, p := range w.inodeAliasPaths(fileIno, path) {
+		if p == path || !w.uploader.QueuedOrActive(p) {
+			continue
+		}
+		if meta, ok := w.wbCache.GetMeta(p); ok && meta != nil && meta.Kind != staging.PendingNew {
+			if err := w.uploader.UploadSync(ctx, p); err != nil && !w.uploader.IsLedgerOwnedError(err) {
+				return landed, err
+			}
+			landed = true
+		} else if w.uploader.InFlight(p) {
+			w.uploader.WaitPath(p)
+			landed = true
+		}
+	}
+	return landed, nil
 }
 
 // landedAt records this mount's own just-landed commits (queue/uploader
@@ -6119,10 +6945,10 @@ func (r *bufferReader) ReadAt(p []byte, off int64) (int, error) {
 // the image is too large for the whole-image tracks (v1's large-file
 // bypass of the .dat/.meta track).
 func (h *bufferingHandle) commitInline(ctx context.Context) error {
-	var cacheGen uint64
+	var cachePutGen uint64
 	if h.w.wbCache != nil {
-		if meta, ok := h.w.wbCache.GetMeta(h.path); ok {
-			cacheGen = meta.Generation
+		if meta, ok := h.w.wbCache.GetMeta(h.path); ok && meta != nil {
+			cachePutGen = meta.PutGen()
 		}
 	}
 	h.mu.Lock()
@@ -6194,8 +7020,8 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 		}
 	}
 	if err == nil {
-		if cacheGen != 0 {
-			h.w.wbCache.RemoveIfGeneration(h.path, cacheGen)
+		if cachePutGen != 0 {
+			h.w.wbCache.RemoveIfPutGeneration(h.path, cachePutGen)
 		}
 		var crc uint32
 		var img []byte
@@ -6518,6 +7344,15 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 	// nil/empty buffer that Write then dereferenced, and skipped the
 	// O_TRUNC dirty initialization).
 	ledgerOwned := h.w.opts.Staging != nil && h.w.opts.Staging.Pending.HasPending(h.path)
+	if h.trunc {
+		// O_TRUNC: empty base, marked dirty so a write-less close still
+		// commits the truncation (ZeroBase + commit at boundary). Checked
+		// before wbCache.Get so a still-cached pre-truncation payload does
+		// not repopulate the truncated buffer.
+		h.dirty = true
+		h.baseLoaded = true
+		return nil
+	}
 	if !h.isNew && h.w.wbCache != nil && !ledgerOwned {
 		// The write cache is LOCAL-path keyed (stageToWriteCache Put uses
 		// h.path): querying the remote name under a RemoteRoot subtree
@@ -6535,13 +7370,6 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 			h.baseLoaded = true
 			return nil
 		}
-	}
-	if h.trunc {
-		// O_TRUNC: empty base, marked dirty so a write-less close still
-		// commits the truncation (ZeroBase + commit at boundary).
-		h.dirty = true
-		h.baseLoaded = true
-		return nil
 	}
 	if (h.isNew || h.inner == nil || ledgerOwned) && h.w.opts.Staging != nil {
 		// A pending image owns this path (queue track): preload the
@@ -6679,6 +7507,12 @@ func (h *bufferingHandle) stageAndEnqueue(ctx context.Context) error {
 // JournalCommit marker lands at a higher Seq — replay then cannot
 // resurrect a path the commit settled (v1 interactive fsync ordering).
 func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journalFsync, retainBuffer bool) error {
+	h.mu.Lock()
+	closed := h.closed
+	h.mu.Unlock()
+	if closed {
+		return nil
+	}
 	// #1023 staging fence: an append handle must not publish an image a
 	// sibling's landed commit already superseded — compose (or reject)
 	// before this staging owns the path (v1 adoptLandedAppendSnapshot at
@@ -6690,13 +7524,15 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 		}
 		if image != nil {
 			h.mu.Lock()
-			if !h.unlinked && h.buf != nil {
-				cur := append([]byte(nil), h.buf.Bytes()...)
-				if !bytes.Equal(image, cur) || landedRev > h.baseRev {
-					if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
-						h.mu.Unlock()
-						return err
-					}
+			if h.closed || h.buf == nil {
+				h.mu.Unlock()
+				return nil
+			}
+			cur := append([]byte(nil), h.buf.Bytes()...)
+			if !h.unlinked && (!bytes.Equal(image, cur) || landedRev > h.baseRev) {
+				if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
+					h.mu.Unlock()
+					return err
 				}
 			}
 			h.mu.Unlock()
@@ -6704,17 +7540,22 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 	}
 	w := h.w
 	st := w.opts.Staging
-	// Queue cleanup uses this lock order too; snapshot the mutable buffer only
-	// after obtaining the path lock so Drain cannot race a write during spill.
-	unlock := w.pathLocks.lock(h.path)
+	// Queue cleanup and survivor/rename retargets use this lock order too;
+	// lockStagePath re-verifies h.path after acquiring pathLocks so a concurrent
+	// atomic retarget + cache move never races a stage onto the old pathname.
+	stagePath, unlock := h.lockStagePath()
 	defer unlock()
-	var cacheGen uint64
+	var cachePutGen uint64
 	if w.wbCache != nil {
-		if meta, ok := w.wbCache.GetMeta(h.path); ok {
-			cacheGen = meta.Generation
+		if meta, ok := w.wbCache.GetMeta(stagePath); ok && meta != nil {
+			cachePutGen = meta.PutGen()
 		}
 	}
 	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return nil
+	}
 	if h.unlinked {
 		h.dirty = false
 		h.visTrunc = false
@@ -6794,19 +7635,19 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 		// upload asynchronously: close(2) returns after the LOCAL durable
 		// stage (the write-back policy's defining contract), not after the
 		// network transfer.
-		if err := h.spillToShadow(st, buf, baseRev, zeroBase, retainBuffer); err != nil {
+		if err := h.spillToShadow(st, stagePath, buf, baseRev, zeroBase, retainBuffer); err != nil {
 			h.mu.Unlock()
 			return err
 		}
 		if durable {
-			if err := st.Shadow.Sync(h.path); err != nil {
+			if err := st.Shadow.Sync(stagePath); err != nil {
 				h.mu.Unlock()
 				return err
 			}
 		}
 	} else {
 		image = buf.Bytes()
-		if err := st.Shadow.WriteFull(h.path, image, baseRev); err != nil {
+		if err := st.Shadow.WriteFull(stagePath, image, baseRev); err != nil {
 			h.mu.Unlock()
 			return err
 		}
@@ -6815,23 +7656,23 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 			// BEFORE the pending meta is published — Put's WAL record promises
 			// the bytes are durable (journal replay rebuilds the pending entry
 			// and the commit queue re-uploads from the shadow).
-			if err := st.Shadow.Sync(h.path); err != nil {
+			if err := st.Shadow.Sync(stagePath); err != nil {
 				h.mu.Unlock()
 				return err
 			}
 		}
 	}
-	shadowGen := st.Shadow.ActiveGeneration(h.path)
+	shadowGen := st.Shadow.ActiveGeneration(stagePath)
 	h.mu.Unlock()
 	if image != nil && w.pendingSeeder != nil {
-		w.pendingSeeder(h.path, image)
+		w.pendingSeeder(stagePath, image)
 	}
 	var pendingGen uint64
 	var err error
 	if spill {
-		pendingGen, err = st.Pending.PutShadowSpillWithModeAndLineage(h.path, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, true)
+		pendingGen, err = st.Pending.PutShadowSpillWithModeAndLineage(stagePath, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, true)
 	} else {
-		pendingGen, err = st.Pending.PutWithBaseRevAndModeAndLineage(h.path, int64(len(image)), kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, true)
+		pendingGen, err = st.Pending.PutWithBaseRevAndModeAndLineage(stagePath, int64(len(image)), kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, true)
 	}
 	if err != nil {
 		return err
@@ -6839,7 +7680,7 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 	if journalFsync && st.Journal != nil {
 		_ = st.Journal.Append(staging.JournalEntry{
 			Op:      staging.JournalFsync,
-			Path:    h.path,
+			Path:    stagePath,
 			Length:  size,
 			BaseRev: baseRev,
 		})
@@ -6849,11 +7690,11 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 	// the Flush left, or Release's Submit double-publishes it as a second
 	// track and one side always 409s (the create case: queue lands the
 	// PendingNew, the uploader's expect-absent CAS then conflicts forever).
-	if cacheGen != 0 {
-		w.wbCache.RemoveIfGeneration(h.path, cacheGen)
+	if cachePutGen != 0 {
+		w.wbCache.RemoveIfPutGeneration(stagePath, cachePutGen)
 	}
 	entry := &CommitEntry{
-		Path:             h.path,
+		Path:             stagePath,
 		Size:             size,
 		Kind:             kind,
 		BaseRev:          baseRev,
@@ -6866,7 +7707,7 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 		ParentSnapshotID: parentSnapshotID,
 	}
 	if w.opts.Events != nil {
-		w.opts.Events.Emit(fs.Event{Kind: fs.EventStaged, Path: h.path, Size: entry.Size})
+		w.opts.Events.Emit(fs.Event{Kind: fs.EventStaged, Path: stagePath, Size: entry.Size})
 	}
 	if err := w.queue.Enqueue(entry); err != nil {
 		return err
@@ -6897,10 +7738,10 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 // part-by-part with bounded memory (v1 large-file close staging). Parts are
 // loaded, written, and evicted; RestorePart and OnPartFull keep the
 // shadow as the buffer's authoritative backing from here on.
-func (h *bufferingHandle) spillToShadow(st *staging.Staging, buf *writebuffer.WriteBuffer, baseRev int64, zeroBase, retainBuffer bool) error {
+func (h *bufferingHandle) spillToShadow(st *staging.Staging, stagePath string, buf *writebuffer.WriteBuffer, baseRev int64, zeroBase, retainBuffer bool) error {
 	partSize := buf.PartSize()
 	if partSize <= 0 {
-		return fmt.Errorf("writeback: spill without part size: %s", h.path)
+		return fmt.Errorf("writeback: spill without part size: %s", stagePath)
 	}
 	size := buf.Size()
 	// v1's spill wrote only the parts the writer touched: a one-byte
@@ -6936,16 +7777,16 @@ func (h *bufferingHandle) spillToShadow(st *staging.Staging, buf *writebuffer.Wr
 		}
 		data := buf.PartData(partNum)
 		if int64(len(data)) < end-start {
-			return fmt.Errorf("writeback: spill short part %d of %s", partNum, h.path)
+			return fmt.Errorf("writeback: spill short part %d of %s", partNum, stagePath)
 		}
-		if _, err := st.Shadow.WriteAt(h.path, start, data[:end-start], baseRev); err != nil {
+		if _, err := st.Shadow.WriteAt(stagePath, start, data[:end-start], baseRev); err != nil {
 			return err
 		}
 		if !retainBuffer {
 			buf.EvictPart(int(start / partSize))
 		}
 	}
-	if err := st.Shadow.Truncate(h.path, size, baseRev); err != nil {
+	if err := st.Shadow.Truncate(stagePath, size, baseRev); err != nil {
 		return err
 	}
 	// Switch the buffer's authoritative backing onto st.Shadow AFTER copying
@@ -7002,6 +7843,12 @@ func restoreShadowPart(store *staging.ShadowStore, path string, wb *writebuffer.
 // and revision-conflict retries. An unlinked handle never commits — the
 // anonymous fd's data dies at Release (semantics).
 func (h *bufferingHandle) commitLocked(ctx context.Context) error {
+	h.mu.Lock()
+	closed := h.closed
+	h.mu.Unlock()
+	if closed {
+		return nil
+	}
 	// The #1023 fence for the inline-commit track (no write cache): the
 	// commit's CAS base is the CURRENT remote revision — composing with
 	// the file's newest state first is what keeps a foreign append from
@@ -7013,13 +7860,15 @@ func (h *bufferingHandle) commitLocked(ctx context.Context) error {
 		}
 		if image != nil {
 			h.mu.Lock()
-			if !h.unlinked && h.buf != nil {
-				cur := append([]byte(nil), h.buf.Bytes()...)
-				if !bytes.Equal(image, cur) || landedRev > h.baseRev {
-					if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
-						h.mu.Unlock()
-						return err
-					}
+			if h.closed || h.buf == nil {
+				h.mu.Unlock()
+				return nil
+			}
+			cur := append([]byte(nil), h.buf.Bytes()...)
+			if !h.unlinked && (!bytes.Equal(image, cur) || landedRev > h.baseRev) {
+				if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
+					h.mu.Unlock()
+					return err
 				}
 			}
 			h.mu.Unlock()
@@ -7029,8 +7878,11 @@ func (h *bufferingHandle) commitLocked(ctx context.Context) error {
 		return errLayerRolledBack
 	}
 	h.mu.Lock()
-	unlinked := h.unlinked
+	unlinked, closed := h.unlinked, h.closed
 	h.mu.Unlock()
+	if closed {
+		return nil
+	}
 	if unlinked {
 		h.mu.Lock()
 		h.dirty = false
@@ -7052,7 +7904,7 @@ func (h *bufferingHandle) commitLocked(ctx context.Context) error {
 		}
 	}
 	h.mu.Lock()
-	if !h.dirty || h.buf == nil {
+	if h.closed || !h.dirty || h.buf == nil {
 		h.mu.Unlock()
 		return nil
 	}
@@ -7087,6 +7939,14 @@ func (h *bufferingHandle) commitLocked(ctx context.Context) error {
 		// hosts), and close(2) returned after the local durable stage.
 		return h.stageAndEnqueue(ctx)
 	}
+	h.inlineCommitMu.Lock()
+	defer h.inlineCommitMu.Unlock()
+	h.mu.Lock()
+	if h.closed || h.unlinked || !h.dirty || h.buf == nil {
+		h.mu.Unlock()
+		return nil
+	}
+	h.mu.Unlock()
 	// Commit dispatch: a partial edit of an existing large file patches
 	// only the dirty parts (the server copies the rest from the current
 	// object); everything else falls through to the full-write path.
@@ -7388,7 +8248,34 @@ func (w *Writeback) putWriteCacheSnapshot(path string, image []byte, kind stagin
 	return gen, err
 }
 
+// lockStagePath locks w.pathLocks for h's current path, retrying if a
+// concurrent retarget moved h.path before the path lock was acquired. While
+// the returned unlock is held, any retarget that also holds w.pathLocks (via
+// lockRenamePaths) cannot move h away from the returned pathname.
+func (h *bufferingHandle) lockStagePath() (string, func()) {
+	for {
+		h.mu.Lock()
+		p := h.path
+		h.mu.Unlock()
+		h.w.notifyTestGate("stage:pathLock")
+		unlock := h.w.pathLocks.lock(p)
+		h.mu.Lock()
+		same := h.path == p
+		h.mu.Unlock()
+		if same {
+			return p, unlock
+		}
+		unlock()
+	}
+}
+
 func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurability) (*writeCacheSnapshot, error) {
+	h.mu.Lock()
+	closed := h.closed
+	h.mu.Unlock()
+	if closed {
+		return nil, nil
+	}
 	// The #1023 fence for the writeback-cache track (close-sync and the
 	// small-file write-back flush both stage here): compose with the
 	// file's newest state before this staging refreshes the CAS base —
@@ -7401,45 +8288,39 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 		}
 		if image != nil {
 			h.mu.Lock()
-			if !h.unlinked && h.buf != nil {
-				cur := append([]byte(nil), h.buf.Bytes()...)
-				if !bytes.Equal(image, cur) || landedRev > h.baseRev {
-					if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
-						h.mu.Unlock()
-						return nil, err
-					}
+			if h.closed || h.buf == nil {
+				h.mu.Unlock()
+				return nil, nil
+			}
+			cur := append([]byte(nil), h.buf.Bytes()...)
+			if !h.unlinked && (!bytes.Equal(image, cur) || landedRev > h.baseRev) {
+				if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
+					h.mu.Unlock()
+					return nil, err
 				}
 			}
 			h.mu.Unlock()
 		}
 	}
-	unlock := h.w.pathLocks.lock(h.path)
+	path, unlock := h.lockStagePath()
 	defer unlock()
-	if dur == stageV1Ladder {
-		h.stageCacheMu.Lock()
-		defer h.stageCacheMu.Unlock()
-	}
-	if h.w.opts.Staging != nil && h.w.opts.Staging.Pending.HasPending(h.path) {
+	if h.w.opts.Staging != nil && h.w.opts.Staging.Pending.HasPending(path) {
 		return nil, errWriteCacheBypass
 	}
 	h.mu.Lock()
-	if h.unlinked {
+	if h.unlinked || h.closed {
 		h.mu.Unlock()
 		return nil, nil
 	}
-	if dur == stageV1Ladder && (h.releasing || !h.dirty) {
-		// Local-only write-back Flush snapshot: Release is the sole submitter
-		// of stageV1Ladder entries, so once Release has claimed teardown or an
-		// earlier boundary retired dirty while we waited for pathLocks, staging
-		// here would leave an unowned .dat/.meta entry stranded in wbCache.
+	if dur == stageV1Ladder && !h.dirty {
 		h.mu.Unlock()
 		return nil, nil
 	}
 	isNew := h.isNew
+	landed := h.landed
 	if h.buf == nil {
-		landed, releasing := h.landed, h.releasing
 		h.mu.Unlock()
-		if !isNew || landed || releasing {
+		if !isNew || landed {
 			return nil, nil
 		}
 		// An O_CREAT claim that never wrote stages as a zero-byte image
@@ -7449,7 +8330,7 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 			return nil, err
 		}
 		h.mu.Lock()
-		if h.unlinked || h.buf == nil {
+		if h.unlinked || h.closed || h.buf == nil {
 			h.mu.Unlock()
 			return nil, nil
 		}
@@ -7461,7 +8342,6 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 	// as classic multipart, never reaching the extent queue. The extent
 	// decision is the more specific rule, so it wins in either direction.
 	size := h.buf.Size()
-	path := h.path
 	promoteToExtent := h.w.extentRouteAllowed(path, size)
 	if size >= commitInlineStreamThreshold || promoteToExtent {
 		h.mu.Unlock()
@@ -7521,7 +8401,7 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 			// unguarded PendingOverwrite would route close-sync through
 			// that same unconditional fallback. A 404 means the row is
 			// gone; the image stages as an expect-absent create instead.
-			st, serr := h.w.opts.Client.StatCtx(ctx, h.w.remotePath(h.path))
+			st, serr := h.w.opts.Client.StatCtx(ctx, h.w.remotePath(path))
 			switch {
 			case serr == nil && st != nil && st.Revision > 0:
 				h.mu.Lock()
@@ -7547,7 +8427,7 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 		kind = staging.PendingNew
 	}
 	h.mu.Lock()
-	if h.unlinked {
+	if h.unlinked || h.closed {
 		h.mu.Unlock()
 		return nil, nil
 	}
@@ -7563,13 +8443,13 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 	// remote name itself (a remote key here made every subtree mount's
 	// upload silently no-op — the git-ops clone's config.lock never
 	// landed).
-	wbGen, err := h.w.putWriteCacheSnapshot(h.path, image, kind, baseRev, mode, hasMode, cacheLineage, cacheAncestors, dur)
+	wbGen, err := h.w.putWriteCacheSnapshot(path, image, kind, baseRev, mode, hasMode, cacheLineage, cacheAncestors, dur)
 	if err != nil {
 		return nil, err
 	}
 	if supersedesSource == pendingGenQueue {
 		if supersedesGen != 0 {
-			h.w.wbCache.MarkSupersedesPendingGen(h.path, supersedesGen, wbGen)
+			h.w.wbCache.MarkSupersedesPendingGen(path, supersedesGen, wbGen)
 		}
 		// A queue-derived handle can later stage its buffer into the cache.
 		// That cache image is now its own newest content: keep the queue
@@ -7605,11 +8485,14 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 	// boundary: readers during the async landing serve these bytes instead
 	// of racing the staging's publication against the stale remote.
 	if h.w.pendingSeeder != nil {
-		h.w.pendingSeeder(h.path, image)
+		h.w.pendingSeeder(path, image)
 	}
 	h.mu.Lock()
-	if dur == stageV1Ladder && !h.unlinked {
-		h.stagedToCache = true
+	if !h.unlinked && !h.closed {
+		h.stagedCacheGen = wbGen
+		if dur == stageV1Ladder {
+			h.stagedToCache = true
+		}
 	}
 	h.retireDirtyLocked(snapshot.wgen)
 	h.mu.Unlock()

@@ -1,0 +1,591 @@
+# Tiered suite manifest for `drive9-simulator run-suite`.
+# Every `.t` file under `tests/cases/` MUST be enrolled here (enforced by unit test).
+
+# ---- PR Gate: fast server/CLI contract cases (no FUSE mount required) ----
+[[case]]
+name = "drive9/api/api"
+tier = "pr-no-mount"
+no_mount = true
+timeout = "10m"
+
+[[case]]
+name = "drive9/api/fork-and-sql"
+tier = "pr-no-mount"
+no_mount = true
+timeout = "5m"
+
+[[case]]
+name = "drive9/api/s3-express-append-log"
+tier = "pr-no-mount"
+no_mount = true
+timeout = "5m"
+
+[[case]]
+name = "drive9/api/journal"
+tier = "pr-no-mount"
+no_mount = true
+timeout = "5m"
+
+[[case]]
+name = "drive9/api/sse-events"
+tier = "pr-no-mount"
+no_mount = true
+timeout = "5m"
+
+[[case]]
+name = "drive9/cli/cli"
+tier = "pr-no-mount"
+no_mount = true
+timeout = "10m"
+
+[[case]]
+name = "drive9/cli/pack"
+tier = "pr-no-mount"
+no_mount = true
+timeout = "5m"
+
+[[case]]
+name = "drive9/cli/object-store"
+tier = "pr-no-mount"
+no_mount = true
+timeout = "5m"
+
+# ---- PR Gate: FUSE core correctness, CAS, attribute & workflow cases ----
+[[case]]
+name = "drive9/fuse/smoke"
+tier = "pr-fuse"
+timeout = "10m"
+
+[[case]]
+name = "drive9/fuse/correctness"
+tier = "pr-fuse"
+timeout = "10m"
+
+[[case]]
+name = "drive9/fuse/cas-conflict"
+tier = "pr-fuse"
+timeout = "10m"
+
+[[case]]
+name = "drive9/fuse/posix-permissions"
+tier = "pr-fuse"
+timeout = "5m"
+
+[[case]]
+name = "drive9/fuse/nodefs"
+tier = "pr-fuse"
+timeout = "10m"
+
+[[case]]
+name = "drive9/fuse/crash-recovery"
+tier = "pr-fuse"
+durability = "interactive"
+timeout = "10m"
+
+[[case]]
+name = "drive9/fuse/supervision"
+tier = "pr-fuse"
+no_mount = true
+timeout = "10m"
+
+[[case]]
+name = "drive9/fuse/patch-storage-class"
+tier = "pr-fuse"
+no_mount = true
+timeout = "10m"
+
+[[case]]
+name = "drive9/fuse/extent-takeover"
+tier = "pr-fuse"
+profile = "none"
+durability = "fsync"
+timeout = "15m"
+
+[[case]]
+name = "drive9/fuse/write-perf-budget"
+tier = "pr-fuse"
+durability = "interactive"
+perf = true
+serial = true
+timeout = "10m"
+
+[[case]]
+name = "drive9/fuse/s3-express-wal"
+tier = "pr-fuse"
+no_mount = true
+serial = true
+env = { FUSE_APPEND_LOG_TRANSACTIONS = "300" }
+timeout = "10m"
+
+[[case]]
+name = "drive9/fuse/git-ops-fast-clone"
+tier = "pr-fuse"
+durability = "interactive"
+env = { DRIVE9_GIT_ALLOW_LOCAL_REPOS = "1" }
+timeout = "15m"
+
+[[case]]
+name = "drive9/fuse/git-workspace-ondemand"
+tier = "pr-fuse"
+durability = "interactive"
+perf = true
+serial = true
+env = { DRIVE9_GIT_ALLOW_LOCAL_REPOS = "1" }
+timeout = "15m"
+
+[[case]]
+name = "community/fsx"
+tier = "pr-fuse"
+timeout = "10m"
+
+[[case]]
+name = "webdev/attrs-remount"
+tier = "pr-fuse"
+timeout = "10m"
+
+[[case]]
+name = "webdev/exclusive-create"
+tier = "pr-fuse"
+timeout = "10m"
+
+[[case]]
+name = "webdev/restructure"
+tier = "pr-fuse"
+timeout = "10m"
+
+[[case]]
+name = "webdev/package-install-overlay"
+tier = "pr-fuse"
+overlay = "node_modules/**,.pnpm-store/**"
+timeout = "10m"
+
+[[case]]
+name = "webdev/upload-cut-and-5xx"
+tier = "pr-fuse"
+durability = "fsync"
+timeout = "10m"
+
+[[case]]
+name = "webdev/rate-limit-storm"
+tier = "pr-fuse"
+durability = "fsync"
+env = { FILES = "40" }
+timeout = "10m"
+
+[[case]]
+name = "webdev/fsync-cut"
+tier = "pr-fuse"
+durability = "fsync"
+env = { FILES = "40" }
+timeout = "10m"
+
+# ---- Daily Fault-Injection, Quota & Crash-Recovery Suite (`daily-fault`) ----
+[[case]]
+name = "webdev/mount-retry"
+tier = "daily-fault"
+timeout = "10m"
+
+[[case]]
+name = "webdev/net-slow-recover"
+tier = "daily-fault"
+durability = "fsync"
+perf = true
+timeout = "20m"
+
+[[case]]
+name = "webdev/response-lost"
+tier = "daily-fault"
+timeout = "20m"
+
+[[case]]
+name = "webdev/cache-threshold"
+tier = "daily-fault"
+write_cache_size_mb = 16
+timeout = "15m"
+
+[[case]]
+name = "webdev/child-exit-during-install"
+tier = "daily-fault"
+timeout = "10m"
+
+[[case]]
+name = "webdev/client-sudden-exit"
+tier = "daily-fault"
+durability = "fsync"
+timeout = "15m"
+
+[[case]]
+name = "webdev/write-cancel"
+tier = "daily-fault"
+durability = "fsync"
+timeout = "15m"
+
+[[case]]
+name = "webdev/exit-recovery-synced"
+tier = "daily-fault"
+durability = "fsync"
+timeout = "10m"
+
+[[case]]
+name = "webdev/exit-recovery-unsynced"
+tier = "daily-fault"
+durability = "fsync"
+timeout = "10m"
+
+[[case]]
+name = "webdev/exit-recovery-partial-sync"
+tier = "daily-fault"
+durability = "fsync"
+timeout = "15m"
+
+# ---- Daily Deep FUSE Conformance, Stress & Multi-Client Suite (`daily-fuse`) ----
+[[case]]
+name = "drive9/fuse/concurrency"
+tier = "daily-fuse"
+timeout = "15m"
+
+[[case]]
+name = "drive9/fuse/sqlite-wal-remount"
+tier = "daily-fuse"
+timeout = "20m"
+
+[[case]]
+name = "drive9/fuse/git-feature"
+tier = "daily-fuse"
+durability = "interactive"
+env = { DRIVE9_GIT_ALLOW_LOCAL_REPOS = "1" }
+timeout = "15m"
+
+[[case]]
+name = "drive9/fuse/toolchain-bench"
+tier = "daily-fuse"
+durability = "interactive"
+timeout = "20m"
+
+[[case]]
+name = "community/pjdfstest"
+tier = "daily-fuse"
+allow_other = true
+timeout = "30m"
+
+[[case]]
+name = "community/ltp"
+tier = "daily-fuse"
+allow_other = true
+timeout = "45m"
+
+[[case]]
+name = "community/fsstress"
+tier = "daily-fuse"
+timeout = "15m"
+
+[[case]]
+name = "community/sqlite"
+tier = "daily-fuse"
+timeout = "20m"
+
+[[case]]
+name = "community/git"
+tier = "daily-fuse"
+timeout = "20m"
+
+[[case]]
+name = "community/stdfs-go"
+tier = "daily-fuse"
+timeout = "15m"
+
+[[case]]
+name = "community/stdfs-python"
+tier = "daily-fuse"
+timeout = "15m"
+
+[[case]]
+name = "community/stdfs-node"
+tier = "daily-fuse"
+timeout = "15m"
+
+[[case]]
+name = "community/stdfs-rust"
+tier = "daily-fuse"
+timeout = "15m"
+
+[[case]]
+name = "juicefs/cache-consistency"
+tier = "daily-fuse"
+timeout = "10m"
+
+[[case]]
+name = "juicefs/fsrand"
+tier = "daily-fuse"
+timeout = "15m"
+
+[[case]]
+name = "juicefs/random-rw"
+tier = "daily-fuse"
+timeout = "15m"
+
+[[case]]
+name = "juicefs/random-stress"
+tier = "daily-fuse"
+timeout = "15m"
+
+[[case]]
+name = "juicefs/rmr"
+tier = "daily-fuse"
+timeout = "10m"
+
+[[case]]
+name = "webdev/asset-install"
+tier = "daily-fuse"
+timeout = "15m"
+
+[[case]]
+name = "webdev/build-cycle"
+tier = "daily-fuse"
+timeout = "15m"
+
+[[case]]
+name = "webdev/change-visibility"
+tier = "daily-fuse"
+perf = true
+timeout = "10m"
+
+[[case]]
+name = "webdev/compare-errno-with-ext4"
+tier = "daily-fuse"
+overlay = "**/.errno-local/**"
+timeout = "15m"
+
+[[case]]
+name = "webdev/cross-client-read"
+tier = "daily-fuse"
+timeout = "15m"
+
+[[case]]
+name = "webdev/environment-recovery"
+tier = "daily-fuse"
+timeout = "15m"
+
+[[case]]
+name = "webdev/package-install"
+tier = "daily-fuse"
+timeout = "15m"
+
+[[case]]
+name = "webdev/project-import"
+tier = "daily-fuse"
+timeout = "15m"
+
+[[case]]
+name = "webdev/save-then-read"
+tier = "daily-fuse"
+timeout = "15m"
+
+[[case]]
+name = "webdev/export-snapshot"
+tier = "daily-fuse"
+timeout = "10m"
+
+[[case]]
+name = "webdev/version-switch"
+tier = "daily-fuse"
+timeout = "10m"
+
+# ---- Daily I/O & Metadata Benchmark Suite (`daily-bench`) ----
+[[case]]
+name = "community/fio-seq-write"
+tier = "daily-bench"
+perf = true
+timeout = "15m"
+
+[[case]]
+name = "community/fio-seq-read"
+tier = "daily-bench"
+perf = true
+timeout = "15m"
+
+[[case]]
+name = "community/fio-rand-write"
+tier = "daily-bench"
+perf = true
+timeout = "15m"
+
+[[case]]
+name = "community/fio-rand-read"
+tier = "daily-bench"
+perf = true
+timeout = "15m"
+
+[[case]]
+name = "community/fio-randrw"
+tier = "daily-bench"
+perf = true
+timeout = "15m"
+
+[[case]]
+name = "community/fio-randrw-read-heavy"
+tier = "daily-bench"
+perf = true
+timeout = "15m"
+
+[[case]]
+name = "community/fio-randrw-write-heavy"
+tier = "daily-bench"
+perf = true
+timeout = "15m"
+
+[[case]]
+name = "community/fio-read-cache"
+tier = "daily-bench"
+perf = true
+timeout = "15m"
+
+[[case]]
+name = "community/fio-smallfiles"
+tier = "daily-bench"
+perf = true
+timeout = "15m"
+
+[[case]]
+name = "community/smallfile"
+tier = "daily-bench"
+perf = true
+timeout = "15m"
+
+[[case]]
+name = "community/fsmark-s0"
+tier = "daily-bench"
+perf = true
+timeout = "15m"
+
+[[case]]
+name = "community/fsmark-s1"
+tier = "daily-bench"
+perf = true
+timeout = "15m"
+
+[[case]]
+name = "community/mdtest-files"
+tier = "daily-bench"
+perf = true
+timeout = "15m"
+
+[[case]]
+name = "community/mdtest-stat"
+tier = "daily-bench"
+perf = true
+timeout = "15m"
+
+[[case]]
+name = "community/mdtest-full"
+tier = "daily-bench"
+perf = true
+timeout = "20m"
+
+[[case]]
+name = "community/mdworkbench-mixed"
+tier = "daily-bench"
+perf = true
+timeout = "15m"
+
+[[case]]
+name = "community/mdworkbench-readonly"
+tier = "daily-bench"
+perf = true
+timeout = "15m"
+
+# ---- Daily / Staging `[prod-ext]` cases (skip cleanly when cloud credentials absent) ----
+[[case]]
+name = "drive9/fuse/git-workspace-checkpoint"
+tier = "daily-prod-ext"
+no_mount = true
+timeout = "60m"
+
+[[case]]
+name = "drive9/fuse/layer-fs"
+tier = "daily-prod-ext"
+no_mount = true
+timeout = "20m"
+
+[[case]]
+name = "drive9/api/tokens"
+tier = "daily-prod-ext"
+no_mount = true
+timeout = "10m"
+
+[[case]]
+name = "drive9/api/extract-config-image"
+tier = "daily-prod-ext"
+no_mount = true
+timeout = "15m"
+
+[[case]]
+name = "drive9/api/extract-config-video"
+tier = "daily-prod-ext"
+no_mount = true
+timeout = "20m"
+
+[[case]]
+name = "drive9/api/extract-config-embedding"
+tier = "daily-prod-ext"
+no_mount = true
+timeout = "15m"
+
+[[case]]
+name = "drive9/cli/native-provision"
+tier = "daily-prod-ext"
+no_mount = true
+timeout = "20m"
+
+[[case]]
+name = "drive9/cli/object-auth-sts"
+tier = "daily-prod-ext"
+no_mount = true
+timeout = "20m"
+
+[[case]]
+name = "drive9/cli/object-auth-s3"
+tier = "daily-prod-ext"
+no_mount = true
+timeout = "20m"
+
+[[case]]
+name = "drive9/cli/object-auth-cos"
+tier = "daily-prod-ext"
+no_mount = true
+timeout = "20m"
+
+[[case]]
+name = "drive9/cli/object-auth-tos"
+tier = "daily-prod-ext"
+no_mount = true
+timeout = "20m"
+
+# ---- Cross-SDK live integration suite ----
+[[case]]
+name = "drive9/api/sdk-integration"
+tier = "daily-sdk"
+no_mount = true
+timeout = "30m"
+
+# ---- 100k-file workspace (GA item: large-workspace scale) ----
+[[case]]
+name = "drive9/fuse/namespace-100k"
+tier = "daily-bench"
+perf = true
+serial = true
+# Bounds a standalone run only. Worst case with cleanup enabled: phase deadlines
+# (600+900+900+900+1200 = 4500s), a 2x(480+15)s drain, three ~210s remounts and a
+# ~190s initial mount add up to ~6310s; the default (no cleanup) is ~5110s. In
+# the scheduled job this value can never fire — the job's own 120-minute limit
+# comes first and runs 57 cases — so the phase deadlines are the effective bound
+# there. Deadlines come from a measured run under the engine on a local SSD (100k
+# files: create 5.4s, drain 200s, cold readdir 270s, cold stat 282s, cold find
+# 282s), so they bound a hang rather than assert performance; the first nightly
+# on a real runner is the measurement that tells whether the 3.2x margin holds.
+# Deleting the 100k tree through FUSE took >20 minutes, so the case deletes it
+# with one server-side recursive call (225s measured) and only where the tenant
+# outlives the case: NAMESPACE_CLEANUP defaults to the engine's EXISTING_TENANT,
+# on for --api-key runs and off for the in-process engine, which drops the tenant
+# and with it the tree.
+timeout = "120m"
