@@ -96,16 +96,15 @@ type WriteBackCache struct {
 	// whose records cannot be read.
 	lostUnknown       map[string]struct{}
 	lostDirUnreadable bool
-	// OnViewLost reports a pruned staged pair to the owner. It is an optional
-	// observer hook: the durable <hash>.lost marker owns failure persistence (a
-	// barrier reads it through ViewLoss), so the engine no longer records the
-	// loss here and a nil hook is fine. It is the ONLY recorder
-	// for pruned pairs: callers invoke it with c.mu released but the per-path
-	// lock still held, so the record exists before another same-path operation
-	// can observe the pruned pair as "nothing staged". It must stay
-	// non-blocking, and it is never invoked for a transient read error (the
-	// entry is kept, so a retry can still succeed). PendingChmod entries never
-	// reach it: their missing .dat is by design.
+	// OnViewLost is an optional observer of a pruned staged pair: the durable
+	// <hash>.lost marker owns failure persistence (a barrier reads it through
+	// ViewLoss), so the engine no longer records the loss here and a nil hook is
+	// fine. It is invoked with c.mu released but the per-path lock still held, so
+	// an observer sees the prune before another same-path operation can read the
+	// pair as "nothing staged". It must stay non-blocking, and it is never invoked
+	// for a transient read error (the entry is kept, so a retry can still
+	// succeed). PendingChmod entries never reach it: their missing .dat is by
+	// design.
 	OnViewLost func(remotePath string, err error)
 	syncMu     sync.Mutex
 	durableGen atomic.Uint64

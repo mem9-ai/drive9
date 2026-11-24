@@ -274,3 +274,63 @@ func TestSyncBarrierFailsAfterARestartLostThePair(t *testing.T) {
 		t.Fatalf("a fresh staging left the loss record: %v", err)
 	}
 }
+
+// TestCancelPrefixRemovesShadowsWhenTheMarkerCannotSync pins the subtree
+// fallback: when the cancel marker cannot be made durable (no journal, or a
+// closed one), the shadow removal itself must be the authority, so a queued
+// entry's staged image really goes instead of surviving as a replay source.
+func TestCancelPrefixRemovesShadowsWhenTheMarkerCannotSync(t *testing.T) {
+	for _, withJournal := range []bool{false, true} {
+		t.Run(map[bool]string{false: "no journal", true: "closed journal"}[withJournal], func(t *testing.T) {
+			shadow, err := staging.NewShadowStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { shadow.Close() })
+			pending, err := staging.NewPendingIndex(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var j *staging.Journal
+			if withJournal {
+				j, err = staging.NewJournal(filepath.Join(t.TempDir(), "marker.wal"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := j.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cq := NewCommitQueue(nil, shadow, pending, j, 1, 8)
+
+			const path = "/tree/a.bin"
+			if err := shadow.WriteFull(path, []byte("staged"), 3); err != nil {
+				t.Fatal(err)
+			}
+			gen, err := pending.Put(path, 6, staging.PendingNew)
+			if err != nil {
+				t.Fatal(err)
+			}
+			entry := &CommitEntry{
+				Path:            path,
+				Size:            6,
+				Kind:            staging.PendingNew,
+				ShadowGen:       shadow.ActiveGeneration(path),
+				PendingIndexGen: gen,
+			}
+			// Park the entry in the queue so the subtree cancel has something to
+			// fence (a worker is not running with a nil client).
+			cq.mu.Lock()
+			cq.queue = append(cq.queue, entry)
+			cq.mu.Unlock()
+
+			cq.CancelPrefix("/tree/")
+			if err := shadow.VerifyRemoved(path); err != nil {
+				t.Fatalf("shadow survived the subtree cancel: %v", err)
+			}
+			if _, ok := pending.GetMeta(path); ok {
+				t.Fatal("the cancelled entry's pending metadata survived")
+			}
+		})
+	}
+}

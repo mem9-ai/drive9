@@ -45,10 +45,13 @@ type PendingIndex struct {
 	journalSyncOnPut bool
 	shadows          *ShadowStore // wired once before staging/recovery
 	layerAbandoned   bool         // prevents late publications from reviving a rolled-back overlay
-	// closed fences every disk write. Teardown closes the index so a worker that
-	// is still finishing a commit cannot create .meta/.fence/.tmp files in a
-	// directory the caller is about to remove (t.TempDir cleanup, unmount).
-	closed bool
+	// writeMu is the leaf lock for every disk write this index performs, and the
+	// guard for closed. Teardown closes the index so a worker that is still
+	// finishing a commit cannot create .meta/.fence/.tmp files in a directory the
+	// caller is about to remove (t.TempDir cleanup, unmount); Close waits for the
+	// in-flight writers to leave before it returns.
+	writeMu sync.RWMutex
+	closed  bool
 }
 
 // pendingPathLock is a refcounted per-path mutex, mirroring WriteBackCache's
@@ -76,23 +79,29 @@ func NewPendingIndex(dir string) (*PendingIndex, error) {
 
 // Close stops the index from writing to disk. It is idempotent, and every
 // subsequent writer returns os.ErrClosed instead of creating files under the
-// index directory; readers keep working, so an in-flight recovery over the same
-// index still sees its state.
+// index directory; an in-flight write that already passed the fence is awaited,
+// so no file appears after Close returns. Readers keep working, so an in-flight
+// recovery over the same index still sees its state.
 func (idx *PendingIndex) Close() {
 	if idx == nil {
 		return
 	}
-	idx.mu.Lock()
+	idx.writeMu.Lock()
 	idx.closed = true
-	idx.mu.Unlock()
+	idx.writeMu.Unlock()
 }
 
-// closedLocked reports whether the index has been closed. The caller holds
-// idx.mu (read or write).
-func (idx *PendingIndex) closedLocked() bool { return idx.closed }
-
-// errClosed builds the error a writer returns after Close.
-func (idx *PendingIndex) errClosedLocked() error { return os.ErrClosed }
+// writeFile is the single choke point for the index's durable writes: it takes
+// the leaf write lock (so Close can drain it) and refuses after Close. Every
+// .meta/.fence writer must go through it.
+func (idx *PendingIndex) writeFile(path string, data []byte) error {
+	idx.writeMu.RLock()
+	defer idx.writeMu.RUnlock()
+	if idx.closed {
+		return os.ErrClosed
+	}
+	return atomicWrite(path, data)
+}
 
 // Dir reports the index's on-disk directory (recovery and tests rebuild a
 // fresh index over it).
@@ -412,7 +421,7 @@ func (idx *PendingIndex) RenamePending(oldPath, newPath string) bool {
 	// recovery always has a consistent view.
 	metaBytes, _ := json.Marshal(&newMeta)
 	newMetaPath := filepath.Join(idx.dir, HashPath(newPath)+".meta")
-	if err := atomicWrite(newMetaPath, metaBytes); err != nil {
+	if err := idx.writeFile(newMetaPath, metaBytes); err != nil {
 		return false
 	}
 
@@ -793,17 +802,11 @@ func (t *PendingConflictTransfer) release() {
 
 // writeMetaFile persists one pending entry's .meta under the index directory.
 func (idx *PendingIndex) writeMetaFile(meta *WriteBackMeta) error {
-	idx.mu.RLock()
-	closed := idx.closedLocked()
-	idx.mu.RUnlock()
-	if closed {
-		return os.ErrClosed
-	}
 	raw, err := json.Marshal(meta)
 	if err != nil {
 		return fmt.Errorf("marshal pending meta for %s: %w", meta.Path, err)
 	}
-	if err := atomicWrite(filepath.Join(idx.dir, HashPath(meta.Path)+".meta"), raw); err != nil {
+	if err := idx.writeFile(filepath.Join(idx.dir, HashPath(meta.Path)+".meta"), raw); err != nil {
 		return fmt.Errorf("persist pending meta for %s: %w", meta.Path, err)
 	}
 	return nil
@@ -836,7 +839,7 @@ func (idx *PendingIndex) PrepareRename(oldPath, newPath string) (*WriteBackMeta,
 	if err != nil {
 		return nil, fmt.Errorf("marshal prepared meta for %s: %w", newPath, err)
 	}
-	if err := atomicWrite(filepath.Join(idx.dir, HashPath(newPath)+".meta"), metaBytes); err != nil {
+	if err := idx.writeFile(filepath.Join(idx.dir, HashPath(newPath)+".meta"), metaBytes); err != nil {
 		return nil, fmt.Errorf("persist prepared meta for %s: %w", newPath, err)
 	}
 	return &newMeta, nil
@@ -983,7 +986,7 @@ func (idx *PendingIndex) UpdateMode(remotePath string, mode uint32) error {
 		}
 	} else {
 		metaPath := filepath.Join(idx.dir, HashPath(remotePath)+".meta")
-		if err := atomicWrite(metaPath, metaBytes); err != nil {
+		if err := idx.writeFile(metaPath, metaBytes); err != nil {
 			return fmt.Errorf("pending index update mode: %w", err)
 		}
 	}
@@ -1034,7 +1037,7 @@ func (idx *PendingIndex) MarkLayerCommittedIfGeneration(remotePath string, gener
 		}
 	} else {
 		metaPath := filepath.Join(idx.dir, HashPath(remotePath)+".meta")
-		if err := atomicWrite(metaPath, metaBytes); err != nil {
+		if err := idx.writeFile(metaPath, metaBytes); err != nil {
 			return fmt.Errorf("pending index mark layer committed: %w", err)
 		}
 	}
@@ -1068,7 +1071,7 @@ func (idx *PendingIndex) MarkConflict(remotePath string) error {
 		return fmt.Errorf("pending index marshal conflict: %w", err)
 	}
 	metaPath := filepath.Join(idx.dir, HashPath(remotePath)+".meta")
-	if err := atomicWrite(metaPath, metaBytes); err != nil {
+	if err := idx.writeFile(metaPath, metaBytes); err != nil {
 		return fmt.Errorf("pending index write conflict: %w", err)
 	}
 
@@ -1153,7 +1156,7 @@ func (idx *PendingIndex) MarkConflictIfGeneration(remotePath string, expectedGen
 		return false, fmt.Errorf("pending index marshal conflict: %w", err)
 	}
 	metaPath := filepath.Join(idx.dir, HashPath(remotePath)+".meta")
-	if err := atomicWrite(metaPath, metaBytes); err != nil {
+	if err := idx.writeFile(metaPath, metaBytes); err != nil {
 		return false, fmt.Errorf("pending index write conflict: %w", err)
 	}
 
@@ -1184,10 +1187,6 @@ func (idx *PendingIndex) MarkCommittedIfGeneration(remotePath string, expectedGe
 	defer idx.releasePathLock(remotePath, pl)
 
 	idx.mu.Lock()
-	if idx.closedLocked() {
-		idx.mu.Unlock()
-		return false, idx.errClosedLocked()
-	}
 	idx.ensureCommittedFencesLoadedLocked()
 	meta, ok := idx.items[remotePath]
 	if !ok || meta.Generation != expectedGen {
@@ -1205,7 +1204,7 @@ func (idx *PendingIndex) MarkCommittedIfGeneration(remotePath string, expectedGe
 	if err != nil {
 		return false, fmt.Errorf("pending index marshal committed fence: %w", err)
 	}
-	if err := atomicWrite(idx.fenceFile(remotePath), raw); err != nil {
+	if err := idx.writeFile(idx.fenceFile(remotePath), raw); err != nil {
 		return false, fmt.Errorf("pending index write committed fence: %w", err)
 	}
 
@@ -1368,14 +1367,8 @@ func (idx *PendingIndex) publishMeta(meta *WriteBackMeta, onlyIfAbsent bool) (ui
 			}
 		}
 	} else {
-		idx.mu.RLock()
-		closed := idx.closedLocked()
-		idx.mu.RUnlock()
-		if closed {
-			return 0, os.ErrClosed
-		}
 		metaPath := filepath.Join(idx.dir, HashPath(remotePath)+".meta")
-		if err := atomicWrite(metaPath, metaBytes); err != nil {
+		if err := idx.writeFile(metaPath, metaBytes); err != nil {
 			return 0, fmt.Errorf("pending index put meta: %w", err)
 		}
 	}

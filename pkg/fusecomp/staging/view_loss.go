@@ -234,7 +234,9 @@ func (c *WriteBackCache) clearViewLossLocked(remotePath string, gen uint64) {
 	}
 	if !diskOK {
 		c.mu.Lock()
-		if liveGen, liveOK := c.lostGens[remotePath]; !liveOK || liveGen <= gen {
+		liveGen, liveOK := c.lostGens[remotePath]
+		_, liveUnkOK := c.lostUnknown[lostHash(remotePath)]
+		if (!liveOK || liveGen <= gen) && (!liveUnkOK || gen == ^uint64(0)) {
 			c.forgetViewLossLocked(remotePath)
 		}
 		c.mu.Unlock()
@@ -257,7 +259,8 @@ func (c *WriteBackCache) clearViewLossLocked(remotePath string, gen uint64) {
 	// lock, so a newer record may have been installed while the marker was being
 	// unlinked. Forgetting it here would silence its deferred .lost write.
 	liveGen, liveOK := c.lostGens[remotePath]
-	if !liveOK || liveGen <= gen {
+	_, liveUnkOK := c.lostUnknown[lostHash(remotePath)]
+	if (!liveOK || liveGen <= gen) && (!liveUnkOK || gen == ^uint64(0)) {
 		c.forgetViewLossLocked(remotePath)
 	}
 	c.mu.Unlock()
