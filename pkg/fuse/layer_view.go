@@ -275,58 +275,45 @@ func (b *layerMountBinding) startRenewLoop(initialCallStart time.Time, initialTT
 
 func (b *layerMountBinding) runRenewLoop(ctx context.Context, deadline time.Time, timing layerLeaseTiming) {
 	defer close(b.renewDone)
+	next := timing.renewInterval
 	for {
-		remaining := time.Until(deadline)
-		if remaining <= timing.selfFenceMargin {
-			b.triggerSelfFence("mount_lease_ttl_ms entered 10s pre-expiry safety margin")
+		fenceAt := deadline.Add(-timing.selfFenceMargin)
+		if !sleepContext(ctx, min(next, time.Until(fenceAt))) {
 			return
 		}
-		wait := timing.renewInterval
-		if untilMargin := remaining - timing.selfFenceMargin; untilMargin < wait {
-			wait = untilMargin
-		}
-		if !sleepContext(ctx, wait) {
-			return
-		}
-		if time.Until(deadline) <= timing.selfFenceMargin {
-			b.triggerSelfFence("mount_lease_ttl_ms entered 10s pre-expiry safety margin")
-			return
-		}
-
 		callStart := time.Now()
-		callCtx, callCancel := context.WithTimeout(ctx, timing.callTimeout)
+		if !callStart.Before(fenceAt) {
+			b.triggerSelfFence("mount lease entered its pre-expiry safety margin")
+			return
+		}
+		timeout := min(timing.callTimeout, fenceAt.Sub(callStart))
+		callCtx, callCancel := context.WithDeadline(ctx, callStart.Add(timeout))
 		resp, err := b.BaseClient.RenewLayerMount(callCtx, b.LayerID, client.LayerMountRenewRequest{
 			MountID: b.MountID,
 			Fence:   b.Fence,
 		})
 		callCancel()
+		if ctx.Err() != nil {
+			return
+		}
+		if !time.Now().Before(fenceAt) {
+			b.triggerSelfFence("mount lease entered its pre-expiry safety margin during renewal")
+			return
+		}
 		if err == nil {
 			ttl := defaultLayerLeaseFallbackTTL
 			if resp != nil && resp.MountLeaseTTLMS > 0 {
 				ttl = time.Duration(resp.MountLeaseTTLMS) * time.Millisecond
 			}
 			deadline = callStart.Add(ttl)
+			next = timing.renewInterval
 			continue
-		}
-		if ctx.Err() != nil {
-			return
 		}
 		if isTerminalLayerRenewError(err) {
 			b.triggerSelfFence(fmt.Sprintf("renew-mount rejected: %v", err))
 			return
 		}
-		remaining = time.Until(deadline)
-		if remaining <= timing.selfFenceMargin {
-			b.triggerSelfFence(fmt.Sprintf("renew-mount failed before safety margin: %v", err))
-			return
-		}
-		retryWait := timing.retryInterval
-		if untilMargin := remaining - timing.selfFenceMargin; untilMargin < retryWait {
-			retryWait = untilMargin
-		}
-		if !sleepContext(ctx, retryWait) {
-			return
-		}
+		next = timing.retryInterval
 	}
 }
 

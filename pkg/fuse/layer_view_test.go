@@ -245,3 +245,67 @@ func TestResolveLayerMountViewRejectsActiveOddFenceAndInvalidPostExpireFence(t *
 		t.Fatalf("bind-mount should not be called when post-expire fence is odd, got %d calls", bindCalls.Load())
 	}
 }
+
+func TestLayerRenewRetriesBeforeSafetyMargin(t *testing.T) {
+	const layerID = "layer_01j8z6kh2m9q7w3r5t6y8v0p1b"
+	retried := make(chan struct{})
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if calls.Load() == 2 {
+			close(retried)
+		}
+		_ = json.NewEncoder(w).Encode(client.LayerMountLease{LayerID: layerID, Fence: 1, MountLeaseTTLMS: 1000})
+	}))
+	defer server.Close()
+	b := &layerMountBinding{LayerID: layerID, Fence: 1, MountID: "test-mount", BaseClient: client.New(server.URL, "")}
+	b.startRenewLoop(time.Now(), 1000, layerLeaseTiming{
+		renewInterval: 500 * time.Millisecond, retryInterval: 10 * time.Millisecond,
+		selfFenceMargin: 200 * time.Millisecond, callTimeout: 100 * time.Millisecond,
+	})
+	defer b.StopRenew()
+	select {
+	case <-retried:
+	case <-b.renewDone:
+		t.Fatal("mount self-fenced after a single temporary error without retrying")
+	case <-time.After(3 * time.Second):
+		t.Fatal("renewal did not retry")
+	}
+}
+
+func TestLayerStalledRenewStopsAtSafetyMargin(t *testing.T) {
+	const layerID = "layer_01j8z6kh2m9q7w3r5t6y8v0p1b"
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer server.Close()
+	defer close(release)
+	b := &layerMountBinding{LayerID: layerID, Fence: 1, MountID: "test-mount", BaseClient: client.New(server.URL, "")}
+	b.startRenewLoop(time.Now(), 500, layerLeaseTiming{
+		renewInterval: 50 * time.Millisecond, retryInterval: 10 * time.Millisecond,
+		selfFenceMargin: 200 * time.Millisecond, callTimeout: 5 * time.Second,
+	})
+	defer b.StopRenew()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("renewal did not start")
+	}
+	select {
+	case <-b.renewDone:
+		if !errors.Is(b.checkWriteAllowed(), ErrLayerLeaseSelfFenced) {
+			t.Fatal("old lease still permits writes after the safety margin")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a stalled renewal delayed self-fencing beyond lease expiration")
+	}
+}
