@@ -120,7 +120,7 @@ func (h *gitHandle) Read(ctx context.Context, off int64, dest []byte) (int, erro
 	if h.buf == nil && h.treeSHA != "" {
 		if _, hit := h.w.lookup(h.rel); !hit {
 			data, err := h.g.materializeTreeEntry(ctx, h.w, h.rel, h.treeSHA)
-			if err != nil && ctx.Err() == nil {
+			if err != nil && !gitReadInterrupted(err) {
 				// The blob's local .git may simply not be here yet: the
 				// discovery-time restore ran before the CLI uploaded its
 				// checkpoint. Pull the state once, then retry.
@@ -226,11 +226,11 @@ func (h *gitHandle) releaseBuffer() {
 	writebuffer.Discard(&h.buf)
 }
 
-// Truncate applies a local truncation; the image lands at the boundary.
-func (h *gitHandle) Truncate(size int64) error {
+// truncate applies a local truncation; the image lands at the boundary.
+func (h *gitHandle) truncate(ctx context.Context, size int64) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if err := h.ensureBufferLocked(context.Background()); err != nil {
+	if err := h.ensureBufferLocked(ctx); err != nil {
 		return err
 	}
 	if err := h.buf.Truncate(size); err != nil {
@@ -378,7 +378,7 @@ func (h *gitHandle) ensureBufferLocked(ctx context.Context) (err error) {
 	}
 	if n, ok := h.w.treeLookup(h.rel); ok && n.Kind == "file" && n.ObjectSHA != "" {
 		data, err := h.g.materializeTreeEntry(ctx, h.w, h.rel, n.ObjectSHA)
-		if err != nil {
+		if err != nil && !gitReadInterrupted(err) {
 			if rerr := h.g.ensureWorkspaceState(ctx, h.w); rerr == nil {
 				data, err = h.g.materializeTreeEntry(ctx, h.w, h.rel, n.ObjectSHA)
 			}
@@ -389,6 +389,9 @@ func (h *gitHandle) ensureBufferLocked(ctx context.Context) (err error) {
 			}
 			buf.ClearDirty()
 			return nil
+		}
+		if gitReadInterrupted(err) {
+			return err
 		}
 		// Fall through to the remote base: the blob may be materializable
 		// there even though the local git dir cannot serve it.

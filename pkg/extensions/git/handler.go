@@ -4,6 +4,7 @@ package git
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -13,6 +14,12 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
 )
+
+// An unavailable clean object may fall back to the base filesystem. Once
+// this read is cancelled, no other provider should start work on its behalf.
+func gitReadInterrupted(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errGitRuntimeStopped)
+}
 
 func kindOf(e overlayEntry) fs.Kind {
 	switch e.Kind {
@@ -45,6 +52,9 @@ func (g *Git) emit(path string) {
 
 func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
 	g.ensure(ctx)
+	if err := ctx.Err(); err != nil {
+		return fs.Result{}, err
+	}
 	w, rel, ok := g.workspaceFor(op.Path)
 	if !ok {
 		// A workspace registered after this mount started (git clone
@@ -79,6 +89,9 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 	case fs.OpLookup, fs.OpGetAttr:
 		if (rel == ".git" || strings.HasPrefix(rel, ".git/")) && g.localRoot != "" && !w.isRestoreLatched() {
 			_ = g.ensureWorkspaceState(ctx, w)
+			if err := ctx.Err(); err != nil {
+				return fs.Result{}, err
+			}
 		}
 		e, hit := w.lookup(rel)
 		if !hit {
@@ -137,6 +150,8 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 		} else if n, tok := w.treeLookup(rel); tok && n.Kind == "symlink" {
 			if data, err := g.materializeTreeEntry(ctx, w, rel, n.ObjectSHA); err == nil {
 				return fs.Result{Data: data}, nil
+			} else if gitReadInterrupted(err) {
+				return fs.Result{}, err
 			}
 		}
 		return next(ctx, op)
@@ -190,6 +205,8 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 					data = data[off:end]
 				}
 				return fs.Result{Data: data}, nil
+			} else if gitReadInterrupted(err) {
+				return fs.Result{}, err
 			}
 		}
 		return next(ctx, op)
@@ -379,7 +396,7 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 				h.SetMode(op.Mode)
 			}
 			if op.Size >= 0 {
-				if err := h.Truncate(op.Size); err != nil {
+				if err := h.truncate(ctx, op.Size); err != nil {
 					return fs.Result{}, err
 				}
 			}
@@ -407,6 +424,8 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 						if err := g.putOverlay(ctx, w, rel, e); err != nil {
 							return fs.Result{}, err
 						}
+					} else if gitReadInterrupted(merr) {
+						return fs.Result{}, merr
 					}
 				}
 			}
@@ -541,6 +560,8 @@ func (g *Git) renameOverlay(ctx context.Context, oldPath, newPath string) error 
 				return err
 			}
 			return g.putOverlay(ctx, wOld, relOld, overlayEntry{Op: "whiteout", Kind: "file"})
+		} else if gitReadInterrupted(merr) {
+			return merr
 		}
 	}
 	// base content moves through one fetch + upsert
@@ -569,6 +590,9 @@ func (g *Git) renameOverlay(ctx context.Context, oldPath, newPath string) error 
 func (g *Git) listMerged(ctx context.Context, w *workspace, dir string, next fs.Next) (fs.Result, error) {
 	if dir == w.rootPath() && g.localRoot != "" && !w.isRestoreLatched() {
 		_ = g.ensureWorkspaceState(ctx, w)
+		if err := ctx.Err(); err != nil {
+			return fs.Result{}, err
+		}
 	}
 	res, err := next(ctx, &fs.Op{Kind: fs.OpList, Path: dir})
 	if err != nil && !fs.IsNotFound(err) {

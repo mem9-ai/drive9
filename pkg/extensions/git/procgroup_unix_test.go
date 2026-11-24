@@ -226,42 +226,91 @@ done
 	}
 }
 
-func TestCanceledGetAttrDoesNotCacheZeroSize(t *testing.T) {
-	dir := t.TempDir()
-	ready := filepath.Join(dir, "ready")
-	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
-	t.Setenv("READER_READY", ready)
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "git"), []byte(`#!/bin/sh
+func TestCanceledFilesystemGitReads(t *testing.T) {
+	for _, op := range []string{"getattr", "read", "readlink", "setattr", "rename", "handle-write", "handle-truncate"} {
+		t.Run(op, func(t *testing.T) {
+			dir := t.TempDir()
+			ready := filepath.Join(dir, "ready")
+			t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+			t.Setenv("READER_READY", ready)
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "git"), []byte(`#!/bin/sh
 while read -r oid; do
   if mkdir "$READER_READY" 2>/dev/null; then exec sleep 60; fi
   printf '%s blob 4\n' "$oid"
+  [ "$4" != --batch ] || printf 'blob\n'
 done
 `), 0o755))
-	w := &workspace{root: "/repo", id: dir, tree: map[string]client.GitTreeNode{"f": {Kind: "file", ObjectSHA: strings.Repeat("a", 40), SizeBytes: -1}}}
-	g := &Git{localRoot: dir, loaded: true, workspaces: []*workspace{w}}
-	t.Cleanup(func() { _ = g.Stop(context.Background()) })
-	require.NoError(t, os.MkdirAll(g.gitDirFor(w.root), 0o755))
-	attr := func(ctx context.Context) (fs.Result, error) {
-		return g.Do(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: "/repo/f"}, func(context.Context, *fs.Op) (fs.Result, error) {
-			return fs.Result{}, errors.New("unexpected fallback")
+			kind := "file"
+			if op == "readlink" {
+				kind = "symlink"
+			}
+			w := &workspace{root: "/repo", id: dir, tree: map[string]client.GitTreeNode{"f": {Kind: kind, ObjectSHA: strings.Repeat("a", 40), SizeBytes: -1}}}
+			g := &Git{localRoot: dir, loaded: true, workspaces: []*workspace{w}}
+			t.Cleanup(func() { _ = g.Stop(context.Background()) })
+			require.NoError(t, os.MkdirAll(g.gitDirFor(w.root), 0o755))
+			pathFS := fs.HandlerFilesystem(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+				return g.Do(ctx, op, func(context.Context, *fs.Op) (fs.Result, error) {
+					return fs.Result{}, errors.New("unexpected fallback")
+				})
+			})
+			query := func(ctx context.Context) error {
+				switch op {
+				case "setattr":
+					mode := uint32(0o644)
+					return pathFS.SetAttr(ctx, "/repo/f", fs.AttrPatch{Mode: &mode})
+				case "rename":
+					return pathFS.Rename(ctx, "/repo/f", "/repo/dst", fs.RenameOptions{})
+				case "handle-write", "handle-truncate":
+					h := &gitHandle{g: g, w: w, path: "/repo/f", rel: "f"}
+					defer h.releaseBuffer()
+					if op == "handle-truncate" {
+						_, err := g.Do(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: h.path, Handle: h, Size: 2}, nil)
+						return err
+					}
+					return h.Write(ctx, 1, []byte("x"))
+				case "read":
+					data, err := pathFS.Read(ctx, "/repo/f", 0, 4)
+					if err == nil && string(data) != "blob" {
+						return errors.New("incorrect file contents")
+					}
+					return err
+				case "readlink":
+					target, err := pathFS.Readlink(ctx, "/repo/f")
+					if err == nil && target != "blob" {
+						return errors.New("incorrect symlink target")
+					}
+					return err
+				default:
+					attr, err := pathFS.GetAttr(ctx, "/repo/f")
+					if err == nil && attr.Size != 4 {
+						return errors.New("incorrect size")
+					}
+					return err
+				}
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- query(ctx) }()
+			require.Eventually(t, func() bool { _, err := os.Stat(ready); return err == nil }, 3*time.Second, time.Millisecond*5)
+			cancel()
+			select {
+			case err := <-done:
+				require.ErrorIs(t, err, context.Canceled)
+			case <-time.After(time.Second):
+				t.Fatal("cancelled operation remained blocked")
+			}
+			node, ok := w.treeLookup("f")
+			require.True(t, ok)
+			require.EqualValues(t, -1, node.SizeBytes)
+			require.Empty(t, w.overlay)
+			if op == "getattr" || op == "readlink" {
+				require.NoError(t, query(t.Context()))
+			} else {
+				data, err := pathFS.Read(t.Context(), "/repo/f", 0, 4)
+				require.NoError(t, err)
+				require.Equal(t, "blob", string(data))
+			}
 		})
 	}
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { _, err := attr(ctx); done <- err }()
-	require.Eventually(t, func() bool { _, err := os.Stat(ready); return err == nil }, 3*time.Second, time.Millisecond*5)
-	cancel()
-	select {
-	case err := <-done:
-		require.ErrorIs(t, err, context.Canceled)
-	case <-time.After(time.Second):
-		t.Fatal("cancelled getattr remained blocked")
-	}
-	node, ok := w.treeLookup("f")
-	require.True(t, ok)
-	require.EqualValues(t, -1, node.SizeBytes)
-	next, err := attr(t.Context())
-	require.NoError(t, err)
-	require.EqualValues(t, 4, next.Attr.Size)
 }
