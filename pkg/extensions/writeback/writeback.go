@@ -5538,17 +5538,11 @@ func (w *Writeback) untrack(h *bufferingHandle) {
 	w.retireLocked(h)
 }
 
-// retireDirty clears the handle's dirty state only when the write
+// retireDirtyLocked clears the handle's dirty state only when the write
 // generation still matches the image the completion carried: a mutation
 // acknowledged after that snapshot keeps its own dirty flag for the next
 // durability barrier (Drain flushes without the per-FH write lock).
-func (h *bufferingHandle) retireDirty(stagedGen uint64) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.retireDirtyLocked(stagedGen)
-}
-
-// retireDirtyLocked is retireDirty with h.mu already held.
+// h.mu must be held.
 func (h *bufferingHandle) retireDirtyLocked(stagedGen uint64) {
 	if h.wgen == stagedGen {
 		h.dirty = false
