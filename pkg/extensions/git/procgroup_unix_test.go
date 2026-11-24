@@ -15,6 +15,9 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/fs"
 )
 
 func waitForPIDGone(t *testing.T, pid int, timeout time.Duration) {
@@ -97,9 +100,9 @@ func TestStopInterruptsBlockedCatFileAndClosesAdmission(t *testing.T) {
 				defer close(done)
 				oid := strings.Repeat("1", 40)
 				if mode == "size" {
-					b.sizeBlob(oid)
+					_, _, _ = b.query(context.Background(), oid, false)
 				} else {
-					_, _, _ = b.readBlob(oid)
+					_, _, _ = b.query(context.Background(), oid, true)
 				}
 			}()
 			require.Eventually(t, func() bool { data, _ := os.ReadFile(pidFile); return len(data) > 1 }, 3*time.Second, time.Millisecond*10)
@@ -137,17 +140,128 @@ func TestBatchReaderRejectsInvalidAndNonBlobObjects(t *testing.T) {
 	t.Cleanup(func() { _ = g.Stop(context.Background()) })
 	b := g.batchReaderFor(filepath.Join(dir, ".git"))
 	for _, invalid := range []string{"", blob + "\n" + blob, tree} {
-		_, found, err := b.readBlob(invalid)
+		_, size, err := b.query(t.Context(), invalid, true)
 		require.Error(t, err)
-		require.False(t, found)
-		_, ok := b.sizeBlob(invalid)
-		require.False(t, ok)
-		data, found, err := b.readBlob(blob)
+		require.Negative(t, size)
+		_, _, err = b.query(t.Context(), invalid, false)
+		require.Error(t, err)
+		data, size, err := b.query(t.Context(), blob, true)
 		require.NoError(t, err)
-		require.True(t, found)
+		require.EqualValues(t, 4, size)
 		require.Equal(t, "blob", string(data))
-		size, ok := b.sizeBlob(blob)
-		require.True(t, ok)
+		_, size, err = b.query(t.Context(), blob, false)
+		require.NoError(t, err)
 		require.EqualValues(t, 4, size)
 	}
+}
+
+// Exercise the real handle read path. The first process accepts a query and
+// stalls. Each caller can cancel independently, and the surviving caller
+// reads the requested object without Stop or a new mount.
+func TestGitReadCancellationIsolatedAcrossConcurrentCallers(t *testing.T) {
+	for _, cancelFirst := range []bool{true, false} {
+		t.Run(strconv.FormatBool(cancelFirst), func(t *testing.T) {
+			dir := t.TempDir()
+			ready := filepath.Join(dir, "ready")
+			release := filepath.Join(dir, "release")
+			t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+			t.Setenv("READER_READY", ready)
+			t.Setenv("READER_RELEASE", release)
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "git"), []byte(`#!/bin/sh
+while read -r oid; do
+  if mkdir "$READER_READY" 2>/dev/null; then
+    while [ ! -f "$READER_RELEASE" ]; do sleep 0.05; done
+  fi
+  printf '%s blob 4\nblob\n' "$oid"
+done
+`), 0o755))
+			g := &Git{localRoot: dir}
+			t.Cleanup(func() { _ = g.Stop(context.Background()) })
+			w := &workspace{root: "/repo", id: dir}
+			require.NoError(t, os.MkdirAll(g.gitDirFor(w.root), 0o755))
+			sha := strings.Repeat("a", 40)
+			read := func(ctx context.Context) <-chan error {
+				ch := make(chan error, 1)
+				go func() {
+					h := &gitHandle{g: g, w: w, rel: "f", treeSHA: sha}
+					buf := make([]byte, 4)
+					n, err := h.Read(ctx, 0, buf)
+					if err == nil && (n != 4 || string(buf) != "blob") {
+						err = errors.New("incorrect blob")
+					}
+					ch <- err
+				}()
+				return ch
+			}
+			first, stopFirst := context.WithCancel(t.Context())
+			defer stopFirst()
+			second, stopSecond := context.WithCancel(t.Context())
+			defer stopSecond()
+			left := read(first)
+			require.Eventually(t, func() bool { _, err := os.Stat(ready); return err == nil }, 3*time.Second, 5*time.Millisecond)
+			right := read(second)
+			victim, survivor := right, left
+			if cancelFirst {
+				victim, survivor = left, right
+				stopFirst()
+			} else {
+				stopSecond()
+			}
+			select {
+			case err := <-victim:
+				require.ErrorIs(t, err, context.Canceled)
+			case <-time.After(time.Second):
+				t.Fatal("cancelled read remained blocked")
+			}
+			if !cancelFirst {
+				require.NoError(t, os.WriteFile(release, nil, 0o644))
+			}
+			select {
+			case err := <-survivor:
+				require.NoError(t, err)
+			case <-time.After(2 * time.Second):
+				t.Fatal("live reader failed to finish")
+			}
+		})
+	}
+}
+
+func TestCanceledGetAttrDoesNotCacheZeroSize(t *testing.T) {
+	dir := t.TempDir()
+	ready := filepath.Join(dir, "ready")
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	t.Setenv("READER_READY", ready)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "git"), []byte(`#!/bin/sh
+while read -r oid; do
+  if mkdir "$READER_READY" 2>/dev/null; then exec sleep 60; fi
+  printf '%s blob 4\n' "$oid"
+done
+`), 0o755))
+	w := &workspace{root: "/repo", id: dir, tree: map[string]client.GitTreeNode{"f": {Kind: "file", ObjectSHA: strings.Repeat("a", 40), SizeBytes: -1}}}
+	g := &Git{localRoot: dir, loaded: true, workspaces: []*workspace{w}}
+	t.Cleanup(func() { _ = g.Stop(context.Background()) })
+	require.NoError(t, os.MkdirAll(g.gitDirFor(w.root), 0o755))
+	attr := func(ctx context.Context) (fs.Result, error) {
+		return g.Do(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: "/repo/f"}, func(context.Context, *fs.Op) (fs.Result, error) {
+			return fs.Result{}, errors.New("unexpected fallback")
+		})
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := attr(ctx); done <- err }()
+	require.Eventually(t, func() bool { _, err := os.Stat(ready); return err == nil }, 3*time.Second, time.Millisecond*5)
+	cancel()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("cancelled getattr remained blocked")
+	}
+	node, ok := w.treeLookup("f")
+	require.True(t, ok)
+	require.EqualValues(t, -1, node.SizeBytes)
+	next, err := attr(t.Context())
+	require.NoError(t, err)
+	require.EqualValues(t, 4, next.Attr.Size)
 }

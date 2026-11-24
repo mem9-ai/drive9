@@ -419,6 +419,7 @@ type Git struct {
 	// mount start while foreground lookups still bypass the queue.
 	bgRestoreSem chan struct{}
 
+	blobReads    singleFlight
 	batchMu      sync.Mutex
 	batchReaders map[string]*catFileBatch
 }

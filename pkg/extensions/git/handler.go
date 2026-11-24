@@ -92,8 +92,14 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 					// single failed exec flap the served size and pin git
 					// status entries as modified.
 					if n.SizeBytes < 0 && (n.Kind == "file" || n.Kind == "symlink") && n.ObjectSHA != "" {
-						attr.Size = g.resolveTreeNodeSize(ctx, w, rel, n.ObjectSHA)
-						w.noteTreeSize(rel, attr.Size)
+						size := g.resolveTreeNodeSize(ctx, w, rel, n.ObjectSHA)
+						if err := ctx.Err(); err != nil {
+							return fs.Result{}, err
+						}
+						if size >= 0 {
+							attr.Size = size
+							w.noteTreeSize(rel, size)
+						}
 					}
 					return fs.Result{Attr: &attr}, nil
 				}
@@ -235,8 +241,11 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 					h.dirty = true
 					h.mu.Unlock()
 				}
+				attr := h.attr(ctx)
+				if err := ctx.Err(); err != nil {
+					return fs.Result{}, err
+				}
 				g.trackWorkspace(op.Path, h)
-				attr := h.Attr()
 				return fs.Result{Handle: h, Attr: &attr}, nil
 			}
 		}
@@ -265,8 +274,11 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 				if h.mode == 0 {
 					h.mode = 0o644
 				}
+				attr := h.attr(ctx)
+				if err := ctx.Err(); err != nil {
+					return fs.Result{}, err
+				}
 				g.trackWorkspace(op.Path, h)
-				attr := h.Attr()
 				return fs.Result{Handle: h, Attr: &attr}, nil
 			}
 			return next(ctx, op)
@@ -371,7 +383,10 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 					return fs.Result{}, err
 				}
 			}
-			attr := h.Attr()
+			attr := h.attr(ctx)
+			if err := ctx.Err(); err != nil {
+				return fs.Result{}, err
+			}
 			return fs.Result{Attr: &attr}, nil
 		}
 		handled := false
@@ -645,6 +660,9 @@ func (g *Git) listMerged(ctx context.Context, w *workspace, dir string, next fs.
 	w.mu.RUnlock()
 	for _, u := range pending {
 		size := g.resolveTreeNodeSize(ctx, w, u.rel, u.sha)
+		if err := ctx.Err(); err != nil {
+			return fs.Result{}, err
+		}
 		w.noteTreeSize(u.rel, size)
 		if e, ok := out[u.name]; ok && size > 0 {
 			e.Attr.Size = size

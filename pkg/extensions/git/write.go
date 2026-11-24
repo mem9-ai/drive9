@@ -86,7 +86,9 @@ func (g *Git) claimWorkspaceOpen(w *workspace, path, rel string, flags uint32, m
 	return h, nil
 }
 
-func (h *gitHandle) Attr() fs.Attr {
+func (h *gitHandle) Attr() fs.Attr { return h.attr(context.Background()) }
+
+func (h *gitHandle) attr(ctx context.Context) fs.Attr {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	size := int64(0)
@@ -104,12 +106,12 @@ func (h *gitHandle) Attr() fs.Attr {
 		if n, tok := h.w.treeLookup(h.rel); tok {
 			size = n.SizeBytes
 			if size < 0 {
-				size = h.g.resolveTreeNodeSize(context.Background(), h.w, h.rel, h.treeSHA)
+				size = h.g.resolveTreeNodeSize(ctx, h.w, h.rel, h.treeSHA)
 				h.w.noteTreeSize(h.rel, size)
 			}
 		}
 	}
-	return fs.Attr{Kind: fs.KindFile, Mode: h.mode, Size: size, Mtime: mtime}
+	return fs.Attr{Kind: fs.KindFile, Mode: h.mode, Size: max(0, size), Mtime: mtime}
 }
 
 func (h *gitHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
@@ -118,7 +120,7 @@ func (h *gitHandle) Read(ctx context.Context, off int64, dest []byte) (int, erro
 	if h.buf == nil && h.treeSHA != "" {
 		if _, hit := h.w.lookup(h.rel); !hit {
 			data, err := h.g.materializeTreeEntry(ctx, h.w, h.rel, h.treeSHA)
-			if err != nil {
+			if err != nil && ctx.Err() == nil {
 				// The blob's local .git may simply not be here yet: the
 				// discovery-time restore ran before the CLI uploaded its
 				// checkpoint. Pull the state once, then retry.
