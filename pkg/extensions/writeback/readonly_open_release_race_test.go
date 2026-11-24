@@ -63,18 +63,16 @@ func TestReadOnlyOpenFlushRacingCreateReleaseDoesNotStrandWriteCache(t *testing.
 				select {
 				case <-allowPut:
 				case <-testDone:
-					http.Error(w, "test abort", http.StatusServiceUnavailable)
-					return
 				}
 			}
 			backend.ServeHTTP(w, r)
 		}))
 		t.Cleanup(srv.Close)
-		t.Cleanup(func() { close(testDone) })
+		defer close(testDone)
 
 		st, err := staging.NewStagingWithQuota(t.TempDir(), -1, 0)
 		require.NoError(t, err)
-		defer st.Close()
+		t.Cleanup(st.Close)
 
 		wbcache, err := staging.NewWriteBackCache(t.TempDir())
 		require.NoError(t, err)
@@ -193,7 +191,7 @@ func TestReadOnlyOpenFlushRacingCreateReleaseDoesNotStrandWriteCache(t *testing.
 					select {
 					case <-allowHead:
 					case <-testDone:
-						http.Error(w, "test abort", http.StatusServiceUnavailable)
+						http.NotFound(w, r)
 						return
 					}
 					if tc.headSeesPrePutAbsent {
@@ -206,18 +204,16 @@ func TestReadOnlyOpenFlushRacingCreateReleaseDoesNotStrandWriteCache(t *testing.
 					select {
 					case <-allowPut:
 					case <-testDone:
-						http.Error(w, "test abort", http.StatusServiceUnavailable)
-						return
 					}
 				}
 				backend.ServeHTTP(w, r)
 			}))
 			t.Cleanup(srv.Close)
-			t.Cleanup(func() { close(testDone) })
+			defer close(testDone)
 
 			st, err := staging.NewStagingWithQuota(t.TempDir(), -1, 0)
 			require.NoError(t, err)
-			defer st.Close()
+			t.Cleanup(st.Close)
 
 			wbcache, err := staging.NewWriteBackCache(t.TempDir())
 			require.NoError(t, err)
