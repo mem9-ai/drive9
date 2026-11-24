@@ -1,6 +1,8 @@
+import routes from "../../../pkg/viewprotocol/testdata/client_routes.json";
 import { describe, expect, it } from "vitest";
 import {
   InvalidLayerViewRequestError,
+  UnsupportedInLayerViewError,
   fetchViewObjectRedirect,
   rewriteRequestForView,
   setClientViewBinding,
@@ -65,6 +67,32 @@ describe("Layer view WriteGuard and redirect validation parity", () => {
       await expect(fetchViewObjectRedirect(fakeClient, sourceUrl, target)).rejects.toThrow(
         InvalidLayerViewRequestError
       );
+    }
+  });
+});
+
+describe("Go and JavaScript Layer route contract", () => {
+  const origin = "https://api.drive9.example/deploy";
+  const layerId = "layer_01j8z4r9w3m5n7p9q2s4t6v8xz";
+  const binding = validateViewBinding({ layerId, fence: 1 }, origin);
+
+  it.each(routes)("$method $target => $action", ({ method, target, action }) => {
+    const request = () => rewriteRequestForView(binding, origin + target, { method });
+    switch (action) {
+      case "pass":
+        expect(request().url).toBe(origin + target);
+        break;
+      case "rewrite":
+        expect(request().url).toBe(origin + "/v1/views/" + layerId + target);
+        break;
+      case "unsupported":
+        expect(request).toThrow(UnsupportedInLayerViewError);
+        break;
+      case "invalid":
+        expect(request).toThrow(InvalidLayerViewRequestError);
+        break;
+      default:
+        throw new Error("Unknown route action: " + action);
     }
   });
 });
