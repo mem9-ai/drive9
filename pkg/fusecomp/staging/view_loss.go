@@ -67,7 +67,18 @@ func (c *WriteBackCache) writeViewLoss(remotePath string, gen uint64, err error)
 // recordViewLossLocked installs the in-process record for a path and drops any
 // "unknown marker" bookkeeping for its hash (the marker is now readable). The
 // caller holds c.mu.
+//
+// A non-finite generation (the no-generation zero or the unreadable-marker
+// sentinel) is never stored: writing one would make LossGenerationBound and
+// rekeyViewLoss treat it as a real value. Such a record keeps the path failing
+// closed through lostUnknown instead.
 func (c *WriteBackCache) recordViewLossLocked(remotePath string, gen uint64) {
+	if gen == 0 || gen == ^uint64(0) {
+		if _, ok := c.lostGens[remotePath]; !ok {
+			c.markLostUnknownLocked(lostHash(remotePath))
+		}
+		return
+	}
 	if c.lostGens == nil {
 		c.lostGens = make(map[string]uint64)
 	}
@@ -103,12 +114,18 @@ func (c *WriteBackCache) ViewLoss(remotePath string) error {
 	}
 	c.mu.Lock()
 	gen, ok := c.lostGens[remotePath]
+	_, unkOK := c.lostUnknown[lostHash(remotePath)]
 	c.mu.Unlock()
 	if ok {
 		return fmt.Errorf("%w: staged image for %s (generation %d) was pruned", ErrStagedViewLost, remotePath, gen)
 	}
 	loss, ok := c.readViewLoss(remotePath)
 	if !ok {
+		if unkOK {
+			// An unattributable marker recorded for this path (a rekey of one):
+			// the image cannot be proven to have landed.
+			return fmt.Errorf("%w: unreadable view loss marker (%s)", ErrStagedViewLost, remotePath)
+		}
 		return nil
 	}
 	if loss.Error != "" {
@@ -128,7 +145,7 @@ func (c *WriteBackCache) readViewLoss(remotePath string) (ViewLoss, bool) {
 		return ViewLoss{Path: remotePath, Generation: ^uint64(0), Error: fmt.Sprintf("unreadable view loss marker: %v", err)}, true
 	}
 	var loss ViewLoss
-	if err := json.Unmarshal(raw, &loss); err != nil || loss.Path == "" || loss.Generation == 0 {
+	if err := json.Unmarshal(raw, &loss); err != nil || loss.Path == "" || loss.Generation == 0 || loss.Generation == ^uint64(0) {
 		// A partial write of a previous process: unreadable, not "no loss".
 		return ViewLoss{Path: remotePath, Generation: ^uint64(0), Error: "unreadable view loss marker"}, true
 	}
@@ -149,8 +166,10 @@ func (c *WriteBackCache) ClearViewLossIfGeneration(remotePath string, gen uint64
 
 // ClearViewLoss drops any loss record for a path unconditionally. It is for
 // callers that just published the path's image themselves (a queue staging, an
-// inline commit, a patched commit): their image is the newest one this mount
-// knows, so every earlier loss record for the name is superseded.
+// explicit removal, a rename destination): their image is the newest one this
+// mount knows, so every earlier loss record for the name is superseded. Landings
+// use ClearViewLossIfGeneration instead, so a newer image that died while the
+// upload was on the wire keeps its record.
 func (c *WriteBackCache) ClearViewLoss(remotePath string) {
 	if c == nil {
 		return
@@ -292,19 +311,35 @@ func (c *WriteBackCache) rekeyViewLoss(oldPath, newPath string) {
 	}
 	c.mu.Lock()
 	gen, ok := c.lostGens[oldPath]
+	_, unkOK := c.lostUnknown[lostHash(oldPath)]
 	c.mu.Unlock()
 	if !ok {
 		loss, has := c.readViewLoss(oldPath)
-		if !has {
+		if !has && !unkOK {
 			return
 		}
-		if loss.Generation == ^uint64(0) {
-			// An unattributable marker: it cannot be re-keyed to a generation, so
-			// the destination keeps failing closed instead of persisting the
-			// sentinel as a real value.
+		if unkOK || (has && loss.Generation == ^uint64(0)) {
+			// An unattributable marker: it cannot be re-keyed to a generation.
+			// Persist it as such on the destination (a zero generation, which both
+			// readers treat as unattributable) so the obligation survives a
+			// restart, and keep the destination failing closed in-process.
+			if raw, merr := json.Marshal(&ViewLoss{Path: newPath, Error: "unreadable view loss marker"}); merr == nil {
+				_ = atomicWrite(c.lostFile(newPath), raw)
+			}
 			c.mu.Lock()
-			c.markLostUnknownLocked(lostHash(newPath))
+			if c.lostUnknown == nil {
+				c.lostUnknown = make(map[string]struct{})
+			}
+			c.lostUnknown[lostHash(newPath)] = struct{}{}
 			c.mu.Unlock()
+			if err := os.Remove(c.lostFile(oldPath)); err == nil {
+				_ = fsyncDir(c.dir)
+			}
+			if _, err := os.Stat(c.lostFile(oldPath)); errors.Is(err, os.ErrNotExist) {
+				c.mu.Lock()
+				c.forgetViewLossLocked(oldPath)
+				c.mu.Unlock()
+			}
 			return
 		}
 		gen = loss.Generation

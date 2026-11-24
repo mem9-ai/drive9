@@ -698,3 +698,82 @@ func TestGenerationCounterIgnoresTheSentinel(t *testing.T) {
 		t.Fatal("the counter wrapped to zero after an advance to the sentinel")
 	}
 }
+
+// TestUnattributableLossFollowsRekey pins the gap the review found: a marker
+// that cannot be attributed must stay visible through ViewLoss (the destination
+// is where the object now lives), survive a restart, and never be written as a
+// finite or sentinel generation in the mirror.
+func TestUnattributableLossFollowsRekey(t *testing.T) {
+	dir := t.TempDir()
+	const (
+		src = "/unk-src.txt"
+		dst = "/unk-dst.txt"
+	)
+	first, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(first.lostFile(src), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A fresh cache adopts the marker as unattributable.
+	c, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ViewLoss(src); err == nil {
+		t.Fatal("the unreadable marker did not report a loss")
+	}
+	c.RekeyViewLoss(src, dst)
+	if err := c.ViewLoss(dst); err == nil {
+		t.Fatal("the unattributable loss did not follow the rekey")
+	}
+	if _, err := os.Stat(c.lostFile(dst)); err != nil {
+		t.Fatalf("no durable marker at the destination: %v", err)
+	}
+	// A restart must still fail the destination closed.
+	restarted, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.ViewLoss(dst); err == nil {
+		t.Fatal("the rekeyed marker did not survive a restart")
+	}
+	if got := restarted.ViewLossCount(); got == 0 {
+		t.Fatal("the drain counter dropped the rekeyed marker")
+	}
+}
+
+// TestRecordViewLossNeverStoresNonFiniteGenerations pins the choke point: a
+// failed unlink over an unreadable marker must not leave zero or the sentinel in
+// the mirror, where LossGenerationBound and rekeyViewLoss would treat it as real.
+func TestRecordViewLossNeverStoresNonFiniteGenerations(t *testing.T) {
+	const path = "/nonfinite.txt"
+	dir := t.TempDir()
+	c, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	c.recordViewLossLocked(path, ^uint64(0))
+	c.recordViewLossLocked("/zero.txt", 0)
+	c.mu.Unlock()
+	for _, p := range []string{path, "/zero.txt"} {
+		c.mu.Lock()
+		gen, ok := c.lostGens[p]
+		_, unk := c.lostUnknown[lostHash(p)]
+		c.mu.Unlock()
+		if ok {
+			t.Fatalf("lostGens[%s] = %d, want no entry", p, gen)
+		}
+		if !unk {
+			t.Fatalf("%s was not marked unknown", p)
+		}
+		if err := c.ViewLoss(p); err == nil {
+			t.Fatalf("ViewLoss(%s) returned nil despite the unattributable record", p)
+		}
+	}
+	if got := c.LossGenerationBound(path, 7); got != 0 {
+		t.Fatalf("bound = %d, want 0 for an unattributable record", got)
+	}
+}
