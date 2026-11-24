@@ -487,7 +487,13 @@ type bufferingHandle struct {
 	// stagedToCache records that Flush snapshotted the image into the
 	// .dat/.meta track; Release owes the uploader a Submit for it (v1: the
 	// write-back cache fast path — Flush persists locally, the upload is
-	// enqueued once, at the close boundary).
+	// enqueued once, at the close boundary). stagedCacheGen identifies the
+	// exact wbCache generation this handle most recently staged.
+	stagedCacheGen uint64
+	// drainFlight tracks an in-flight synchronous wbCache upload started by
+	// DrainFlush so concurrent DrainFlush callers await the same landing and
+	// observe its outcome instead of returning early while the upload is running.
+	drainFlight *drainUploadFlight
 	// selfLandSize/selfLandSum remember THIS handle's last streamed inline
 	// commit when the stream protocol reported no revision: the next write
 	// on the same descriptor needs a continuation base, and only a verified
@@ -1813,14 +1819,12 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 						if !w.waitPathCommit(op.Path) {
 							return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
 						}
-						if qerr := w.queue.PathTerminalFailure(op.Path); qerr != nil {
-							return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EIO))
-						}
 					}
 					w.waitUploaderPath(op.Path)
 					if w.wbCache != nil && w.uploader != nil {
 						if m, ok := w.wbCache.GetMeta(op.Path); ok && m != nil {
 							putGen := m.PutGen()
+							initialGen := m.Generation
 							supersedesGen := m.SupersedesPendingGen
 							failureSeq := uint64(0)
 							if w.queue != nil {
@@ -1845,27 +1849,89 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 								}
 							} else {
 								w.uploader.WaitPath(op.Path)
+								landedGen := initialGen
 								if meta != nil {
+									landedGen = meta.Generation
+								}
+								if meta != nil || !w.wbCache.HasMeta(op.Path) {
 									for _, wr := range writers {
 										wr.mu.Lock()
-										if wr.path == op.Path && !wr.dirty {
-											wr.stagedToCache = false
+										if wr.path == op.Path {
+											if !wr.dirty && wr.stagedCacheGen == landedGen {
+												wr.stagedToCache = false
+											}
+											if meta != nil {
+												wr.landed = true
+												wr.isNew = false
+												if rev > 0 && rev > wr.baseRev {
+													wr.baseRev = rev
+												}
+											}
 										}
 										wr.mu.Unlock()
-										if rev > 0 {
-											wr.markLanded(rev)
-										}
 									}
 								}
-								w.resolveLandedStaging(op.Path, rev, supersedesGen, failureSeq)
+								if meta != nil {
+									w.resolveLandedStaging(op.Path, rev, supersedesGen, failureSeq)
+								}
+							}
+						}
+					}
+					// Check sticky terminal failure AFTER landing any staged wbCache
+					// replacement above (matching strict Sync): a newer replacement
+					// retires superseded failures via resolveLandedStaging.
+					if w.queue != nil {
+						if qerr := w.queue.PathTerminalFailure(op.Path); qerr != nil {
+							return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EIO))
+						}
+					}
+					var movedCache bool
+					var oldCacheGen, newCacheGen uint64
+					if w.wbCache != nil {
+						if remMeta, ok := w.wbCache.GetMeta(op.Path); ok && remMeta != nil {
+							oldCacheGen = remMeta.Generation
+							movedCache = w.wbCache.RenamePending(op.Path, survivor)
+							if movedCache {
+								if survMeta, sok := w.wbCache.GetMeta(survivor); sok && survMeta != nil {
+									newCacheGen = survMeta.Generation
+								}
 							}
 						}
 					}
 					w.retarget(op.Path, survivor)
+					rebindCacheGen := func(path string, fromGen, toGen uint64) {
+						if fromGen == 0 || toGen == 0 {
+							return
+						}
+						w.regMu.Lock()
+						cands := make([]*bufferingHandle, 0, len(w.liveByPath[path]))
+						for cand := range w.liveByPath[path] {
+							cands = append(cands, cand)
+						}
+						w.regMu.Unlock()
+						for _, cand := range cands {
+							cand.mu.Lock()
+							if cand.path == path && cand.stagedCacheGen == fromGen {
+								cand.stagedCacheGen = toGen
+							}
+							cand.mu.Unlock()
+						}
+					}
+					if movedCache {
+						rebindCacheGen(survivor, oldCacheGen, newCacheGen)
+					}
 					if _, err := next(ctx, op); err != nil {
 						// DELETE failed: bind back so nothing is lost.
 						w.retarget(survivor, op.Path)
+						if movedCache && w.wbCache.RenamePending(survivor, op.Path) {
+							if backMeta, bok := w.wbCache.GetMeta(op.Path); bok && backMeta != nil {
+								rebindCacheGen(op.Path, newCacheGen, backMeta.Generation)
+							}
+						}
 						return fs.Result{}, err
+					}
+					if movedCache && w.uploader != nil && !w.hasUnclosedStagedCacheOwner(survivor) {
+						w.uploader.Submit(survivor)
 					}
 					return fs.Result{}, nil
 				}
@@ -3497,6 +3563,12 @@ func (h *bufferingHandle) flushLiveExtent(ctx context.Context, waitReleasing boo
 	return true, h.flushMigratedMode(ctx)
 }
 
+type drainUploadFlight struct {
+	done chan struct{}
+	gen  uint64
+	err  error
+}
+
 func (h *bufferingHandle) DrainFlush(ctx context.Context) (err error) {
 	if handled, ferr := h.flushLiveExtent(ctx, true); handled {
 		return ferr
@@ -3510,118 +3582,161 @@ func (h *bufferingHandle) DrainFlush(ctx context.Context) (err error) {
 			err = ferr
 		}
 	}()
-	h.flushMu.Lock()
-	flushUnlocked := false
-	unlockFlush := func() {
-		if !flushUnlocked {
-			flushUnlocked = true
-			h.flushMu.Unlock()
+	for {
+		h.flushMu.Lock()
+		flushUnlocked := false
+		unlockFlush := func() {
+			if !flushUnlocked {
+				flushUnlocked = true
+				h.flushMu.Unlock()
+			}
 		}
-	}
-	defer unlockFlush()
-	if handled, ferr := h.flushLiveExtent(ctx, true); handled {
-		return ferr
-	}
-	retainBuffer := false
-	h.mu.Lock()
-	if h.closed {
-		path := h.path
+		if handled, ferr := h.flushLiveExtent(ctx, true); handled {
+			unlockFlush()
+			return ferr
+		}
+		h.mu.Lock()
+		flight := h.drainFlight
+		curPath := h.path
+		curDirty, curGen := h.dirty, h.wgen
+		if flight != nil {
+			h.mu.Unlock()
+			unlockFlush()
+			select {
+			case <-flight.done:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			if flight.err != nil {
+				return flight.err
+			}
+			if !curDirty && curGen <= flight.gen {
+				if !h.w.waitPathCommit(curPath) {
+					return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
+				}
+				return nil
+			}
+			continue
+		}
+		if h.closed {
+			h.mu.Unlock()
+			unlockFlush()
+			if !h.w.waitPathCommit(curPath) {
+				return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
+			}
+			return nil
+		}
+		staged, unlinked := h.stagedToCache, h.unlinked
+		dirty, uploadGen := h.dirty, h.wgen
+		uploadPath := h.path
+		h.stagedToCache = false
 		h.mu.Unlock()
-		unlockFlush()
-		if !h.w.waitPathCommit(path) {
+
+		landWriteCache := func(stageGen uint64) error {
+			myFlight := &drainUploadFlight{
+				done: make(chan struct{}),
+				gen:  stageGen,
+			}
+			h.mu.Lock()
+			h.drainFlight = myFlight
+			h.mu.Unlock()
+			var landErr error
+			defer func() {
+				if landErr != nil && h.w.wbCache != nil {
+					if _, ok := h.w.wbCache.GetMeta(uploadPath); ok {
+						submit := false
+						h.mu.Lock()
+						if h.path == uploadPath && !h.unlinked {
+							if !h.closed && !h.releasing {
+								h.stagedToCache = true
+							} else {
+								submit = true
+							}
+						}
+						h.mu.Unlock()
+						if submit && h.w.uploader != nil {
+							h.w.uploader.Submit(uploadPath)
+						}
+					}
+				}
+				h.mu.Lock()
+				myFlight.err = landErr
+				if h.drainFlight == myFlight {
+					h.drainFlight = nil
+				}
+				h.mu.Unlock()
+				close(myFlight.done)
+			}()
+			supersedesGen, failureSeq := h.stagedLandingFence(uploadPath)
+			unlockFlush()
+			rev, meta, uploadErr := h.w.uploader.uploadSyncWithMetadata(ctx, uploadPath)
+			if uploadErr != nil {
+				landErr = uploadErr
+				return uploadErr
+			}
+			if meta != nil {
+				h.mu.Lock()
+				if h.path == uploadPath {
+					h.retireDirtyLocked(stageGen)
+					h.markLandedLocked(rev)
+				}
+				h.mu.Unlock()
+				h.w.resolveLandedStaging(uploadPath, rev, supersedesGen, failureSeq)
+			}
+			return nil
+		}
+
+		retainBuffer := false
+		if staged && !unlinked && h.w.uploader != nil && h.w.wbCache != nil {
+			if _, ok := h.w.wbCache.GetMeta(uploadPath); ok {
+				useCache := true
+				if dirty {
+					snapshot, stageErr := h.stageToWriteCache(ctx, stageFullDurable)
+					if errors.Is(stageErr, errWriteCacheBypass) {
+						useCache = false
+						retainBuffer = true
+					} else if stageErr != nil {
+						if _, stillOK := h.w.wbCache.GetMeta(uploadPath); stillOK {
+							h.mu.Lock()
+							if h.path == uploadPath && !h.unlinked && !h.closed && !h.releasing {
+								h.stagedToCache = true
+							}
+							h.mu.Unlock()
+						}
+						unlockFlush()
+						return stageErr
+					}
+					if snapshot != nil {
+						uploadGen = snapshot.wgen
+					}
+				}
+				if useCache {
+					return landWriteCache(uploadGen)
+				}
+			}
+		}
+		// Hold flushMu through commitLocked on the normal path so neither Flush nor
+		// Release can slip in between the stagedToCache check above and commitLocked.
+		// On the sparse-growth bypass path (retainBuffer == true, buffer >= stream
+		// threshold), unlock before stageAndEnqueueOpt so a concurrent truncate+Flush
+		// triggered from EventStaged can queue on pathLocks ahead of the async upload;
+		// pathLocks serializes any concurrent Release's stageAndEnqueue on the same
+		// generation.
+		if retainBuffer && h.w.queue != nil && h.w.opts.Staging != nil {
+			unlockFlush()
+			err = h.stageAndEnqueueOpt(ctx, !h.w.lazy, false, true)
+		} else {
+			err = h.commitLocked(ctx)
+			unlockFlush()
+		}
+		if err != nil {
+			return err
+		}
+		if !h.w.waitPathCommit(uploadPath) {
 			return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
 		}
 		return nil
 	}
-	staged, unlinked := h.stagedToCache, h.unlinked
-	dirty, uploadGen := h.dirty, h.wgen
-	h.stagedToCache = false
-	h.mu.Unlock()
-	landWriteCache := func(stageGen uint64) error {
-		var landErr error
-		defer func() {
-			if landErr != nil {
-				if _, ok := h.w.wbCache.GetMeta(h.path); ok {
-					submit := false
-					h.mu.Lock()
-					if !h.unlinked {
-						if !h.closed && !h.releasing {
-							h.stagedToCache = true
-						} else {
-							submit = true
-						}
-					}
-					h.mu.Unlock()
-					if submit {
-						h.w.uploader.Submit(h.path)
-					}
-				}
-			}
-		}()
-		supersedesGen, failureSeq := h.stagedLandingFence()
-		unlockFlush()
-		rev, meta, uploadErr := h.w.uploader.uploadSyncWithMetadata(ctx, h.path)
-		if uploadErr != nil {
-			landErr = uploadErr
-			return uploadErr
-		}
-		if meta != nil {
-			h.mu.Lock()
-			h.retireDirtyLocked(stageGen)
-			h.mu.Unlock()
-			h.markLanded(rev)
-			h.w.resolveLandedStaging(h.path, rev, supersedesGen, failureSeq)
-		}
-		return nil
-	}
-	if staged && !unlinked && h.w.uploader != nil && h.w.wbCache != nil {
-		if _, ok := h.w.wbCache.GetMeta(h.path); ok {
-			useCache := true
-			if dirty {
-				snapshot, stageErr := h.stageToWriteCache(ctx, stageFullDurable)
-				if errors.Is(stageErr, errWriteCacheBypass) {
-					useCache = false
-					retainBuffer = true
-				} else if stageErr != nil {
-					if _, stillOK := h.w.wbCache.GetMeta(h.path); stillOK {
-						h.mu.Lock()
-						if !h.unlinked && !h.closed && !h.releasing {
-							h.stagedToCache = true
-						}
-						h.mu.Unlock()
-					}
-					return stageErr
-				}
-				if snapshot != nil {
-					uploadGen = snapshot.wgen
-				}
-			}
-			if useCache {
-				return landWriteCache(uploadGen)
-			}
-		}
-	}
-	// Hold flushMu through commitLocked on the normal path so neither Flush nor
-	// Release can slip in between the stagedToCache check above and commitLocked.
-	// On the sparse-growth bypass path (retainBuffer == true, buffer >= stream
-	// threshold), unlock before stageAndEnqueueOpt so a concurrent truncate+Flush
-	// triggered from EventStaged can queue on pathLocks ahead of the async upload;
-	// pathLocks serializes any concurrent Release's stageAndEnqueue on the same
-	// generation.
-	if retainBuffer && h.w.queue != nil && h.w.opts.Staging != nil {
-		unlockFlush()
-		err = h.stageAndEnqueueOpt(ctx, !h.w.lazy, false, true)
-	} else {
-		err = h.commitLocked(ctx)
-		unlockFlush()
-	}
-	if err != nil {
-		return err
-	}
-	if !h.w.waitPathCommit(h.path) {
-		return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
-	}
-	return nil
 }
 
 // syncWaitDeadlineSizeLocked reports the image a strict Sync may have to wait
@@ -4201,21 +4316,25 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 	// must run before the sticky-failure check below, or a rewritten file
 	// could never fsync successfully again.
 	h.mu.Lock()
-	staged := h.stagedToCache
+	staged, syncPath := h.stagedToCache, h.path
 	h.mu.Unlock()
 	if staged && h.w.uploader != nil {
-		supersedesGen, failureSeq := h.stagedLandingFence()
-		rev, meta, err := h.w.uploader.uploadSyncWithMetadata(ctx, h.path)
+		supersedesGen, failureSeq := h.stagedLandingFence(syncPath)
+		rev, meta, err := h.w.uploader.uploadSyncWithMetadata(ctx, syncPath)
 		if err != nil {
 			return err
 		}
 		h.mu.Lock()
-		h.stagedToCache = false
-		h.mu.Unlock()
-		if meta != nil {
-			h.markLanded(rev)
+		if h.path == syncPath {
+			if meta == nil || h.stagedCacheGen == meta.Generation {
+				h.stagedToCache = false
+			}
+			if meta != nil {
+				h.markLandedLocked(rev)
+			}
 		}
-		h.w.resolveLandedStaging(h.path, rev, supersedesGen, failureSeq)
+		h.mu.Unlock()
+		h.w.resolveLandedStaging(syncPath, rev, supersedesGen, failureSeq)
 	}
 	// The wait above also ends when the commit terminally failed and was
 	// dropped with local state preserved: an idle path is then
@@ -4224,7 +4343,7 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 	// data that exists only locally. Anything a landing above already
 	// retired has been cleared (or generation-fenced out) by then.
 	if h.w.queue != nil {
-		if err := h.w.queue.PathTerminalFailure(h.path); err != nil {
+		if err := h.w.queue.PathTerminalFailure(syncPath); err != nil {
 			return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 		}
 	}
@@ -4242,15 +4361,15 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 
 // stagedLandingFence snapshots the fence state a synchronous staged landing
 // needs before it starts: the staged image's superseded pending generation
-// and the currently recorded terminal-failure stamp.
-func (h *bufferingHandle) stagedLandingFence() (supersedesGen, failureSeq uint64) {
+// and the currently recorded terminal-failure stamp for path.
+func (h *bufferingHandle) stagedLandingFence(path string) (supersedesGen, failureSeq uint64) {
 	if h.w.wbCache != nil {
-		if meta, ok := h.w.wbCache.GetMeta(h.path); ok && meta != nil {
+		if meta, ok := h.w.wbCache.GetMeta(path); ok && meta != nil {
 			supersedesGen = meta.SupersedesPendingGen
 		}
 	}
 	if h.w.queue != nil {
-		failureSeq = h.w.queue.PathTerminalFailureSeq(h.path)
+		failureSeq = h.w.queue.PathTerminalFailureSeq(path)
 	}
 	return supersedesGen, failureSeq
 }
@@ -4354,10 +4473,11 @@ func (h *bufferingHandle) Flush(ctx context.Context) (err error) {
 				return nil
 			}
 			h.mu.Lock()
+			flushPath := h.path
 			h.stagedToCache = true
 			h.mu.Unlock()
-			supersedesGen, failureSeq := h.stagedLandingFence()
-			rev, meta, err := h.w.uploader.uploadSyncWithMetadata(ctx, h.path)
+			supersedesGen, failureSeq := h.stagedLandingFence(flushPath)
+			rev, meta, err := h.w.uploader.uploadSyncWithMetadata(ctx, flushPath)
 			if err != nil {
 				return err
 			}
@@ -4365,25 +4485,18 @@ func (h *bufferingHandle) Flush(ctx context.Context) (err error) {
 			// its landed record was written at the upload's success point
 			// (the uploader's RecordLanding callback). This side retires
 			// exactly the failure state the image superseded.
-			_ = meta
-			h.w.resolveLandedStaging(h.path, rev, supersedesGen, failureSeq)
+			h.w.resolveLandedStaging(flushPath, rev, supersedesGen, failureSeq)
 			h.mu.Lock()
-			h.stagedToCache = false
-			// The image is on the remote now — for every create shape, not
-			// only the empty one: Release's materialize path keys on
-			// landed, and re-materializing a published image would PUT a
-			// second copy at the open-time base (close-sync double-upload).
-			// Only the staged generation may retire dirty: a write
-			// acknowledged while the upload was in flight (Drain flushes
-			// without the per-FH write lock) keeps its own dirty flag and
-			// the next durability barrier commits it.
-			h.retireDirtyLocked(snapshot.wgen)
-			h.mu.Unlock()
-			// The landed revision also retires isNew: a later write on
-			// this handle must stage as an overwrite of that revision.
-			if meta != nil {
-				h.markLanded(rev)
+			if h.path == flushPath {
+				if meta == nil || h.stagedCacheGen == meta.Generation {
+					h.stagedToCache = false
+				}
+				h.retireDirtyLocked(snapshot.wgen)
+				if meta != nil {
+					h.markLandedLocked(rev)
+				}
 			}
+			h.mu.Unlock()
 			return nil
 		}
 		if emptyCreate {
@@ -5014,14 +5127,12 @@ func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64, generation
 	}
 }
 
-func (h *bufferingHandle) markLanded(rev int64) {
-	h.mu.Lock()
+func (h *bufferingHandle) markLandedLocked(rev int64) {
 	h.landed = true
 	h.isNew = false
 	if rev > 0 {
 		h.baseRev = rev
 	}
-	h.mu.Unlock()
 }
 
 func attrSize(res fs.Result) int64 {
@@ -8270,11 +8381,14 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 	// boundary: readers during the async landing serve these bytes instead
 	// of racing the staging's publication against the stale remote.
 	if h.w.pendingSeeder != nil {
-		h.w.pendingSeeder(h.path, image)
+		h.w.pendingSeeder(path, image)
 	}
 	h.mu.Lock()
-	if dur == stageV1Ladder && !h.unlinked && !h.closed {
-		h.stagedToCache = true
+	if !h.unlinked && !h.closed {
+		h.stagedCacheGen = wbGen
+		if dur == stageV1Ladder {
+			h.stagedToCache = true
+		}
 	}
 	h.retireDirtyLocked(snapshot.wgen)
 	h.mu.Unlock()

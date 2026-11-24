@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1723,25 +1724,25 @@ func TestReadOpenFlushRacesWriterCloseDoesNotStrandZeroByteCache(t *testing.T) {
 		if err := openRes.Handle.Write(ctx, 0, payload); err != nil {
 			t.Fatal(err)
 		}
-		pathUnlock := wb.pathLocks.lock(barrierPath)
+		rawUnlock := wb.pathLocks.lock(barrierPath)
+		var unlockOnce sync.Once
+		releaseBarrier := func() { unlockOnce.Do(rawUnlock) }
+		defer releaseBarrier()
 		flushDone := make(chan error, 1)
 		go func() {
 			flushDone <- openRes.Handle.Flush(ctx)
 		}()
-		deadline := time.Now().Add(2 * time.Second)
-		for time.Now().Before(deadline) {
-			if !bh.flushMu.TryLock() {
-				break
-			}
-			bh.flushMu.Unlock()
-			time.Sleep(time.Millisecond)
-		}
+		waitFlushMuHeld(t, bh)
+		releaseEntered := make(chan struct{})
 		releaseDone := make(chan error, 1)
 		go func() {
+			close(releaseEntered)
 			releaseDone <- openRes.Handle.Release(ctx)
 		}()
+		readEntered := make(chan struct{})
 		readDone := make(chan error, 1)
 		go func() {
+			close(readEntered)
 			rdRes, rerr := chain.Dispatch(ctx, &fs.Op{
 				Kind:  fs.OpCreate,
 				Path:  barrierPath,
@@ -1764,8 +1765,18 @@ func TestReadOpenFlushRacesWriterCloseDoesNotStrandZeroByteCache(t *testing.T) {
 			}
 			readDone <- nil
 		}()
-		time.Sleep(5 * time.Millisecond)
-		pathUnlock()
+		select {
+		case <-releaseEntered:
+		case <-ctx.Done():
+			t.Fatal("Release contender did not start")
+		}
+		select {
+		case <-readEntered:
+		case <-ctx.Done():
+			t.Fatal("reader contender did not start")
+		}
+		runtime.Gosched()
+		releaseBarrier()
 		if err := <-flushDone; err != nil {
 			t.Fatalf("barrier writer Flush: %v", err)
 		}
@@ -2068,14 +2079,29 @@ func TestReleaseCommitLockedBlocksConcurrentFlushAndDrainFlush(t *testing.T) {
 		t.Fatal("Release did not enter inline PUT")
 	}
 
+	flushEntered := make(chan struct{})
 	flushDone := make(chan error, 1)
 	go func() {
+		close(flushEntered)
 		flushDone <- h.Flush(ctx)
 	}()
+	drainEntered := make(chan struct{})
 	drainDone := make(chan error, 1)
 	go func() {
+		close(drainEntered)
 		drainDone <- h.DrainFlush(ctx)
 	}()
+	select {
+	case <-flushEntered:
+	case <-ctx.Done():
+		t.Fatal("Flush contender did not start")
+	}
+	select {
+	case <-drainEntered:
+	case <-ctx.Done():
+		t.Fatal("DrainFlush contender did not start")
+	}
+	runtime.Gosched()
 
 	select {
 	case err := <-flushDone:
@@ -2084,7 +2110,7 @@ func TestReleaseCommitLockedBlocksConcurrentFlushAndDrainFlush(t *testing.T) {
 	case err := <-drainDone:
 		_, exists := b.Node("/release-barrier.txt")
 		t.Fatalf("concurrent DrainFlush returned (%v) before Release commitLocked finished (remoteExists=%v)", err, exists)
-	case <-time.After(30 * time.Millisecond):
+	default:
 	}
 
 	unblockPut()
@@ -2128,24 +2154,27 @@ func TestDrainFlushSynchronizesWithConcurrentWritebackFlushAndDebounce(t *testin
 		// Hold wbCache's per-path lock so h.Flush blocks mid-stageToWriteCache
 		// while DrainFlush contends on flushMu right behind it.
 		pl := wb.wbCache.AcquirePathLock("/drain-race.txt")
+		var unlockOnce sync.Once
+		releaseCacheLock := func() { unlockOnce.Do(func() { wb.wbCache.ReleasePathLock("/drain-race.txt", pl) }) }
+		defer releaseCacheLock()
 		flushDone := make(chan error, 1)
 		go func() {
 			flushDone <- h.Flush(ctx)
 		}()
-		deadline := time.Now().Add(2 * time.Second)
-		for time.Now().Before(deadline) {
-			if !h.flushMu.TryLock() {
-				break
-			}
-			h.flushMu.Unlock()
-			time.Sleep(time.Millisecond)
-		}
+		waitFlushMuHeld(t, h)
+		drainEntered := make(chan struct{})
 		drainDone := make(chan error, 1)
 		go func() {
+			close(drainEntered)
 			drainDone <- wb.Drain(ctx)
 		}()
-		time.Sleep(5 * time.Millisecond)
-		wb.wbCache.ReleasePathLock("/drain-race.txt", pl)
+		select {
+		case <-drainEntered:
+		case <-ctx.Done():
+			t.Fatal("Drain contender did not start")
+		}
+		runtime.Gosched()
+		releaseCacheLock()
 
 		if err := <-flushDone; err != nil {
 			t.Fatalf("Flush: %v", err)
@@ -2197,28 +2226,32 @@ func TestDrainFlushSynchronizesWithConcurrentWritebackFlushAndDebounce(t *testin
 		// then invoke DrainFlush concurrently so it must wait on flushMu rather
 		// than racing commitLocked against Release's cache refresh + Submit.
 		pl := wb.wbCache.AcquirePathLock("/drain-release-race.txt")
+		var unlockOnce sync.Once
+		releaseCacheLock := func() { unlockOnce.Do(func() { wb.wbCache.ReleasePathLock("/drain-release-race.txt", pl) }) }
+		defer releaseCacheLock()
 		releaseDone := make(chan error, 1)
 		go func() {
 			releaseDone <- h.Release(ctx)
 		}()
-		deadline := time.Now().Add(2 * time.Second)
-		for time.Now().Before(deadline) {
-			if !h.flushMu.TryLock() {
-				break
-			}
-			h.flushMu.Unlock()
-			time.Sleep(time.Millisecond)
-		}
+		waitFlushMuHeld(t, h)
+		drainEntered := make(chan struct{})
 		drainFlushDone := make(chan error, 1)
 		go func() {
+			close(drainEntered)
 			drainFlushDone <- h.DrainFlush(ctx)
 		}()
 		select {
+		case <-drainEntered:
+		case <-ctx.Done():
+			t.Fatal("DrainFlush contender did not start")
+		}
+		runtime.Gosched()
+		select {
 		case err := <-drainFlushDone:
 			t.Fatalf("DrainFlush returned (%v) while Release held flushMu", err)
-		case <-time.After(15 * time.Millisecond):
+		default:
 		}
-		wb.wbCache.ReleasePathLock("/drain-release-race.txt", pl)
+		releaseCacheLock()
 
 		if err := <-releaseDone; err != nil {
 			t.Fatalf("Release: %v", err)
@@ -2359,6 +2392,9 @@ func TestMigratedHandleNeverFlushesAfterReleaseAndPreservesCallerContext(t *test
 		enteredFlush := make(chan struct{})
 		allowFlush := make(chan struct{})
 		var once sync.Once
+		var releaseOnce sync.Once
+		releaseGate := func() { releaseOnce.Do(func() { close(allowFlush) }) }
+		defer releaseGate()
 		rec := &recordingMigratedHandle{
 			onFlush: func() {
 				once.Do(func() {
@@ -2377,19 +2413,31 @@ func TestMigratedHandleNeverFlushesAfterReleaseAndPreservesCallerContext(t *test
 		go func() {
 			flushDone <- h.Flush(ctx)
 		}()
-		<-enteredFlush
+		select {
+		case <-enteredFlush:
+		case <-ctx.Done():
+			t.Fatal("migrated Flush did not reach the extent handle")
+		}
 
+		releaseEntered := make(chan struct{})
 		releaseDone := make(chan error, 1)
 		go func() {
+			close(releaseEntered)
 			releaseDone <- h.Release(ctx)
 		}()
 		select {
+		case <-releaseEntered:
+		case <-ctx.Done():
+			t.Fatal("migrated Release contender did not start")
+		}
+		runtime.Gosched()
+		select {
 		case err := <-releaseDone:
 			t.Fatalf("Release completed (%v) while migrated Flush was still active", err)
-		case <-time.After(20 * time.Millisecond):
+		default:
 		}
 
-		close(allowFlush)
+		releaseGate()
 		if err := <-flushDone; err != nil {
 			t.Fatalf("active migrated Flush: %v", err)
 		}
@@ -2593,4 +2641,528 @@ func TestHardlinkUnlinkSurvivorPropagatesUploadSyncFailure(t *testing.T) {
 	if reason, count := wb.DrainPending(); count != 0 {
 		t.Fatalf("DrainPending = (%q, %d), want empty", reason, count)
 	}
+}
+
+func waitFlushMuHeld(t *testing.T, h *bufferingHandle) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if !h.flushMu.TryLock() {
+			return
+		}
+		h.flushMu.Unlock()
+		runtime.Gosched()
+	}
+	t.Fatal("timed out waiting for contender to acquire flushMu")
+}
+
+func TestConcurrentDrainFlushWaitsForInFlightCacheUploadOutcome(t *testing.T) {
+	for _, failFirstPut := range []bool{false, true} {
+		name := "shared-success"
+		if failFirstPut {
+			name = "shared-failure"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			b := testbackend.NewBackend()
+			enteredPut := make(chan struct{})
+			allowPut := make(chan struct{})
+			var enterOnce, allowOnce sync.Once
+			releaseGate := func() { allowOnce.Do(func() { close(allowPut) }) }
+			defer releaseGate()
+
+			var failPut atomic.Bool
+			failPut.Store(failFirstPut)
+
+			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPut && r.URL.Path == "/v1/fs/two-drains.txt" {
+					enterOnce.Do(func() { close(enteredPut) })
+					select {
+					case <-allowPut:
+					case <-r.Context().Done():
+						return
+					}
+					if failPut.Load() {
+						http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+						return
+					}
+				}
+				b.ServeHTTP(w, r)
+			})
+
+			ts := httptest.NewServer(handler)
+			t.Cleanup(ts.Close)
+			cl := client.New(ts.URL, "")
+			wbcache, err := staging.NewWriteBackCache(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Pure write-cache stack (no commit queue) plus clean staged handle:
+			// a second DrainFlush must still block on the first DrainFlush's
+			// synchronous wbCache upload and share its success/error outcome.
+			wb, err := New(Options{
+				Policy:     PolicyWriteBack,
+				Client:     cl,
+				WriteCache: wbcache,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+			terminal, err := core.New(cl, core.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			chain, err := fs.NewChain(wb, terminal)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			res, err := chain.Dispatch(ctx, &fs.Op{
+				Kind:  fs.OpCreate,
+				Path:  "/two-drains.txt",
+				Flags: uint32(syscall.O_CREAT | syscall.O_TRUNC | syscall.O_WRONLY),
+				Mode:  0o644, HasMode: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := writebackHandleOf(res.Handle)
+			if err := h.Write(ctx, 0, []byte("two-drains-payload")); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.Flush(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			drainADone := make(chan error, 1)
+			go func() {
+				drainADone <- h.DrainFlush(ctx)
+			}()
+			select {
+			case <-enteredPut:
+			case <-ctx.Done():
+				t.Fatal("DrainFlush A did not enter synchronous PUT")
+			}
+
+			drainBEntered := make(chan struct{})
+			drainBDone := make(chan error, 1)
+			go func() {
+				close(drainBEntered)
+				drainBDone <- h.DrainFlush(ctx)
+			}()
+			select {
+			case <-drainBEntered:
+			case <-ctx.Done():
+				t.Fatal("DrainFlush B did not start")
+			}
+			runtime.Gosched()
+
+			select {
+			case berr := <-drainBDone:
+				t.Fatalf("concurrent DrainFlush B returned (%v) while DrainFlush A was still blocked in PUT", berr)
+			default:
+			}
+
+			releaseGate()
+			errA := <-drainADone
+			errB := <-drainBDone
+
+			if !failFirstPut {
+				if errA != nil || errB != nil {
+					t.Fatalf("DrainFlush A/B = (%v, %v), want (nil, nil)", errA, errB)
+				}
+				node, ok := b.Node("/two-drains.txt")
+				if !ok || string(node.Data) != "two-drains-payload" {
+					t.Fatalf("remote /two-drains.txt = %q (ok=%v), want %q", node.Data, ok, "two-drains-payload")
+				}
+			} else {
+				if errA == nil || errB == nil {
+					t.Fatalf("DrainFlush A/B on 503 = (%v, %v), want both non-nil", errA, errB)
+				}
+				h.mu.Lock()
+				restored := h.stagedToCache
+				h.mu.Unlock()
+				if !restored {
+					t.Fatal("failed DrainFlush did not restore stagedToCache for retry")
+				}
+				failPut.Store(false)
+				if err := h.DrainFlush(ctx); err != nil {
+					t.Fatalf("retry DrainFlush after clearing 503: %v", err)
+				}
+				node, ok := b.Node("/two-drains.txt")
+				if !ok || string(node.Data) != "two-drains-payload" {
+					t.Fatalf("remote /two-drains.txt after retry = %q (ok=%v), want %q", node.Data, ok, "two-drains-payload")
+				}
+			}
+
+			if err := h.Release(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := wb.Drain(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if reason, count := wb.DrainPending(); count != 0 {
+				t.Fatalf("DrainPending = (%q, %d), want empty", reason, count)
+			}
+		})
+	}
+}
+
+func TestHardlinkUnlinkSurvivorPreservesNewerFlushDuringUpload(t *testing.T) {
+	t.Run("newer-write-flush-during-survivor-upload", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		b := testbackend.NewBackend()
+		b.Seed("/link1", []byte("orig"))
+
+		enteredPut := make(chan struct{})
+		allowPut := make(chan struct{})
+		var enterOnce, allowOnce sync.Once
+		releaseGate := func() { allowOnce.Do(func() { close(allowPut) }) }
+		defer releaseGate()
+
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPut && r.URL.Path == "/v1/fs/link1" {
+				enterOnce.Do(func() {
+					close(enteredPut)
+					<-allowPut
+				})
+			}
+			b.ServeHTTP(w, r)
+		})
+		chain, wb := newReviewDrainStack(t, handler, nil)
+		if _, err := chain.Dispatch(ctx, &fs.Op{
+			Kind:  fs.OpLink,
+			Path:  "/link1",
+			Path2: "/link2",
+		}); err != nil {
+			t.Fatalf("OpLink(/link1 -> /link2): %v", err)
+		}
+		wb.SetSurvivorLookup(func(path string) (string, bool) {
+			if path == "/link1" {
+				return "/link2", true
+			}
+			return "", false
+		})
+
+		res, err := chain.Dispatch(ctx, &fs.Op{
+			Kind:  fs.OpCreate,
+			Path:  "/link1",
+			Flags: uint32(syscall.O_WRONLY),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := writebackHandleOf(res.Handle)
+		if err := h.Write(ctx, 0, []byte("v1-older")); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		unlinkDone := make(chan error, 1)
+		go func() {
+			_, uerr := chain.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/link1"})
+			unlinkDone <- uerr
+		}()
+		select {
+		case <-enteredPut:
+		case <-ctx.Done():
+			t.Fatal("survivor OpUnlink did not enter PUT /link1")
+		}
+
+		// While the older generation is paused in PUT /link1, the open writer
+		// writes and flushes a newer generation on the same handle.
+		if err := h.Write(ctx, 0, []byte("v2-newer-after-flush")); err != nil {
+			t.Fatalf("Write during survivor PUT: %v", err)
+		}
+		if err := h.Flush(ctx); err != nil {
+			t.Fatalf("Flush during survivor PUT: %v", err)
+		}
+
+		releaseGate()
+		if err := <-unlinkDone; err != nil {
+			t.Fatalf("OpUnlink(/link1): %v", err)
+		}
+		if err := h.Release(ctx); err != nil {
+			t.Fatalf("Release retargeted writer: %v", err)
+		}
+		if err := wb.Drain(ctx); err != nil {
+			t.Fatalf("Drain: %v", err)
+		}
+		if reason, count := wb.DrainPending(); count != 0 {
+			t.Fatalf("DrainPending = (%q, %d), want empty", reason, count)
+		}
+		if _, exists := b.Node("/link1"); exists {
+			t.Fatal("/link1 still exists remotely after OpUnlink + Release + Drain")
+		}
+		node2, ok := b.Node("/link2")
+		if !ok || string(node2.Data) != "v2-newer-after-flush" {
+			t.Fatalf("remote /link2 = %q (ok=%v), want %q", node2.Data, ok, "v2-newer-after-flush")
+		}
+	})
+
+	t.Run("staged-replacement-retires-terminal-failure", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		b := testbackend.NewBackend()
+		b.Seed("/link1", []byte("orig"))
+		ts := httptest.NewServer(b)
+		t.Cleanup(ts.Close)
+		cl := client.New(ts.URL, "")
+		wbcache, err := staging.NewWriteBackCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		wb, err := New(Options{
+			Policy:     PolicyWriteBack,
+			Client:     cl,
+			Staging:    mustStaging(t),
+			WriteCache: wbcache,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := wb.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+		terminal, err := core.New(cl, core.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		chain, err := fs.NewChain(wb, terminal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := chain.Dispatch(ctx, &fs.Op{
+			Kind:  fs.OpLink,
+			Path:  "/link1",
+			Path2: "/link2",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		wb.SetSurvivorLookup(func(path string) (string, bool) {
+			if path == "/link1" {
+				return "/link2", true
+			}
+			return "", false
+		})
+
+		res, err := chain.Dispatch(ctx, &fs.Op{
+			Kind:  fs.OpCreate,
+			Path:  "/link1",
+			Flags: uint32(syscall.O_WRONLY),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := writebackHandleOf(res.Handle)
+		wb.queue.RecordTerminalFailureForPath("/link1", errors.New("prior failure"))
+		if err := h.Write(ctx, 0, []byte("replacement-bytes")); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := chain.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/link1"}); err != nil {
+			t.Fatalf("OpUnlink(/link1) with staged replacement: %v", err)
+		}
+		if err := h.Release(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := wb.Drain(ctx); err != nil {
+			t.Fatal(err)
+		}
+		node2, ok := b.Node("/link2")
+		if !ok || string(node2.Data) != "replacement-bytes" {
+			t.Fatalf("remote /link2 = %q (ok=%v), want %q", node2.Data, ok, "replacement-bytes")
+		}
+	})
+}
+
+func TestDrainFlushRetargetDuringPausedCacheUploadSettlesUploadedPath(t *testing.T) {
+	t.Run("success-retarget-settles-uploaded-path-only", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		b := testbackend.NewBackend()
+		enteredPut := make(chan struct{})
+		allowPut := make(chan struct{})
+		var enterOnce, allowOnce sync.Once
+		releaseGate := func() { allowOnce.Do(func() { close(allowPut) }) }
+		defer releaseGate()
+
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPut && r.URL.Path == "/v1/fs/old-drain.txt" {
+				enterOnce.Do(func() { close(enteredPut) })
+				select {
+				case <-allowPut:
+				case <-r.Context().Done():
+					return
+				}
+			}
+			b.ServeHTTP(w, r)
+		})
+		ts := httptest.NewServer(handler)
+		t.Cleanup(ts.Close)
+		cl := client.New(ts.URL, "")
+		wbcache, err := staging.NewWriteBackCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		wb, err := New(Options{
+			Policy:     PolicyWriteBack,
+			Client:     cl,
+			Staging:    mustStaging(t),
+			WriteCache: wbcache,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := wb.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+		terminal, err := core.New(cl, core.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		chain, err := fs.NewChain(wb, terminal)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		wb.queue.RecordTerminalFailureForPath("/old-drain.txt", errors.New("old failure"))
+		wb.queue.RecordTerminalFailureForPath("/new-drain.txt", errors.New("new failure must stay"))
+
+		res, err := chain.Dispatch(ctx, &fs.Op{
+			Kind:  fs.OpCreate,
+			Path:  "/old-drain.txt",
+			Flags: uint32(syscall.O_CREAT | syscall.O_TRUNC | syscall.O_WRONLY),
+			Mode:  0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := writebackHandleOf(res.Handle)
+		if err := h.Write(ctx, 0, []byte("old-drain-bytes")); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		drainDone := make(chan error, 1)
+		go func() {
+			drainDone <- h.DrainFlush(ctx)
+		}()
+		select {
+		case <-enteredPut:
+		case <-ctx.Done():
+			t.Fatal("DrainFlush did not enter PUT /old-drain.txt")
+		}
+
+		// Retarget h to /new-drain.txt while /old-drain.txt's PUT is paused.
+		wb.retarget("/old-drain.txt", "/new-drain.txt")
+		releaseGate()
+		if err := <-drainDone; err != nil {
+			t.Fatalf("DrainFlush: %v", err)
+		}
+
+		if ferr := wb.queue.PathTerminalFailure("/old-drain.txt"); ferr != nil {
+			t.Fatalf("expected /old-drain.txt terminal failure retired, got %v", ferr)
+		}
+		if ferr := wb.queue.PathTerminalFailure("/new-drain.txt"); ferr == nil {
+			t.Fatal("expected /new-drain.txt terminal failure preserved across /old-drain.txt settlement")
+		}
+		h.mu.Lock()
+		landedOnNew := h.landed
+		h.mu.Unlock()
+		if landedOnNew {
+			t.Fatal("old-path upload settlement must not mark retargeted handle landed on /new-drain.txt")
+		}
+		wb.markUnlinked("/new-drain.txt", false)
+		if err := h.Release(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("failure-retarget-does-not-corrupt-new-path-staging", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		b := testbackend.NewBackend()
+		enteredPut := make(chan struct{})
+		allowPut := make(chan struct{})
+		var enterOnce, allowOnce sync.Once
+		releaseGate := func() { allowOnce.Do(func() { close(allowPut) }) }
+		defer releaseGate()
+
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPut && r.URL.Path == "/v1/fs/old-fail.txt" {
+				enterOnce.Do(func() { close(enteredPut) })
+				select {
+				case <-allowPut:
+				case <-r.Context().Done():
+					return
+				}
+				http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			b.ServeHTTP(w, r)
+		})
+		chain, wb := newReviewDrainStack(t, handler, nil)
+
+		res, err := chain.Dispatch(ctx, &fs.Op{
+			Kind:  fs.OpCreate,
+			Path:  "/old-fail.txt",
+			Flags: uint32(syscall.O_CREAT | syscall.O_TRUNC | syscall.O_WRONLY),
+			Mode:  0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := writebackHandleOf(res.Handle)
+		if err := h.Write(ctx, 0, []byte("old-fail-bytes")); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		drainDone := make(chan error, 1)
+		go func() {
+			drainDone <- h.DrainFlush(ctx)
+		}()
+		select {
+		case <-enteredPut:
+		case <-ctx.Done():
+			t.Fatal("DrainFlush did not enter PUT /old-fail.txt")
+		}
+
+		wb.retarget("/old-fail.txt", "/new-fail.txt")
+		releaseGate()
+		if err := <-drainDone; err == nil {
+			t.Fatal("expected DrainFlush on 503 to return error")
+		}
+
+		h.mu.Lock()
+		stagedOnNew := h.stagedToCache
+		h.mu.Unlock()
+		if stagedOnNew {
+			t.Fatal("failed /old-fail.txt upload must not set stagedToCache on retargeted /new-fail.txt handle")
+		}
+		wb.wbCache.Remove("/old-fail.txt")
+		wb.markUnlinked("/new-fail.txt", false)
+		if err := h.Release(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
