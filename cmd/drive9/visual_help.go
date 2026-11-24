@@ -853,7 +853,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 				{Command: "drive9 mount --profile coding-agent :/workspace ./mnt", Desc: "profile mount"},
 				{Command: "DRIVE9_MOUNT_REMOTE_ONLY_PATTERNS='**/tmp/**' drive9 mount :/workspace ./mnt", Desc: "keep tmp paths remote-persistent"},
 				{Command: "drive9 mount --extent '*.db' :/data ./mnt", Desc: "store matching files as content_layout=extent"},
-				{Command: "drive9 mount --layer task=auth ./mnt", Desc: "mount a layer view (defaults to its base_root_path)"},
+				{Command: "drive9 mount --layer tag:task=auth ./mnt", Desc: "mount a layer view (defaults to its base_root_path)"},
 				{Command: "drive9 mount --perf-dir ./perf --foreground :/ ./mnt", Desc: "foreground worker only with profiling outputs"},
 			},
 		},

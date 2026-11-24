@@ -40,6 +40,30 @@ func fsHandleForArg(defaultClient *client.Client, raw string) (fsHandle, error) 
 	return fsHandleForArgOpts(defaultClient, raw, false)
 }
 
+func fsHandleForLayerArg(c *client.Client, raw, layerRef string, fence int64) (fsHandle, error) {
+	loc, err := Parse(raw)
+	if err != nil {
+		return fsHandle{}, err
+	}
+	if layerRef != "" {
+		switch loc.Kind {
+		case KindObject:
+			return fsHandle{}, fmt.Errorf("--layer is drive9-only")
+		case KindDrive9:
+			if err := requireNoLayerWithRemoteContext(layerRef, c, RemotePath{Context: loc.Context, Path: loc.Path}, raw); err != nil {
+				return fsHandle{}, err
+			}
+		}
+		if loc.Kind != KindStdin {
+			c, err = BindCLIViewClient(context.Background(), c, layerRef, fence)
+			if err != nil {
+				return fsHandle{}, err
+			}
+		}
+	}
+	return openFSLocation(c, loc, false)
+}
+
 func peelObjectAuth(args []string) (authLocal bool, rest []string, err error) {
 	rest = make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
@@ -74,6 +98,11 @@ func fsHandleForArgOpts(defaultClient *client.Client, raw string, forCopy bool) 
 	if err != nil {
 		return fsHandle{}, err
 	}
+	return openFSLocation(defaultClient, loc, forCopy)
+}
+
+func openFSLocation(defaultClient *client.Client, loc Location, forCopy bool) (fsHandle, error) {
+	raw := loc.Raw
 	if !forCopy {
 		loc = promoteBareFSArg(loc)
 	}
@@ -98,6 +127,7 @@ func fsHandleForArgOpts(defaultClient *client.Client, raw string, forCopy bool) 
 			if err := requireNoLayerWithRemoteContext("", defaultClient, RemotePath{Context: loc.Context, Path: loc.Path}, raw); err != nil {
 				return fsHandle{}, err
 			}
+			var err error
 			c, err = newFSClientForContext(loc.Context)
 			if err != nil {
 				return fsHandle{}, err

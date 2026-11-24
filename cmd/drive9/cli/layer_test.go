@@ -217,3 +217,32 @@ func TestLayerResolutionRejectsMissingIdentity(t *testing.T) {
 		t.Fatal("duplicate exec layer accepted")
 	}
 }
+
+func TestExplicitLayerRejectsIncompatibleLocationBeforeLookup(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request %s", r.URL.Path)
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	c := client.New(srv.URL, "")
+	for _, cmd := range []struct {
+		name string
+		run  func(*client.Client, []string) error
+	}{
+		{"rm", Rm}, {"mkdir", Mkdir}, {"chmod", Chmod}, {"cat", Cat}, {"ls", Ls}, {"stat", Stat},
+	} {
+		for _, target := range []struct{ path, want string }{
+			{"s3://fixture/object", "drive9-only"}, {"another:/entry", "context-scoped"},
+		} {
+			t.Run(cmd.name+"/"+target.want, func(t *testing.T) {
+				args := []string{"--layer", "named-layer"}
+				if cmd.name == "chmod" {
+					args = append(args, "644")
+				}
+				if err := cmd.run(c, append(args, target.path)); err == nil || !strings.Contains(err.Error(), target.want) {
+					t.Fatalf("want %q, got %v", target.want, err)
+				}
+			})
+		}
+	}
+}

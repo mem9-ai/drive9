@@ -30,6 +30,8 @@ import {
   UnsupportedInLayerViewError,
   clientFetch,
   fetchViewObjectRedirect,
+  getClientViewBinding,
+  rewriteRequestForView,
   hasActiveLayerView,
 } from "./view.js";
 
@@ -88,18 +90,24 @@ async function streamToUint8Array(stream: ReadableStream<Uint8Array>, size: numb
   return result.slice(0, offset);
 }
 
-export async function readStreamImpl(client: Client, path: string): Promise<ReadableStream<Uint8Array>> {
-  const baseUrl = client.fsUrl(path);
-  const resp = await clientFetch(client, baseUrl, {
+async function fetchReadPlan(client: Client, path: string, range?: string) {
+  const headers = client["authHeaders"]({ "X-Dat9-Extent-Read-Plan": "1", ...(range && { Range: range }) });
+  const req = rewriteRequestForView(getClientViewBinding(client), client.fsUrl(path), {
     method: "GET",
-    headers: client["authHeaders"]({ "X-Dat9-Extent-Read-Plan": "1" }),
+    headers,
     redirect: "manual",
   });
+  const resp = await fetch(req.url, req.init);
+  return { resp, sourceUrl: resp.url || req.url };
+}
+
+export async function readStreamImpl(client: Client, path: string): Promise<ReadableStream<Uint8Array>> {
+  const { resp, sourceUrl } = await fetchReadPlan(client, path);
   const status = resp.status;
   if (status === 302 || status === 307) {
     const location = resp.headers.get("location") || resp.headers.get("Location");
     if (!location) throw new Drive9Error("302 without Location header");
-    const resp2 = await fetchViewObjectRedirect(client, resp.url || baseUrl, location);
+    const resp2 = await fetchViewObjectRedirect(client, sourceUrl, location);
     await checkError(resp2);
     if (!resp2.body) throw new Drive9Error("empty response body");
     return resp2.body;
@@ -132,21 +140,13 @@ export async function readStreamRangeImpl(
       },
     });
   }
-  const baseUrl = client.fsUrl(path);
   const rangeHeader = `bytes=${offset}-${offset + length - 1}`;
-  const resp = await clientFetch(client, baseUrl, {
-    method: "GET",
-    headers: client["authHeaders"]({
-      "X-Dat9-Extent-Read-Plan": "1",
-      Range: rangeHeader,
-    }),
-    redirect: "manual",
-  });
+  const { resp, sourceUrl } = await fetchReadPlan(client, path, rangeHeader);
   const status = resp.status;
   if (status === 302 || status === 307) {
     const location = resp.headers.get("location") || resp.headers.get("Location");
     if (!location) throw new Drive9Error("302 without Location header");
-    const resp2 = await fetchViewObjectRedirect(client, resp.url || baseUrl, location, { Range: rangeHeader });
+    const resp2 = await fetchViewObjectRedirect(client, sourceUrl, location, { Range: rangeHeader });
     if (resp2.status === 416) {
       await resp2.text().catch(() => "");
       return new ReadableStream({ start(c) { c.close(); } });

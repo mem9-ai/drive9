@@ -10,8 +10,6 @@ import (
 
 var _ = os.Stderr
 
-var errLayerRolledBack = errors.New("fs layer has been rolled back; remount required")
-
 var errCommitPayloadStale = errors.New("commit payload generation is stale")
 
 type safeLogValue struct{ value any }

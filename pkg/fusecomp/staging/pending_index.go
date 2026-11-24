@@ -22,16 +22,15 @@ import (
 // replacement Put's new .meta must never be deleted by a stale owner's
 // remove that already passed its generation check in memory.
 type PendingIndex struct {
-	layerPublicationMu sync.RWMutex // rollback waits for publishers before dropping caches
-	mu                 sync.RWMutex
-	items              map[string]*WriteBackMeta // path → metadata
-	fences             map[string]CommittedFence // path → landed replay fence (never a pending entry)
-	fenceMask          map[string]struct{}       // hashes of fences that could not be read
-	fencesLoaded       bool
-	fencesErr          error
-	dir                string // directory for .meta persistence
-	nextGen            atomic.Uint64
-	pathLocks          map[string]*pendingPathLock
+	mu           sync.RWMutex
+	items        map[string]*WriteBackMeta // path → metadata
+	fences       map[string]CommittedFence // path → landed replay fence (never a pending entry)
+	fenceMask    map[string]struct{}       // hashes of fences that could not be read
+	fencesLoaded bool
+	fencesErr    error
+	dir          string // directory for .meta persistence
+	nextGen      atomic.Uint64
+	pathLocks    map[string]*pendingPathLock
 	// journal, when set, is the durable publication channel for new pending
 	// entries: one group-committed WAL fsync replaces the per-entry
 	// atomicWrite (tmp fsync + dir fsync). Callers must have made the entry's
@@ -44,7 +43,6 @@ type PendingIndex struct {
 	// background SyncLoop / fsync(2) / umount make it durable.
 	journalSyncOnPut bool
 	shadows          *ShadowStore // wired once before staging/recovery
-	layerAbandoned   bool         // prevents late publications from reviving a rolled-back overlay
 	// writeMu is the leaf lock for every disk write this index performs, and the
 	// guard for closed. Teardown closes the index so a worker that is still
 	// finishing a commit cannot create .meta/.fence/.tmp files in a directory the
@@ -266,15 +264,6 @@ func (idx *PendingIndex) PutWithBaseRev(remotePath string, size int64, kind Pend
 func (idx *PendingIndex) PutWithBaseRevAndMode(remotePath string, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool) (uint64, error) {
 	return idx.PutWithBaseRevAndModeAndLineage(remotePath, size, kind, baseRev, mode, hasMode, "", "", false)
 }
-
-// PutLayerCache publishes content already persisted in a Layer. It remains
-// visible through the overlay index, but does not require another upload.
-func (idx *PendingIndex) PutLayerCache(remotePath string, size int64, baseRev int64, mode uint32, hasMode bool, identity LayerCacheIdentity) (uint64, error) {
-	return idx.putInternal(WriteBackMeta{Path: remotePath, Size: size, Kind: PendingOverwrite, BaseRev: baseRev, Mode: mode, HasMode: hasMode, LayerClean: true, LayerID: identity.LayerID, LayerEntrySeq: identity.EntrySeq})
-}
-
-// putLayerCacheIfAbsent never replaces a publication that arrived while a
-// chmod with no initial metadata was reading or uploading its payload.
 
 // PutWithBaseRevAndModeAndLineage attaches process-local causal identity to
 // the durable metadata. The IDs are intentionally excluded from JSON; empty
@@ -995,57 +984,6 @@ func (idx *PendingIndex) UpdateMode(remotePath string, mode uint32) error {
 	return nil
 }
 
-// MarkLayerCommittedIfGeneration marks only the uploaded publication as a
-// durable overlay. An older completion cannot acknowledge a newer local edit.
-func (idx *PendingIndex) MarkLayerCommittedIfGeneration(remotePath string, generation uint64, committedRev int64, mode uint32, hasMode bool, identity LayerCacheIdentity) error {
-	pl := idx.acquirePathLock(remotePath)
-	defer idx.releasePathLock(remotePath, pl)
-
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-
-	meta, ok := idx.items[remotePath]
-	if !ok || generation == 0 || meta.Generation != generation || idx.layerAbandoned || meta.Kind == PendingConflict {
-		return nil
-	}
-	updated := cloneWriteBackMeta(meta)
-	updated.Kind = PendingOverwrite
-	updated.LayerClean = true
-	updated.LayerID = identity.LayerID
-	updated.LayerEntrySeq = identity.EntrySeq
-	if hasMode {
-		updated.Mode = mode & posixPermissionModeMask
-		updated.HasMode = true
-	}
-	if committedRev > 0 {
-		updated.BaseRev = committedRev
-	}
-	updated.Mtime = time.Now()
-
-	metaBytes, err := json.Marshal(&updated)
-	if err != nil {
-		return fmt.Errorf("pending index marshal committed: %w", err)
-	}
-	if idx.journal != nil {
-		// Publish under the same path lock as Put. A path-only commit marker
-		// could otherwise hide a newer WAL publication after a crash.
-		if err := idx.journal.Append(JournalEntry{Op: JournalPendingMeta, Path: remotePath, Meta: metaBytes}); err != nil {
-			return fmt.Errorf("pending index mark layer committed: %w", err)
-		}
-		if err := idx.journal.FsyncShared(); err != nil {
-			return fmt.Errorf("pending index sync layer commit: %w", err)
-		}
-	} else {
-		metaPath := filepath.Join(idx.dir, HashPath(remotePath)+".meta")
-		if err := idx.writeFile(metaPath, metaBytes); err != nil {
-			return fmt.Errorf("pending index mark layer committed: %w", err)
-		}
-	}
-	cp := updated
-	idx.items[remotePath] = &cp
-	return nil
-}
-
 // MarkConflict marks a pending entry as conflicted so that RecoverPending
 // skips it on restart. The entry is kept on disk for manual recovery.
 // The in-memory state is only updated after the disk write succeeds to
@@ -1300,40 +1238,14 @@ func (idx *PendingIndex) releaseTwoPathLocks(a, b string, pla, plb *pendingPathL
 func (idx *PendingIndex) putInternal(meta WriteBackMeta) (uint64, error) {
 	meta.Mode &= posixPermissionModeMask
 	meta.liveAncestors = append([]string(nil), meta.liveAncestors...)
-	return idx.publishMeta(&meta, false)
-}
-
-// publishMeta serializes a publication, including an optional absence check,
-// with acknowledgements and rollback cache removal.
-func (idx *PendingIndex) publishMeta(meta *WriteBackMeta, onlyIfAbsent bool) (uint64, error) {
-	idx.layerPublicationMu.RLock()
-	defer idx.layerPublicationMu.RUnlock()
 	remotePath := meta.Path
 	pl := idx.acquirePathLock(remotePath)
 	defer idx.releasePathLock(remotePath, pl)
 	idx.mu.RLock()
-	abandoned := idx.layerAbandoned
-	previous, exists := idx.items[remotePath]
-	if exists && !meta.LayerClean {
-		// Dirty staging retains the Layer snapshot it was based on. Replay
-		// needs this identity to detect an external update after Flush.
-		meta.LayerID, meta.LayerEntrySeq = previous.LayerID, previous.LayerEntrySeq
-		// Re-staging is not conflict resolution. In particular, a first
-		// write can be conflicted without ever having had a Layer identity.
-		if previous.Kind == PendingConflict {
-			meta.Kind = PendingConflict
-		}
-	}
-	idx.mu.RUnlock()
-	if onlyIfAbsent && exists {
-		return 0, nil
-	}
-	if abandoned {
-		if meta.LayerClean {
-			return 0, errLayerRolledBack
-		}
+	if previous := idx.items[remotePath]; previous != nil && previous.Kind == PendingConflict {
 		meta.Kind = PendingConflict
 	}
+	idx.mu.RUnlock()
 	meta.Mtime = time.Now()
 	meta.CreatedAt = meta.Mtime
 	gen := idx.nextGen.Add(1)
@@ -1374,7 +1286,7 @@ func (idx *PendingIndex) publishMeta(meta *WriteBackMeta, onlyIfAbsent bool) (ui
 	}
 
 	idx.mu.Lock()
-	idx.items[remotePath] = meta
+	idx.items[remotePath] = &meta
 	// A newer staging supersedes a landed-replay fence for the path: the fence
 	// only masks frames at or below its own generation, and leaving it would
 	// keep suppressing nothing while still pinning a stale shadow at settle.
@@ -1386,9 +1298,6 @@ func (idx *PendingIndex) publishMeta(meta *WriteBackMeta, onlyIfAbsent bool) (ui
 
 	return gen, nil
 }
-
-// abandonLayer fences clean publishers already in progress and makes future
-// dirty publications conflicts instead of reviving the abandoned Layer.
 
 // publishRecoveredMeta installs a pending entry unmarshaled from a WAL frame
 // during crash recovery. It is in-memory only: the WAL record remains on disk

@@ -52,14 +52,11 @@ func Rm(c *client.Client, args []string) error {
 		return fmt.Errorf("usage: drive9 fs rm [-r|--recursive] [--auth=local|server] <path>")
 	}
 
-	h, herr := fsHandleForArg(c, path)
+	h, herr := fsHandleForLayerArg(c, path, layerRef, fence)
 	if herr != nil {
 		return herr
 	}
 	if h.Loc.Kind == KindObject {
-		if layerRef != "" {
-			return fmt.Errorf("--layer is drive9-only")
-		}
 		ctx, cancel := withObjectOpTimeout(context.Background())
 		defer cancel()
 		if err := h.Backend.Remove(ctx, h.Loc, recursive); err != nil {
@@ -67,18 +64,7 @@ func Rm(c *client.Client, args []string) error {
 		}
 		return nil
 	}
-	if h.Loc.Kind == KindDrive9 && h.Loc.Context != "" {
-		if err := requireNoLayerWithRemoteContext(layerRef, c, RemotePath{Context: h.Loc.Context, Path: h.Path}, path); err != nil {
-			return err
-		}
-	}
 	c, path = h.Client, h.Path
-	if layerRef != "" {
-		c, err = BindCLIViewClient(context.Background(), c, layerRef, fence)
-		if err != nil {
-			return err
-		}
-	}
 	if recursive {
 		return c.RemoveAll(path)
 	}

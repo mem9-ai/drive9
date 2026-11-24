@@ -44,6 +44,13 @@ describe("Layer view WriteGuard and redirect validation parity", () => {
     );
   });
 
+  it("recognizes an API route under the decoded deployment prefix", async () => {
+    const client = { baseUrl: "https://example.test/%64eploy" };
+    setClientViewBinding(client, validateViewBinding({ layerId }, client.baseUrl));
+    await expect(fetchViewObjectRedirect(client, client.baseUrl, "/deploy/v1/status"))
+      .rejects.toBeInstanceOf(InvalidLayerViewRequestError);
+  });
+
   it("blocks redirect rebounds across alternate ports, subdomains, duplicate slashes, dot segments, and encoded separators", async () => {
     const fakeClient = { baseUrl: "https://api.drive9.example/deploy" };
     const binding = validateViewBinding({ layerId, fence: 1 }, fakeClient.baseUrl);

@@ -291,7 +291,6 @@ export interface BatchWriteItem {
   data: Uint8Array;
   expectedRevision?: number;
   mode?: number;
-  tags?: Record<string, string>;
 }
 
 export interface BatchWriteResult {
