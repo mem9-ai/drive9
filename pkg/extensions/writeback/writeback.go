@@ -7951,10 +7951,19 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 		h.mu.Unlock()
 		return nil, nil
 	}
-	isNew := h.isNew
+	isNew, landed := h.isNew, h.landed
 	if h.buf == nil {
 		h.mu.Unlock()
 		if !isNew {
+			return nil, nil
+		}
+		if landed {
+			// The handle's image already landed (a streamed inline commit, or a
+			// queue landing that published it). Materializing the empty buffer
+			// now would stage a zero-byte image over the real content — the same
+			// reason Release keys its empty materialization on landed — and if it
+			// landed it would truncate the file; if it did not, it stranded a
+			// bogus pending entry that failed the unmount drain.
 			return nil, nil
 		}
 		// An O_CREAT claim that never wrote stages as a zero-byte image
