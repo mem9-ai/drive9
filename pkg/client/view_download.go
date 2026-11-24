@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
 
 	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
@@ -33,7 +32,7 @@ func (c *Client) rewriteRequestForView(req *http.Request) (*http.Request, error)
 		return out, nil
 
 	case viewprotocol.RouteRewriteView:
-		write := viewRouteRequiresWriteGuard(req.Method, innerEscaped)
+		write := viewprotocol.RouteMutatesView(req.Method, innerEscaped)
 		if write && c.view.WriteGuard != nil {
 			if err := c.view.WriteGuard(); err != nil {
 				return nil, err
@@ -69,18 +68,6 @@ func (c *Client) rewriteRequestForView(req *http.Request) (*http.Request, error)
 	default:
 		return nil, viewprotocol.ErrUnsupportedInLayerView
 	}
-}
-
-func viewRouteRequiresWriteGuard(method, innerEscaped string) bool {
-	if method == http.MethodPost && (innerEscaped == "/v1/fs:batch-stat" || innerEscaped == "/v1/fs:batch-read-small") {
-		return false
-	}
-	if method != http.MethodGet && method != http.MethodHead {
-		return true
-	}
-	return method == http.MethodGet &&
-		strings.HasPrefix(innerEscaped, "/v1/uploads/") &&
-		strings.HasSuffix(innerEscaped, "/resume")
 }
 
 func (c *Client) doObjectLocation(ctx context.Context, sourceURL *url.URL, rawLocation string, hdr http.Header) (*http.Response, error) {

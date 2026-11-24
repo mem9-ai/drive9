@@ -538,7 +538,7 @@ export class Client {
     }
     let totalBytes = 0;
     const wireItems = items.map((item) => {
-      if (item.tags !== undefined) throw new Drive9Error("batch write does not support tags");
+      if ("tags" in item && item.tags !== undefined) throw new Drive9Error("batch write does not support tags");
       totalBytes += item.data.byteLength;
       if (totalBytes > MaxBatchWriteBytes) {
         throw new Drive9Error(`batch write: ${totalBytes} bytes exceeds limit of ${MaxBatchWriteBytes}`);

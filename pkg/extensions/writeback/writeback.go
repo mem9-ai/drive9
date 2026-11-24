@@ -945,6 +945,9 @@ func (w *Writeback) AbandonLayerForRollback() {
 		return
 	}
 	w.rolledBack.Store(true)
+	if w.uploader != nil {
+		w.uploader.abandonLayer()
+	}
 	if w.queue != nil {
 		w.queue.AbandonLayer()
 	}
@@ -1132,6 +1135,11 @@ func (w *Writeback) Drain(ctx context.Context) error {
 			// loss: the drain must not certify it (FS.Drain reports the same
 			// state through DrainPending).
 			firstErr = fmt.Errorf("writeback: %d staged image(s) were lost before they landed: %w", n, staging.ErrStagedViewLost)
+		}
+	}
+	if firstErr == nil && w.rolledBack.Load() {
+		if reason, n := w.DrainPending(); n > 0 {
+			return fmt.Errorf("%w: %s (%d)", errLayerRolledBack, reason, n)
 		}
 	}
 	return firstErr
@@ -6375,6 +6383,11 @@ func (w *Writeback) DrainPending() (string, int) {
 	if w.wbCache != nil {
 		if n := w.wbCache.ViewLossCount(); n > 0 {
 			return "lost_staged_images", n
+		}
+	}
+	if w.rolledBack.Load() && w.opts.Staging != nil && w.opts.Staging.Pending != nil {
+		if n := len(w.opts.Staging.Pending.ListUncommittedPaths()); n != 0 {
+			return "fenced_pending_writes", n
 		}
 	}
 	return "", 0

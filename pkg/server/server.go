@@ -1755,8 +1755,7 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 //     chmod stays owner-only)
 //   - /v1/uploads* + /v2/uploads/* (action-aware, mirrors actual upload
 //     dispatch table; see isScopedV{1,2}UploadRouteAllowed)
-//   - /v1/layers* + /v1/layer-checkpoints/* (route-aware, with per-layer
-//     base root and per-entry path authorization in fs_layer.go)
+//   - /v1/layers* and /v1/views* return the built-in LayerFS capability error.
 //
 // chmod (POST /v1/fs/<path>?chmod=1) is explicitly NOT and never will be in
 // the scoped allowlist — chmod escalates ACLs and is owner-token-only.

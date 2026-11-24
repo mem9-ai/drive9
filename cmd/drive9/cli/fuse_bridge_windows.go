@@ -4,6 +4,10 @@ package cli
 
 import "fmt"
 
+func mountLayerConfigError(action string, err error) error {
+	return fmt.Errorf("%s: %w", action, err)
+}
+
 func classifyMountLayerLookupError(ref string, err error) error {
 	return fmt.Errorf("resolve layer %q: %w", ref, err)
 }

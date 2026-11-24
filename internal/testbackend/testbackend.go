@@ -41,21 +41,6 @@ type Node struct {
 	Tags map[string]string
 }
 
-// LayerEntry is one recorded fs-layer entry (the layers subtree is a log,
-// not part of the base namespace).
-type LayerEntry struct {
-	Path        string
-	Op          string
-	Kind        string
-	Mode        uint32
-	Content     []byte
-	ContentText string
-	// StorageType marks object-uploaded bodies ("s3"): entry fetches reply
-	// it and omit the inline content, forcing the stream fetch.
-	StorageType string
-	Seq         int64
-}
-
 // Backend implements http.Handler with the drive9 fs wire contract subset:
 // HEAD stat headers, ?list=1, Range GETs, conditional PUTs, create/mkdir/
 // rename/symlink/hardlink/chmod POSTs, DELETE, and a forced-conflict knob
@@ -77,14 +62,6 @@ type Backend struct {
 	// PatchUnsupported makes PATCH /v1/fs answer the not-S3-stored code,
 	// forcing callers onto their full-rewrite fallback.
 	PatchUnsupported bool
-	// layerLog records fs-layer entries per layer ID; layerSeq is its cursor.
-	layerLog map[string][]LayerEntry
-	layerSeq int64
-	// layerEvents holds synthetic events (rollbacks) injected by tests,
-	// appended after the entry-derived write events.
-	layerEvents map[string][]LayerEntry
-	// checkpoints maps checkpoint ID → durable seq bound.
-	checkpoints map[string]int64
 	// gitWorkspaces seeds GET /v1/git-workspaces; gitOverlay is the overlay
 	// log per workspace (path → entry).
 	gitWorkspaces []map[string]any
@@ -92,13 +69,6 @@ type Backend struct {
 	// gitStates/gitPacks back the git-state checkpoint endpoints.
 	gitStates map[string][]byte
 	gitPacks  map[string][][]byte
-	// layerEntryDelay slows layer-entry POSTs (test knob).
-	layerEntryDelay time.Duration
-	// layerEntryResponseHold parks a layer-entry POST's RESPONSE after
-	// the entry is applied and its event published (test knob).
-	layerEntryResponseHold time.Duration
-	// failLayerEntry injects one failing response per recorded path.
-	failLayerEntry map[string]int
 	// uploads tracks v2 multipart sessions (initiate → parts → complete).
 	uploads   map[string]*uploadState
 	uploadSeq int64
@@ -130,18 +100,14 @@ func (us *uploadState) partSizeFor(num int) int64 {
 
 func NewBackend() *Backend {
 	return &Backend{
-		files:          map[string]*Node{"/": {IsDir: true, Mode: 0o755}},
-		nextRev:        10, // fixtures use revs 1..9
-		forceConflict:  map[string]int{},
-		failDelete:     map[string]int{},
-		layerLog:       map[string][]LayerEntry{},
-		layerEvents:    map[string][]LayerEntry{},
-		failLayerEntry: map[string]int{},
-		uploads:        map[string]*uploadState{},
-		checkpoints:    map[string]int64{},
-		requests:       map[string]int{},
-		gitStates:      map[string][]byte{},
-		gitPacks:       map[string][][]byte{},
+		files:         map[string]*Node{"/": {IsDir: true, Mode: 0o755}},
+		nextRev:       10, // fixtures use revs 1..9
+		forceConflict: map[string]int{},
+		failDelete:    map[string]int{},
+		uploads:       map[string]*uploadState{},
+		requests:      map[string]int{},
+		gitStates:     map[string][]byte{},
+		gitPacks:      map[string][][]byte{},
 	}
 }
 
@@ -320,20 +286,6 @@ func (b *Backend) GitOverlay(id string) map[string]map[string]any {
 	return out
 }
 
-// SetCheckpoint pins a checkpoint's durable seq bound.
-func (b *Backend) SetCheckpoint(id string, seq int64) {
-	b.mu.Lock()
-	b.checkpoints[id] = seq
-	b.mu.Unlock()
-}
-
-// LayerLog returns the recorded fs-layer entries for one layer ID.
-func (b *Backend) LayerLog(layerID string) []LayerEntry {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return append([]LayerEntry(nil), b.layerLog[layerID]...)
-}
-
 // Requests returns the per "METHOD path" request counts observed so far.
 func (b *Backend) Requests() map[string]int {
 	b.mu.Lock()
@@ -343,28 +295,6 @@ func (b *Backend) Requests() map[string]int {
 		out[k] = v
 	}
 	return out
-}
-
-// DelayLayerEntriesForTest slows layer-entry POSTs (mutation-lock rows).
-func (b *Backend) DelayLayerEntriesForTest(d time.Duration) {
-	b.mu.Lock()
-	b.layerEntryDelay = d
-	b.mu.Unlock()
-}
-
-// HoldLayerEntryResponses parks layer-entry POST responses (after the
-// entry is applied) for the given duration.
-func (b *Backend) HoldLayerEntryResponses(d time.Duration) {
-	b.mu.Lock()
-	b.layerEntryResponseHold = d
-	b.mu.Unlock()
-}
-
-// ForceLayerEntryFailure injects n failing layer-entry responses for path.
-func (b *Backend) ForceLayerEntryFailure(path string, n int) {
-	b.mu.Lock()
-	b.failLayerEntry[path] = n
-	b.mu.Unlock()
 }
 
 // ForceConflict arms N forced 409s for conditional writes to path.
@@ -389,15 +319,6 @@ func (b *Backend) ForceDeleteFailure(path string, n int) {
 	b.mu.Lock()
 	b.failDelete[path] = n
 	b.mu.Unlock()
-}
-
-// AppendLayerEvent injects a synthetic layer event (e.g. rollback) for the
-// watcher tests.
-func (b *Backend) AppendLayerEvent(layerID, op string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.layerSeq++
-	b.layerEvents[layerID] = append(b.layerEvents[layerID], LayerEntry{Op: op, Seq: b.layerSeq})
 }
 
 func (b *Backend) writeErr(w http.ResponseWriter, code int, msg string) {
@@ -718,204 +639,12 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	// checkpoints: GET /v1/layer-checkpoints/{id} (durable_seq bounds replay)
-	if strings.HasPrefix(r.URL.Path, "/v1/layer-checkpoints/") && r.Method == http.MethodGet {
-		id := strings.TrimPrefix(r.URL.Path, "/v1/layer-checkpoints/")
-		b.mu.Lock()
-		seq := b.layerSeq
-		if cp, ok := b.checkpoints[id]; ok {
-			seq = cp
-		}
-		b.mu.Unlock()
-		b.writeJSON(w, map[string]any{"checkpoint_id": id, "layer_id": "L1", "durable_seq": seq})
-		return
-	}
-	// fs-layer subtree: POST /v1/layers/{id}/entries, GET /v1/layers/{id}/diff
-	if strings.HasPrefix(r.URL.Path, "/v1/layers/") {
-		rest := strings.TrimPrefix(r.URL.Path, "/v1/layers/")
-		id := rest
-		if i := strings.IndexByte(rest, '/'); i >= 0 {
-			id = rest[:i]
-			tail := rest[i+1:]
-			switch {
-			case tail == "entries" && r.Method == http.MethodPost:
-				var req struct {
-					Path        string `json:"path"`
-					Op          string `json:"op"`
-					Kind        string `json:"kind"`
-					Mode        uint32 `json:"mode"`
-					Content     []byte `json:"content"`
-					ContentText string `json:"content_text"`
-				}
-				_ = json.NewDecoder(r.Body).Decode(&req)
-				b.mu.Lock()
-				if b.failLayerEntry[req.Path] > 0 {
-					b.failLayerEntry[req.Path]--
-					b.mu.Unlock()
-					b.writeErr(w, http.StatusInternalServerError, "layer entry forced failure")
-					return
-				}
-				delay := b.layerEntryDelay
-				hold := b.layerEntryResponseHold
-				b.layerSeq++
-				e := LayerEntry{Path: req.Path, Op: req.Op, Kind: req.Kind, Mode: req.Mode, Content: req.Content, ContentText: req.ContentText, Seq: b.layerSeq}
-				b.layerLog[id] = append(b.layerLog[id], e)
-				b.mu.Unlock()
-				if delay > 0 {
-					time.Sleep(delay)
-				}
-				if hold > 0 {
-					time.Sleep(hold)
-				}
-				b.writeJSON(w, map[string]any{"layer_id": id, "path": req.Path, "op": req.Op, "seq": e.Seq, "entry_seq": e.Seq})
-				return
-			case tail == "events" && r.Method == http.MethodGet:
-				since := int64(0)
-				if v := r.URL.Query().Get("since"); v != "" {
-					since, _ = strconv.ParseInt(v, 10, 64)
-				}
-				b.mu.Lock()
-				log := append([]LayerEntry(nil), b.layerLog[id]...)
-				extra := append([]LayerEntry(nil), b.layerEvents[id]...)
-				b.mu.Unlock()
-				type ev struct {
-					Seq  int64  `json:"seq"`
-					Op   string `json:"op"`
-					Path string `json:"path"`
-				}
-				out := []ev{}
-				for _, e := range log {
-					if e.Seq > since {
-						out = append(out, ev{Seq: e.Seq, Op: "write", Path: e.Path})
-					}
-				}
-				for _, e := range extra {
-					if e.Seq > since {
-						out = append(out, ev{Seq: e.Seq, Op: e.Op, Path: e.Path})
-					}
-				}
-				b.writeJSON(w, map[string]any{"events": out})
-				return
-			case tail == "entries" && r.Method == http.MethodGet:
-				path := r.URL.Query().Get("path")
-				maxSeq := int64(-1)
-				if v := r.URL.Query().Get("max_seq"); v != "" {
-					maxSeq, _ = strconv.ParseInt(v, 10, 64)
-				}
-				b.mu.Lock()
-				log := append([]LayerEntry(nil), b.layerLog[id]...)
-				b.mu.Unlock()
-				var found *LayerEntry
-				for i := range log {
-					e := &log[i]
-					if e.Path != path || (maxSeq >= 0 && e.Seq > maxSeq) {
-						continue
-					}
-					if found == nil || e.Seq > found.Seq {
-						found = e
-					}
-				}
-				if found == nil {
-					b.writeErr(w, http.StatusNotFound, "layer endpoint not found")
-					return
-				}
-				m := map[string]any{
-					"layer_id": id, "path": found.Path, "op": found.Op, "kind": found.Kind,
-					"mode": found.Mode, "size_bytes": int64(len(found.Content)), "entry_seq": found.Seq,
-					"content_text": found.ContentText,
-				}
-				if found.StorageType == "s3" {
-					m["storage_type"] = "s3"
-				} else {
-					m["content"] = found.Content
-				}
-				b.writeJSON(w, m)
-				return
-			case tail == "objects" && r.Method == http.MethodPost:
-				path := r.URL.Query().Get("path")
-				mode := uint32(0o644)
-				if v := r.URL.Query().Get("mode"); v != "" {
-					parsed, _ := strconv.ParseInt(v, 8, 32)
-					mode = uint32(parsed)
-				}
-				baseRev := int64(0)
-				if v := r.URL.Query().Get("base_revision"); v != "" {
-					baseRev, _ = strconv.ParseInt(v, 10, 64)
-				}
-				body, rerr := io.ReadAll(r.Body)
-				if rerr != nil {
-					b.writeErr(w, http.StatusBadRequest, "read body")
-					return
-				}
-				b.mu.Lock()
-				b.layerSeq++
-				e := LayerEntry{Path: path, Op: "upsert", Kind: "file", Mode: mode, Content: body, StorageType: "s3", Seq: b.layerSeq}
-				b.layerLog[id] = append(b.layerLog[id], e)
-				b.mu.Unlock()
-				b.writeJSON(w, map[string]any{"layer_id": id, "path": path, "op": "upsert", "entry_seq": e.Seq, "storage_type": "s3", "size_bytes": int64(len(body)), "base_revision": baseRev})
-				return
-			case tail == "objects" && r.Method == http.MethodGet:
-				path := r.URL.Query().Get("path")
-				maxSeq := int64(-1)
-				if v := r.URL.Query().Get("max_seq"); v != "" {
-					maxSeq, _ = strconv.ParseInt(v, 10, 64)
-				}
-				b.mu.Lock()
-				log := append([]LayerEntry(nil), b.layerLog[id]...)
-				b.mu.Unlock()
-				var found *LayerEntry
-				for i := range log {
-					e := &log[i]
-					if e.Path != path || e.Op != "upsert" || e.Kind != "file" || (maxSeq >= 0 && e.Seq > maxSeq) {
-						continue
-					}
-					if found == nil || e.Seq > found.Seq {
-						found = e
-					}
-				}
-				if found == nil {
-					b.writeErr(w, http.StatusNotFound, "layer object not found")
-					return
-				}
-				w.Header().Set("Content-Type", "application/octet-stream")
-				w.WriteHeader(http.StatusOK)
-				if len(found.Content) > 0 {
-					_, _ = w.Write(found.Content)
-				} else {
-					_, _ = w.Write([]byte(found.ContentText))
-				}
-				return
-			case tail == "diff" && r.Method == http.MethodGet:
-				b.mu.Lock()
-				log := append([]LayerEntry(nil), b.layerLog[id]...)
-				b.mu.Unlock()
-				maxSeq := int64(-1)
-				if v := r.URL.Query().Get("max_seq"); v != "" {
-					maxSeq, _ = strconv.ParseInt(v, 10, 64)
-				}
-				out := make([]map[string]any, 0, len(log))
-				for _, e := range log {
-					if maxSeq >= 0 && e.Seq > maxSeq {
-						continue
-					}
-					m := map[string]any{"layer_id": id, "path": e.Path, "op": e.Op, "kind": e.Kind, "mode": e.Mode, "entry_seq": e.Seq}
-					if len(e.Content) > 0 {
-						m["content"] = e.Content
-					}
-					if e.ContentText != "" {
-						m["content_text"] = e.ContentText
-					}
-					out = append(out, m)
-				}
-				b.writeJSON(w, map[string]any{"entries": out})
-				return
-			}
-		}
-		if r.Method == http.MethodGet && id != "" && !strings.Contains(rest, "/") {
+	if id, ok := strings.CutPrefix(r.URL.Path, "/v1/layers/"); ok {
+		if r.Method == http.MethodGet && id != "" && !strings.Contains(id, "/") {
 			b.writeJSON(w, map[string]any{"layer_id": id, "state": "active"})
-			return
+		} else {
+			b.writeErr(w, http.StatusNotFound, "layer endpoint not found")
 		}
-		b.writeErr(w, http.StatusNotFound, "layer endpoint not found")
 		return
 	}
 

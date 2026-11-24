@@ -180,7 +180,7 @@ func resolveLayerMountView(
 			Kind:    "expire",
 		})
 		if uerr != nil {
-			return nil, ClassifyLayerStartupError(fmt.Sprintf("expire stale mount lease on layer %s", info.LayerID), uerr)
+			return nil, classifyLayerBindError(fmt.Sprintf("expire stale mount lease on layer %s", info.LayerID), uerr)
 		}
 		if unb == nil || unb.Fence < 0 || unb.Fence%2 != 0 {
 			return nil, ExitStartupTransientErr(
@@ -205,7 +205,7 @@ func resolveLayerMountView(
 		ExpectedFence: expectedFence,
 	})
 	if err != nil {
-		return nil, ClassifyLayerStartupError(fmt.Sprintf("bind exclusive mount lease on layer %s", info.LayerID), err)
+		return nil, classifyLayerBindError(fmt.Sprintf("bind exclusive mount lease on layer %s", info.LayerID), err)
 	}
 
 	binding := &layerMountBinding{
@@ -353,6 +353,14 @@ func isTerminalLayerRenewError(err error) bool {
 		}
 	}
 	return false
+}
+
+func classifyLayerBindError(action string, err error) *MountExitError {
+	var status *client.StatusError
+	if errors.Is(err, client.ErrConflict) || (errors.As(err, &status) && status.StatusCode == http.StatusConflict) {
+		return newMountExit(ExitLayerLeaseBusy, ExitReasonLayerLeaseBusy, action, err)
+	}
+	return ClassifyLayerStartupError(action, err)
 }
 
 // ClassifyLayerStartupError preserves the worker exit code for Layer control-plane failures.

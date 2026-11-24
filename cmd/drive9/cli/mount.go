@@ -157,7 +157,11 @@ func fsMountCmd(args []string) error {
 	return fsMountCmdWithBackground(args, false)
 }
 
-func fsMountCmdWithBackground(args []string, background bool) (resultErr error) {
+func fsMountCmdWithBackground(args []string, background bool) error {
+	return fsMountWithLeaseRecovery(args, background, false)
+}
+
+func fsMountWithLeaseRecovery(args []string, background, recovering bool) (resultErr error) {
 	authLocal, args, err := peelObjectAuth(args)
 	if err != nil {
 		return err
@@ -174,6 +178,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	apiKey := fs.String("api-key", "", "owner API key (overrides $DRIVE9_API_KEY and config)")
 	mode := fs.String("mode", "auto", "mount mode: auto, fuse, or webdav")
 	foreground := fs.Bool("foreground", false, "run in the foreground and block until unmounted")
+	recoverLease := fs.Bool("recover-layer-lease", recovering, "wait for an earlier worker's Layer lease during recovery")
 	superviseForeground := fs.Bool("supervise-foreground", false, "run as in-process supervisor and block until stop (sandbox/systemd friendly)")
 	noSupervise := fs.Bool("no-supervise", false, "legacy fire-and-forget background mount without supervisor")
 	defaultOwner := fs.String("owner", "", "UID:GID to report for files without a stored owner (FUSE; default: the mounting user)")
@@ -757,11 +762,11 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 			}
 			archiveClient, err = archiveClient.WithView(client.ViewBinding{LayerID: info.LayerID})
 			if err != nil {
-				return err
+				return mountLayerConfigError("invalid layer view", err)
 			}
 			_, remoteRoot, err = mountpath.LayerRoots(info.BaseRootPath, remoteRoot, remoteRootDefaulted)
 			if err != nil {
-				return err
+				return mountLayerConfigError("invalid layer mount root", err)
 			}
 			// Pin child processes to the same layer as the supervisor and archive.
 			if strings.HasPrefix(originalArgs[layerArgIndex], "-layer=") || strings.HasPrefix(originalArgs[layerArgIndex], "--layer=") {
@@ -829,6 +834,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 			LocalRoot:         normalizedLocalRoot,
 			LayerID:           layerRef,
 			LayerReadOnly:     layerRef != "" && *readOnly,
+			RecoverLayerLease: *recoverLease,
 			PackPaths:         append([]string(nil), effectivePackPaths...),
 			MaxRestarts:       *maxRestarts,
 			RestartWindow:     *restartWindow,
@@ -854,6 +860,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 				LocalRoot:         normalizedLocalRoot,
 				LayerID:           layerRef,
 				LayerReadOnly:     layerRef != "" && *readOnly,
+				RecoverLayerLease: *recoverLease,
 				PackPaths:         append([]string(nil), effectivePackPaths...),
 				MaxRestarts:       *maxRestarts,
 				RestartWindow:     *restartWindow,
@@ -1063,6 +1070,7 @@ func (e mountCommandRedactedError) ExitCode() int {
 type mountSuperviseStartRequest struct {
 	LayerID           string
 	LayerReadOnly     bool
+	RecoverLayerLease bool
 	OriginalArgs      []string
 	MountPoint        string
 	Server            string
@@ -1096,10 +1104,10 @@ func workerArgsForSupervise(args []string) []string {
 	for i := 0; i < len(cleaned); i++ {
 		a := cleaned[i]
 		switch {
-		case a == "--foreground" || a == "--supervise-foreground" || a == "--no-supervise" || a == "--supervised":
+		case a == "--foreground" || a == "--supervise-foreground" || a == "--recover-layer-lease" || a == "--no-supervise" || a == "--supervised":
 			continue
 		case strings.HasPrefix(a, "--foreground=") || strings.HasPrefix(a, "--supervise-foreground=") ||
-			strings.HasPrefix(a, "--no-supervise=") || strings.HasPrefix(a, "--supervised="):
+			strings.HasPrefix(a, "--recover-layer-lease=") || strings.HasPrefix(a, "--no-supervise=") || strings.HasPrefix(a, "--supervised="):
 			continue
 		default:
 			out = append(out, a)
@@ -1132,6 +1140,9 @@ func superviseCommandArgs(req mountSuperviseStartRequest, logPath string) ([]str
 	}
 	if req.LayerID != "" {
 		out = append(out, "--layer-id-meta", req.LayerID)
+		if req.RecoverLayerLease && !req.LayerReadOnly {
+			out = append(out, "--recover-layer-lease")
+		}
 		if req.LayerReadOnly {
 			out = append(out, "--layer-read-only-meta")
 		}
@@ -1270,7 +1281,8 @@ func applyScrubbedMountEnv(scrubbed []string) {
 }
 
 func waitForSupervisedMountReady(mountPoint string, supervisorPID int, waitCh <-chan error, logPath string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
+	start := time.Now()
+	deadline := start.Add(timeout)
 	// Capture child identity once (Darwin ProcessCreationTime shells out to ps).
 	supCreation, _ := mountstate.ProcessCreationTime(supervisorPID)
 	for {
@@ -1286,9 +1298,14 @@ func waitForSupervisedMountReady(mountPoint string, supervisorPID int, waitCh <-
 		// (PID+creation) and its worker is identity-alive — never accept a
 		// stale pidfile from a previous generation.
 		if st, _, err := mountstate.ReadSupervisorState(mountPoint); err == nil {
-			if supervisorStateMatchesGeneration(st, supervisorPID, supCreation) && !st.LayerLeaseRecoveryUntil.IsZero() {
-				if until := st.LayerLeaseRecoveryUntil.Add(timeout); until.After(deadline) {
-					deadline = until
+			if supervisorStateMatchesGeneration(st, supervisorPID, supCreation) {
+				if st.State == mountstate.SupervisorStateFailed || st.State == mountstate.SupervisorStateCircuitOpen {
+					return fmt.Errorf("drive9 mount: supervisor %s before becoming ready after %s (%s; log: %s)", st.State, time.Since(start).Round(time.Millisecond), st.LastExitReason, logPath)
+				}
+				for _, until := range []time.Time{st.LayerWorkerStartupUntil, st.LayerLeaseRecoveryUntil} {
+					if !until.IsZero() && until.Add(timeout).After(deadline) {
+						deadline = until.Add(timeout)
+					}
 				}
 			}
 			if supervisedReadyStateMatches(st, supervisorPID, supCreation) && probeMountReadyForCLI(mountPoint) {
@@ -1300,7 +1317,7 @@ func waitForSupervisedMountReady(mountPoint string, supervisorPID int, waitCh <-
 			// SupervisorState matching this generation (PID+creation); never
 			// act on stale state or PID-only liveness (fail closed).
 			cleanupSupervisedReadyTimeout(mountPoint, supervisorPID, supCreation)
-			return fmt.Errorf("drive9 mount: timed out waiting for supervised mount to become ready after %s (log: %s)", timeout, logPath)
+			return fmt.Errorf("drive9 mount: timed out waiting for supervised mount to become ready after %s (log: %s)", time.Since(start).Round(time.Millisecond), logPath)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}

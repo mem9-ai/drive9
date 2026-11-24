@@ -389,22 +389,17 @@ function validateViewRedirectTarget(baseOrigin: URL, sourceUrl: URL, resolved: U
       throw new InvalidLayerViewRequestError("encoded separator not allowed in layer view redirect");
     }
     let decoded: string;
+    let decodedBase: string;
     try {
       decoded = decodeURIComponent(esc);
+      decodedBase = decodeURIComponent(baseOrigin.pathname);
     } catch {
       throw new InvalidLayerViewRequestError("invalid redirect path in layer view request");
     }
     if (decoded.includes("\\") || decoded.includes("\0")) {
       throw new InvalidLayerViewRequestError("invalid redirect path in layer view request");
     }
-    let lowerBasePrefix = "";
-    const trimmedBase = baseOrigin.pathname.replace(/^\/+|\/+$/g, "");
-    if (trimmedBase) {
-      const cleanedPrefix = posixCleanPath(`/${trimmedBase}`).replace(/\/+$/, "");
-      if (cleanedPrefix && cleanedPrefix !== "/") {
-        lowerBasePrefix = cleanedPrefix.toLowerCase();
-      }
-    }
+    const prefixes = new Set([baseOrigin.pathname, decodedBase].map(prefix => posixCleanPath(prefix).toLowerCase()));
     const candidates = [
       esc,
       `/${esc.replace(/^\/+/, "")}`,
@@ -417,8 +412,9 @@ function validateViewRedirectTarget(baseOrigin: URL, sourceUrl: URL, resolved: U
       if (isDrive9ApiRoutePath(lp)) {
         throw new InvalidLayerViewRequestError("redirect to API route not allowed for layer view request");
       }
-      if (lowerBasePrefix && lp.startsWith(`${lowerBasePrefix}/`)) {
-        const stripped = lp.slice(lowerBasePrefix.length);
+      for (const prefix of prefixes) {
+        if (prefix === "/" || !lp.startsWith(`${prefix}/`)) continue;
+        const stripped = lp.slice(prefix.length);
         const normStripped = `/${stripped.replace(/^\/+/, "")}`;
         if (isDrive9ApiRoutePath(stripped) || isDrive9ApiRoutePath(normStripped) || isDrive9ApiRoutePath(posixCleanPath(normStripped))) {
           throw new InvalidLayerViewRequestError("redirect to API route not allowed for layer view request");

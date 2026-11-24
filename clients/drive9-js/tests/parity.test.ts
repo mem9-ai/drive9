@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -38,7 +38,8 @@ describe("TypeScript SDK parity surface", () => {
       { path: "/private", data, mode: 0o600 },
       { path: "/inherit", data },
     ])).toHaveLength(3);
-    await expect(c.batchWrite([{ path: "/tagged", data, tags: { env: "test" } }])).rejects.toThrow(/does not support tags/);
+    const tagged = { path: "/tagged", data, tags: { env: "test" } };
+    await expect(c.batchWrite([tagged])).rejects.toThrow(/does not support tags/);
   });
 
   it("resolves relative object locations from the view URL under a deployment prefix", async () => {
@@ -52,6 +53,25 @@ describe("TypeScript SDK parity surface", () => {
     );
     expect(new TextDecoder().decode(await c.read("/blob"))).toBe("abc");
     expect(await new Response(await c.readStreamRange("/blob", 1, 1)).text()).toBe("b");
+  });
+
+  it.each([false, true])("resolves redirects with an empty Response.url (range=%s)", async ranged => {
+    const layerId = "layer_01j8z6kh2m9q7w3r5t6y8v0p1a";
+    const base = "https://example.test/deploy";
+    const c = new Client(base, "key").withView({ layerId });
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(null, { status: 307, headers: { Location: "../../../../../objects/blob" } }))
+      .mockResolvedValueOnce(new Response("b", { status: ranged ? 206 : 200 }));
+    try {
+      const body = ranged ? await c.readStreamRange("/blob", 1, 1) : await c.readStream("/blob");
+      expect(await new Response(body).text()).toBe("b");
+      expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+        base + "/v1/views/" + layerId + "/v1/fs/blob",
+        base + "/objects/blob",
+      ]);
+    } finally {
+      fetchMock.mockRestore();
+    }
   });
 
   it("loads the current context from DRIVE9_CONFIG and treats missing type as owner", () => {

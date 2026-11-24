@@ -192,13 +192,9 @@ type WriteBackMeta struct {
 	// metadata — the metadata overlays must not serve it as a staged image
 	// (that would overwrite a nonempty remote's size with zero).
 	WitnessOnly bool `json:"witness_only,omitempty"`
-	// LayerClean retains a remotely durable overlay for reads, not recovery.
-	// Every new staging publication resets it; legacy records remain dirty.
+	// Older journals can contain a remotely committed read-cache entry.
+	// Exclude it from uploads until a new local edit replaces it.
 	LayerClean bool `json:"layer_clean,omitempty"`
-	// LayerID and LayerEntrySeq identify the server publication behind a clean
-	// cache. Missing identity is legacy/unknown and must be refreshed.
-	LayerID       string `json:"layer_id,omitempty"`
-	LayerEntrySeq int64  `json:"layer_entry_seq,omitempty"`
 	// lineageTrusted is deliberately process-local and never serialized.
 	// Recovering a mutable path-keyed payload cannot prove that the bytes and
 	// JSON metadata were replaced atomically across a crash.

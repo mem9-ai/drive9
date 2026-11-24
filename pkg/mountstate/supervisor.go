@@ -51,6 +51,7 @@ type SupervisorState struct {
 	PackPaths       []string  `json:"pack_paths,omitempty"`
 
 	// The CLI parent uses the recovery deadline only for its own supervisor generation.
+	LayerWorkerStartupUntil time.Time `json:"layer_worker_startup_until,omitzero"`
 	LayerLeaseRecoveryUntil time.Time `json:"layer_lease_recovery_until,omitzero"`
 }
 

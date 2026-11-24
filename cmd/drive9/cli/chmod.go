@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 	"strconv"
 
@@ -27,24 +26,13 @@ func Chmod(c *client.Client, args []string) error {
 	if err != nil {
 		return fmt.Errorf("invalid mode %q: %w", modeStr, err)
 	}
-	h, err := fsHandleForArg(c, path)
+	h, err := fsHandleForLayerArg(c, path, layerRef, fence)
 	if err != nil {
 		return err
 	}
 	if err := requireCapOnHandle(h, CapChmod, "chmod"); err != nil {
 		return err
 	}
-	if h.Loc.Kind == KindDrive9 && h.Loc.Context != "" {
-		if err := requireNoLayerWithRemoteContext(layerRef, c, RemotePath{Context: h.Loc.Context, Path: h.Path}, args[1]); err != nil {
-			return err
-		}
-	}
 	c, path = h.Client, h.Path
-	if layerRef != "" {
-		c, err = BindCLIViewClient(context.Background(), c, layerRef, fence)
-		if err != nil {
-			return err
-		}
-	}
 	return c.Chmod(path, uint32(mode64))
 }

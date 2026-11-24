@@ -350,3 +350,10 @@ func TestRenewReturnAtOldCutoffUsesConfirmedLease(t *testing.T) {
 		})
 	}
 }
+
+func TestBindAndExpireConflictsReportBusyLease(t *testing.T) {
+	for _, err := range []error{client.ErrConflict, &client.StatusError{StatusCode: http.StatusConflict}} {
+		assertMountExit(t, classifyLayerBindError("acquire layer lease", err), ExitLayerLeaseBusy, ExitReasonLayerLeaseBusy)
+	}
+	assertMountExit(t, classifyLayerBindError("acquire layer lease", &client.StatusError{StatusCode: http.StatusForbidden}), ExitStartupPermanent, ExitReasonStartupPermanent)
+}
