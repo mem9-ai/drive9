@@ -71,6 +71,9 @@ func (c *Client) rewriteRequestForView(req *http.Request) (*http.Request, error)
 }
 
 func viewRouteRequiresWriteGuard(method, innerEscaped string) bool {
+	if method == http.MethodPost && (innerEscaped == "/v1/fs:batch-stat" || innerEscaped == "/v1/fs:batch-read-small") {
+		return false
+	}
 	if method != http.MethodGet && method != http.MethodHead {
 		return true
 	}

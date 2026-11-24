@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -307,5 +308,40 @@ func TestLayerStalledRenewStopsAtSafetyMargin(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("a stalled renewal delayed self-fencing beyond lease expiration")
+	}
+}
+
+func TestRenewReturnAtOldCutoffUsesConfirmedLease(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		ttl    int64
+		fenced bool
+	}{
+		{"extended", 60000, false},
+		{"already inside new margin", 1000, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				b := &layerMountBinding{renewDone: make(chan struct{})}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				calls := 0
+				go b.runRenewLoop(ctx, time.Now().Add(5*time.Second), layerLeaseTiming{
+					renewInterval: time.Second, selfFenceMargin: time.Second, callTimeout: 5 * time.Second,
+				}, func(call context.Context, _ string, _ client.LayerMountRenewRequest) (*client.LayerMountLease, error) {
+					calls++
+					// The response was accepted, then the caller resumed at the old cutoff.
+					<-call.Done()
+					return &client.LayerMountLease{MountLeaseTTLMS: tt.ttl}, nil
+				})
+				time.Sleep(4 * time.Second)
+				synctest.Wait()
+				if calls != 1 || b.fenced.Load() != tt.fenced {
+					t.Fatalf("renewals=%d fenced=%v, want 1 and %v", calls, b.fenced.Load(), tt.fenced)
+				}
+				cancel()
+				<-b.renewDone
+			})
+		})
 	}
 }

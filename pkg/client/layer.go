@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/viewprotocol"
@@ -128,6 +130,9 @@ func (c *Client) GetLayer(ctx context.Context, ref string) (*LayerInfo, error) {
 	var out LayerInfo
 	if err := c.doLayerJSON(ctx, http.MethodGet, "/v1/layers/"+url.PathEscape(norm), nil, &out); err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(out.LayerID) == "" {
+		return nil, fmt.Errorf("resolve layer %q: server returned an empty layer ID", ref)
 	}
 	return &out, nil
 }

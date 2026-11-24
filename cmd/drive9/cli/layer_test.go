@@ -166,3 +166,53 @@ func TestFSDataCommandsRouteThroughUnifiedLayerView_V36(t *testing.T) {
 		t.Fatalf("Find --layer err = %v, want unsupported in layer view", err)
 	}
 }
+
+func TestLayerFlagsRejectRepeatedValues(t *testing.T) {
+	for _, args := range [][]string{
+		{"--layer", "a", "--layer=b"}, {"--layer=a", "--layer=a"},
+		{"--layer=a", "--fence", "1", "--fence=3"},
+	} {
+		if _, _, _, err := ParseLayerViewFlags(args); err == nil || !strings.Contains(err.Error(), "multiple times") {
+			t.Errorf("%q: %v", args, err)
+		}
+	}
+}
+
+func TestBoundLayerRejectsIncompatibleBackends(t *testing.T) {
+	c, err := client.New("http://example.invalid", "").WithView(client.ViewBinding{LayerID: "layer_01j8z6kh2m9q7w3r5t6y8v0p1a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		name string
+		run  func(*client.Client, []string) error
+		args []string
+		want string
+	}{
+		{"rm", Rm, []string{"--auth=local", "s3://test-fixture/a"}, "drive9-only"},
+		{"mv", Mv, []string{"--auth=local", "s3://test-fixture/a", "s3://test-fixture/b"}, "drive9-only"},
+		{"archive", Archive, []string{"example:/dir", filepath.Join(t.TempDir(), "out")}, "context-scoped"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.run(c, tt.args); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("want %s, got %v", tt.want, err)
+			}
+		})
+	}
+	if _, _, err := clientForRemoteArchiveArg(c, "example:/dir/archive"); err == nil || !strings.Contains(err.Error(), "context-scoped") {
+		t.Fatalf("unpack context: %v", err)
+	}
+}
+
+func TestLayerResolutionRejectsMissingIdentity(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"name":"example","base_root_path":"/repo"}`)
+	}))
+	defer srv.Close()
+	if _, err := BindCLIViewClient(t.Context(), client.New(srv.URL, ""), "example", 0); err == nil {
+		t.Fatal("empty lookup result selected main")
+	}
+	if _, err := parseExecArgs([]string{"--layer=a", "--layer", "b", "--", "pwd"}); err == nil {
+		t.Fatal("duplicate exec layer accepted")
+	}
+}

@@ -141,25 +141,12 @@ func resolveLayerMountView(
 	if err != nil {
 		return nil, classifyLayerStartupError(fmt.Sprintf("resolve layer %q", ref), err)
 	}
-	baseRoot, err := mountpath.NormalizeRoot(info.BaseRootPath)
-	if err != nil {
-		return nil, ExitStartupPermanentErr(fmt.Sprintf("invalid layer %s base_root_path %q", info.LayerID, info.BaseRootPath), err)
+	if err := viewprotocol.ValidateLayerID(info.LayerID); err != nil {
+		return nil, ExitStartupPermanentErr("invalid layer identity returned by server", err)
 	}
-
-	var remoteRoot string
-	if strings.TrimSpace(rawRemoteRoot) == "" || remoteRootDefaulted {
-		remoteRoot = baseRoot
-	} else {
-		remoteRoot, err = mountpath.NormalizeRoot(rawRemoteRoot)
-		if err != nil {
-			return nil, fmt.Errorf("fuse: normalize remote root: %w", err)
-		}
-		if !viewprotocol.PathWithinBaseRoot(baseRoot, remoteRoot) {
-			return nil, ExitStartupPermanentErr(
-				fmt.Sprintf("remote root %q is outside layer %s base_root_path %q", remoteRoot, info.LayerID, baseRoot),
-				nil,
-			)
-		}
+	baseRoot, remoteRoot, err := mountpath.LayerRoots(info.BaseRootPath, rawRemoteRoot, remoteRootDefaulted)
+	if err != nil {
+		return nil, ExitStartupPermanentErr(fmt.Sprintf("resolve root for layer %s: %v", info.LayerID, err), err)
 	}
 
 	if readOnly {
@@ -270,10 +257,12 @@ func (b *layerMountBinding) startRenewLoop(initialCallStart time.Time, initialTT
 	ctx, cancel := context.WithCancel(context.Background())
 	b.renewCancel = cancel
 	b.renewDone = make(chan struct{})
-	go b.runRenewLoop(ctx, deadline, timing)
+	go b.runRenewLoop(ctx, deadline, timing, b.BaseClient.RenewLayerMount)
 }
 
-func (b *layerMountBinding) runRenewLoop(ctx context.Context, deadline time.Time, timing layerLeaseTiming) {
+func (b *layerMountBinding) runRenewLoop(ctx context.Context, deadline time.Time, timing layerLeaseTiming,
+	renew func(context.Context, string, client.LayerMountRenewRequest) (*client.LayerMountLease, error),
+) {
 	defer close(b.renewDone)
 	next := timing.renewInterval
 	for {
@@ -288,16 +277,12 @@ func (b *layerMountBinding) runRenewLoop(ctx context.Context, deadline time.Time
 		}
 		timeout := min(timing.callTimeout, fenceAt.Sub(callStart))
 		callCtx, callCancel := context.WithDeadline(ctx, callStart.Add(timeout))
-		resp, err := b.BaseClient.RenewLayerMount(callCtx, b.LayerID, client.LayerMountRenewRequest{
+		resp, err := renew(callCtx, b.LayerID, client.LayerMountRenewRequest{
 			MountID: b.MountID,
 			Fence:   b.Fence,
 		})
 		callCancel()
 		if ctx.Err() != nil {
-			return
-		}
-		if !time.Now().Before(fenceAt) {
-			b.triggerSelfFence("mount lease entered its pre-expiry safety margin during renewal")
 			return
 		}
 		if err == nil {
@@ -307,13 +292,16 @@ func (b *layerMountBinding) runRenewLoop(ctx context.Context, deadline time.Time
 			}
 			deadline = callStart.Add(ttl)
 			next = timing.renewInterval
-			continue
-		}
-		if isTerminalLayerRenewError(err) {
+		} else if isTerminalLayerRenewError(err) {
 			b.triggerSelfFence(fmt.Sprintf("renew-mount rejected: %v", err))
 			return
+		} else {
+			next = timing.retryInterval
 		}
-		next = timing.retryInterval
+		if !time.Now().Before(deadline.Add(-timing.selfFenceMargin)) {
+			b.triggerSelfFence("mount lease entered its pre-expiry safety margin during renewal")
+			return
+		}
 	}
 }
 

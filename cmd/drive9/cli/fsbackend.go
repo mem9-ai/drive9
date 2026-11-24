@@ -84,6 +84,9 @@ func fsHandleForArgOpts(defaultClient *client.Client, raw string, forCopy bool) 
 		}
 		return fsHandle{Loc: loc, Path: "-"}, nil
 	case KindObject:
+		if defaultClient.ViewBinding().LayerID != "" {
+			return fsHandle{}, fmt.Errorf("--layer is drive9-only")
+		}
 		b, err := openObjectAuthenticated(context.Background(), defaultClient, loc, objectAuthLocal)
 		if err != nil {
 			return fsHandle{}, err
@@ -92,6 +95,9 @@ func fsHandleForArgOpts(defaultClient *client.Client, raw string, forCopy bool) 
 	case KindDrive9:
 		c := defaultClient
 		if loc.Context != "" {
+			if err := requireNoLayerWithRemoteContext("", defaultClient, RemotePath{Context: loc.Context, Path: loc.Path}, raw); err != nil {
+				return fsHandle{}, err
+			}
 			c, err = newFSClientForContext(loc.Context)
 			if err != nil {
 				return fsHandle{}, err

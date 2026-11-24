@@ -28,6 +28,9 @@ func ParseLayerViewFlags(args []string) (layerRef string, fence int64, rest []st
 			rest = append(rest, arg)
 			continue
 		}
+		if (flag == "--layer" && layerRef != "") || (flag == "--fence" && fence != 0) {
+			return "", 0, nil, fmt.Errorf("%s specified multiple times", flag)
+		}
 		if !inline {
 			if i+1 == len(args) {
 				return "", 0, nil, fmt.Errorf("%s requires an argument", flag)

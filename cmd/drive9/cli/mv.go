@@ -37,7 +37,7 @@ func Mv(c *client.Client, args []string) error {
 	newLoc = promoteBareFSArg(newLoc)
 
 	if oldLoc.Kind == KindObject || newLoc.Kind == KindObject {
-		if layerRef != "" {
+		if layerRef != "" || c.ViewBinding().LayerID != "" {
 			return fmt.Errorf("--layer is drive9-only")
 		}
 		if oldLoc.Kind != KindObject || newLoc.Kind != KindObject {

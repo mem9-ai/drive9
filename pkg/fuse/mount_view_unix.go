@@ -72,22 +72,13 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 		if gerr != nil {
 			return nil, classifyLayerStartupError(fmt.Sprintf("resolve layer %q", layerRef), gerr)
 		}
-		var berr error
-		baseRoot, berr = mountpath.NormalizeRoot(info.BaseRootPath)
-		if berr != nil {
-			return nil, ExitStartupPermanentErr(fmt.Sprintf("invalid layer %s base_root_path %q", info.LayerID, info.BaseRootPath), berr)
+		if berr := viewprotocol.ValidateLayerID(info.LayerID); berr != nil {
+			return nil, ExitStartupPermanentErr("invalid layer identity returned by server", berr)
 		}
-		if strings.TrimSpace(cfg.RemoteRoot) == "" || cfg.RemoteRootDefaulted {
-			remoteRoot = baseRoot
-		} else {
-			remoteRoot, berr = mountpath.NormalizeRoot(cfg.RemoteRoot)
-			if berr != nil {
-				return nil, fmt.Errorf("fuse: normalize remote root: %w", berr)
-			}
-			if !viewprotocol.PathWithinBaseRoot(baseRoot, remoteRoot) {
-				return nil, ExitStartupPermanentErr(
-					fmt.Sprintf("remote root %q is outside layer %s base_root_path %q", remoteRoot, info.LayerID, baseRoot), nil)
-			}
+		var berr error
+		baseRoot, remoteRoot, berr = mountpath.LayerRoots(info.BaseRootPath, cfg.RemoteRoot, cfg.RemoteRootDefaulted)
+		if berr != nil {
+			return nil, ExitStartupPermanentErr(fmt.Sprintf("resolve root for layer %s: %v", info.LayerID, berr), berr)
 		}
 		targetInfo = info
 	}

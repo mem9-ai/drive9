@@ -99,7 +99,7 @@ export async function readStreamImpl(client: Client, path: string): Promise<Read
   if (status === 302 || status === 307) {
     const location = resp.headers.get("location") || resp.headers.get("Location");
     if (!location) throw new Drive9Error("302 without Location header");
-    const resp2 = await fetchViewObjectRedirect(client, baseUrl, location);
+    const resp2 = await fetchViewObjectRedirect(client, resp.url || baseUrl, location);
     await checkError(resp2);
     if (!resp2.body) throw new Drive9Error("empty response body");
     return resp2.body;
@@ -146,7 +146,7 @@ export async function readStreamRangeImpl(
   if (status === 302 || status === 307) {
     const location = resp.headers.get("location") || resp.headers.get("Location");
     if (!location) throw new Drive9Error("302 without Location header");
-    const resp2 = await fetchViewObjectRedirect(client, baseUrl, location, { Range: rangeHeader });
+    const resp2 = await fetchViewObjectRedirect(client, resp.url || baseUrl, location, { Range: rangeHeader });
     if (resp2.status === 416) {
       await resp2.text().catch(() => "");
       return new ReadableStream({ start(c) { c.close(); } });

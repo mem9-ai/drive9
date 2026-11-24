@@ -163,3 +163,23 @@ func TestSetMetaServerErrorPropagates(t *testing.T) {
 		t.Fatalf("SetMeta err = %v, want not found", err)
 	}
 }
+
+func TestSetMetaRejectsNamedContextWithLayer(t *testing.T) {
+	const id = "layer_01j8z6kh2m9q7w3r5t6y8v0p1a"
+	base := client.New("http://localhost.invalid", "")
+	bound, err := base.WithView(client.ViewBinding{LayerID: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		client *client.Client
+		args   []string
+	}{
+		{base, []string{"--layer", id, "--tag", "k=v", "prod:/a"}},
+		{bound, []string{"--tag", "k=v", "prod:/a"}},
+	} {
+		if err := SetMeta(tc.client, tc.args); err == nil || !strings.Contains(err.Error(), "context-scoped remote path") {
+			t.Errorf("SetMeta(%q) got %v", tc.args, err)
+		}
+	}
+}

@@ -1,3 +1,4 @@
+import { clientFetch } from "./view.js";
 import type { Client } from "./client.js";
 import { checkError } from "./error.js";
 import type {
@@ -28,7 +29,7 @@ async function ndjson<T>(resp: Response): Promise<T[]> {
 
 export async function createJournal(client: Client, req: JournalCreateRequest): Promise<Journal> {
   return json<Journal>(
-    await fetch(`${client.baseUrl}/v1/journals`, {
+    await clientFetch(client, `${client.baseUrl}/v1/journals`, {
       method: "POST",
       headers: client.authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(req),
@@ -43,7 +44,7 @@ export async function appendJournalEntries(
   entries: JournalEntryInput[]
 ): Promise<JournalAppendResponse> {
   return json<JournalAppendResponse>(
-    await fetch(`${client.baseUrl}/v1/journals/${encodeURIComponent(journalId)}/entries`, {
+    await clientFetch(client, `${client.baseUrl}/v1/journals/${encodeURIComponent(journalId)}/entries`, {
       method: "POST",
       headers: client.authHeaders({
         "Content-Type": "application/json",
@@ -65,7 +66,7 @@ export async function readJournalEntries(
   if (limit > 0) qs.set("limit", String(limit));
   const suffix = qs.toString() ? `?${qs.toString()}` : "";
   return ndjson<JournalEntry>(
-    await fetch(`${client.baseUrl}/v1/journals/${encodeURIComponent(journalId)}/entries${suffix}`, {
+    await clientFetch(client, `${client.baseUrl}/v1/journals/${encodeURIComponent(journalId)}/entries${suffix}`, {
       headers: client.authHeaders(),
     })
   );
@@ -86,13 +87,13 @@ export async function searchJournal(client: Client, req: JournalSearchRequest): 
   if (req.entries) qs.set("include", "entry");
   const suffix = qs.toString() ? `?${qs.toString()}` : "";
   return ndjson<JournalSearchMatch>(
-    await fetch(`${client.baseUrl}/v1/journal-entries${suffix}`, { headers: client.authHeaders() })
+    await clientFetch(client, `${client.baseUrl}/v1/journal-entries${suffix}`, { headers: client.authHeaders() })
   );
 }
 
 export async function verifyJournal(client: Client, journalId: string): Promise<JournalVerifyResult> {
   return json<JournalVerifyResult>(
-    await fetch(`${client.baseUrl}/v1/journals/${encodeURIComponent(journalId)}/verify`, {
+    await clientFetch(client, `${client.baseUrl}/v1/journals/${encodeURIComponent(journalId)}/verify`, {
       headers: client.authHeaders(),
     })
   );

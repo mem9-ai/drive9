@@ -844,11 +844,14 @@ func mountWithConfig(cfg MountConfig) error {
 		if ctrl != nil {
 			controlSock = ctrl.SocketPath()
 		}
-		pidFile, pidErr := mountstate.WriteProcessState(cfg.MountPoint, buildMountProcessState(
+		state := buildMountProcessState(
 			cfg.RemoteRoot, cfg.Profile, cfg.LocalRoot, cfg.Server, cfg.APIKey, cfg.Token,
 			cfg.PackPaths, prof, cfg.Supervised, cfg.OmitProcessStateCredentials,
 			stateMountPoint, creationTime, credentialKind, controlSock, time.Now().UTC(),
-		))
+		)
+		state.LayerID = rt.binding.LayerID
+		state.LayerReadOnly = state.LayerID != "" && rt.binding.ReadOnly
+		pidFile, pidErr := mountstate.WriteProcessState(cfg.MountPoint, state)
 		if pidErr != nil {
 			return fmt.Errorf("fuse: write mount pid file: %w", pidErr)
 		}

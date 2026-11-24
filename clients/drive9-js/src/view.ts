@@ -290,7 +290,9 @@ export function rewriteRequestForView(
         method === "GET" &&
         stripped.innerEscaped.startsWith("/v1/uploads/") &&
         stripped.innerEscaped.endsWith("/resume");
-      if (((method !== "GET" && method !== "HEAD") || isGetUploadResume) && view.writeGuard) {
+      const isBatchRead = method === "POST" &&
+        (stripped.innerEscaped === "/v1/fs:batch-stat" || stripped.innerEscaped === "/v1/fs:batch-read-small");
+      if (((method !== "GET" && method !== "HEAD" && !isBatchRead) || isGetUploadResume) && view.writeGuard) {
         view.writeGuard();
       }
       if (headers.get("X-Dat9-Description")) {

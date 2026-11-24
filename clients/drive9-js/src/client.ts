@@ -538,6 +538,7 @@ export class Client {
     }
     let totalBytes = 0;
     const wireItems = items.map((item) => {
+      if (item.tags !== undefined) throw new Drive9Error("batch write does not support tags");
       totalBytes += item.data.byteLength;
       if (totalBytes > MaxBatchWriteBytes) {
         throw new Drive9Error(`batch write: ${totalBytes} bytes exceeds limit of ${MaxBatchWriteBytes}`);
@@ -546,8 +547,7 @@ export class Client {
         path: item.path,
         data: Buffer.from(item.data).toString("base64"),
         expected_revision: item.expectedRevision ?? -1,
-        ...(item.mode != null ? { mode: item.mode } : {}),
-        ...(item.tags ? { tags: item.tags } : {}),
+        ...(item.mode != null ? { mode: item.mode, hasMode: true } : {}),
       };
     });
     const resp = await clientFetch(this, `${this.baseUrl}/v1/fs:batch-write`, {
