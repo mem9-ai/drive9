@@ -300,7 +300,7 @@ func (w *Writeback) notifyTestGate(gate string) {
 
 type stripedLocks struct {
 	mu sync.Mutex
-	m  map[string]*sync.Mutex
+	m  map[string]pathLock
 }
 
 // bufferingHandle accumulates writes in a writebuffer.WriteBuffer (read-your-writes
@@ -531,6 +531,9 @@ type bufferingHandle struct {
 	// unlinked marks the handle anonymous (fh.Unlinked): the buffer
 	// keeps serving the fd, commits are discarded.
 	unlinked bool
+	// stageNameChanged wakes a stage waiting for the old pathname's lock.
+	// Accessed under mu and allocated only on contention.
+	stageNameChanged chan struct{}
 	// trunc records an open(O_TRUNC): the buffer starts empty and dirty so
 	// a close with no writes still publishes size 0 (ZeroBase).
 	trunc bool
@@ -4418,6 +4421,44 @@ func (h *bufferingHandle) stagedLandingFence(path string) (supersedesGen, failur
 	return supersedesGen, failureSeq
 }
 
+// waitQueuedCommit follows the open handle through renames. An unlinked
+// handle no longer owns the queue entry or terminal error at its old name.
+func (h *bufferingHandle) waitQueuedCommit() error {
+	deadline := time.Now().Add(uploadTimeout)
+	for {
+		h.mu.Lock()
+		path, anonymous := h.path, h.unlinked
+		h.mu.Unlock()
+		if anonymous {
+			return nil
+		}
+		h.w.notifyTestGate("flush:queueOutcome")
+		idle := h.w.queue.WaitPathTimeout(path, 0)
+		var failure error
+		if idle {
+			failure = h.w.queue.PathTerminalFailure(path)
+		}
+
+		// Namespace changes can run during either queue lookup. Accept its
+		// result only while the descriptor still names the observed file.
+		h.mu.Lock()
+		same, anonymous := h.path == path, h.unlinked
+		h.mu.Unlock()
+		if anonymous {
+			return nil
+		}
+		if same && idle && failure == nil {
+			return nil
+		}
+		if (same && failure != nil) || !time.Now().Before(deadline) {
+			return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
+		}
+		if same {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+}
+
 // Flush implements fs.Handle.
 func (h *bufferingHandle) Flush(ctx context.Context) (err error) {
 	// Migrated: a flush is the engine's flush, which publishes the slices
@@ -4479,10 +4520,7 @@ func (h *bufferingHandle) Flush(ctx context.Context) (err error) {
 			if err := h.stageAndEnqueueOpt(ctx, true, false, false); err != nil {
 				return err
 			}
-			if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
-				return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
-			}
-			return nil
+			return h.waitQueuedCommit()
 		}
 		// close-sync owes remote durability at close(2) itself (its
 		// defining contract): the .dat snapshot + a synchronous landing.
@@ -4504,10 +4542,7 @@ func (h *bufferingHandle) Flush(ctx context.Context) (err error) {
 					if err := h.stageAndEnqueueOpt(ctx, true, false, false); err != nil {
 						return err
 					}
-					if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
-						return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
-					}
-					return nil
+					return h.waitQueuedCommit()
 				}
 				return h.commitLocked(ctx)
 			}
@@ -5777,6 +5812,7 @@ func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHand
 		// snapshot must not make this operation's target look read-only).
 		if match && !h.unlinked {
 			h.unlinked = true
+			h.wakeStageNameWaitersLocked()
 			marked = append(marked, h)
 			if h.buf == nil && !h.isNew && !h.dirty {
 				clean = append(clean, h)
@@ -6253,6 +6289,7 @@ func (w *Writeback) retarget(oldPath, newPath string) {
 		}
 		if next != "" {
 			h.path = next
+			h.wakeStageNameWaitersLocked()
 			// Refresh the registry snapshot under the same lock: the
 			// lock-free sibling sweeps read identity from it.
 			w.liveSet.Store(h, &handleInfo{path: next, ino: h.ino})
@@ -7540,9 +7577,12 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 	w := h.w
 	st := w.opts.Staging
 	// Queue cleanup and survivor/rename retargets use this lock order too;
-	// lockStagePath re-verifies h.path after acquiring pathLocks so a concurrent
+	// lockLinkedStagePath re-verifies h.path after acquiring pathLocks so a concurrent
 	// atomic retarget + cache move never races a stage onto the old pathname.
-	stagePath, unlock := h.lockStagePath()
+	stagePath, unlock := h.lockLinkedStagePath()
+	if unlock == nil {
+		return nil
+	}
 	defer unlock()
 	var cachePutGen uint64
 	if w.wbCache != nil {
@@ -7924,9 +7964,7 @@ func (h *bufferingHandle) commitLocked(ctx context.Context) error {
 			// The synchronous policies promise remote durability here, so a
 			// terminally failed upload must be reported rather than read as
 			// idle.
-			if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
-				return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
-			}
+			return h.waitQueuedCommit()
 		}
 		return nil
 	}
@@ -8246,6 +8284,51 @@ func (w *Writeback) putWriteCacheSnapshot(path string, image []byte, kind stagin
 	return gen, err
 }
 
+func (h *bufferingHandle) wakeStageNameWaitersLocked() {
+	if h.stageNameChanged != nil {
+		close(h.stageNameChanged)
+		h.stageNameChanged = nil
+	}
+}
+
+// lockLinkedStagePath returns no lock once unlink makes this handle anonymous.
+// A replacement's uploader may hold the old name lock throughout a remote PUT.
+func (h *bufferingHandle) lockLinkedStagePath() (string, func()) {
+	for {
+		h.w.notifyTestGate("stage:pathLock")
+		h.mu.Lock()
+		if h.unlinked || h.closed {
+			h.mu.Unlock()
+			return "", nil
+		}
+		path := h.path
+		lock := h.w.pathLocks.forPath(path)
+		select {
+		case lock <- struct{}{}:
+			h.mu.Unlock()
+			return path, lock.unlock
+		default:
+		}
+		if h.stageNameChanged == nil {
+			h.stageNameChanged = make(chan struct{})
+		}
+		changed := h.stageNameChanged
+		h.mu.Unlock()
+		select {
+		case <-changed:
+			continue
+		case lock <- struct{}{}:
+		}
+		h.mu.Lock()
+		valid := !h.unlinked && !h.closed && h.path == path
+		h.mu.Unlock()
+		if valid {
+			return path, lock.unlock
+		}
+		lock.unlock()
+	}
+}
+
 // lockStagePath locks w.pathLocks for h's current path, retrying if a
 // concurrent retarget moved h.path before the path lock was acquired. While
 // the returned unlock is held, any retarget that also holds w.pathLocks (via
@@ -8299,7 +8382,10 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 			h.mu.Unlock()
 		}
 	}
-	path, unlock := h.lockStagePath()
+	path, unlock := h.lockLinkedStagePath()
+	if unlock == nil {
+		return nil, nil
+	}
 	defer unlock()
 	hasPending := h.w.opts.Staging != nil && h.w.opts.Staging.Pending.HasPending(path)
 	h.mu.Lock()
@@ -8528,19 +8614,28 @@ func (h *bufferingHandle) applyPendingMode(ctx context.Context) error {
 	return err
 }
 
-func (l *stripedLocks) lock(path string) func() {
+type pathLock chan struct{}
+
+func (m pathLock) unlock() { <-m }
+
+func (l *stripedLocks) forPath(path string) pathLock {
 	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.m == nil {
-		l.m = map[string]*sync.Mutex{}
+		l.m = make(map[string]pathLock)
 	}
 	m := l.m[path]
 	if m == nil {
-		m = &sync.Mutex{}
+		m = make(pathLock, 1)
 		l.m[path] = m
 	}
-	l.mu.Unlock()
-	m.Lock()
-	return m.Unlock
+	return m
+}
+
+func (l *stripedLocks) lock(path string) func() {
+	m := l.forPath(path)
+	m <- struct{}{}
+	return m.unlock
 }
 
 // extentRoutesImage reports whether THIS handle's current image is one the

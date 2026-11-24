@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -18,15 +20,17 @@ import (
 )
 
 func TestUnlinkWhileAppendRefreshReadsRemote(t *testing.T) {
-	for _, track := range []string{"inline", "queue", "write-cache", "close-sync-pending"} {
+	for _, track := range []string{"inline", "queue", "write-cache", "close-sync-pending", "close-sync-bypass", "close-sync-large", "close-sync-wait"} {
+		pendingReplacement := strings.HasPrefix(track, "close-sync-")
+		lateUnlink := pendingReplacement && track != "close-sync-pending"
 		names := []string{"absent", "recreated"}
-		if track == "close-sync-pending" {
+		if pendingReplacement {
 			names = []string{"recreated"}
 		}
 		for _, reuse := range names {
 			t.Run(track+"/"+reuse, func(t *testing.T) {
 				const path = "/append"
-				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 				defer cancel()
 				backend := testbackend.NewBackend()
 				backend.Seed(path, []byte("base"))
@@ -67,13 +71,13 @@ func TestUnlinkWhileAppendRefreshReadsRemote(t *testing.T) {
 				t.Cleanup(srv.Close)
 				cl := client.New(srv.URL, "")
 				opts := Options{Client: cl, Policy: PolicyCloseSync}
-				if track == "queue" || track == "close-sync-pending" {
+				if track == "queue" || pendingReplacement {
 					st, err := staging.NewStagingWithQuota(t.TempDir(), -1, 0)
 					require.NoError(t, err)
 					t.Cleanup(st.Close)
 					opts.Staging = st
 				}
-				if track == "write-cache" || track == "close-sync-pending" {
+				if track == "write-cache" || pendingReplacement {
 					cache, err := staging.NewWriteBackCache(t.TempDir())
 					require.NoError(t, err)
 					opts.WriteCache = cache
@@ -93,9 +97,32 @@ func TestUnlinkWhileAppendRefreshReadsRemote(t *testing.T) {
 				h := res.Handle
 				require.NotNil(t, h)
 				require.NoError(t, h.Write(ctx, 4, []byte("-old")))
-				require.NoError(t, cl.WriteCtx(ctx, path, []byte("base-old-foreign")))
-
-				pauseRead.Store(true)
+				if lateUnlink {
+					// A small cache sends a small file down the bypass. A sparse
+					// file at the streaming threshold takes the direct large branch.
+					wb.wbCacheMaxBytes = 1
+					gate, occurrence := "stage:pathLock", int32(2)
+					switch track {
+					case "close-sync-large":
+						require.NoError(t, h.Write(ctx, commitInlineStreamThreshold, []byte("z")))
+						occurrence = 1
+					case "close-sync-wait":
+						gate, occurrence = "flush:queueOutcome", 1
+					}
+					var seen atomic.Int32
+					installTestGateHook(t, wb, func(name string) {
+						if name == gate && seen.Add(1) == occurrence {
+							close(reading)
+							select {
+							case <-resume:
+							case <-ctx.Done():
+							}
+						}
+					})
+				} else {
+					require.NoError(t, cl.WriteCtx(ctx, path, []byte("base-old-foreign")))
+					pauseRead.Store(true)
+				}
 				flush := h.Sync
 				if opts.WriteCache != nil {
 					flush = h.Flush
@@ -105,12 +132,12 @@ func TestUnlinkWhileAppendRefreshReadsRemote(t *testing.T) {
 				select {
 				case <-reading:
 				case <-ctx.Done():
-					t.Fatal("append refresh did not read the newer remote revision")
+					t.Fatal("flush did not reach the requested unlink point")
 				}
 				_, err = chain.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: path})
 				require.NoError(t, err)
 				var replacement fs.Handle
-				if track == "close-sync-pending" {
+				if pendingReplacement {
 					replacement = open(t, chain, path)
 					require.NoError(t, replacement.Write(ctx, 0, []byte("replacement")))
 					pauseUpload.Store(true)
@@ -133,6 +160,9 @@ func TestUnlinkWhileAppendRefreshReadsRemote(t *testing.T) {
 				}
 
 				buf := make([]byte, 32)
+				if track == "close-sync-large" {
+					buf = buf[:len("base-old")]
+				}
 				n, err := h.Read(ctx, 0, buf)
 				require.NoError(t, err)
 				require.Equal(t, "base-old", string(buf[:n]))
@@ -154,4 +184,83 @@ func TestUnlinkWhileAppendRefreshReadsRemote(t *testing.T) {
 			})
 		}
 	}
+}
+
+// An upload holds its pathname lock until its remote PUT finishes. A stage
+// already waiting on that lock must wake when its handle loses the name.
+func TestStageLockWakesOnNamespaceChange(t *testing.T) {
+	for _, change := range []string{"unlink", "rename"} {
+		t.Run(change, func(t *testing.T) {
+			const oldPath = "/old"
+			chain, wb, _ := newSparseGrowthSuccessStack(t, nil)
+			fd := open(t, chain, oldPath)
+			require.NoError(t, fd.Write(t.Context(), 0, []byte("old")))
+			h := writebackHandleOf(fd)
+			unlockOld := wb.pathLocks.lock(oldPath)
+			defer unlockOld()
+			got := make(chan string, 1)
+			go func() {
+				path, unlock := h.lockLinkedStagePath()
+				if unlock != nil {
+					unlock()
+				}
+				got <- path
+			}()
+			require.Eventually(t, func() bool {
+				h.mu.Lock()
+				defer h.mu.Unlock()
+				return h.stageNameChanged != nil
+			}, 3*time.Second, time.Millisecond)
+
+			want := ""
+			if change == "rename" {
+				want = "/new"
+				wb.retarget(oldPath, want)
+			} else {
+				wb.markUnlinked(oldPath, false)
+			}
+			select {
+			case path := <-got:
+				require.Equal(t, want, path)
+			case <-time.After(3 * time.Second):
+				t.Fatal("stage still waiting for the old pathname lock")
+			}
+		})
+	}
+}
+
+func TestQueuedFailureBelongsToCurrentName(t *testing.T) {
+	const path = "/error"
+	chain, wb, _ := newSparseGrowthSuccessStack(t, nil)
+	old := open(t, chain, path)
+	require.NoError(t, old.Write(t.Context(), 0, []byte("old")))
+
+	checking, resume := make(chan struct{}), make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(resume) })
+	defer unblock()
+	var first atomic.Bool
+	installTestGateHook(t, wb, func(gate string) {
+		if gate == "flush:queueOutcome" && first.CompareAndSwap(false, true) {
+			close(checking)
+			<-resume
+		}
+	})
+	done := make(chan error, 1)
+	go func() { done <- writebackHandleOf(old).waitQueuedCommit() }()
+	select {
+	case <-checking:
+	case <-time.After(3 * time.Second):
+		t.Fatal("old handle never reached the queue check")
+	}
+	wb.markUnlinked(path, false)
+	replacement := open(t, chain, path)
+	wb.queue.RecordTerminalFailureForPath(path, syscall.EIO)
+	unblock()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("old handle did not finish its queue check")
+	}
+	require.EqualValues(t, syscall.EIO, fs.StatusOf(writebackHandleOf(replacement).waitQueuedCommit()))
 }
