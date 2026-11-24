@@ -270,7 +270,7 @@ func buildViewRuntime(
 	}
 
 	var gitExt *git.Git
-	if wantExt["git"] && localCfg.EnableGitWorkspaces {
+	if wantExt["git"] && localCfg.EnableGitWorkspaces && binding.LayerID == "" {
 		gitExt, err = git.New(git.Options{
 			Client:             cl,
 			Events:             bus,

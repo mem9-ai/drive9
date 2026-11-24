@@ -9,6 +9,10 @@ import (
 	"github.com/mem9-ai/drive9/pkg/vaultfs"
 )
 
+func classifyMountLayerLookupError(ref string, err error) error {
+	return drive9fuse.ClassifyLayerStartupError(fmt.Sprintf("resolve layer %q", ref), err)
+}
+
 func mountFuseImpl(opts *mountFuseOptions) error {
 	if opts.OmitProcessStateCredentials {
 		if err := hardenMountCredentialProcess(); err != nil {

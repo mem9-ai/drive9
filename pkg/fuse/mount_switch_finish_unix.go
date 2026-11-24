@@ -105,7 +105,7 @@ func (s *mountViewSwitch) finishPendingLocked(ctx context.Context, opID string) 
 					RemoteRoot: s.remoteRoot, MountID: snap.MountID, OperationID: dec.OperationID, Fence: dec.Target.Fence,
 				}
 				vc, verr := s.baseClient.WithView(client.ViewBinding{
-					LayerID: dec.Target.LayerID, Fence: dec.Target.Fence, WriteGuard: targetLease.checkWriteAllowed,
+					LayerID: dec.Target.LayerID, Fence: dec.Target.Fence, WriteGuard: targetLease.checkWriteAllowed, ReadUnfenced: targetLease.fenced.Load,
 				})
 				if verr != nil {
 					return s.recoveringResp(dec, verr)

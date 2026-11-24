@@ -1496,8 +1496,24 @@ func TestMountCmdRejectsInvalidGVisorCompatEnvironment(t *testing.T) {
 	}
 }
 
+func mountLayerRefFixture(t *testing.T) (string, string) {
+	t.Helper()
+	const id = "layer_01j8z6kh2m9q7w3r5t6y8v0p1a"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/layers/task=auth" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = fmt.Fprintf(w, `{"layer_id":%q,"base_root_path":"/repo"}`, id)
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	return srv.URL, id
+}
+
 func TestMountCmdPassesLayerRefOption(t *testing.T) {
 	stubMountProfileAppendLogProbe(t)
+	server, layerID := mountLayerRefFixture(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -1511,7 +1527,7 @@ func TestMountCmdPassesLayerRefOption(t *testing.T) {
 	err := MountCmd([]string{
 		"--foreground",
 		"--mode", "fuse",
-		"--server", "https://drive9.example",
+		"--server", server, "--profile=coding-agent", "--no-auto-unpack",
 		"--api-key", "sk-test",
 		"--layer", "task=auth",
 		":/repo",
@@ -1523,8 +1539,8 @@ func TestMountCmdPassesLayerRefOption(t *testing.T) {
 	if got == nil {
 		t.Fatal("mountFuse was not called")
 	}
-	if got.LayerRef != "task=auth" {
-		t.Errorf("LayerRef = %q, want task=auth", got.LayerRef)
+	if got.LayerRef != layerID {
+		t.Errorf("LayerRef = %q, want %q", got.LayerRef, layerID)
 	}
 	if got.RemoteRoot != "/repo" || got.RemoteRootDefaulted {
 		t.Errorf("RemoteRoot = %q (defaulted=%v), want /repo (defaulted=false)", got.RemoteRoot, got.RemoteRootDefaulted)
@@ -1533,6 +1549,7 @@ func TestMountCmdPassesLayerRefOption(t *testing.T) {
 
 func TestMountCmdLayerDefaultsRemoteRootWhenOmitted(t *testing.T) {
 	stubMountProfileAppendLogProbe(t)
+	server, layerID := mountLayerRefFixture(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -1546,7 +1563,7 @@ func TestMountCmdLayerDefaultsRemoteRootWhenOmitted(t *testing.T) {
 	err := MountCmd([]string{
 		"--foreground",
 		"--mode", "fuse",
-		"--server", "https://drive9.example",
+		"--server", server, "--profile=coding-agent", "--no-auto-unpack",
 		"--api-key", "sk-test",
 		"--layer", "task=auth",
 		t.TempDir(),
@@ -1554,8 +1571,8 @@ func TestMountCmdLayerDefaultsRemoteRootWhenOmitted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MountCmd: %v", err)
 	}
-	if got == nil || !got.RemoteRootDefaulted {
-		t.Fatalf("got = %+v, want RemoteRootDefaulted=true", got)
+	if got == nil || got.LayerRef != layerID || got.RemoteRoot != "/repo" || got.RemoteRootDefaulted {
+		t.Fatal("worker must receive the canonical layer ID and resolved /repo root")
 	}
 }
 

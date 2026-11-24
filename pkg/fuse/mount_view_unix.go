@@ -70,7 +70,7 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 	} else {
 		info, gerr := baseClient.GetLayer(ctx, layerRef)
 		if gerr != nil {
-			return nil, classifyLayerStartupError(fmt.Sprintf("resolve layer %q", layerRef), gerr)
+			return nil, ClassifyLayerStartupError(fmt.Sprintf("resolve layer %q", layerRef), gerr)
 		}
 		if berr := viewprotocol.ValidateLayerID(info.LayerID); berr != nil {
 			return nil, ExitStartupPermanentErr("invalid layer identity returned by server", berr)
@@ -145,16 +145,16 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 	}
 
 	if derr := journal.DrainPendingUnbinds(ctx, unbindFn); derr != nil {
-		return nil, classifyLayerStartupError("drain pending layer unbinds", derr)
+		return nil, ClassifyLayerStartupError("drain pending layer unbinds", derr)
 	}
 	drainedPrior, perr := mountstate.DrainPriorScopeJournals(ctx, jPath, scope, unbindFn)
 	if perr != nil {
-		return nil, classifyLayerStartupError("drain prior mount switch journal", perr)
+		return nil, ClassifyLayerStartupError("drain prior mount switch journal", perr)
 	}
 	if targetInfo != nil && drainedPrior {
 		refreshed, gerr := baseClient.GetLayer(ctx, targetInfo.LayerID)
 		if gerr != nil {
-			return nil, classifyLayerStartupError(fmt.Sprintf("refresh layer %q after draining prior journal", targetInfo.LayerID), gerr)
+			return nil, ClassifyLayerStartupError(fmt.Sprintf("refresh layer %q after draining prior journal", targetInfo.LayerID), gerr)
 		}
 		targetInfo = refreshed
 	}
@@ -179,7 +179,7 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 			}
 		} else {
 			if targetInfo.Fence%2 == 1 && !targetInfo.MountExpired {
-				return nil, ExitStartupPermanentErr(
+				return nil, newMountExit(ExitLayerLeaseBusy, ExitReasonLayerLeaseBusy,
 					fmt.Sprintf("layer %s already has an active exclusive mount lease", targetInfo.LayerID), client.ErrConflict)
 			}
 			expectedFence := targetInfo.Fence
@@ -188,7 +188,7 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 					MountID: actorID, Kind: mountstate.UnbindKindExpire,
 				})
 				if uerr != nil {
-					return nil, classifyLayerStartupError(fmt.Sprintf("expire stale mount lease on layer %s", targetInfo.LayerID), uerr)
+					return nil, ClassifyLayerStartupError(fmt.Sprintf("expire stale mount lease on layer %s", targetInfo.LayerID), uerr)
 				}
 				if unb == nil || unb.Fence < 0 || unb.Fence%2 != 0 {
 					return nil, ExitStartupTransientErr(
@@ -217,7 +217,7 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 				MountID: actorID, OperationID: opID, ExpectedFence: expectedFence,
 			})
 			if berr != nil {
-				return nil, classifyLayerStartupError(fmt.Sprintf("bind exclusive mount lease on layer %s", targetInfo.LayerID), berr)
+				return nil, ClassifyLayerStartupError(fmt.Sprintf("bind exclusive mount lease on layer %s", targetInfo.LayerID), berr)
 			}
 			var crashErr error
 			failpoint.InjectCall("prepareMountViewAfterInitialServerBind", &crashErr)
@@ -231,7 +231,7 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 				RemoteRoot: remoteRoot, MountID: actorID, OperationID: opID, Fence: leaseResp.Fence,
 			}
 			vc, verr := baseClient.WithView(client.ViewBinding{
-				LayerID: targetInfo.LayerID, Fence: leaseResp.Fence, WriteGuard: initialLease.checkWriteAllowed,
+				LayerID: targetInfo.LayerID, Fence: leaseResp.Fence, WriteGuard: initialLease.checkWriteAllowed, ReadUnfenced: initialLease.fenced.Load,
 			})
 			if verr != nil {
 				return nil, ExitStartupPermanentErr(fmt.Sprintf("bind writable layer view %s", targetInfo.LayerID), verr)

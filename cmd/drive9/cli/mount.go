@@ -717,15 +717,6 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 			return fmt.Errorf("drive9 mount: --unpack requires an overlay profile")
 		}
 	}
-	if normalizedLocalRoot == "" && overlayProfile && resolved == MountModeFUSE {
-		normalizedLocalRoot, err = defaultMountLocalRoot(*server, remoteRoot, mountCredentialCacheKey(apiKeyVal, tokenVal))
-		if err != nil {
-			return err
-		}
-	}
-	if err := validateMountProfileFlags(profileCfg.Name, normalizedLocalRoot, effectiveLocalOnlyPatterns, effectiveLocalGitignoreAwarePatterns, effectiveRemoteOnlyPatterns, effectivePackPaths); err != nil {
-		return err
-	}
 	if resolved == MountModeFUSE && runtime.GOOS != "windows" && len(profileCfg.AppendLogPatterns) > 0 {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		supported := mountProfileAppendLogSupported(ctx, serverVal, apiKeyVal, tokenVal)
@@ -749,28 +740,26 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	envSuperviseOff := strings.EqualFold(strings.TrimSpace(os.Getenv("DRIVE9_MOUNT_SUPERVISE")), "off")
 	wantSupervise := !*noSupervise && !envSuperviseOff
 	supervising := *superviseForeground || (background && !*foreground && wantSupervise && runtime.GOOS != "windows")
-	packLocalRoot := normalizedLocalRoot
+	needDefaultRoot := normalizedLocalRoot == "" && overlayProfile && resolved == MountModeFUSE
 	var archiveClient *client.Client
-	if autoUnpack || len(unpackArchives) > 0 || (supervising && layerRef != "") {
+	if autoUnpack || len(unpackArchives) > 0 || ((supervising || needDefaultRoot) && layerRef != "") {
 		if token != "" {
 			archiveClient = client.NewWithToken(serverVal, token)
 		} else {
 			archiveClient = client.New(serverVal, apiKeyVal)
 		}
 		if layerRef != "" {
-			info, err := archiveClient.GetLayer(context.Background(), layerRef)
+			lookupCtx, cancelLookup := context.WithTimeout(context.Background(), defaultMountBackgroundReadyTimeout)
+			info, err := archiveClient.GetLayer(lookupCtx, layerRef)
+			cancelLookup()
 			if err != nil {
-				return err
+				return classifyMountLayerLookupError(layerRef, err)
 			}
 			archiveClient, err = archiveClient.WithView(client.ViewBinding{LayerID: info.LayerID})
 			if err != nil {
 				return err
 			}
 			_, remoteRoot, err = mountpath.LayerRoots(info.BaseRootPath, remoteRoot, remoteRootDefaulted)
-			if err != nil {
-				return err
-			}
-			packLocalRoot, err = mountstate.LayerLocalRoot(normalizedLocalRoot, info.LayerID)
 			if err != nil {
 				return err
 			}
@@ -782,6 +771,22 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 			}
 			layerRef = info.LayerID
 			remoteRootDefaulted = false
+		}
+	}
+	if needDefaultRoot {
+		normalizedLocalRoot, err = defaultMountLocalRoot(*server, remoteRoot, mountCredentialCacheKey(apiKeyVal, tokenVal))
+		if err != nil {
+			return err
+		}
+	}
+	if err := validateMountProfileFlags(profileCfg.Name, normalizedLocalRoot, effectiveLocalOnlyPatterns, effectiveLocalGitignoreAwarePatterns, effectiveRemoteOnlyPatterns, effectivePackPaths); err != nil {
+		return err
+	}
+	packLocalRoot := normalizedLocalRoot
+	if layerRef != "" && archiveClient != nil {
+		packLocalRoot, err = mountstate.LayerLocalRoot(normalizedLocalRoot, layerRef)
+		if err != nil {
+			return err
 		}
 	}
 	if runtime.GOOS == "windows" && resolved == MountModeFUSE && len(unpackArchives) == 0 && !autoUnpack {
@@ -1277,20 +1282,25 @@ func waitForSupervisedMountReady(mountPoint string, supervisorPID int, waitCh <-
 			return fmt.Errorf("drive9 mount: supervised mount exited before becoming ready (log: %s)", logPath)
 		default:
 		}
+		// Ready only when SupervisorState matches the child we just spawned
+		// (PID+creation) and its worker is identity-alive — never accept a
+		// stale pidfile from a previous generation.
+		if st, _, err := mountstate.ReadSupervisorState(mountPoint); err == nil {
+			if supervisorStateMatchesGeneration(st, supervisorPID, supCreation) && !st.LayerLeaseRecoveryUntil.IsZero() {
+				if until := st.LayerLeaseRecoveryUntil.Add(timeout); until.After(deadline) {
+					deadline = until
+				}
+			}
+			if supervisedReadyStateMatches(st, supervisorPID, supCreation) && probeMountReadyForCLI(mountPoint) {
+				return nil
+			}
+		}
 		if time.Now().After(deadline) {
 			// Stop only the supervisor we just spawned. Worker kill is gated on
 			// SupervisorState matching this generation (PID+creation); never
 			// act on stale state or PID-only liveness (fail closed).
 			cleanupSupervisedReadyTimeout(mountPoint, supervisorPID, supCreation)
 			return fmt.Errorf("drive9 mount: timed out waiting for supervised mount to become ready after %s (log: %s)", timeout, logPath)
-		}
-		// Ready only when SupervisorState matches the child we just spawned
-		// (PID+creation) and its worker is identity-alive — never accept a
-		// stale pidfile from a previous generation.
-		if st, _, err := mountstate.ReadSupervisorState(mountPoint); err == nil {
-			if supervisedReadyStateMatches(st, supervisorPID, supCreation) && probeMountReadyForCLI(mountPoint) {
-				return nil
-			}
 		}
 		time.Sleep(200 * time.Millisecond)
 	}

@@ -25,6 +25,8 @@ type ViewBinding struct {
 	LayerID    string
 	Fence      int64
 	WriteGuard func() error
+	// ReadUnfenced permits reads to continue after the mount loses its write lease.
+	ReadUnfenced func() bool
 }
 
 // ViewBinding returns the Client's immutable Layer view binding.
@@ -150,8 +152,8 @@ func splitOrigin(rawScheme, rawHost string) (scheme, host, port string, ok bool)
 }
 
 func stripBaseOriginPrefix(baseOrigin *url.URL, escapedPath string) (basePrefix, innerEscaped string, ok bool) {
-	if baseOrigin != nil && strings.Trim(baseOrigin.Path, "/") != "" {
-		basePrefix = strings.TrimSuffix(path.Clean("/"+strings.TrimLeft(baseOrigin.Path, "/")), "/")
+	if baseOrigin != nil {
+		basePrefix = strings.TrimSuffix(path.Clean("/"+strings.TrimLeft(baseOrigin.EscapedPath(), "/")), "/")
 		if basePrefix != "" && basePrefix != "/" {
 			if !strings.HasPrefix(escapedPath, basePrefix+"/") {
 				return "", "", false

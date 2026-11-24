@@ -21,6 +21,10 @@ import (
 // runMountSupervise is the hidden supervisor entrypoint:
 // drive9 mount supervise --state ... -- [worker args...]
 func runMountSupervise(args []string) error {
+	return runMountSuperviseWith(args, mountsupervisor.Run)
+}
+
+func runMountSuperviseWith(args []string, run func(mountsupervisor.Config) error) error {
 	fs := flag.NewFlagSet("mount supervise", flag.ContinueOnError)
 	mountPoint := fs.String("mountpoint", "", "mount point")
 	logPath := fs.String("log", "", "log file path")
@@ -132,7 +136,7 @@ func runMountSupervise(args []string) error {
 
 	// Stop-token clearing is done inside mountsupervisor after exclusive lock
 	// so a concurrent umount intent cannot be erased by a non-owner process.
-	return mountsupervisor.Run(mountsupervisor.Config{
+	return run(mountsupervisor.Config{
 		MountPoint:          *mountPoint,
 		Executable:          exe,
 		WorkerArgs:          workerArgs,
@@ -372,7 +376,7 @@ func runMountEnsure(args []string) error {
 	})
 }
 
-func adoptSupervisorCommandArgs(mp, logPath, storedServer, sanitizedJSON string, workerPID int, workerCreation uint64, mountKind string) []string {
+func adoptSupervisorCommandArgs(mp, logPath, storedServer, sanitizedJSON string, workerPID int, workerCreation uint64, mountKind string, packState mountstate.ProcessState) ([]string, error) {
 	args := []string{
 		"mount", "supervise",
 		"--mountpoint", mp,
@@ -386,7 +390,17 @@ func adoptSupervisorCommandArgs(mp, logPath, storedServer, sanitizedJSON string,
 	if mountKind != "" {
 		args = append(args, "--mount-kind", mountKind)
 	}
-	return args
+	if packState.LayerID != "" {
+		packPaths, err := json.Marshal(packState.PackPaths)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, "--layer-id-meta", packState.LayerID, "--local-root-meta", packState.LocalRoot, "--remote-root", packState.RemoteRoot, "--profile", packState.Profile, "--pack-paths-json", string(packPaths))
+		if packState.LayerReadOnly {
+			args = append(args, "--layer-read-only-meta")
+		}
+	}
+	return args, nil
 }
 
 // ensureAdoptSupervisor starts a poll-based supervisor over a live orphan worker.
@@ -438,16 +452,9 @@ func ensureAdoptSupervisor(mp string, snap mountsupervisor.StatusSnapshot) error
 	if err != nil {
 		return err
 	}
-	args := adoptSupervisorCommandArgs(mp, logPath, storedServer, string(sanitizedJSON), snap.WorkerPID, workerCreation, storedKind)
-	if packState.LayerID != "" {
-		packPaths, err := json.Marshal(packState.PackPaths)
-		if err != nil {
-			return err
-		}
-		args = append(args, "--layer-id-meta", packState.LayerID, "--local-root-meta", packState.LocalRoot, "--remote-root", packState.RemoteRoot, "--profile", packState.Profile, "--pack-paths-json", string(packPaths))
-		if packState.LayerReadOnly {
-			args = append(args, "--layer-read-only-meta")
-		}
+	args, err := adoptSupervisorCommandArgs(mp, logPath, storedServer, string(sanitizedJSON), snap.WorkerPID, workerCreation, storedKind, packState)
+	if err != nil {
+		return err
 	}
 	return withEnsureCredentialEnv(storedServer, storedAPIKey, storedToken, func() error {
 		cmd := exec.Command(exe, args...)

@@ -372,3 +372,20 @@ func TestMountViewSwitchRecoverStopsOutgoingLeaseQueryAbortedAndReplaysIdempoten
 	require.NoError(t, cur.stop(ctx))
 	require.NoError(t, cur.stop(ctx))
 }
+
+func TestPrepareMountViewReportsBusyLeaseToSupervisor(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+	t.Setenv("HOME", dir)
+	require.NoError(t, mountstate.EnsureStateDir())
+	_, srv := newFakeSwitchBackend(t)
+	base := client.New(srv.URL, "test-key-placeholder")
+	ctx := context.Background()
+	const layerID = "layer_01j00000000000000000000001"
+	_, err := base.BindLayerMount(ctx, layerID, client.LayerMountBindRequest{MountID: "existing", OperationID: "bind_existing", ExpectedFence: 0})
+	require.NoError(t, err)
+	cfg := MountConfig{Server: srv.URL, APIKey: "test-key-placeholder", MountPoint: dir, LayerRef: layerID}
+	_, err = prepareMountView(ctx, cfg, base, "new-worker")
+	assertMountExit(t, err, ExitLayerLeaseBusy, ExitReasonLayerLeaseBusy)
+	require.ErrorIs(t, err, client.ErrConflict)
+}

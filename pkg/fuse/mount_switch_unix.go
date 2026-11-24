@@ -466,7 +466,7 @@ func (s *mountViewSwitch) executeSwitchPrecheckedLocked(
 			vc, verr := s.baseClient.WithView(client.ViewBinding{
 				LayerID:    targetInfo.LayerID,
 				Fence:      leaseResp.Fence,
-				WriteGuard: newLease.checkWriteAllowed,
+				WriteGuard: newLease.checkWriteAllowed, ReadUnfenced: newLease.fenced.Load,
 			})
 			if verr != nil {
 				return rollbackPreDecision(verr)

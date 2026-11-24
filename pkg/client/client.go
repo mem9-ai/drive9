@@ -1141,7 +1141,7 @@ func (c *Client) ListWithOptionsCtx(ctx context.Context, path string, opts ListO
 		rawQuery := "?list=1"
 		if c.view.LayerID != "" {
 			if opts.Limit > 0 {
-				rawQuery += "&limit=" + strconv.Itoa(opts.Limit)
+				rawQuery += "&limit=" + strconv.Itoa(min(opts.Limit-len(allEntries), 1000))
 			}
 			if cursor != "" {
 				rawQuery += "&cursor=" + url.QueryEscape(cursor)
