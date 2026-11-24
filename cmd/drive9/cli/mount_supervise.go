@@ -46,6 +46,7 @@ func runMountSuperviseWith(args []string, run func(mountsupervisor.Config) error
 	localRootMeta := fs.String("local-root-meta", "", "local root for pack metadata")
 	packPathsJSON := fs.String("pack-paths-json", "", "JSON array of pack paths")
 	sanitizedJSON := fs.String("sanitized-args-json", "", "JSON array of sanitized args")
+	recoverLease := fs.Bool("recover-layer-lease", false, "wait for the previous worker lease")
 	adopt := fs.Bool("adopt", false, "adopt an existing worker by PID (poll-based; no waitpid)")
 	adoptWorkerPID := fs.Int("adopt-worker-pid", 0, "worker PID to adopt")
 	adoptWorkerCreation := fs.Uint64("adopt-worker-creation", 0, "worker process creation identity")
@@ -161,6 +162,7 @@ func runMountSuperviseWith(args []string, run func(mountsupervisor.Config) error
 		LocalRoot:           *localRootMeta,
 		LayerID:             *layerID,
 		LayerReadOnly:       *layerReadOnly,
+		RecoverLayerLease:   *recoverLease,
 		PackPaths:           packPaths,
 		Adopt:               *adopt,
 		AdoptWorkerPID:      *adoptWorkerPID,
@@ -370,7 +372,7 @@ func runMountEnsure(args []string) error {
 	// --server is non-secret and may be injected as a flag for clarity.
 	sanitized = injectEnsureServerFlag(sanitized, storedServer)
 	return withEnsureCredentialEnv(storedServer, storedAPIKey, storedToken, func() error {
-		return fsMountCmdWithBackground(sanitized, true)
+		return fsMountWithLeaseRecovery(sanitized, true, true)
 	})
 }
 
@@ -552,7 +554,7 @@ func runMountSystemdUnit(args []string) error {
 		return err
 	}
 	// Build ExecStart with --supervise-foreground.
-	startArgs := []string{exe, "mount", "--supervise-foreground"}
+	startArgs := []string{exe, "mount", "--supervise-foreground", "--recover-layer-lease"}
 	startArgs = append(startArgs, rest...)
 	// Quote simply; escape % for systemd (%% is a literal percent).
 	execStart := systemdEscapePercents(shellJoin(startArgs))

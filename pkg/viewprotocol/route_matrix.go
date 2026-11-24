@@ -47,6 +47,19 @@ func FormatViewPath(layerID, innerEscapedPath string) (string, error) {
 	return RoutePrefix + layerID + innerEscapedPath, nil
 }
 
+// RouteMutatesView reports whether an admitted view data route requires its write guard.
+func RouteMutatesView(method, innerEscaped string) bool {
+	if method == http.MethodPost && (innerEscaped == "/v1/fs:batch-stat" || innerEscaped == "/v1/fs:batch-read-small") {
+		return false
+	}
+	if method != http.MethodGet && method != http.MethodHead {
+		return true
+	}
+	return method == http.MethodGet &&
+		strings.HasPrefix(innerEscaped, "/v1/uploads/") &&
+		strings.HasSuffix(innerEscaped, "/resume")
+}
+
 // ClassifyClientRoute applies the exhaustive 3-set routing table (v35 §6.5 #3)
 // for a Client bound to a non-empty ViewBinding.LayerID.
 func ClassifyClientRoute(method, escapedPath string, query url.Values) RouteAction {

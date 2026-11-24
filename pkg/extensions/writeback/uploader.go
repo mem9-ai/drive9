@@ -70,6 +70,7 @@ type WriteBackUploader struct {
 	activePaths map[string]int
 	wg          sync.WaitGroup
 	stopOnce    sync.Once
+	selfFenced  chan struct{}
 	stopped     atomic.Bool
 	active      atomic.Int64
 
@@ -167,6 +168,7 @@ func NewWriteBackUploader(c *client.Client, cache *staging.WriteBackCache, numWo
 	}
 	u := &WriteBackUploader{
 		client:      c,
+		selfFenced:  make(chan struct{}),
 		cache:       cache,
 		remoteRoot:  root,
 		queuedSet:   make(map[string]struct{}),
@@ -322,6 +324,31 @@ func (u *WriteBackUploader) WaitIdle(ctx context.Context) error {
 	}
 }
 
+func (u *WriteBackUploader) isSelfFenced() bool {
+	select {
+	case <-u.selfFenced:
+		return true
+	default:
+		return false
+	}
+}
+
+// abandonLayer stops dispatching writes but leaves staged images on disk.
+func (u *WriteBackUploader) abandonLayer() {
+	u.queueMu.Lock()
+	defer u.queueMu.Unlock()
+	if u.isSelfFenced() {
+		return
+	}
+	close(u.selfFenced)
+	u.stopped.Store(true)
+	u.queue = nil
+	u.queueHead = 0
+	clear(u.queuedSet)
+	u.queueCond.Broadcast()
+	u.stateCond.Broadcast()
+}
+
 // Submit enqueues a local namespace path for background upload without blocking
 // foreground FUSE_RELEASE callers. Paths already queued (not yet popped by a
 // worker) are deduplicated in place; if called after DrainAll has stopped the
@@ -331,6 +358,10 @@ func (u *WriteBackUploader) Submit(localPath string) {
 		u.perf.uploaderSubmit.add(1)
 	}
 	u.queueMu.Lock()
+	if u.isSelfFenced() {
+		u.queueMu.Unlock()
+		return
+	}
 	if u.stopped.Load() {
 		if u.activePaths == nil {
 			u.activePaths = make(map[string]int)
@@ -516,6 +547,9 @@ func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPat
 	// publish the same generation and trigger a false revision conflict.
 	release := u.acquirePath(localPath)
 	defer release()
+	if u.isSelfFenced() {
+		return 0, nil, errLayerRolledBack
+	}
 
 	// One atomic lookup under the path lock: the state carries the reason, so a
 	// PendingChmod record (no .dat by design) is not mistaken for a pruned pair,
@@ -962,7 +996,13 @@ func (u *WriteBackUploader) tryUploadBatch(firstPath string) bool {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*uploadTimeout)
 	uploadStart := time.Now()
-	results, err := u.client.BatchWriteCtx(ctx, remoteItems)
+	var results []client.BatchWriteResult
+	var err error
+	if u.isSelfFenced() {
+		err = errLayerRolledBack
+	} else {
+		results, err = u.client.BatchWriteCtx(ctx, remoteItems)
+	}
 	cancel()
 	if u.batchSem != nil {
 		<-u.batchSem
@@ -1070,6 +1110,9 @@ func (u *WriteBackUploader) acquirePath(localPath string) func() {
 func (u *WriteBackUploader) uploadOne(localPath string) {
 	release := u.acquirePath(localPath)
 	defer release()
+	if u.isSelfFenced() {
+		return
+	}
 
 	// One atomic lookup: the callback captures the staging-store generations
 	// under the same path lock, so a concurrent same-path write cannot leave a
@@ -1117,9 +1160,16 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 			if delay > uploadBackoffMax {
 				delay = uploadBackoffMax
 			}
-			time.Sleep(delay)
+			select {
+			case <-u.selfFenced:
+				return
+			case <-time.After(delay):
+			}
 		}
 
+		if u.isSelfFenced() {
+			return
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
 		uploadStart := time.Now()
 		committedRev, lastErr = uploadBufferedRemoteFileWithRevision(ctx, u.client, u.remotePath(localPath), data, expectedRevision)

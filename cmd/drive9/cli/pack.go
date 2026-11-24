@@ -163,6 +163,9 @@ func Pack(c *client.Client, args []string) error {
 		if err != nil {
 			return err
 		}
+		if resolved.LayerID != "" && c.ViewBinding().Fence == 0 {
+			return fmt.Errorf("drive9 pack: writing through a mounted Layer requires the worker's active fence. Use drive9 umount --pack to archive the overlay")
+		}
 		if strings.TrimSpace(*localRoot) == "" {
 			*localRoot = resolved.LocalRoot
 		}

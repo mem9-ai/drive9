@@ -74,16 +74,20 @@ describe("Layer view WriteGuard and redirect validation parity", () => {
 describe("Go and JavaScript Layer route contract", () => {
   const origin = "https://api.drive9.example/deploy";
   const layerId = "layer_01j8z4r9w3m5n7p9q2s4t6v8xz";
-  const binding = validateViewBinding({ layerId, fence: 1 }, origin);
-
-  it.each(routes)("$method $target => $action", ({ method, target, action }) => {
-    const request = () => rewriteRequestForView(binding, origin + target, { method });
+  it.each(routes)("$method $target => $action", ({ method, target, action, mutates }) => {
+    let guardCalls = 0;
+    const binding = validateViewBinding({ layerId, fence: 1, writeGuard: () => { guardCalls++; } }, origin);
+    const request = () => rewriteRequestForView(binding, origin + target, { method, headers: { "X-FS-Layer-Fence": "99" } });
     switch (action) {
       case "pass":
-        expect(request().url).toBe(origin + target);
+        const passed = request();
+        expect(new Headers(passed.init?.headers).get("X-FS-Layer-Fence")).toBeNull();
+        expect(passed.url).toBe(origin + target);
         break;
       case "rewrite":
-        expect(request().url).toBe(origin + "/v1/views/" + layerId + target);
+        const rewritten = request();
+        expect(new Headers(rewritten.init?.headers).get("X-FS-Layer-Fence")).toBe("1");
+        expect(rewritten.url).toBe(origin + "/v1/views/" + layerId + target);
         break;
       case "unsupported":
         expect(request).toThrow(UnsupportedInLayerViewError);
@@ -94,5 +98,6 @@ describe("Go and JavaScript Layer route contract", () => {
       default:
         throw new Error("Unknown route action: " + action);
     }
+    expect(guardCalls).toBe(mutates ? 1 : 0);
   });
 });

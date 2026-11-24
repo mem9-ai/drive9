@@ -9,6 +9,10 @@ import (
 	"github.com/mem9-ai/drive9/pkg/vaultfs"
 )
 
+func mountLayerConfigError(action string, err error) error {
+	return drive9fuse.ExitStartupPermanentErr(action, err)
+}
+
 func classifyMountLayerLookupError(ref string, err error) error {
 	return drive9fuse.ClassifyLayerStartupError(fmt.Sprintf("resolve layer %q", ref), err)
 }

@@ -656,12 +656,34 @@ exit 5
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- cmd.Wait() }()
 	err := waitForSupervisedMountReady(mp, cmd.Process.Pid, waitCh, "/dev/null", 800*time.Millisecond)
-	if err == nil || !strings.Contains(err.Error(), "exited before becoming ready") || ctx.Err() != nil {
+	if err == nil || !strings.Contains(err.Error(), "before becoming ready") || ctx.Err() != nil {
 		t.Fatalf("parent result %v (context %v)", err, ctx.Err())
 	}
 	for _, stage := range []string{"bound", "busy", "retried"} {
 		if _, err := os.Stat(filepath.Join(dir, stage)); err != nil {
 			t.Errorf("missing worker stage %s: %v", stage, err)
 		}
+	}
+}
+
+func TestParentReturnsTerminalSupervisorStateDuringLeaseWait(t *testing.T) {
+	for _, state := range []string{mountstate.SupervisorStateFailed, mountstate.SupervisorStateCircuitOpen} {
+		t.Run(state, func(t *testing.T) {
+			mp := t.TempDir()
+			self := os.Getpid()
+			creation, _ := mountstate.ProcessCreationTime(self)
+			st := mountstate.SupervisorState{PID: self, CreationTime: creation, MountPoint: mp, State: state, LayerLeaseRecoveryUntil: time.Now().Add(time.Hour)}
+			if err := mountstate.WriteSupervisorState(mp, st); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = mountstate.ClearSupervisorState(mp) })
+			wait := make(chan error, 1)
+			timer := time.AfterFunc(time.Second, func() { wait <- errors.New("parent missed terminal state") })
+			defer timer.Stop()
+			err := waitForSupervisedMountReady(mp, self, wait, "/dev/null", 30*time.Second)
+			if err == nil || !strings.Contains(err.Error(), state) {
+				t.Fatalf("parent result %v", err)
+			}
+		})
 	}
 }

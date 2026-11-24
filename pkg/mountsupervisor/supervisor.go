@@ -24,6 +24,7 @@ import (
 )
 
 const workerReadyTimeout = 30 * time.Second
+const layerLeaseRetryInterval = 5 * time.Second
 
 // Config configures a mount supervisor.
 type Config struct {
@@ -45,15 +46,16 @@ type Config struct {
 	AlertWebhook   string
 	AlertFile      string
 	// SanitizedArgs stored for ensure (no secrets).
-	SanitizedArgs []string
-	Server        string
-	LayerID       string
-	LayerReadOnly bool
-	RemoteRoot    string
-	Profile       string
-	MountKind     string
-	LocalRoot     string
-	PackPaths     []string
+	SanitizedArgs     []string
+	Server            string
+	LayerID           string
+	LayerReadOnly     bool
+	RecoverLayerLease bool
+	RemoteRoot        string
+	Profile           string
+	MountKind         string
+	LocalRoot         string
+	PackPaths         []string
 	// Adopt-by-monitor: poll an existing worker without waitpid (orphan recovery).
 	Adopt               bool
 	AdoptWorkerPID      int
@@ -155,11 +157,6 @@ func newSupervisor(cfg Config) (*supervisor, error) {
 			Profile:      cfg.Profile,
 		},
 	}
-	if cfg.LayerID != "" && !cfg.LayerReadOnly {
-		// A worker can bind the lease before its first readiness probe succeeds.
-		// Allow its probe, termination and first replacement to report a busy lease.
-		s.state.LayerLeaseRecoveryUntil = now.Add(workerReadyTimeout + cfg.StopTimeout + cfg.BackoffMax)
-	}
 	if s.adopted {
 		s.state.WorkerPID = cfg.AdoptWorkerPID
 		s.state.WorkerCreation = cfg.AdoptWorkerCreation
@@ -244,7 +241,7 @@ func (s *supervisor) loop() error {
 		readyOnce.Do(func() { close(s.cfg.ReadyNotify) })
 	}
 
-	recoverLayerLease := s.adopted
+	recoverLayerLease := s.adopted || (s.cfg.RecoverLayerLease && s.cfg.LayerID != "" && !s.cfg.LayerReadOnly)
 	var leaseDeadline time.Time
 	// Adopt-by-monitor: do not force-clean a live healthy orphan worker.
 	if s.adopted {
@@ -338,7 +335,7 @@ func (s *supervisor) loop() error {
 			}
 			if code == drive9fuse.ExitLayerLeaseBusy {
 				if recoverLayerLease && leaseDeadline.IsZero() {
-					leaseDeadline = s.cfg.Now().Add(s.cfg.RestartWindow)
+					leaseDeadline = s.cfg.Now().Add(drive9fuse.LayerMountLeaseTTL + layerLeaseRetryInterval)
 					s.mu.Lock()
 					s.state.LayerLeaseRecoveryUntil = leaseDeadline
 					s.mu.Unlock()
@@ -354,7 +351,7 @@ func (s *supervisor) loop() error {
 				// A dying worker can finish a renewal after the supervisor
 				// observes its exit. Only the server can confirm expiry.
 				s.logf("layer lease still active; retrying until %s", leaseDeadline)
-				if !s.waitForLayerLease(sigCh, min(s.nextBackoff(), leaseDeadline.Sub(s.cfg.Now()))) {
+				if !s.waitForLayerLease(sigCh, min(s.nextBackoff(), layerLeaseRetryInterval, leaseDeadline.Sub(s.cfg.Now()))) {
 					return s.shutdownClean()
 				}
 				continue
@@ -388,9 +385,6 @@ func (s *supervisor) loop() error {
 		s.healthFails = 0
 		s.workerReady = true
 		leaseDeadline = time.Time{}
-		s.mu.Lock()
-		s.state.LayerLeaseRecoveryUntil = time.Time{}
-		s.mu.Unlock()
 		recoverLayerLease = true
 		s.setState(mountstate.SupervisorStateRunning)
 		notifyReady()
@@ -685,6 +679,10 @@ func (s *supervisor) spawnWorker() error {
 	s.workerWait = waitCh
 	s.state.WorkerPID = cmd.Process.Pid
 	s.state.WorkerCreation = creation
+	if s.cfg.LayerID != "" && !s.cfg.LayerReadOnly && !s.workerReady && s.state.LayerWorkerStartupUntil.IsZero() {
+		// The first worker can acquire the lease before FUSE reports ready.
+		s.state.LayerWorkerStartupUntil = s.cfg.Now().Add(workerReadyTimeout + s.cfg.StopTimeout + layerLeaseRetryInterval)
+	}
 	s.mu.Unlock()
 	_ = s.persist()
 	_ = s.writeAuthoritativeProcessState()
@@ -1094,6 +1092,11 @@ func (s *supervisor) nextBackoff() time.Duration {
 func (s *supervisor) setState(state string) {
 	s.mu.Lock()
 	s.state.State = state
+	switch state {
+	case mountstate.SupervisorStateRunning, mountstate.SupervisorStateFailed, mountstate.SupervisorStateCircuitOpen:
+		s.state.LayerLeaseRecoveryUntil = time.Time{}
+		s.state.LayerWorkerStartupUntil = time.Time{}
+	}
 	s.mu.Unlock()
 	_ = s.persist()
 }

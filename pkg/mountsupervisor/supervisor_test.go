@@ -377,7 +377,7 @@ func TestSupervisorReplacesStoredLayerMetadata(t *testing.T) {
 }
 
 func TestSupervisorRecoversAfterOldWorkerLeaseExpires(t *testing.T) {
-	for _, stage := range []string{"adopt", "startup", "running", "first-busy", "deadline"} {
+	for _, stage := range []string{"adopt", "reboot", "startup", "running", "first-busy", "deadline"} {
 		t.Run(stage, func(t *testing.T) {
 			dir := t.TempDir()
 			mountPoint := filepath.Join(dir, "mount")
@@ -411,7 +411,7 @@ sleep 2
 			}
 			exists := func(name string) bool { _, err := os.Stat(filepath.Join(dir, name)); return err == nil }
 			cfg := Config{MountPoint: mountPoint, Executable: worker, WorkerArgs: []string{dir, stage}, LayerID: "layer-test",
-				Adopt: stage == "adopt" || stage == "deadline", AdoptWorkerPID: 1 << 30, AdoptWorkerCreation: 1, RestartWindow: 2 * time.Minute,
+				RecoverLayerLease: stage == "reboot", Adopt: stage == "adopt" || stage == "deadline", AdoptWorkerPID: 1 << 30, AdoptWorkerCreation: 1, RestartWindow: 30 * time.Second,
 				Now: func() time.Time { return now },
 				Sleep: func(d time.Duration) {
 					if d == 200*time.Millisecond {
@@ -448,8 +448,8 @@ sleep 2
 				if stage == "first-busy" && now != start {
 					t.Fatal("initial conflict waited for another mount")
 				}
-				if stage == "deadline" && now.Sub(start) < cfg.RestartWindow {
-					t.Fatal("gave up before restart window elapsed")
+				if stage == "deadline" && now.Sub(start) != drive9fuse.LayerMountLeaseTTL+layerLeaseRetryInterval {
+					t.Fatalf("lease retry duration = %v", now.Sub(start))
 				}
 			} else if err != nil || !exists("recovered") {
 				t.Fatalf("old worker lease recovery: %v", err)
