@@ -555,3 +555,25 @@ name = "drive9/api/sdk-integration"
 tier = "daily-sdk"
 no_mount = true
 timeout = "30m"
+
+# ---- 100k-file workspace (GA item: large-workspace scale) ----
+[[case]]
+name = "drive9/fuse/namespace-100k"
+tier = "daily-bench"
+perf = true
+serial = true
+# Bounds a standalone run only. Worst case with cleanup enabled: phase deadlines
+# (600+900+900+900+1200 = 4500s), a 2x(480+15)s drain, three ~210s remounts and a
+# ~190s initial mount add up to ~6310s; the default (no cleanup) is ~5110s. In
+# the scheduled job this value can never fire — the job's own 120-minute limit
+# comes first and runs 57 cases — so the phase deadlines are the effective bound
+# there. Deadlines come from a measured run under the engine on a local SSD (100k
+# files: create 5.4s, drain 200s, cold readdir 270s, cold stat 282s, cold find
+# 282s), so they bound a hang rather than assert performance; the first nightly
+# on a real runner is the measurement that tells whether the 3.2x margin holds.
+# Deleting the 100k tree through FUSE took >20 minutes, so the case deletes it
+# with one server-side recursive call (225s measured) and only where the tenant
+# outlives the case: NAMESPACE_CLEANUP defaults to the engine's EXISTING_TENANT,
+# on for --api-key runs and off for the in-process engine, which drops the tenant
+# and with it the tree.
+timeout = "120m"
