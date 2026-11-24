@@ -165,7 +165,7 @@ func viewSwitchFixture(t *testing.T) (*mountViewSwitch, *fakeSwitchBackend, stri
 	mb := membudget.New(64<<20, membudget.ModeEnforce, nil)
 	counters := perf.NewCounters(false)
 	var sharedExt *extent.Engine
-	rt, err := buildViewRuntime(cfg, baseClient, "/", "mount-1", viewprotocol.SwitchBinding{}, nil, mountRuntimeGeneration{MountID: "mount-1", Generation: 1}, mb, counters, &sharedExt)
+	rt, err := buildViewRuntime(cfg, baseClient, "/", "mount-1", viewprotocol.SwitchBinding{}, nil, mb, counters, &sharedExt)
 	require.NoError(t, err)
 	rt.fs.Init2(context.Background())
 	t.Cleanup(func() { _ = rt.stop(context.Background()) })
@@ -185,14 +185,15 @@ func viewSwitchFixture(t *testing.T) (*mountViewSwitch, *fakeSwitchBackend, stri
 		fence:      func(context.Context) error { return nil },
 		timing:     layerLeaseTiming{renewInterval: 5 * time.Second, callTimeout: 500 * time.Millisecond},
 	}
-	sw.buildRuntime = func(_ context.Context, target viewprotocol.SwitchBinding, lease *layerMountBinding, gen mountRuntimeGeneration) (*mountRuntime, error) {
+	sw.buildRuntime = func(_ context.Context, target viewprotocol.SwitchBinding, lease *layerMountBinding) (*mountRuntime, error) {
 		vc := baseClient
 		if target.LayerID != "" && lease != nil && lease.ViewClient != nil {
 			vc = lease.ViewClient
 		}
-		return buildViewRuntime(cfg, vc, "/", "mount-1", target, lease, gen, mb, counters, &sharedExt)
+		return buildViewRuntime(cfg, vc, "/", "mount-1", target, lease, mb, counters, &sharedExt)
 	}
 	t.Cleanup(func() {
+		sw.stopAsyncUnbinds()
 		if cur := sw.currentRuntime(); cur != nil {
 			_ = cur.stop(context.Background())
 		}

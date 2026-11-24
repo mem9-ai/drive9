@@ -254,8 +254,7 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 	}
 	sharedCounters := perf.NewCounters(cfg.PerfCounters || cfg.PerfSamplesPath != "")
 	var sharedExtent *extent.Engine
-	gen1 := mountRuntimeGeneration{MountID: actorID, Generation: 1}
-	rt, err := buildViewRuntime(cfg, viewClient, remoteRoot, actorID, initialBinding, initialLease, gen1, memoryBudget, sharedCounters, &sharedExtent)
+	rt, err := buildViewRuntime(cfg, viewClient, remoteRoot, actorID, initialBinding, initialLease, memoryBudget, sharedCounters, &sharedExtent)
 	if err != nil {
 		return nil, err
 	}
@@ -282,7 +281,7 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 		fence:       func(fctx context.Context) error { return fenceViewRootUpdates(fctx, mv) },
 		timing:      timing,
 	}
-	sw.buildRuntime = func(bctx context.Context, target viewprotocol.SwitchBinding, lease *layerMountBinding, gen mountRuntimeGeneration) (*mountRuntime, error) {
+	sw.buildRuntime = func(bctx context.Context, target viewprotocol.SwitchBinding, lease *layerMountBinding) (*mountRuntime, error) {
 		if err := bctx.Err(); err != nil {
 			return nil, err
 		}
@@ -294,7 +293,7 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 		if target.LayerID != "" && lease != nil && lease.ViewClient != nil {
 			vc = lease.ViewClient
 		}
-		next, berr := buildViewRuntime(cfg, vc, remoteRoot, actorID, target, lease, gen, memoryBudget, sharedCounters, &mv.sharedExtent)
+		next, berr := buildViewRuntime(cfg, vc, remoteRoot, actorID, target, lease, memoryBudget, sharedCounters, &mv.sharedExtent)
 		if berr != nil {
 			return nil, berr
 		}
@@ -360,7 +359,7 @@ func (v *mountView) drainShutdownResponse(ctx context.Context) mountcontrol.Drai
 		resp.Finish(time.Now().UTC())
 		return resp
 	}
-	if v.switcher.recoveringPaused {
+	if v.switcher.recoveringPaused.Load() {
 		if v.switcher.current != nil && v.switcher.current.layerLease != nil {
 			v.switcher.current.layerLease.StopRenew()
 		}
@@ -396,11 +395,34 @@ func (v *mountView) drainShutdownResponse(ctx context.Context) mountcontrol.Drai
 	return resp
 }
 
+func (v *mountView) bindProcessStateUpdater(fn func(string, bool)) {
+	if v == nil || v.switcher == nil || fn == nil {
+		return
+	}
+	v.switcher.mu.Lock()
+	v.switcher.onSwitchDone = func(b viewprotocol.SwitchBinding) {
+		fn(b.LayerID, b.LayerID != "" && b.ReadOnly)
+	}
+	var (
+		hasSnap bool
+		snap    mountstate.SwitchSnapshot
+	)
+	if v.switcher.journal != nil && !v.switcher.journal.Uncertain() {
+		snap = v.switcher.journal.Snapshot()
+		hasSnap = true
+	}
+	v.switcher.mu.Unlock()
+	if hasSnap {
+		fn(snap.Binding.LayerID, snap.Binding.LayerID != "" && snap.Binding.ReadOnly)
+	}
+}
+
 func (v *mountView) close(ctx context.Context) error {
 	if v == nil || v.switcher == nil {
 		return nil
 	}
 	v.ready.Store(false)
+	v.switcher.stopAsyncUnbinds()
 	v.switcher.mu.Lock()
 	defer v.switcher.mu.Unlock()
 	if v.switcher.pendingLease != nil {

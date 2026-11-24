@@ -57,17 +57,23 @@ type Handler struct {
 func New(opts Options) *Handler {
 	h := &Handler{opts: opts, handles: make(map[string][]*engineHandle)}
 	if opts.Engine != nil && opts.Engine.Bridge != nil {
-		opts.Engine.Bridge.onRetireClosed = func(localPath string, ino meta.Ino) {
+		opts.Engine.Bridge.onRetireClosed = func(localPath string, ino meta.Ino) bool {
 			unlock := h.lockPaths(localPath)
 			defer unlock()
 			h.mu.Lock()
-			open := len(h.handles[localPath]) > 0
-			h.mu.Unlock()
-			if open {
-				opts.Engine.Bridge.ClearClosedRetained(ino)
-				return
+			sameInoOpen := false
+			for _, eh := range h.handles[localPath] {
+				if eh.ino == ino {
+					sameInoOpen = true
+					break
+				}
 			}
-			opts.Engine.Bridge.RetireClosedIno(localPath, ino)
+			h.mu.Unlock()
+			if sameInoOpen {
+				opts.Engine.Bridge.ClearClosedRetained(ino)
+				return true
+			}
+			return opts.Engine.Bridge.RetireClosedIno(localPath, ino)
 		}
 	}
 	if opts.Events != nil {
@@ -100,8 +106,8 @@ func New(opts Options) *Handler {
 			h.mu.Lock()
 			_, open := h.handles[ev.Path]
 			h.mu.Unlock()
-			if !open {
-				h.drop(ev.Path)
+			if !open && h.opts.Engine != nil && h.opts.Engine.Bridge != nil {
+				h.opts.Engine.Bridge.ForgetInvalidatedPath(ev.Path)
 			}
 		})
 	}

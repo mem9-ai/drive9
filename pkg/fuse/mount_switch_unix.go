@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -30,17 +31,22 @@ type mountViewSwitch struct {
 	notifier     viewCacheNotifier
 	fence        func(context.Context) error
 	timing       layerLeaseTiming
-	buildRuntime func(context.Context, viewprotocol.SwitchBinding, *layerMountBinding, mountRuntimeGeneration) (*mountRuntime, error)
+	buildRuntime func(context.Context, viewprotocol.SwitchBinding, *layerMountBinding) (*mountRuntime, error)
+	onSwitchDone func(viewprotocol.SwitchBinding)
 
 	pendingPause     *viewPause
 	pendingPlan      viewCacheInvalidation
 	pendingLease     *layerMountBinding
 	pendingTarget    *mountRuntime
 	pendingInstalled bool
-	recoveringPaused bool
+	outgoingStopped  bool
+	recoveringPaused atomic.Bool
 
 	asyncUnbindMu      sync.Mutex
 	asyncUnbindRunning bool
+	asyncUnbindStopped bool
+	asyncUnbindStop    chan struct{}
+	asyncUnbindWg      sync.WaitGroup
 }
 
 func (s *mountViewSwitch) supported() bool {
@@ -86,41 +92,98 @@ func (s *mountViewSwitch) drainPendingUnbindsLocked(ctx context.Context) error {
 	return s.journal.DrainPendingUnbinds(ctx, s.executeUnbind)
 }
 
+func (s *mountViewSwitch) stopAsyncUnbinds() {
+	s.asyncUnbindMu.Lock()
+	if !s.asyncUnbindStopped {
+		s.asyncUnbindStopped = true
+		if s.asyncUnbindStop == nil {
+			s.asyncUnbindStop = make(chan struct{})
+		}
+		close(s.asyncUnbindStop)
+	}
+	s.asyncUnbindMu.Unlock()
+	s.asyncUnbindWg.Wait()
+}
+
 func (s *mountViewSwitch) kickAsyncDrainUnbinds() {
 	s.asyncUnbindMu.Lock()
-	if s.asyncUnbindRunning {
+	if s.asyncUnbindStopped || s.asyncUnbindRunning {
 		s.asyncUnbindMu.Unlock()
 		return
 	}
+	if s.asyncUnbindStop == nil {
+		s.asyncUnbindStop = make(chan struct{})
+	}
+	stopCh := s.asyncUnbindStop
 	s.asyncUnbindRunning = true
+	s.asyncUnbindWg.Add(1)
 	s.asyncUnbindMu.Unlock()
 
 	go func() {
+		defer s.asyncUnbindWg.Done()
 		defer func() {
 			s.asyncUnbindMu.Lock()
 			s.asyncUnbindRunning = false
 			s.asyncUnbindMu.Unlock()
 		}()
 		for attempt := 0; attempt < 5; attempt++ {
+			select {
+			case <-stopCh:
+				return
+			default:
+			}
 			s.mu.Lock()
 			if s.journal == nil || s.journal.Uncertain() {
 				s.mu.Unlock()
 				return
 			}
-			snap := s.journal.Snapshot()
-			if len(snap.PendingUnbinds) == 0 {
-				s.mu.Unlock()
-				return
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			err := s.drainPendingUnbindsLocked(ctx)
-			cancel()
-			empty := len(s.journal.Snapshot().PendingUnbinds) == 0
+			items := s.journal.Snapshot().PendingUnbinds
 			s.mu.Unlock()
-			if err == nil && empty {
+			if len(items) == 0 {
 				return
 			}
-			time.Sleep(500 * time.Millisecond)
+			allDone := true
+			for _, item := range items {
+				callCtx, cancel := context.WithTimeout(context.Background(), s.leaseCallTimeout())
+				watchDone := make(chan struct{})
+				go func() {
+					select {
+					case <-stopCh:
+						cancel()
+					case <-watchDone:
+					}
+				}()
+				uerr := s.executeUnbind(callCtx, item)
+				close(watchDone)
+				cancel()
+				if uerr != nil {
+					allDone = false
+					continue
+				}
+				s.mu.Lock()
+				if s.journal == nil || s.journal.Uncertain() {
+					s.mu.Unlock()
+					return
+				}
+				if aerr := s.journal.AppendUnbindDone(item); aerr != nil {
+					s.mu.Unlock()
+					return
+				}
+				s.mu.Unlock()
+			}
+			if allDone {
+				s.mu.Lock()
+				empty := s.journal == nil || len(s.journal.Snapshot().PendingUnbinds) == 0
+				s.mu.Unlock()
+				if empty {
+					return
+				}
+			}
+			select {
+			case <-stopCh:
+				return
+			case <-time.After(500 * time.Millisecond):
+			}
 		}
 	}()
 }
@@ -184,7 +247,7 @@ func (s *mountViewSwitch) drain(ctx context.Context) mountcontrol.DrainResponse 
 		resp.Finish(time.Now().UTC())
 		return resp
 	}
-	if s.recoveringPaused {
+	if s.recoveringPaused.Load() {
 		resp.Finish(time.Now().UTC())
 		return resp
 	}
@@ -211,28 +274,49 @@ func (s *mountViewSwitch) apply(ctx context.Context, req mountcontrol.SwitchRequ
 	isMain, layerRef, _ := req.NormalizedTarget()
 
 	if prior, ok := s.journal.Operation(req.OperationID); ok {
-		if prior.FromGeneration != req.ExpectedGeneration || !s.targetMatchesReplay(ctx, isMain, layerRef, prior.Target) {
+		if prior.FromGeneration != req.ExpectedGeneration {
 			return switchErrResp(req, viewprotocol.CodeConflict, "CONFLICT", mountstate.ErrSwitchConflict)
 		}
-		switch prior.State {
-		case mountstate.SwitchDone:
-			return mountcontrol.SwitchResponse{MountID: snap.MountID, OperationID: req.OperationID, Receipt: &prior}
-		case mountstate.SwitchTargetRevoked:
-			if !req.Recover {
+		if prior.State == mountstate.SwitchTargetRevoked {
+			if (isMain && prior.Target.LayerID == "") || (!isMain && prior.Target.LayerID != "") {
 				return mountcontrol.SwitchResponse{
 					MountID: snap.MountID, OperationID: req.OperationID, Receipt: &prior,
 					Code: viewprotocol.CodeSwitchTargetRevoked, ErrorKind: "TARGET_REVOKED", Error: "target layer or lease was revoked",
 				}
 			}
-		case mountstate.SwitchRecovering:
-			if snap.Pending != nil && snap.Pending.OperationID == req.OperationID {
+			return switchErrResp(req, viewprotocol.CodeConflict, "CONFLICT", mountstate.ErrSwitchConflict)
+		}
+		matched, matchErr := s.targetMatchesReplay(ctx, isMain, layerRef, prior.Target)
+		if matchErr != nil {
+			return switchErrResp(req, viewprotocol.CodeSwitchRecovering, "RECOVERING", matchErr)
+		}
+		if prior.State == mountstate.SwitchRecovering && snap.Pending != nil && snap.Pending.OperationID == req.OperationID {
+			if matched {
 				return s.finishPendingLocked(ctx, req.OperationID)
 			}
+			if !isMain && prior.Target.LayerID != "" {
+				callCtx, cancel := context.WithTimeout(ctx, s.leaseCallTimeout())
+				_, gerr := s.baseClient.GetLayer(callCtx, prior.Target.LayerID)
+				cancel()
+				if gerr != nil {
+					if isRevokedTargetError(gerr) {
+						return s.finishPendingLocked(ctx, req.OperationID)
+					}
+					return switchErrResp(req, viewprotocol.CodeSwitchRecovering, "RECOVERING", gerr)
+				}
+			}
+			return switchErrResp(req, viewprotocol.CodeConflict, "CONFLICT", mountstate.ErrSwitchConflict)
+		}
+		if !matched {
+			return switchErrResp(req, viewprotocol.CodeConflict, "CONFLICT", mountstate.ErrSwitchConflict)
+		}
+		if prior.State == mountstate.SwitchDone {
+			return mountcontrol.SwitchResponse{MountID: snap.MountID, OperationID: req.OperationID, Receipt: &prior}
 		}
 		return switchErrResp(req, viewprotocol.CodeConflict, "CONFLICT", mountstate.ErrSwitchConflict)
 	}
 
-	recoveringFromRevoked := s.recoveringPaused
+	recoveringFromRevoked := s.recoveringPaused.Load()
 	if req.Recover {
 		if snap.Pending != nil {
 			if snap.Pending.State != mountstate.SwitchTargetRevoked {
@@ -260,8 +344,11 @@ func (s *mountViewSwitch) apply(ctx context.Context, req mountcontrol.SwitchRequ
 					s.current = s.pendingTarget
 					s.pendingTarget = nil
 					s.pendingInstalled = false
+					s.outgoingStopped = false
 				} else {
-					_ = s.pendingTarget.stop(ctx)
+					if serr := s.pendingTarget.stop(ctx); serr != nil {
+						return switchErrResp(req, viewprotocol.CodeSwitchRecovering, "RECOVERING", serr)
+					}
 					s.pendingTarget = nil
 				}
 			}
@@ -272,14 +359,14 @@ func (s *mountViewSwitch) apply(ctx context.Context, req mountcontrol.SwitchRequ
 				}
 				return switchErrResp(req, viewprotocol.CodeConflict, "CONFLICT", aerr)
 			}
-			s.recoveringPaused = true
+			s.recoveringPaused.Store(true)
 			recoveringFromRevoked = true
 			snap = s.journal.Snapshot()
-		} else if !s.recoveringPaused {
+		} else if !recoveringFromRevoked {
 			return switchErrResp(req, viewprotocol.CodeConflict, "CONFLICT", mountstate.ErrSwitchNotRevoked)
 		}
-	} else if snap.Pending != nil {
-		if snap.Pending.State == mountstate.SwitchTargetRevoked {
+	} else if snap.Pending != nil || recoveringFromRevoked {
+		if recoveringFromRevoked || snap.Pending != nil && snap.Pending.State == mountstate.SwitchTargetRevoked {
 			return switchErrResp(req, viewprotocol.CodeSwitchTargetRevoked, "TARGET_REVOKED",
 				errors.New("pending switch target was revoked; use --recover or unmount"))
 		}
@@ -297,18 +384,26 @@ func (s *mountViewSwitch) apply(ctx context.Context, req mountcontrol.SwitchRequ
 	return s.executeSwitchPrecheckedLocked(ctx, req, snap, isMain, layerRef, recoveringFromRevoked)
 }
 
-func (s *mountViewSwitch) targetMatchesReplay(ctx context.Context, isMain bool, layerRef string, target viewprotocol.SwitchBinding) bool {
+func (s *mountViewSwitch) targetMatchesReplay(ctx context.Context, isMain bool, layerRef string, target viewprotocol.SwitchBinding) (bool, error) {
 	if isMain {
-		return target.LayerID == ""
+		return target.LayerID == "", nil
 	}
 	if target.LayerID == "" {
-		return false
+		return false, nil
 	}
 	if target.LayerID == layerRef {
-		return true
+		return true, nil
 	}
-	info, err := s.baseClient.GetLayer(ctx, layerRef)
-	return err == nil && info != nil && info.LayerID == target.LayerID
+	callCtx, cancel := context.WithTimeout(ctx, s.leaseCallTimeout())
+	info, err := s.baseClient.GetLayer(callCtx, layerRef)
+	cancel()
+	if err != nil {
+		if isRevokedTargetError(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return info != nil && info.LayerID == target.LayerID, nil
 }
 
 func (s *mountViewSwitch) executeSwitchPrecheckedLocked(
@@ -386,6 +481,14 @@ func (s *mountViewSwitch) executeSwitchPrecheckedLocked(
 	var plan viewCacheInvalidation
 	if recoveringFromRevoked {
 		pause = s.pendingPause
+		if pause == nil {
+			p, perr := s.adapter.admission.pause()
+			if perr != nil {
+				return switchErrResp(req, viewprotocol.CodeSwitchRecovering, "RECOVERING", perr)
+			}
+			pause = p
+			s.pendingPause = p
+		}
 		plan = s.pendingPlan
 		if len(plan.inodes) == 0 && s.current != nil && s.current.fs != nil {
 			var perr error
@@ -503,7 +606,13 @@ func (s *mountViewSwitch) executeSwitchPrecheckedLocked(
 	s.pendingPause = pause
 	s.pendingPlan = plan
 	s.pendingLease = newLease
-	s.pendingTarget = nil
+	if s.pendingTarget != nil {
+		_ = s.pendingTarget.stop(context.Background())
+		s.pendingTarget = nil
+	}
 	s.pendingInstalled = false
+	if !recoveringFromRevoked {
+		s.outgoingStopped = false
+	}
 	return s.finishPendingLocked(ctx, req.OperationID)
 }

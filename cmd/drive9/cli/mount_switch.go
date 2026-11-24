@@ -175,6 +175,21 @@ func runMountSwitch(args []string, query bool, output io.Writer, deps mountSwitc
 			result.Unknown = switchErr.Unknown
 		}
 	}
+	if !o.asJSON {
+		if exchangeErr != nil {
+			return exchangeErr
+		}
+		if resp != nil && resp.Receipt != nil {
+			layer := resp.Receipt.Target.LayerID
+			if layer == "" {
+				layer = "main"
+			}
+			_, err := fmt.Fprintf(output, "mount_id: %s\noperation_id: %s\ngeneration: %d\nview: %s\nstate: %s\n",
+				resp.MountID, resp.OperationID, resp.Receipt.Generation, layer, resp.Receipt.State)
+			return err
+		}
+		return nil
+	}
 	if err := json.NewEncoder(output).Encode(result); err != nil {
 		return errors.Join(exchangeErr, fmt.Errorf("mount switch %s/%s: write result: %w", o.request.MountID, o.request.OperationID, err))
 	}

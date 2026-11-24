@@ -41,7 +41,13 @@ func readMountStatusView(point string) (*mountstate.SwitchSnapshot, error) {
 }
 
 func fixedMountStatus(status *mountcontrol.StatusResponse) (*mountstate.SwitchSnapshot, error) {
-	if status == nil || !status.OK {
+	if status == nil {
+		return nil, errors.New("mount view status unavailable")
+	}
+	if !status.OK {
+		if status.Error != "" {
+			return nil, errors.New(status.Error)
+		}
 		return nil, errors.New("mount view status unavailable")
 	}
 	if status.MountID == "" && status.Generation == 0 && status.Binding == nil {
@@ -54,6 +60,7 @@ func fixedMountStatus(status *mountcontrol.StatusResponse) (*mountstate.SwitchSn
 		MountID:    status.MountID,
 		Generation: status.Generation,
 		Binding:    *status.Binding,
+		Recovering: status.Recovering,
 	}
 	if p := status.Pending; p != nil {
 		if viewprotocol.ValidateOperationID(p.OperationID) != nil ||
@@ -98,6 +105,8 @@ func writeMountStatusView(w io.Writer, view *mountstate.SwitchSnapshot, viewErr 
 	state, op := mountstate.SwitchDone, ""
 	if view.Pending != nil {
 		state, op = view.Pending.State, view.Pending.OperationID
+	} else if view.Recovering {
+		state = mountstate.SwitchRecovering
 	}
 	if _, err := fmt.Fprintf(w, "mount_id: %s\ngeneration: %d\nview: %s\nview_state: %s\n", view.MountID, view.Generation, layer, state); err != nil {
 		return err

@@ -53,250 +53,6 @@ func (b *Bridge) GetFormat() meta.Format {
 	return b.format
 }
 
-func (b *Bridge) Shutdown() error {
-	return b.ShutdownCtx(context.Background())
-}
-
-// ShutdownCtx stops background retry work and waits for any in-flight retry
-// pass to finish before releasing staged slices. If ctx expires while a retry
-// pass is still unwinding, ShutdownCtx returns ctx.Err() without tearing down
-// slices underneath the active worker.
-func (b *Bridge) ShutdownCtx(ctx context.Context) error {
-	if b == nil {
-		return nil
-	}
-	b.mu.Lock()
-	stopCh := b.retryStop
-	if stopCh != nil {
-		b.retryOnce.Do(func() { close(stopCh) })
-	}
-	b.mu.Unlock()
-	done := make(chan struct{})
-	go func() {
-		b.retryWg.Wait()
-		b.fetchWg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-	b.mu.Lock()
-	var spooled int64
-	for id, sl := range b.stagedSlices {
-		spooled += sl.closeAndSpoolBytes()
-		delete(b.stagedSlices, id)
-	}
-	b.mu.Unlock()
-	if spooled > 0 {
-		b.blocks.releaseDiskSpool(spooled)
-	}
-	return nil
-}
-
-func (b *Bridge) hasUncommittedLocked(ino meta.Ino) bool {
-	if len(b.pending[ino]) > 0 || b.commitErr[ino] != nil {
-		return true
-	}
-	if _, ok := b.truncs[ino]; ok {
-		return true
-	}
-	return b.needsFreshIdentityLocked(ino)
-}
-
-// HasUncommitted reports whether ino still holds uncommitted slices, pending
-// truncates, unresolved commit errors, or an unmaterialized local-only create.
-func (b *Bridge) HasUncommitted(ino meta.Ino) bool {
-	if b == nil {
-		return false
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.hasUncommittedLocked(ino)
-}
-
-// NeedsFreshIdentity reports whether ino is a locally-created descriptor whose
-// remote identity has not been established yet.
-func (b *Bridge) NeedsFreshIdentity(ino meta.Ino) bool {
-	if b == nil {
-		return false
-	}
-	return b.needsFreshIdentity(ino)
-}
-
-// RetainClosedIfUncommitted records a closed handle's path when its final flush
-// left uncommitted state behind so background retry and Drain can complete
-// publication before forgetting the inode.
-func (b *Bridge) RetainClosedIfUncommitted(localPath string, ino meta.Ino) bool {
-	if b == nil {
-		return false
-	}
-	b.mu.Lock()
-	if !b.hasUncommittedLocked(ino) {
-		delete(b.closedRetained, ino)
-		b.mu.Unlock()
-		return false
-	}
-	b.closedRetained[ino] = localPath
-	b.mu.Unlock()
-	b.kickPendingFlush()
-	return true
-}
-
-// ClearClosedRetained drops any closed-handle retention marker when a new open
-// handle claims the inode again.
-func (b *Bridge) ClearClosedRetained(ino meta.Ino) {
-	if b == nil {
-		return
-	}
-	b.mu.Lock()
-	delete(b.closedRetained, ino)
-	b.mu.Unlock()
-}
-
-func (b *Bridge) isClosedRetained(ino meta.Ino) bool {
-	b.mu.Lock()
-	_, ok := b.closedRetained[ino]
-	b.mu.Unlock()
-	return ok
-}
-
-// RetireClosedIno forgets localPath when ino is still marked closed-retained
-// and all uncommitted state has now landed.
-func (b *Bridge) RetireClosedIno(localPath string, ino meta.Ino) bool {
-	b.mu.Lock()
-	retainedPath, ok := b.closedRetained[ino]
-	if !ok || retainedPath != localPath || b.hasUncommittedLocked(ino) {
-		b.mu.Unlock()
-		return false
-	}
-	delete(b.closedRetained, ino)
-	b.mu.Unlock()
-	b.ForgetPath(localPath)
-	b.DropDeletedOpen(localPath)
-	return true
-}
-
-func (b *Bridge) retireClosed(ino meta.Ino) {
-	b.mu.Lock()
-	localPath, ok := b.closedRetained[ino]
-	cb := b.onRetireClosed
-	if !ok || b.hasUncommittedLocked(ino) {
-		b.mu.Unlock()
-		return
-	}
-	b.mu.Unlock()
-	if cb != nil {
-		cb(localPath, ino)
-		return
-	}
-	b.RetireClosedIno(localPath, ino)
-}
-
-func (b *Bridge) collectUncommittedLocked() map[meta.Ino]struct{} {
-	seen := make(map[meta.Ino]struct{})
-	for ino := range b.pending {
-		if b.hasUncommittedLocked(ino) {
-			seen[ino] = struct{}{}
-		}
-	}
-	for ino := range b.commitErr {
-		if b.hasUncommittedLocked(ino) {
-			seen[ino] = struct{}{}
-		}
-	}
-	for ino := range b.truncs {
-		if b.hasUncommittedLocked(ino) {
-			seen[ino] = struct{}{}
-		}
-	}
-	for ino := range b.freshCreate {
-		if b.hasUncommittedLocked(ino) {
-			seen[ino] = struct{}{}
-		}
-	}
-	for ino := range b.closedRetained {
-		if b.hasUncommittedLocked(ino) {
-			seen[ino] = struct{}{}
-		}
-	}
-	return seen
-}
-
-// PendingCommitCount reports how many inodes retain uncommitted extent slices,
-// pending truncates, unresolved commit errors, or unmaterialized local-only creates.
-func (b *Bridge) PendingCommitCount() int {
-	if b == nil {
-		return 0
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return len(b.collectUncommittedLocked())
-}
-
-// Drain attempts to flush all pending slices, truncates, unmaterialized
-// local-only creates, or previously failed extent commits, and reports an
-// error if any uncommitted state remains when it finishes.
-func (b *Bridge) Drain(ctx context.Context) error {
-	if b == nil {
-		return nil
-	}
-	b.flushAnyPending(ctx)
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	b.mu.Lock()
-	candidates := b.collectUncommittedLocked()
-	b.mu.Unlock()
-
-	var firstErr error
-	for ino := range candidates {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if b.isClosedRetained(ino) {
-			if err := b.FlushFileFinal(ctx, ino); err != nil {
-				if firstErr == nil {
-					firstErr = err
-				}
-			} else {
-				b.retireClosed(ino)
-			}
-			continue
-		}
-		if err := b.FlushFile(ctx, ino); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		if b.needsFreshIdentity(ino) {
-			unlock := b.lockCommit(ino)
-			if b.needsFreshIdentity(ino) {
-				if err := b.MaterializeEmpty(ctx, ino); err != nil && firstErr == nil {
-					firstErr = err
-				}
-			}
-			unlock()
-		}
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for _, err := range b.commitErr {
-		if err != nil {
-			return err
-		}
-	}
-	if firstErr != nil {
-		return firstErr
-	}
-	if len(b.collectUncommittedLocked()) > 0 {
-		return syscall.EAGAIN
-	}
-	return nil
-}
-
 func (b *Bridge) OnReload(cb func(*meta.Format)) {}
 
 func (b *Bridge) NewSession(record bool) error {
@@ -359,25 +115,49 @@ func isRangeNotSatisfiable(err error) bool {
 
 // ---- namespace ----
 
+func (b *Bridge) peekIncarnationIno(full string) (meta.Ino, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if rep, hasRep := b.replacements[full]; hasRep {
+		return rep, false
+	}
+	ino := inoFor(full)
+	if held, isHeld := b.heldInoForLocked(full); isHeld && held == ino {
+		return 0, true
+	}
+	return ino, false
+}
+
+func (b *Bridge) resolveOrCreateIncarnationIno(full string) meta.Ino {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if rep, hasRep := b.replacements[full]; hasRep {
+		return rep
+	}
+	ino := inoFor(full)
+	if held, isHeld := b.heldInoForLocked(full); isHeld && held == ino {
+		rep := b.allocateHeldReplacementInoLocked()
+		b.replacements[full] = rep
+		return rep
+	}
+	return ino
+}
+
 func (b *Bridge) Lookup(ctx meta.Context, parent meta.Ino, name string, inode *meta.Ino, attr *meta.Attr, checkPerm bool) syscall.Errno {
 	pp, ok := b.remotePath(parent)
 	if !ok {
 		return syscall.ESTALE
 	}
 	path := childPath(pp, name)
-	// The live incarnation's key: a replacement's synthetic inode when one
-	// owns this pathname, else the path hash.
-	b.mu.Lock()
-	ino := b.liveInoLocked(path)
-	b.mu.Unlock()
+	ino, deferredReplacement := b.peekIncarnationIno(path)
 	st, err := b.client().StatCtx(ctxOf(ctx), path)
 	if err != nil {
-		// Fresh files exist only locally until their first commit.
-		if client.IsNotFound(err) {
+		if client.IsNotFound(err) && !deferredReplacement {
 			b.mu.Lock()
 			size, fresh := b.sizes[ino]
+			mappedPath := b.paths[ino]
 			b.mu.Unlock()
-			if fresh {
+			if fresh && mappedPath == path {
 				if inode != nil {
 					*inode = ino
 				}
@@ -388,6 +168,9 @@ func (b *Bridge) Lookup(ctx meta.Context, parent meta.Ino, name string, inode *m
 			}
 		}
 		return errnoOf(err)
+	}
+	if deferredReplacement {
+		ino = b.resolveOrCreateIncarnationIno(path)
 	}
 	b.remember(ino, path)
 	b.observeRevisionWithSize(ino, st.Revision, st.Size)
@@ -542,18 +325,7 @@ func (b *Bridge) Mknod(ctx meta.Context, parent meta.Ino, name string, _type uin
 		return syscall.ESTALE
 	}
 	full := childPath(pp, name)
-	ino := inoFor(full)
-	// A held path hash (live deleted-open or renamed-away descriptor) means
-	// this create is a NEW incarnation: allocate its synthetic key and
-	// publish it in the same critical section, so the same incarnation's
-	// later resolutions (Create's mandatory ResolvePath, repeated opens)
-	// land on THIS inode and no concurrent resolution can publish another.
-	b.mu.Lock()
-	if held, isHeld := b.heldInoForLocked(full); isHeld && held == ino {
-		ino = b.allocateHeldReplacementInoLocked()
-		b.replacements[full] = ino
-	}
-	b.mu.Unlock()
+	ino := b.resolveOrCreateIncarnationIno(full)
 	b.remember(ino, full)
 	b.mu.Lock()
 	if _, has := b.sizes[ino]; !has {
@@ -2084,38 +1856,26 @@ func blockData(b *Bridge, ctx context.Context, path string, w *pendingWrite) []b
 // resolve through the local table.
 func (b *Bridge) ResolveLocal(ctx context.Context, local string) (meta.Ino, syscall.Errno) {
 	full := b.fullPath(local)
-	ino := inoFor(full)
-	// The registered owner of a pathname — a replacement incarnation, or a
-	// renamed file at its new name — IS the live inode: every open of that
-	// name converges on it (JuiceFS keys reader/writer state and write
-	// invalidation by inode; a second key for one object would let a
-	// reader keep stale bytes after a write through the other handle).
-	// Otherwise a held path hash (live deleted-open or renamed-away
-	// descriptor) means this is a NEW incarnation: allocate its synthetic
-	// key and publish it in the same critical section, so concurrent first
-	// resolutions converge and Create's mandatory re-resolve lands on the
-	// key its Mknod allocated.
-	b.mu.Lock()
-	if rep, hasRep := b.replacements[full]; hasRep {
-		ino = rep
-	} else if held, isHeld := b.heldInoForLocked(full); isHeld && held == ino {
-		ino = b.allocateHeldReplacementInoLocked()
-		b.replacements[full] = ino
-	}
-	b.mu.Unlock()
+	ino, deferredReplacement := b.peekIncarnationIno(full)
 	st, err := b.client().StatCtx(ctx, full)
 	if err != nil {
 		if client.IsNotFound(err) {
-			b.mu.Lock()
-			_, fresh := b.sizes[ino]
-			b.mu.Unlock()
-			if fresh {
-				b.remember(ino, full)
-				return ino, 0
+			if !deferredReplacement {
+				b.mu.Lock()
+				_, fresh := b.sizes[ino]
+				mappedPath := b.paths[ino]
+				b.mu.Unlock()
+				if fresh && mappedPath == full {
+					b.remember(ino, full)
+					return ino, 0
+				}
 			}
 			return 0, syscall.ENOENT
 		}
 		return 0, syscall.EIO
+	}
+	if deferredReplacement {
+		ino = b.resolveOrCreateIncarnationIno(full)
 	}
 	b.remember(ino, full)
 	b.observeRevisionWithSize(ino, st.Revision, st.Size)
@@ -2694,6 +2454,15 @@ func (b *Bridge) RemapLocal(oldPath, newPath string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	newIno := inoFor(newFull)
+	if displaced := b.liveInoLocked(newFull); b.paths[displaced] == newFull {
+		if _, closedAtDest := b.closedRetained[displaced]; closedAtDest {
+			if b.replacements[newFull] == displaced {
+				delete(b.replacements, newFull)
+			}
+			delete(b.moved, displaced)
+			b.forgetInoLocked(displaced)
+		}
+	}
 	if rep, ok := b.replacements[oldFull]; ok {
 		// A registered owner (replacement incarnation, or a file renamed
 		// before) holds oldPath: follow IT and carry its registration. The

@@ -34,7 +34,6 @@ import (
 type mountRuntime struct {
 	binding    viewprotocol.SwitchBinding
 	layerLease *layerMountBinding
-	generation mountRuntimeGeneration
 	fs         *FS
 	writeback  *writeback.Writeback
 	staging    *staging.Staging
@@ -117,7 +116,6 @@ func buildViewRuntime(
 	remoteRoot, actorID string,
 	binding viewprotocol.SwitchBinding,
 	layerLease *layerMountBinding,
-	generation mountRuntimeGeneration,
 	memoryBudget *membudget.Budget,
 	sharedCounters *perf.Counters,
 	sharedExtent **extent.Engine,
@@ -146,7 +144,7 @@ func buildViewRuntime(
 	}
 	mountHash, readCacheHash := "", ""
 	if cacheBase != "" {
-		mountHash, readCacheHash, err = mountRuntimeCacheHashes(localCfg, remoteRoot, binding, generation)
+		mountHash, readCacheHash, err = mountRuntimeCacheHashes(localCfg, remoteRoot, binding)
 		if err != nil {
 			return nil, err
 		}
@@ -270,7 +268,7 @@ func buildViewRuntime(
 	}
 
 	var gitExt *git.Git
-	if wantExt["git"] && localCfg.EnableGitWorkspaces {
+	if wantExt["git"] && localCfg.EnableGitWorkspaces && binding.LayerID == "" {
 		gitExt, err = git.New(git.Options{
 			Client:             cl,
 			Events:             bus,
@@ -489,7 +487,6 @@ func buildViewRuntime(
 	return &mountRuntime{
 		binding:    binding,
 		layerLease: layerLease,
-		generation: generation,
 		fs:         f,
 		writeback:  wb,
 		staging:    stagingLedger,

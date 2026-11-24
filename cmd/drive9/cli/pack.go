@@ -15,11 +15,13 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/mountcontrol"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 	"github.com/mem9-ai/drive9/pkg/pathutil"
@@ -1789,6 +1791,27 @@ func resolveMountedPackTarget(target string) (mountedPackTarget, error) {
 	for {
 		state, _, err := mountstate.ReadProcessState(candidate)
 		if err == nil {
+			if runtime.GOOS != "windows" &&
+				(strings.TrimSpace(state.MountKind) == "" || state.MountKind == mountstate.MountKindFUSE) &&
+				strings.TrimSpace(state.ControlSocket) != "" {
+				stCtx, stCancel := context.WithTimeout(context.Background(), time.Second)
+				st, serr := mountcontrol.RequestStatus(stCtx, strings.TrimSpace(state.ControlSocket), time.Second)
+				stCancel()
+				if serr == nil && st != nil && st.OK {
+					if strings.TrimSpace(st.RemoteRoot) != "" {
+						state.RemoteRoot = st.RemoteRoot
+					}
+					if st.Binding != nil {
+						state.LayerID = st.Binding.LayerID
+						state.LayerReadOnly = st.Binding.LayerID != "" && st.Binding.ReadOnly
+					} else if st.Layer != nil {
+						state.LayerID = *st.Layer
+						if state.LayerID == "" {
+							state.LayerReadOnly = false
+						}
+					}
+				}
+			}
 			if strings.TrimSpace(state.LocalRoot) == "" {
 				return mountedPackTarget{}, fmt.Errorf("drive9 mount metadata for %q does not include local_root; remount with an overlay profile", candidate)
 			}

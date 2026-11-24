@@ -148,7 +148,20 @@ func exchangeSwitch(ctx context.Context, socketPath, op string, req SwitchReques
 	if err := json.Unmarshal(statusFrame, &status); err != nil {
 		return nil, &SwitchError{MountID: req.MountID, OperationID: req.OperationID, Unknown: true, Cause: err}
 	}
-	if !status.OK || !status.ViewSwitch {
+	if !status.OK {
+		msg := status.Error
+		if msg == "" {
+			msg = "mount control status not ok"
+		}
+		return nil, &SwitchError{
+			MountID:     req.MountID,
+			OperationID: req.OperationID,
+			Code:        viewprotocol.CodeSwitchRecovering,
+			Unknown:     true,
+			Cause:       fmt.Errorf("%w: %s", ErrSwitchRecovering, msg),
+		}
+	}
+	if !status.ViewSwitch {
 		return nil, &SwitchError{MountID: req.MountID, OperationID: req.OperationID, Code: viewprotocol.CodeSwitchUnsupported, Unknown: false, Cause: ErrSwitchUnsupported}
 	}
 	if status.MountID != req.MountID {

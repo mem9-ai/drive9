@@ -67,3 +67,29 @@ func (v *viewRequestFS) installTargetAtGeneration(ctx context.Context, pause *vi
 		return nil
 	})
 }
+
+func (v *viewRequestFS) replaceTargetAtGeneration(ctx context.Context, pause *viewPause, generation uint64, target gofuse.RawFileSystem) error {
+	if pause == nil || pause.gate != &v.admission {
+		return errViewPauseLost
+	}
+	if generation == 0 || target == nil {
+		return errViewGenerationConflict
+	}
+	value := reflect.ValueOf(target)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		if value.IsNil() {
+			return errViewGenerationConflict
+		}
+	}
+	return pause.atIdle(ctx, func() error {
+		if v.unmounted.Load() {
+			return errViewUnmounted
+		}
+		if current := v.currentTarget(); current.fs == nil || current.generation != generation {
+			return errViewGenerationConflict
+		}
+		v.selected.Store(&viewRequestTarget{fs: target, generation: generation})
+		return nil
+	})
+}
