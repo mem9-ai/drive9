@@ -1121,6 +1121,42 @@ func (s *ShadowStore) RemoveIfGeneration(remotePath string, expectedGen ContentG
 	return s.remove(remotePath, expectedGen, shadowRetiredInvalidated)
 }
 
+// RemoveIfGenerationDurable removes the shadow and makes the removal durable
+// before returning: the unlink (or the retire rename) is followed by a
+// directory sync. A caller whose crash-recovery reasoning depends on the shadow
+// staying gone — a commit marker that could not be fsynced — must use this
+// instead of RemoveIfGeneration, whose cleanup discards its errors and never
+// syncs the directory.
+//
+// removed reports whether this call removed the expected generation; err is
+// non-nil when the removal happened but could not be made durable.
+func (s *ShadowStore) RemoveIfGenerationDurable(remotePath string, expectedGen ContentGen) (removed bool, err error) {
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
+	s.mu.Lock()
+	cleanup, ok := s.removeCoreLocked(remotePath, expectedGen, shadowRetiredInvalidated)
+	s.mu.Unlock()
+	if !ok {
+		return false, nil
+	}
+	// The unlink/retire verdict comes back under the path lock the removal
+	// took: checking for the file afterwards would race a concurrent spill that
+	// legitimately created a fresher shadow.
+	removedOnDisk, rerr := s.runRemoveCleanupChecked(cleanup)
+	if rerr != nil {
+		return true, fmt.Errorf("remove shadow %s: %w", remotePath, rerr)
+	}
+	if !removedOnDisk {
+		// Nothing was on disk: a clean path (or a wbCache-only staged image)
+		// must not pay a shadow-directory fsync.
+		return true, nil
+	}
+	if derr := fsyncDir(s.dir); derr != nil {
+		return true, fmt.Errorf("shadow dir sync after removing %s: %w", remotePath, derr)
+	}
+	return true, nil
+}
+
 // ActiveGeneration returns the current content generation for remotePath, or 0
 // if no shadow exists. Bumped on every mutating write (WriteFull/WriteAt/
 // Ensure/WriteStream/Truncate) so callers can snapshot it before an upload and
@@ -2025,24 +2061,48 @@ func shadowDataExtentsFD(fd int, size int64, total *int64) error {
 }
 
 func (s *ShadowStore) runRemoveCleanup(cleanup shadowRemoveCleanup) {
+	// The legacy callers only need the bookkeeping; the on-disk verdict is
+	// discarded here by design (Remove/RemoveIfGeneration are best effort).
+	_, _ = s.runRemoveCleanupChecked(cleanup)
+}
+
+// runRemoveCleanupChecked is runRemoveCleanup with the on-disk verdict: it
+// reports why the bytes may still be there, for callers whose crash reasoning
+// depends on the removal actually having happened.
+func (s *ShadowStore) runRemoveCleanupChecked(cleanup shadowRemoveCleanup) (removedOnDisk bool, err error) {
 	if cleanup.removedSize > 0 {
 		s.pendingBytes.Add(-cleanup.removedSize)
 	}
 	if cleanup.retire {
-		if err := os.Rename(cleanup.srcDiskPath, cleanup.retiredPath); err != nil {
-			_ = os.Remove(cleanup.srcDiskPath)
+		if rerr := os.Rename(cleanup.srcDiskPath, cleanup.retiredPath); rerr != nil {
+			if rmErr := os.Remove(cleanup.srcDiskPath); rmErr != nil {
+				if cleanup.retired != nil {
+					close(cleanup.retired.cleanupDone)
+				}
+				if errors.Is(rmErr, os.ErrNotExist) {
+					return false, nil
+				}
+				return false, rmErr
+			}
+			removedOnDisk = true
+		} else {
+			removedOnDisk = true
 		}
 		if cleanup.retired != nil {
 			close(cleanup.retired.cleanupDone)
 		}
-	} else if cleanup.immediatePath != "" {
-		// Always attempt disk cleanup — the shadow may exist only on disk
-		// (e.g. after crash/restart recovery where it was never loaded into
-		// the files map). Without this, a successfully committed shadow
-		// would remain on disk and be served as stale local data by
-		// Has()/ReadAt()/ReadAll() fallback paths.
-		_ = os.Remove(cleanup.immediatePath)
+		return removedOnDisk, nil
 	}
+	if cleanup.immediatePath != "" {
+		if rerr := os.Remove(cleanup.immediatePath); rerr != nil {
+			if errors.Is(rerr, os.ErrNotExist) {
+				return false, nil
+			}
+			return false, rerr
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 func (s *ShadowStore) remove(remotePath string, expectedGen ContentGen, reason shadowRetirementReason) bool {

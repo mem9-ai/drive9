@@ -1,0 +1,539 @@
+package staging
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// ErrStagedViewLost marks a recorded loss of a staged image, so callers can
+// tell it apart from other terminal failures (a standalone queue transfer
+// record, for instance) when a barrier consults the loss record.
+var ErrStagedViewLost = errors.New("staged image was lost")
+
+// ViewLoss is a durable record that a staged pair was pruned: its only local
+// copy of the image is gone, so a durability barrier for the path must fail
+// instead of reading the missing entry as a completed upload.
+//
+// It lives on disk in the cache directory next to the staged pairs
+// (<hash>.lost beside <hash>.dat/<hash>.meta) rather than in a bounded
+// in-process map, because a bounded map can evict the FIRST report of a loss and
+// turn real data loss into a silent success. A fresh staging or an explicit
+// removal clears it; a landing clears it only when it landed a generation at or
+// above the lost one, so an older upload finishing cannot erase the record of a
+// newer image that was lost.
+//
+// The in-process mirror (lostGens, lostUnknown, lostDirUnreadable) is
+// authoritative after construction: every marker this process writes goes
+// through writeViewLoss, and loadViewLossFromDisk adopts whatever a previous
+// process left. That is what keeps ViewLossCount O(1) on the syncfs path and the
+// prefix helpers off the directory on every rename.
+type ViewLoss struct {
+	Path       string `json:"path"`
+	Generation uint64 `json:"generation"`
+	Error      string `json:"error,omitempty"`
+}
+
+// lostFile is the on-disk view-loss marker for a remote path.
+func (c *WriteBackCache) lostFile(remotePath string) string {
+	return filepath.Join(c.dir, HashPath(remotePath)+".lost")
+}
+
+// lostHash is the marker's basename fragment, the key for lostUnknown.
+func lostHash(remotePath string) string { return HashPath(remotePath) }
+
+// writeViewLoss persists a loss for the path and reminds this process about it.
+// The caller holds the path lock.
+func (c *WriteBackCache) writeViewLoss(remotePath string, gen uint64, err error) {
+	loss := ViewLoss{Path: remotePath, Generation: gen}
+	if err != nil {
+		loss.Error = err.Error()
+	}
+	if raw, merr := json.Marshal(&loss); merr == nil {
+		if werr := atomicWrite(c.lostFile(remotePath), raw); werr != nil {
+			// The in-process record below still fails this process's barriers;
+			// only durability across the next restart is lost.
+			safeLogPrintf("writeback cache: view loss marker for %s not durable: %v", remotePath, werr)
+		}
+	}
+	c.mu.Lock()
+	c.recordViewLossLocked(remotePath, gen)
+	c.mu.Unlock()
+}
+
+// notePrunedViewLocked installs the in-process loss record for a pair this
+// critical section just pruned. It must be called while still holding c.mu
+// (together with the prune) so a concurrent drain — which reads PendingSummary
+// and ViewLossCount under that same lock — never observes both counters at zero
+// while the durable marker is still being written.
+func (c *WriteBackCache) notePrunedViewLocked(remotePath string, gen uint64) {
+	c.recordViewLossLocked(remotePath, gen)
+}
+
+// recordViewLossLocked installs the in-process record for a path and drops any
+// "unknown marker" bookkeeping for its hash (the marker is now readable). The
+// caller holds c.mu.
+//
+// A non-finite generation (the no-generation zero or the unreadable-marker
+// sentinel) is never stored: writing one would make LossGenerationBound and
+// rekeyViewLoss treat it as a real value. Such a record keeps the path failing
+// closed through lostUnknown instead.
+func (c *WriteBackCache) recordViewLossLocked(remotePath string, gen uint64) {
+	if gen == 0 || gen == ^uint64(0) {
+		if _, ok := c.lostGens[remotePath]; !ok {
+			c.markLostUnknownLocked(lostHash(remotePath))
+		}
+		return
+	}
+	if c.lostGens == nil {
+		c.lostGens = make(map[string]uint64)
+	}
+	c.lostGens[remotePath] = gen
+	if c.lostUnknown != nil {
+		delete(c.lostUnknown, lostHash(remotePath))
+	}
+}
+
+// forgetViewLossLocked drops the in-process record for a path. The caller holds
+// c.mu.
+func (c *WriteBackCache) forgetViewLossLocked(remotePath string) {
+	delete(c.lostGens, remotePath)
+	if c.lostUnknown != nil {
+		delete(c.lostUnknown, lostHash(remotePath))
+	}
+}
+
+// markLostUnknownLocked remembers a marker that could not be attributed. The
+// caller holds c.mu.
+func (c *WriteBackCache) markLostUnknownLocked(hash string) {
+	if c.lostUnknown == nil {
+		c.lostUnknown = make(map[string]struct{})
+	}
+	c.lostUnknown[hash] = struct{}{}
+}
+
+// ViewLoss reports the recorded loss for a path, if any: from the in-process
+// map first, then from the durable marker a previous process may have left.
+func (c *WriteBackCache) ViewLoss(remotePath string) error {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	gen, ok := c.lostGens[remotePath]
+	_, unkOK := c.lostUnknown[lostHash(remotePath)]
+	dirUnreadable := c.lostDirUnreadable
+	c.mu.Unlock()
+	if ok {
+		return fmt.Errorf("%w: staged image for %s (generation %d) was pruned", ErrStagedViewLost, remotePath, gen)
+	}
+	if !dirUnreadable && !unkOK {
+		// The mirror is authoritative after a successful load: a clean path needs
+		// no file read. This runs on every healthy barrier, so the syscall is the
+		// whole cost of the check.
+		return nil
+	}
+	loss, ok := c.readViewLoss(remotePath)
+	if !ok {
+		if unkOK {
+			// An unattributable marker recorded for this path (a rekey of one):
+			// the image cannot be proven to have landed.
+			return fmt.Errorf("%w: unreadable view loss marker (%s)", ErrStagedViewLost, remotePath)
+		}
+		return nil
+	}
+	if loss.Error != "" {
+		return fmt.Errorf("%w: %s (%s)", ErrStagedViewLost, loss.Error, remotePath)
+	}
+	return fmt.Errorf("%w: staged image for %s (generation %d) was pruned", ErrStagedViewLost, remotePath, loss.Generation)
+}
+
+// readViewLoss reads a durable marker. Any error other than "not exist" reports
+// a loss: a hole in the failure record must not read as "nothing was lost".
+func (c *WriteBackCache) readViewLoss(remotePath string) (ViewLoss, bool) {
+	raw, err := os.ReadFile(c.lostFile(remotePath))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return ViewLoss{}, false
+		}
+		return ViewLoss{Path: remotePath, Generation: ^uint64(0), Error: fmt.Sprintf("unreadable view loss marker: %v", err)}, true
+	}
+	var loss ViewLoss
+	if err := json.Unmarshal(raw, &loss); err != nil || loss.Path == "" || loss.Generation == 0 || loss.Generation == ^uint64(0) {
+		// A partial write of a previous process: unreadable, not "no loss".
+		return ViewLoss{Path: remotePath, Generation: ^uint64(0), Error: "unreadable view loss marker"}, true
+	}
+	return loss, true
+}
+
+// ClearViewLossIfGeneration drops the loss record for a path when the caller
+// landed a generation at or above the lost one. A newer loss survives: an older
+// upload finishing says nothing about an image that died after it.
+func (c *WriteBackCache) ClearViewLossIfGeneration(remotePath string, gen uint64) {
+	if c == nil {
+		return
+	}
+	pl := c.AcquirePathLock(remotePath)
+	defer c.ReleasePathLock(remotePath, pl)
+	c.clearViewLossLocked(remotePath, gen)
+}
+
+// ClearViewLoss drops any loss record for a path unconditionally. It is for
+// callers that just published the path's image themselves (a queue staging, an
+// explicit removal, a rename destination): their image is the newest one this
+// mount knows, so every earlier loss record for the name is superseded. Landings
+// use ClearViewLossIfGeneration instead, so a newer image that died while the
+// upload was on the wire keeps its record.
+func (c *WriteBackCache) ClearViewLoss(remotePath string) {
+	if c == nil {
+		return
+	}
+	pl := c.AcquirePathLock(remotePath)
+	defer c.ReleasePathLock(remotePath, pl)
+	c.clearViewLossLocked(remotePath, ^uint64(0))
+}
+
+// clearViewLossForNewStagingLocked drops any record for the path: a fresh
+// staging supersedes it. The caller holds the path lock.
+func (c *WriteBackCache) clearViewLossForNewStagingLocked(remotePath string) {
+	c.clearViewLossLocked(remotePath, ^uint64(0))
+}
+
+// clearViewLossLocked drops the record when the lost generation is at or below
+// gen. The caller holds the path lock.
+//
+// The in-process entry is only removed once the disk marker is gone (or provably
+// at or below gen and unlinked): dropping it first would let a concurrent drain
+// observe ViewLossCount() == 0 over a marker that is still on disk.
+func (c *WriteBackCache) clearViewLossLocked(remotePath string, gen uint64) {
+	c.mu.Lock()
+	memGen, memOK := c.lostGens[remotePath]
+	_, unkOK := c.lostUnknown[lostHash(remotePath)]
+	dirUnreadable := c.lostDirUnreadable
+	c.mu.Unlock()
+
+	// The mirror is authoritative once the load succeeded: when it knows nothing
+	// about this path and the directory was readable, there is no marker to look
+	// for. This is the common path (every Put clears).
+	if !dirUnreadable && !memOK && !unkOK {
+		return
+	}
+	loss, diskOK := c.readViewLoss(remotePath)
+	if (memOK && memGen > gen) || (diskOK && loss.Generation > gen) {
+		// A newer image's loss: keep it (an older durable marker may still be the
+		// only crash witness for the generation this landing covers, so it stays
+		// until a landing at or above the newer generation).
+		return
+	}
+	// A finite-generation clear never drops an unattributable record; only the
+	// unconditional clear (a fresh staging, an explicit removal) may.
+	if unkOK && gen != ^uint64(0) {
+		return
+	}
+	if !diskOK {
+		c.mu.Lock()
+		liveGen, liveOK := c.lostGens[remotePath]
+		_, liveUnkOK := c.lostUnknown[lostHash(remotePath)]
+		if (!liveOK || liveGen <= gen) && (!liveUnkOK || gen == ^uint64(0)) {
+			c.forgetViewLossLocked(remotePath)
+		}
+		c.mu.Unlock()
+		return
+	}
+	if err := os.Remove(c.lostFile(remotePath)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		// The marker survives; keep the in-process record so this process still
+		// fails closed — but never lower a newer generation installed meanwhile.
+		c.mu.Lock()
+		liveGen, liveOK := c.lostGens[remotePath]
+		_, liveUnkOK := c.lostUnknown[lostHash(remotePath)]
+		if (!liveOK || (loss.Generation != ^uint64(0) && liveGen < loss.Generation)) && (!liveUnkOK || gen == ^uint64(0)) {
+			c.recordViewLossLocked(remotePath, loss.Generation)
+		}
+		c.mu.Unlock()
+		return
+	}
+	c.mu.Lock()
+	// Re-read the live state: ListPending prunes under c.mu without the path
+	// lock, so a newer record may have been installed while the marker was being
+	// unlinked. Forgetting it here would silence its deferred .lost write.
+	liveGen, liveOK := c.lostGens[remotePath]
+	_, liveUnkOK := c.lostUnknown[lostHash(remotePath)]
+	if (!liveOK || liveGen <= gen) && (!liveUnkOK || gen == ^uint64(0)) {
+		c.forgetViewLossLocked(remotePath)
+	}
+	c.mu.Unlock()
+	// The removal must survive a crash: a resurrected marker would fail barriers
+	// on a name whose image is fine.
+	_ = fsyncDir(c.dir)
+}
+
+// ClearViewLossPrefix drops the loss records of every path under prefix. It is
+// for subtree removals, where the names are gone but their markers would
+// otherwise keep failing barriers on re-created paths. It answers from the
+// in-process mirror, which mirrors every readable marker.
+func (c *WriteBackCache) ClearViewLossPrefix(prefix string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	var inMemory []string
+	for path := range c.lostGens {
+		if strings.HasPrefix(path, prefix) {
+			inMemory = append(inMemory, path)
+		}
+	}
+	c.mu.Unlock()
+	for _, path := range inMemory {
+		c.ClearViewLoss(path)
+	}
+}
+
+// HasViewLossPrefix reports whether any path under prefix carries a recorded
+// loss. A directory rename must consult it: ListByPrefix only sees .meta
+// entries, so a pruned descendant would otherwise be moved as if it landed. A
+// marker that could not be attributed (unreadable, or a directory that could not
+// be read) reports true: those are exactly the cases where a descendant's image
+// cannot be proven to have landed.
+func (c *WriteBackCache) HasViewLossPrefix(prefix string) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lostDirUnreadable || len(c.lostUnknown) > 0 {
+		return true
+	}
+	for path := range c.lostGens {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// RekeyViewLoss moves a recorded loss from oldPath to newPath. A rename carries
+// the obligation with the name: the destination now holds the unlanded image's
+// identity, so dropping the record (or leaving it on the dead name) would let a
+// barrier certify bytes that never landed.
+//
+// Both path locks are taken in a deterministic order, and the new marker is
+// written before the old one is unlinked: a crash in between leaves the record
+// on one of the two names, never on neither. The in-process mirror never dips to
+// zero during the swap, so a concurrent drain cannot certify the mount.
+func (c *WriteBackCache) RekeyViewLoss(oldPath, newPath string) {
+	if c == nil || oldPath == newPath {
+		return
+	}
+	first, second := oldPath, newPath
+	if second < first {
+		first, second = second, first
+	}
+	pf := c.AcquirePathLock(first)
+	ps := c.AcquirePathLock(second)
+	defer c.ReleasePathLock(second, ps)
+	defer c.ReleasePathLock(first, pf)
+	c.rekeyViewLoss(oldPath, newPath)
+}
+
+// rekeyViewLoss is RekeyViewLoss for a caller that already holds both sorted
+// path locks (RenamePending). It never removes the old record before the new
+// marker exists, and it keeps newPath failing closed when the write fails.
+func (c *WriteBackCache) rekeyViewLoss(oldPath, newPath string) {
+	if c == nil || oldPath == newPath {
+		return
+	}
+	c.mu.Lock()
+	gen, ok := c.lostGens[oldPath]
+	_, unkOK := c.lostUnknown[lostHash(oldPath)]
+	dirUnreadable := c.lostDirUnreadable
+	c.mu.Unlock()
+	unattributable := unkOK
+	if !ok && !unkOK {
+		if !dirUnreadable {
+			return
+		}
+		loss, has := c.readViewLoss(oldPath)
+		if !has {
+			return
+		}
+		if loss.Generation == ^uint64(0) {
+			unattributable = true
+		} else {
+			gen = loss.Generation
+		}
+	}
+
+	// Write the destination's marker FIRST: the object already moved, so the
+	// destination must fail closed even if the source marker cannot be removed —
+	// and the source's file is the last durable witness, so it is only unlinked
+	// once the destination's write succeeded.
+	// One payload for both cases: an unattributable marker is persisted with a
+	// zero generation, which both readers already treat as unattributable (and it
+	// never advances nextGen).
+	marker := ViewLoss{Path: newPath, Generation: gen}
+	if unattributable {
+		marker = ViewLoss{Path: newPath, Error: "unreadable view loss marker"}
+	}
+	written := false
+	if raw, merr := json.Marshal(&marker); merr == nil {
+		if werr := atomicWrite(c.lostFile(newPath), raw); werr != nil {
+			safeLogPrintf("writeback cache: view loss rekey %s -> %s failed: %v (source marker kept)", oldPath, newPath, werr)
+		} else {
+			written = true
+		}
+	}
+
+	// The mirrors are mutually exclusive: the destination is either recorded with
+	// a finite generation or unknown, never both.
+	c.mu.Lock()
+	delete(c.lostGens, newPath)
+	if unattributable {
+		c.markLostUnknownLocked(lostHash(newPath))
+	} else {
+		c.recordViewLossLocked(newPath, gen)
+	}
+	c.mu.Unlock()
+	if !written {
+		// The source's durable marker stays: this process fails closed at the
+		// destination, and a restart falls back to the source file.
+		return
+	}
+	if err := os.Remove(c.lostFile(oldPath)); err == nil {
+		_ = fsyncDir(c.dir)
+	}
+	if _, err := os.Stat(c.lostFile(oldPath)); errors.Is(err, os.ErrNotExist) {
+		// Only forget the source once its marker is gone: a surviving file would
+		// otherwise be uncounted by the mirror.
+		c.mu.Lock()
+		c.forgetViewLossLocked(oldPath)
+		c.mu.Unlock()
+	}
+}
+
+// RekeyViewLossPrefix moves every recorded loss under oldPrefix to newPrefix,
+// preserving the relative path.
+func (c *WriteBackCache) RekeyViewLossPrefix(oldPrefix, newPrefix string) {
+	if c == nil || oldPrefix == newPrefix {
+		return
+	}
+	c.mu.Lock()
+	pairs := make(map[string]string)
+	for path := range c.lostGens {
+		if strings.HasPrefix(path, oldPrefix) {
+			pairs[path] = newPrefix + strings.TrimPrefix(path, oldPrefix)
+		}
+	}
+	c.mu.Unlock()
+	for oldPath, newPath := range pairs {
+		c.RekeyViewLoss(oldPath, newPath)
+	}
+}
+
+// ViewLossCount reports how many unresolved view losses are on record. It is the
+// only signal a drain has for a pruned pair whose path no longer has an open
+// handle (closed, or a fresh process after a restart).
+//
+// It is O(1): the in-process mirror is authoritative after construction (every
+// marker this process writes goes through writeViewLoss, and
+// loadViewLossFromDisk adopts the ones a previous process left), and markers that
+// could not be decoded are counted once at load. A directory scan per call would
+// make syncfs(2) O(staged files) on a write-back mount.
+func (c *WriteBackCache) ViewLossCount() int {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	count := len(c.lostGens) + len(c.lostUnknown)
+	if c.lostDirUnreadable && count == 0 {
+		count = 1
+	}
+	return count
+}
+
+// loadViewLossFromDisk seeds the in-process mirror (and the generation counter)
+// from the markers a previous process left, so a recovered marker is honored and
+// a fresh generation can never be mistaken for an older loss.
+//
+// A marker that cannot be read or decoded is remembered by hash instead: the
+// drain must not certify the mount, and a prefix query cannot attribute it, so
+// it fails closed.
+func (c *WriteBackCache) loadViewLossFromDisk() {
+	entries, err := os.ReadDir(c.dir)
+	if err != nil {
+		c.mu.Lock()
+		c.lostDirUnreadable = true
+		c.mu.Unlock()
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".lost") {
+			continue
+		}
+		hash := strings.TrimSuffix(name, ".lost")
+		raw, rerr := os.ReadFile(filepath.Join(c.dir, name))
+		if rerr != nil {
+			if !errors.Is(rerr, os.ErrNotExist) {
+				c.mu.Lock()
+				c.markLostUnknownLocked(hash)
+				c.mu.Unlock()
+			}
+			continue
+		}
+		var loss ViewLoss
+		if jerr := json.Unmarshal(raw, &loss); jerr != nil || loss.Path == "" || loss.Generation == 0 || loss.Generation == ^uint64(0) {
+			c.mu.Lock()
+			c.markLostUnknownLocked(hash)
+			c.mu.Unlock()
+			continue
+		}
+		c.mu.Lock()
+		if c.lostGens == nil {
+			c.lostGens = make(map[string]uint64)
+		}
+		c.lostGens[loss.Path] = loss.Generation
+		c.mu.Unlock()
+		c.advanceNextGen(loss.Generation)
+	}
+}
+
+// LossGenerationBound returns the highest generation a landing may treat as
+// superseded: the caller's own watermark raised to the recorded loss, if any. A
+// landing published after this bound must clear only up to it, so a newer image
+// that died while the upload was on the wire keeps its record.
+func (c *WriteBackCache) LossGenerationBound(remotePath string, bound uint64) uint64 {
+	if c == nil {
+		return bound
+	}
+	c.mu.Lock()
+	gen, ok := c.lostGens[remotePath]
+	_, unkOK := c.lostUnknown[lostHash(remotePath)]
+	dirUnreadable := c.lostDirUnreadable
+	c.mu.Unlock()
+	if ok && gen > bound {
+		return gen
+	}
+	// A marker that cannot be attributed may be newer than anything this landing
+	// published, so the landing must NOT be allowed to clear it. That is
+	// expressed as a bound of 0 — the value clearViewLossLocked already refuses
+	// to clear at — never as ^uint64(0), which is the unconditional-clear
+	// sentinel: returning that would delete the unattributable marker and any
+	// newer loss recorded while the upload was on the wire.
+	if unkOK {
+		return 0
+	}
+	if dirUnreadable {
+		if loss, has := c.readViewLoss(remotePath); has {
+			if loss.Generation == ^uint64(0) {
+				return 0
+			}
+			if loss.Generation > bound {
+				return loss.Generation
+			}
+		}
+	}
+	return bound
+}
