@@ -17,38 +17,35 @@ import (
 // returning the remaining arguments in order.
 func ParseLayerViewFlags(args []string) (layerRef string, fence int64, rest []string, err error) {
 	rest = make([]string, 0, len(args))
-	var fenceRaw string
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if arg == "--" {
 			rest = append(rest, args[i:]...)
 			break
 		}
-		switch {
-		case arg == "--layer":
-			if i+1 >= len(args) {
-				return "", 0, nil, fmt.Errorf("--layer requires argument")
-			}
-			i++
-			layerRef = strings.TrimSpace(args[i])
-		case strings.HasPrefix(arg, "--layer="):
-			layerRef = strings.TrimSpace(strings.TrimPrefix(arg, "--layer="))
-		case arg == "--fence":
-			if i+1 >= len(args) {
-				return "", 0, nil, fmt.Errorf("--fence requires positive odd integer")
-			}
-			i++
-			fenceRaw = strings.TrimSpace(args[i])
-		case strings.HasPrefix(arg, "--fence="):
-			fenceRaw = strings.TrimSpace(strings.TrimPrefix(arg, "--fence="))
-		default:
+		flag, value, inline := strings.Cut(arg, "=")
+		if flag != "--layer" && flag != "--fence" {
 			rest = append(rest, arg)
+			continue
 		}
-	}
-	if fenceRaw != "" {
-		parsed, perr := strconv.ParseInt(fenceRaw, 10, 64)
+		if !inline {
+			if i+1 == len(args) {
+				return "", 0, nil, fmt.Errorf("%s requires an argument", flag)
+			}
+			i++
+			value = args[i]
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return "", 0, nil, fmt.Errorf("%s requires a non-empty argument", flag)
+		}
+		if flag == "--layer" {
+			layerRef = value
+			continue
+		}
+		parsed, perr := strconv.ParseInt(value, 10, 64)
 		if perr != nil || parsed <= 0 || parsed%2 == 0 {
-			return "", 0, nil, fmt.Errorf("invalid --fence %q (must be a positive odd integer)", fenceRaw)
+			return "", 0, nil, fmt.Errorf("invalid --fence %q (must be a positive odd integer)", value)
 		}
 		fence = parsed
 	}

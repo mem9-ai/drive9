@@ -267,6 +267,9 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if flagProvided(fs, "layer") && strings.TrimSpace(*layerRef) == "" {
+		return fmt.Errorf("--layer requires a non-empty argument")
+	}
 	credentialSecrets := []string{*server, *apiKey}
 	defer func() {
 		if *noPersistCredentials {

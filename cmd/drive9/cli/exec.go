@@ -432,6 +432,9 @@ func parseExecArgs(args []string) (execOptions, error) {
 		}
 		return execOptions{}, fmt.Errorf("%w (see drive9 exec --help)", err)
 	}
+	if flagProvided(fs, "layer") && strings.TrimSpace(options.layer) == "" {
+		return execOptions{}, errors.New("--layer requires a non-empty argument")
+	}
 	options.workspaceSet = flagProvided(fs, "w") || flagProvided(fs, "workspace")
 	options.cwdSet = flagProvided(fs, "C") || flagProvided(fs, "cwd")
 	options.env = env

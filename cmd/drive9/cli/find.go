@@ -18,7 +18,7 @@ func Find(c *client.Client, args []string) error {
 	defer withObjectAuthLocal(authLocal)()
 	path := "/"
 	params := url.Values{}
-	layerRef := ""
+	explicitLayer := false
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -27,7 +27,7 @@ func Find(c *client.Client, args []string) error {
 				return fmt.Errorf("--layer requires argument")
 			}
 			i++
-			layerRef = strings.TrimSpace(args[i])
+			explicitLayer = true
 		case "-name":
 			if i+1 >= len(args) {
 				return fmt.Errorf("-name requires argument")
@@ -68,7 +68,7 @@ func Find(c *client.Client, args []string) error {
 			}
 		default:
 			if strings.HasPrefix(args[i], "--layer=") {
-				layerRef = strings.TrimSpace(strings.TrimPrefix(args[i], "--layer="))
+				explicitLayer = true
 			} else if !strings.HasPrefix(args[i], "-") {
 				path = args[i]
 			} else {
@@ -77,7 +77,7 @@ func Find(c *client.Client, args []string) error {
 		}
 	}
 
-	if layerRef != "" || (c != nil && c.ViewBinding().LayerID != "") {
+	if explicitLayer || (c != nil && c.ViewBinding().LayerID != "") {
 		return fmt.Errorf("find: %w (--layer is not supported on search endpoints)", viewprotocol.ErrUnsupportedInLayerView)
 	}
 	h, err := fsHandleForArg(c, path)
