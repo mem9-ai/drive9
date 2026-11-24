@@ -1201,7 +1201,7 @@ func startMountSupervisedBackgroundImpl(req mountSuperviseStartRequest) error {
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- cmd.Wait() }()
 
-	if err := waitForSupervisedMountReady(req.MountPoint, cmd.Process.Pid, waitCh, logPath, defaultMountBackgroundReadyTimeout); err != nil {
+	if err := waitForSupervisedMountReady(req.MountPoint, cmd.Process, waitCh, logPath, defaultMountBackgroundReadyTimeout); err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "drive9: mount supervised in background (supervisor pid: %d, log: %s)\n", cmd.Process.Pid, logPath)
@@ -1276,10 +1276,11 @@ func applyScrubbedMountEnv(scrubbed []string) {
 	}
 }
 
-func waitForSupervisedMountReady(mountPoint string, supervisorPID int, waitCh <-chan error, logPath string, timeout time.Duration) error {
+func waitForSupervisedMountReady(mountPoint string, child *os.Process, waitCh <-chan error, logPath string, timeout time.Duration) error {
 	start := time.Now()
 	deadline := start.Add(timeout)
 	// Capture child identity once (Darwin ProcessCreationTime shells out to ps).
+	supervisorPID := child.Pid
 	supCreation, _ := mountstate.ProcessCreationTime(supervisorPID)
 	for {
 		select {
@@ -1296,7 +1297,8 @@ func waitForSupervisedMountReady(mountPoint string, supervisorPID int, waitCh <-
 		if st, _, err := mountstate.ReadSupervisorState(mountPoint); err == nil {
 			if supervisorStateMatchesGeneration(st, supervisorPID, supCreation) {
 				if st.State == mountstate.SupervisorStateFailed || st.State == mountstate.SupervisorStateCircuitOpen {
-					return fmt.Errorf("drive9 mount: supervisor %s before becoming ready after %s (%s; log: %s)", st.State, time.Since(start).Round(time.Millisecond), st.LastExitReason, logPath)
+					failure := fmt.Errorf("drive9 mount: supervisor %s before becoming ready after %s (%s; log: %s)", st.State, time.Since(start).Round(time.Millisecond), st.LastExitReason, logPath)
+					return errors.Join(failure, waitForTerminalSupervisor(child, waitCh, st.State))
 				}
 				for _, until := range []time.Time{st.LayerWorkerStartupUntil, st.LayerLeaseRecoveryUntil} {
 					if !until.IsZero() && until.Add(timeout).After(deadline) {
@@ -1316,6 +1318,31 @@ func waitForSupervisedMountReady(mountPoint string, supervisorPID int, waitCh <-
 			return fmt.Errorf("drive9 mount: timed out waiting for supervised mount to become ready after %s (log: %s)", time.Since(start).Round(time.Millisecond), logPath)
 		}
 		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// Both terminal states follow worker exit. A failed supervisor is finishing
+// its own cleanup. A circuit-open supervisor stays idle until told to stop.
+func waitForTerminalSupervisor(child *os.Process, waitCh <-chan error, state string) error {
+	if state == mountstate.SupervisorStateCircuitOpen {
+		_ = child.Signal(syscall.SIGTERM)
+	}
+	select {
+	case <-waitCh:
+		return nil
+	case <-time.After(10 * time.Second):
+	}
+
+	// Only act on the spawned process handle; a simultaneous retry can own
+	// the mountpoint as soon as this child exits.
+	if err := child.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return fmt.Errorf("stop supervisor pid %d: %w", child.Pid, err)
+	}
+	select {
+	case <-waitCh:
+		return nil
+	case <-time.After(3 * time.Second):
+		return fmt.Errorf("supervisor pid %d did not exit after kill", child.Pid)
 	}
 }
 

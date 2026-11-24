@@ -9,10 +9,12 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -525,7 +527,7 @@ func TestWaitForSupervisedMountReadyIgnoresStaleState(t *testing.T) {
 	}
 
 	waitCh := make(chan error) // never closes
-	err = waitForSupervisedMountReady(mp, foreignPID, waitCh, "/dev/null", 300*time.Millisecond)
+	err = waitForSupervisedMountReady(mp, cmd.Process, waitCh, "/dev/null", 300*time.Millisecond)
 	if err == nil {
 		t.Fatal("stale healthy state must not satisfy ready for a different supervisor PID")
 	}
@@ -655,7 +657,7 @@ exit 5
 	}
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- cmd.Wait() }()
-	err := waitForSupervisedMountReady(mp, cmd.Process.Pid, waitCh, "/dev/null", 800*time.Millisecond)
+	err := waitForSupervisedMountReady(mp, cmd.Process, waitCh, "/dev/null", 800*time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "before becoming ready") || ctx.Err() != nil {
 		t.Fatalf("parent result %v (context %v)", err, ctx.Err())
 	}
@@ -667,22 +669,79 @@ exit 5
 }
 
 func TestParentReturnsTerminalSupervisorStateDuringLeaseWait(t *testing.T) {
-	for _, state := range []string{mountstate.SupervisorStateFailed, mountstate.SupervisorStateCircuitOpen} {
-		t.Run(state, func(t *testing.T) {
+	const childEnv = "DRIVE9_TEST_TERMINAL_SUPERVISOR"
+	if mp := os.Getenv(childEnv); mp != "" {
+		state := os.Getenv("DRIVE9_TEST_SUPERVISOR_STATE")
+		id, err := mountstate.ProcessCreationTime(os.Getpid())
+		if err != nil {
+			t.Fatal(err)
+		}
+		held, err := mountsupervisor.TryExclusive(mp, func() error {
+			stopping := make(chan os.Signal, 1)
+			if state == mountstate.SupervisorStateCircuitOpen {
+				signal.Notify(stopping, syscall.SIGTERM)
+				defer signal.Stop(stopping)
+			}
+			err := mountstate.WriteSupervisorState(mp, mountstate.SupervisorState{
+				PID: os.Getpid(), CreationTime: id, MountPoint: mp, State: state,
+				LayerLeaseRecoveryUntil: time.Now().Add(time.Hour),
+			})
+			if err != nil {
+				return err
+			}
+			if state == mountstate.SupervisorStateFailed && os.Getenv("DRIVE9_TEST_SUPERVISOR_STUCK") == "" {
+				time.Sleep(750 * time.Millisecond)
+				return os.WriteFile(filepath.Join(mp, "finished-cleanup"), nil, 0600)
+			}
+			if state == mountstate.SupervisorStateCircuitOpen {
+				<-stopping
+				return os.WriteFile(filepath.Join(mp, "finished-cleanup"), nil, 0600)
+			}
+			time.Sleep(time.Minute)
+			return nil
+		})
+		if err != nil || !held {
+			t.Fatalf("child lock: held=%t, err=%v", held, err)
+		}
+		return
+	}
+	for _, tc := range []struct {
+		name, state string
+		stuck       bool
+	}{
+		{"failed", mountstate.SupervisorStateFailed, false},
+		{"circuit-open", mountstate.SupervisorStateCircuitOpen, false},
+		{"stuck-failed", mountstate.SupervisorStateFailed, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			mp := t.TempDir()
-			self := os.Getpid()
-			creation, _ := mountstate.ProcessCreationTime(self)
-			st := mountstate.SupervisorState{PID: self, CreationTime: creation, MountPoint: mp, State: state, LayerLeaseRecoveryUntil: time.Now().Add(time.Hour)}
-			if err := mountstate.WriteSupervisorState(mp, st); err != nil {
+			t.Cleanup(func() { _ = mountstate.ClearSupervisorState(mp) })
+			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestParentReturnsTerminalSupervisorStateDuringLeaseWait$")
+			cmd.Env = append(os.Environ(), childEnv+"="+mp, "DRIVE9_TEST_SUPERVISOR_STATE="+tc.state)
+			if tc.stuck {
+				cmd.Env = append(cmd.Env, "DRIVE9_TEST_SUPERVISOR_STUCK=1")
+			}
+			if err := cmd.Start(); err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() { _ = mountstate.ClearSupervisorState(mp) })
 			wait := make(chan error, 1)
-			timer := time.AfterFunc(time.Second, func() { wait <- errors.New("parent missed terminal state") })
-			defer timer.Stop()
-			err := waitForSupervisedMountReady(mp, self, wait, "/dev/null", 30*time.Second)
-			if err == nil || !strings.Contains(err.Error(), state) {
-				t.Fatalf("parent result %v", err)
+			go func() { wait <- cmd.Wait() }()
+			err := waitForSupervisedMountReady(mp, cmd.Process, wait, "/dev/null", 10*time.Second)
+			if err == nil || !strings.Contains(err.Error(), tc.state) || ctx.Err() != nil {
+				t.Fatalf("parent result %v (context %v)", err, ctx.Err())
+			}
+			if processAliveImpl(cmd.Process.Pid) {
+				t.Error("child still alive after startup failure")
+			}
+			if held, err := mountsupervisor.TryExclusive(mp, nil); err != nil || !held {
+				t.Errorf("retry cannot acquire supervisor lock: held=%t, err=%v", held, err)
+			}
+			if !tc.stuck {
+				if _, err := os.Stat(filepath.Join(mp, "finished-cleanup")); err != nil {
+					t.Error(err)
+				}
 			}
 		})
 	}
