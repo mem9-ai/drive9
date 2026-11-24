@@ -182,12 +182,13 @@ go 1.25.0
 EOF
 
 cat >"${REPO}/Makefile" <<'EOF'
+SHELL := /bin/bash
 DIST_DIR ?= dist
 VERSION ?= dev
 CLI_TARGETS ?= linux/amd64
 
 build-cli-release:
-	@set -euo pipefail; \
+	@set -eu; \
 	mkdir -p "$(DIST_DIR)"; \
 	for target in $(CLI_TARGETS); do \
 		os="$${target%/*}"; \
@@ -379,8 +380,49 @@ assert_exists "${R1}/drive9/commits/${C8}/manifest.json"
 set +e
 run_publisher "$R1" "$L6" env DRIVE9_ARCHIVE_RETAIN_COMMITS=invalid >/dev/null 2>&1
 bad_rc=$?
+run_publisher "$R1" "$L6" env DRIVE9_ARCHIVE_RETAIN_COMMITS=999999999999999999999999 >/dev/null 2>&1
+overflow_rc=$?
 set -e
 [ "$bad_rc" -ne 0 ] || fail "expected invalid DRIVE9_ARCHIVE_RETAIN_COMMITS to fail"
-pass "DRIVE9_ARCHIVE_RETAIN_COMMITS=0 and validation behave as expected"
+[ "$overflow_rc" -ne 0 ] || fail "expected overflowing DRIVE9_ARCHIVE_RETAIN_COMMITS to fail"
+pass "DRIVE9_ARCHIVE_RETAIN_COMMITS=0 and bounded validation behave as expected"
+
+echo "== 7. Stale branch dispatch ranks commits globally by timestamp instead of pruning newer main archives"
+R7="${WORK}/remote7"
+L7="${WORK}/ops7.log"
+: >"$L7"
+# Create an older diverged branch with two ancient commits (STALE_OLD -> STALE_TIP),
+# while main has a much newer commit MAIN_NEW (not protected by latest.json).
+git -C "$REPO" checkout -q -b stale-branch "$C1"
+printf 'stale-old\n' >"${REPO}/stale.txt"
+git -C "$REPO" add -A
+GIT_AUTHOR_DATE="2025-01-01T00:00:00Z" GIT_COMMITTER_DATE="2025-01-01T00:00:00Z" \
+  git -C "$REPO" commit -qm "stale ancient commit"
+STALE_OLD="$(git -C "$REPO" rev-parse HEAD)"
+
+printf 'stale-tip\n' >"${REPO}/stale.txt"
+git -C "$REPO" add -A
+GIT_AUTHOR_DATE="2025-01-02T00:00:00Z" GIT_COMMITTER_DATE="2025-01-02T00:00:00Z" \
+  git -C "$REPO" commit -qm "stale tip commit"
+git -C "$REPO" push -q origin HEAD:stale-branch
+STALE_TIP="$(git -C "$REPO" rev-parse HEAD)"
+
+git -C "$REPO" checkout -q main
+printf 'main-new\n' >"${REPO}/state.txt"
+git -C "$REPO" add -A
+GIT_AUTHOR_DATE="2027-01-01T00:00:00Z" GIT_COMMITTER_DATE="2027-01-01T00:00:00Z" \
+  git -C "$REPO" commit -qm "newer main commit"
+git -C "$REPO" push -q origin HEAD:main
+MAIN_NEW="$(git -C "$REPO" rev-parse HEAD)"
+
+# Seed STALE_OLD (2025-01-01, direct parent of stale-branch) and MAIN_NEW (2027-01-01, NOT latest.json).
+seed_complete_commit "$R7" "$STALE_OLD"
+seed_complete_commit "$R7" "$MAIN_NEW"
+
+run_publisher "$R7" "$L7" env GITHUB_EVENT_NAME=workflow_dispatch DRIVE9_ARCHIVE_BRANCH=stale-branch DRIVE9_ARCHIVE_RETAIN_COMMITS=2 >/dev/null
+assert_missing "${R7}/drive9/commits/${STALE_OLD}"
+assert_exists "${R7}/drive9/commits/${MAIN_NEW}/manifest.json"
+assert_exists "${R7}/drive9/commits/${STALE_TIP}/manifest.json"
+pass "stale branch dispatch pruned ancient ancestor STALE_OLD and preserved newer main commit"
 
 echo "ALL TESTS PASSED"

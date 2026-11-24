@@ -18,7 +18,7 @@ on:
         type: string
 
 concurrency:
-  group: drive9-archive-${{ github.event.inputs.branch || github.ref_name }}
+  group: drive9-archive
   cancel-in-progress: false
 
 jobs:

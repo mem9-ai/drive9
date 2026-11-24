@@ -51,13 +51,13 @@ fi
 if [ "${branch#-}" != "$branch" ] || ! git check-ref-format "refs/heads/${branch}" >/dev/null; then
   die "invalid DRIVE9_ARCHIVE_BRANCH: ${branch}"
 fi
-if ! [[ "$retain_commits" =~ ^[0-9]+$ ]]; then
+if ! [[ "$retain_commits" =~ ^(0|[1-9][0-9]{0,5})$ ]]; then
   die "invalid DRIVE9_ARCHIVE_RETAIN_COMMITS: ${retain_commits}"
 fi
-if ! [[ "$quota_retry_attempts" =~ ^[1-9][0-9]*$ ]]; then
+if ! [[ "$quota_retry_attempts" =~ ^[1-9][0-9]{0,2}$ ]]; then
   die "invalid DRIVE9_ARCHIVE_QUOTA_RETRY_ATTEMPTS: ${quota_retry_attempts}"
 fi
-if ! [[ "$quota_retry_delay" =~ ^[0-9]+$ ]]; then
+if ! [[ "$quota_retry_delay" =~ ^(0|[1-9][0-9]{0,3})$ ]]; then
   die "invalid DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY: ${quota_retry_delay}"
 fi
 
@@ -524,26 +524,38 @@ sort_remote_commits_newest_first() {
   local remote_shas_file=$1
   local sorted_out=$2
   local branch_revlist="${work_root}/branch-revlist.txt"
+  local all_commits_ts="${work_root}/all-commits-ts.txt"
   local ranked_file="${work_root}/remote-commits-ranked.tsv"
   local unranked_file="${work_root}/remote-commits-unranked.txt"
 
   git rev-list "refs/remotes/origin/${branch}" >"$branch_revlist"
+  git log --all --format='%H %ct' >"$all_commits_ts"
   : >"$ranked_file"
   : >"$unranked_file"
 
-  awk -v unranked="$unranked_file" '
-    NR == FNR {
-      rank[$1] = NR
+  # Rank every commit known to git globally by committer timestamp descending so
+  # dispatching a stale branch never prefers ancient ancestors over newer main
+  # archives; use origin/${branch} ancestry position only to break timestamp ties.
+  awk -v f1="$branch_revlist" -v f2="$all_commits_ts" -v unranked="$unranked_file" '
+    FILENAME == f1 {
+      branch_rank[$1] = FNR
+      next
+    }
+    FILENAME == f2 {
+      if (!($1 in ts)) {
+        ts[$1] = $2
+      }
       next
     }
     {
-      if ($1 in rank) {
-        printf "0\t%d\t%s\n", rank[$1], $1
+      if ($1 in ts) {
+        br = ($1 in branch_rank) ? branch_rank[$1] : 999999999
+        printf "0\t%012d\t%09d\t%s\n", (9999999999 - ts[$1]), br, $1
       } else {
         print $1 > unranked
       }
     }
-  ' "$branch_revlist" "$remote_shas_file" >"$ranked_file"
+  ' "$branch_revlist" "$all_commits_ts" "$remote_shas_file" >"$ranked_file"
 
   if [ -s "$unranked_file" ]; then
     local sha ct inv_ct
@@ -552,14 +564,14 @@ sort_remote_commits_newest_first() {
       ct="$(git show -s --format=%ct "${sha}^{commit}" 2>/dev/null || true)"
       if [[ "$ct" =~ ^[0-9]+$ ]]; then
         inv_ct=$((9999999999 - ct))
-        printf '1\t%s\t%s\n' "$inv_ct" "$sha" >>"$ranked_file"
+        printf '0\t%012d\t999999999\t%s\n' "$inv_ct" "$sha" >>"$ranked_file"
       else
-        printf '2\t0\t%s\n' "$sha" >>"$ranked_file"
+        printf '1\t999999999999\t999999999\t%s\n' "$sha" >>"$ranked_file"
       fi
     done <"$unranked_file"
   fi
 
-  LC_ALL=C sort -t $'\t' -k1,1n -k2,2n -k3,3 "$ranked_file" | cut -f3 >"$sorted_out"
+  LC_ALL=C sort -t $'\t' -k1,1n -k2,2n -k3,3n -k4,4 "$ranked_file" | cut -f4 >"$sorted_out"
 }
 
 is_sha_in_list() {
