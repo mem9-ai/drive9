@@ -43,6 +43,9 @@ fail_rm_pattern="${FAKE_FAIL_RM_PATTERN:-}"
 fail_stat_pattern="${FAKE_FAIL_STAT_PATTERN:-}"
 fail_ls_call="${FAKE_FAIL_LS_ON_CALL:-}"
 ls_count_file="${FAKE_LS_COUNT_FILE:-}"
+pause_upload_pattern="${FAKE_PAUSE_AFTER_UPLOAD_PATTERN:-}"
+pause_signal_file="${FAKE_PAUSE_SIGNAL_FILE:-}"
+pause_release_file="${FAKE_PAUSE_RELEASE_FILE:-}"
 
 strip_ref() {
   local ref=$1
@@ -66,7 +69,7 @@ shift 2
 case "$sub" in
 ls)
   rel="$(strip_ref "$1")"
-  if [ -n "$ls_count_file" ]; then
+  if [ -n "$ls_count_file" ] && [[ "$rel" == *"commits"* ]]; then
     count=0
     if [ -f "$ls_count_file" ]; then
       count="$(cat "$ls_count_file")"
@@ -141,12 +144,32 @@ cat)
 mkdir)
   rel="$(strip_ref "$1")"
   target="${root}/${rel}"
-  if [ -d "$target" ]; then
+  mkdir -p "$(dirname "$target")"
+  if ! mkdir "$target" 2>/dev/null; then
     echo "fs mkdir: path already exists" >&2
     exit 1
   fi
   printf 'mkdir %s\n' "$rel" >>"$ops_log"
-  mkdir -p "$target"
+  ;;
+mv)
+  old_rel="$(strip_ref "$1")"
+  new_rel="$(strip_ref "$2")"
+  old_target="${root}/${old_rel}"
+  new_target="${root}/${new_rel}"
+  if [ ! -e "$old_target" ]; then
+    echo "fs mv: HTTP 404: not found" >&2
+    exit 1
+  fi
+  if [ -e "$new_target" ]; then
+    echo "fs mv: HTTP 409: path already exists" >&2
+    exit 1
+  fi
+  mkdir -p "$(dirname "$new_target")"
+  if ! mv "$old_target" "$new_target" 2>/dev/null; then
+    echo "fs mv: HTTP 404: not found" >&2
+    exit 1
+  fi
+  printf 'mv %s %s\n' "$old_rel" "$new_rel" >>"$ops_log"
   ;;
 rm)
   recursive=0
@@ -165,10 +188,17 @@ rm)
     echo "fs rm: HTTP 404: not found" >&2
     exit 1
   fi
-  printf 'rm %s\n' "$rel" >>"$ops_log"
   if [ "$recursive" -eq 1 ]; then
+    printf 'rm %s\n' "$rel" >>"$ops_log"
     rm -rf "$target"
+  elif [ -d "$target" ]; then
+    if ! rmdir "$target" 2>/dev/null; then
+      echo "fs rm: HTTP 409: directory not empty" >&2
+      exit 1
+    fi
+    printf 'rmdir %s\n' "$rel" >>"$ops_log"
   else
+    printf 'rm %s\n' "$rel" >>"$ops_log"
     rm -f "$target"
   fi
   ;;
@@ -189,6 +219,16 @@ cp)
     target="${root}/${rel}"
     mkdir -p "$(dirname "$target")"
     cp "$src" "$target"
+    if [ -n "$pause_upload_pattern" ] && [[ "$rel" == *"$pause_upload_pattern"* ]]; then
+      if [ -n "$pause_signal_file" ]; then
+        touch "$pause_signal_file"
+      fi
+      if [ -n "$pause_release_file" ]; then
+        while [ ! -f "$pause_release_file" ]; do
+          sleep 0.05
+        done
+      fi
+    fi
   elif [[ "$src" == :* ]]; then
     rel="$(strip_ref "$src")"
     target="${root}/${rel}"
@@ -625,5 +665,201 @@ assert_exists "${R12C}/drive9/commits/${C2}/manifest.json"
 assert_exists "${R12C}/drive9/commits/${MAIN_NEW}/manifest.json"
 grep -q "is malformed" "$err12c" || fail "expected malformed latest.json warning"
 pass "missing/empty commits dir and malformed latest.json handled cleanly"
+
+wait_for_file() {
+  local path=$1
+  local timeout_tenths=${2:-100}
+  local i=0
+  while [ ! -f "$path" ]; do
+    i=$((i + 1))
+    if [ "$i" -ge "$timeout_tenths" ]; then
+      fail "timed out waiting for ${path}"
+    fi
+    sleep 0.1
+  done
+}
+
+run_publisher_in_with_arg() {
+  local repo_dir=$1
+  local remote_root=$2
+  local ops_log=$3
+  local commit_arg=$4
+  shift 4
+  (
+    cd "$repo_dir"
+    DRIVE9_SERVER="https://api.example.test" \
+    DRIVE9_API_KEY="test-key" \
+    DRIVE9_PUBLISHER="$FAKE_CLI" \
+    DRIVE9_ARCHIVE_CLI_TARGETS="linux/amd64" \
+    DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY="0" \
+    FAKE_REMOTE_ROOT="$remote_root" \
+    FAKE_OPS_LOG="$ops_log" \
+    "$@" \
+    "$SCRIPT" "$commit_arg"
+  )
+}
+
+# Separate clones simulate two independent runners sharing the same remote archive.
+RUNNER_A_REPO="${WORK}/runner-a-repo"
+RUNNER_B_REPO="${WORK}/runner-b-repo"
+git clone -q "$ORIGIN_GIT" "$RUNNER_A_REPO"
+git clone -q "$ORIGIN_GIT" "$RUNNER_B_REPO"
+
+echo "== 13. Concurrent same-SHA publishers: active upload is protected by remote lock; waiting publisher reuses completed archive"
+R13="${WORK}/remote13"
+L13A="${WORK}/ops13a.log"
+L13B="${WORK}/ops13b.log"
+L13B2="${WORK}/ops13b2.log"
+mkdir -p "$R13"
+: >"$L13A"
+: >"$L13B"
+: >"$L13B2"
+SIG13="${WORK}/pause13.signal"
+REL13="${WORK}/pause13.release"
+
+# Start Publisher A for MAIN_NEW and pause it right after source.tar.gz upload (before manifest.json).
+run_publisher_in_with_arg "$RUNNER_A_REPO" "$R13" "$L13A" "$MAIN_NEW" env \
+  RUNNER_TEMP="${WORK}/tmp13a" \
+  DRIVE9_ARCHIVE_RETAIN_COMMITS=5 \
+  DRIVE9_ARCHIVE_LOCK_TTL_SECONDS=30 \
+  DRIVE9_ARCHIVE_LOCK_RENEW_SECONDS=1 \
+  FAKE_PAUSE_AFTER_UPLOAD_PATTERN="commits/${MAIN_NEW}/source.tar.gz" \
+  FAKE_PAUSE_SIGNAL_FILE="$SIG13" \
+  FAKE_PAUSE_RELEASE_FILE="$REL13" >/dev/null 2>"${WORK}/err13a.log" &
+PID13A=$!
+
+wait_for_file "$SIG13" 150
+assert_exists "${R13}/drive9/commits/${MAIN_NEW}/source.tar.gz"
+assert_missing "${R13}/drive9/commits/${MAIN_NEW}/manifest.json"
+assert_exists "${R13}/drive9/.publish-lock"
+
+# Short-wait Publisher B2 targeting the SAME SHA must fail on lock timeout without deleting A's live files.
+set +e
+run_publisher_in_with_arg "$RUNNER_B_REPO" "$R13" "$L13B2" "$MAIN_NEW" env \
+  RUNNER_TEMP="${WORK}/tmp13b2" \
+  DRIVE9_ARCHIVE_RETAIN_COMMITS=5 \
+  DRIVE9_ARCHIVE_LOCK_WAIT_SECONDS=1 \
+  DRIVE9_ARCHIVE_LOCK_POLL_SECONDS=1 >/dev/null 2>"${WORK}/err13b2.log"
+rc13b2=$?
+set -e
+[ "$rc13b2" -ne 0 ] || fail "expected contending same-SHA publisher B2 to fail on active lock"
+grep -q "held by another active publisher" "${WORK}/err13b2.log" || fail "expected active-lock message from B2"
+assert_exists "${R13}/drive9/commits/${MAIN_NEW}/source.tar.gz"
+
+# Waiting Publisher B targeting the SAME SHA blocks until A finishes, then sees completed archive without deleting it.
+run_publisher_in_with_arg "$RUNNER_B_REPO" "$R13" "$L13B" "$MAIN_NEW" env \
+  RUNNER_TEMP="${WORK}/tmp13b" \
+  DRIVE9_ARCHIVE_RETAIN_COMMITS=5 \
+  DRIVE9_ARCHIVE_LOCK_WAIT_SECONDS=30 \
+  DRIVE9_ARCHIVE_LOCK_POLL_SECONDS=1 >/dev/null 2>"${WORK}/err13b.log" &
+PID13B=$!
+
+sleep 1
+assert_exists "${R13}/drive9/commits/${MAIN_NEW}/source.tar.gz"
+assert_missing "${R13}/drive9/commits/${MAIN_NEW}/manifest.json"
+
+# Release Publisher A and verify both exit cleanly with intact archive and released lock.
+touch "$REL13"
+wait "$PID13A" || { cat "${WORK}/err13a.log" >&2; fail "Publisher A failed"; }
+wait "$PID13B" || { cat "${WORK}/err13b.log" >&2; fail "Publisher B failed"; }
+assert_exists "${R13}/drive9/commits/${MAIN_NEW}/manifest.json"
+assert_exists "${R13}/drive9/commits/${MAIN_NEW}/bin/drive9-linux-amd64"
+[ "$(jq -r '.commit_sha' "${R13}/drive9/latest.json")" = "$MAIN_NEW" ] || fail "latest.json should point to MAIN_NEW"
+assert_missing "${R13}/drive9/.publish-lock"
+if grep -q "^rm drive9/commits/${MAIN_NEW}$" "$L13B"; then
+  fail "Publisher B unexpectedly deleted MAIN_NEW"
+fi
+pass "same-SHA concurrent publishers serialized cleanly; A's live upload was protected and B reused completed archive"
+
+echo "== 14. Expired lock takeover cleans stale target and fences zombie publisher before manifest upload"
+R14="${WORK}/remote14"
+L14A="${WORK}/ops14a.log"
+L14B="${WORK}/ops14b.log"
+mkdir -p "$R14"
+: >"$L14A"
+: >"$L14B"
+SIG14="${WORK}/pause14.signal"
+REL14="${WORK}/pause14.release"
+
+# Publisher A uses a 2s TTL with heartbeat disabled (simulates stalled/zombie runner) and pauses mid-upload.
+run_publisher_in_with_arg "$RUNNER_A_REPO" "$R14" "$L14A" "$MAIN_NEW" env \
+  RUNNER_TEMP="${WORK}/tmp14a" \
+  DRIVE9_ARCHIVE_RETAIN_COMMITS=5 \
+  DRIVE9_ARCHIVE_LOCK_TTL_SECONDS=2 \
+  DRIVE9_ARCHIVE_LOCK_RENEW_SECONDS=0 \
+  FAKE_PAUSE_AFTER_UPLOAD_PATTERN="commits/${MAIN_NEW}/source.tar.gz" \
+  FAKE_PAUSE_SIGNAL_FILE="$SIG14" \
+  FAKE_PAUSE_RELEASE_FILE="$REL14" >/dev/null 2>"${WORK}/err14a.log" &
+PID14A=$!
+
+wait_for_file "$SIG14" 150
+sleep 3
+
+# Publisher B reclaims expired lease, cleans A's stale incomplete dir, and publishes MAIN_NEW cleanly.
+run_publisher_in_with_arg "$RUNNER_B_REPO" "$R14" "$L14B" "$MAIN_NEW" env \
+  RUNNER_TEMP="${WORK}/tmp14b" \
+  DRIVE9_ARCHIVE_RETAIN_COMMITS=5 \
+  DRIVE9_ARCHIVE_LOCK_TTL_SECONDS=30 \
+  DRIVE9_ARCHIVE_LOCK_WAIT_SECONDS=10 \
+  DRIVE9_ARCHIVE_LOCK_POLL_SECONDS=1 >/dev/null 2>"${WORK}/err14b.log"
+assert_exists "${R14}/drive9/commits/${MAIN_NEW}/manifest.json"
+assert_missing "${R14}/drive9/.publish-lock"
+manifest_before="$(cat "${R14}/drive9/commits/${MAIN_NEW}/manifest.json")"
+
+# Unpause zombie Publisher A: fencing check MUST abort A without overwriting B's manifest or latest.json.
+touch "$REL14"
+set +e
+wait "$PID14A"
+rc14a=$?
+set -e
+[ "$rc14a" -ne 0 ] || fail "expected zombie Publisher A to abort after losing lock ownership"
+grep -q "lost archive lock ownership" "${WORK}/err14a.log" || fail "expected lost-lock error from zombie Publisher A"
+[ "$(cat "${R14}/drive9/commits/${MAIN_NEW}/manifest.json")" = "$manifest_before" ] || fail "zombie Publisher A modified manifest.json after losing lock"
+assert_missing "${R14}/drive9/.publish-lock"
+pass "expired lease reclaimed by B and zombie Publisher A aborted at fencing check without corrupting manifest"
+
+echo "== 15. Concurrent different-SHA publishers serialize even with grace=0 so A's in-progress archive is never pruned"
+R15="${WORK}/remote15"
+L15A="${WORK}/ops15a.log"
+L15B="${WORK}/ops15b.log"
+mkdir -p "$R15"
+: >"$L15A"
+: >"$L15B"
+SIG15="${WORK}/pause15.signal"
+REL15="${WORK}/pause15.release"
+
+run_publisher_in_with_arg "$RUNNER_A_REPO" "$R15" "$L15A" "$C3" env \
+  RUNNER_TEMP="${WORK}/tmp15a" \
+  DRIVE9_ARCHIVE_RETAIN_COMMITS=2 \
+  DRIVE9_ARCHIVE_INCOMPLETE_GRACE_SECONDS=0 \
+  DRIVE9_ARCHIVE_LOCK_TTL_SECONDS=30 \
+  DRIVE9_ARCHIVE_LOCK_RENEW_SECONDS=1 \
+  FAKE_PAUSE_AFTER_UPLOAD_PATTERN="commits/${C3}/source.tar.gz" \
+  FAKE_PAUSE_SIGNAL_FILE="$SIG15" \
+  FAKE_PAUSE_RELEASE_FILE="$REL15" >/dev/null 2>"${WORK}/err15a.log" &
+PID15A=$!
+
+wait_for_file "$SIG15" 150
+assert_exists "${R15}/drive9/commits/${C3}/source.tar.gz"
+assert_missing "${R15}/drive9/commits/${C3}/manifest.json"
+
+run_publisher_in_with_arg "$RUNNER_B_REPO" "$R15" "$L15B" "$MAIN_NEW" env \
+  RUNNER_TEMP="${WORK}/tmp15b" \
+  DRIVE9_ARCHIVE_RETAIN_COMMITS=2 \
+  DRIVE9_ARCHIVE_INCOMPLETE_GRACE_SECONDS=0 \
+  DRIVE9_ARCHIVE_LOCK_WAIT_SECONDS=30 \
+  DRIVE9_ARCHIVE_LOCK_POLL_SECONDS=1 >/dev/null 2>"${WORK}/err15b.log" &
+PID15B=$!
+
+sleep 1
+assert_exists "${R15}/drive9/commits/${C3}/source.tar.gz"
+
+touch "$REL15"
+wait "$PID15A" || { cat "${WORK}/err15a.log" >&2; fail "Publisher A (C3) failed"; }
+wait "$PID15B" || { cat "${WORK}/err15b.log" >&2; fail "Publisher B (MAIN_NEW) failed"; }
+assert_exists "${R15}/drive9/commits/${C3}/manifest.json"
+assert_exists "${R15}/drive9/commits/${MAIN_NEW}/manifest.json"
+assert_missing "${R15}/drive9/.publish-lock"
+pass "different-SHA concurrent publishers serialized cleanly even with grace=0; both C3 and MAIN_NEW completed"
 
 echo "ALL TESTS PASSED"

@@ -27,12 +27,17 @@ publisher="${DRIVE9_PUBLISHER:-drive9}"
 archive_root="${DRIVE9_ARCHIVE_ROOT:-/drive9}"
 archive_root="${archive_root%/}"
 latest_index="${archive_root}/latest.json"
+archive_lock_path="${archive_root}/.publish-lock"
 cli_targets="${DRIVE9_ARCHIVE_CLI_TARGETS:-linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64}"
 legacy_agfs_module="github.com/c4pt0r/agfs/agfs-server"
 legacy_agfs_version="${DRIVE9_ARCHIVE_LEGACY_AGFS_VERSION:-v0.0.0-20260410081414-678f51854d2a}"
 work_root="${RUNNER_TEMP:-$(pwd)/.tmp}/drive9-agent-archive"
 artifact_root="${work_root}/artifacts"
 worktree_root="${work_root}/worktrees"
+lock_state_dir="${work_root}/lock-state.$$"
+lock_state_mutex="${lock_state_dir}/mutex"
+lock_lease_file="${lock_state_dir}/lease-name"
+lock_stop_file="${lock_state_dir}/stop"
 repository="${GITHUB_REPOSITORY:-mem9-ai/drive9}"
 branch="${DRIVE9_ARCHIVE_BRANCH:-main}"
 latest_index_branch="${DRIVE9_ARCHIVE_LATEST_BRANCH:-main}"
@@ -40,10 +45,19 @@ retain_commits="${DRIVE9_ARCHIVE_RETAIN_COMMITS:-20}"
 incomplete_grace_seconds="${DRIVE9_ARCHIVE_INCOMPLETE_GRACE_SECONDS:-3600}"
 quota_retry_attempts="${DRIVE9_ARCHIVE_QUOTA_RETRY_ATTEMPTS:-6}"
 quota_retry_delay="${DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY:-10}"
+lock_ttl_seconds="${DRIVE9_ARCHIVE_LOCK_TTL_SECONDS:-300}"
+lock_wait_seconds="${DRIVE9_ARCHIVE_LOCK_WAIT_SECONDS:-1800}"
+lock_poll_seconds="${DRIVE9_ARCHIVE_LOCK_POLL_SECONDS:-5}"
+lock_renew_seconds="${DRIVE9_ARCHIVE_LOCK_RENEW_SECONDS:-}"
 remote_missing_status=42
+remote_conflict_status=43
 active_worktree=""
 pruned_any=0
 deferred_latest_prune=0
+lock_held=0
+lock_heartbeat_pid=""
+lock_owner_host="$(hostname -s 2>/dev/null | tr -cd 'A-Za-z0-9_-' | cut -c1-24 || true)"
+lock_owner_id="${lock_owner_host:-publisher}-$$-$(date -u '+%s')-${RANDOM:-0}"
 
 if [ -z "${DRIVE9_SERVER:-}" ]; then
   die "DRIVE9_SERVER is required"
@@ -71,6 +85,26 @@ if ! [[ "$quota_retry_attempts" =~ ^[1-9][0-9]{0,2}$ ]]; then
 fi
 if ! [[ "$quota_retry_delay" =~ ^(0|[1-9][0-9]{0,3})$ ]]; then
   die "invalid DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY: ${quota_retry_delay}"
+fi
+if ! [[ "$lock_ttl_seconds" =~ ^[1-9][0-9]{0,4}$ ]]; then
+  die "invalid DRIVE9_ARCHIVE_LOCK_TTL_SECONDS: ${lock_ttl_seconds}"
+fi
+if ! [[ "$lock_wait_seconds" =~ ^(0|[1-9][0-9]{0,5})$ ]]; then
+  die "invalid DRIVE9_ARCHIVE_LOCK_WAIT_SECONDS: ${lock_wait_seconds}"
+fi
+if ! [[ "$lock_poll_seconds" =~ ^[1-9][0-9]{0,3}$ ]]; then
+  die "invalid DRIVE9_ARCHIVE_LOCK_POLL_SECONDS: ${lock_poll_seconds}"
+fi
+if [ -z "$lock_renew_seconds" ]; then
+  lock_renew_seconds=$((lock_ttl_seconds / 3))
+  if [ "$lock_renew_seconds" -lt 1 ]; then
+    lock_renew_seconds=1
+  elif [ "$lock_renew_seconds" -gt 60 ]; then
+    lock_renew_seconds=60
+  fi
+fi
+if ! [[ "$lock_renew_seconds" =~ ^(0|[1-9][0-9]{0,4})$ ]]; then
+  die "invalid DRIVE9_ARCHIVE_LOCK_RENEW_SECONDS: ${lock_renew_seconds}"
 fi
 
 remote() {
@@ -182,6 +216,339 @@ remote_mkdir() {
   remote fs mkdir "$(remote_ref "$path")" >/dev/null
 }
 
+remote_mkdir_exclusive() {
+  local path=$1
+  local err="${work_root}/mkdir-exclusive.$$.stderr"
+  if remote fs mkdir "$(remote_ref "$path")" >/dev/null 2>"$err"; then
+    rm -f "$err"
+    return 0
+  fi
+  if grep -qiE '(path already exists|already exists|HTTP 409)' "$err"; then
+    rm -f "$err"
+    return "$remote_conflict_status"
+  fi
+  cat "$err" >&2
+  rm -f "$err"
+  return 1
+}
+
+remote_mv() {
+  local old_path=$1
+  local new_path=$2
+  local err="${work_root}/mv.$$.stderr"
+  if remote fs mv "$(remote_ref "$old_path")" "$(remote_ref "$new_path")" >/dev/null 2>"$err"; then
+    rm -f "$err"
+    return 0
+  fi
+  if grep -qiE '(^|[^[:alnum:]])(not found|HTTP 404)([^[:alnum:]]|$)' "$err"; then
+    rm -f "$err"
+    return "$remote_missing_status"
+  fi
+  if grep -qiE '(path already exists|already exists|HTTP 409)' "$err"; then
+    rm -f "$err"
+    return "$remote_conflict_status"
+  fi
+  cat "$err" >&2
+  rm -f "$err"
+  return 1
+}
+
+remote_rm_empty_dir() {
+  local path=$1
+  local err="${work_root}/rm-empty.$$.stderr"
+  if remote fs rm "$(remote_ref "$path")" >/dev/null 2>"$err"; then
+    rm -f "$err"
+    return 0
+  fi
+  if grep -qiE '(^|[^[:alnum:]])(not found|HTTP 404)([^[:alnum:]]|$)' "$err"; then
+    rm -f "$err"
+    return 0
+  fi
+  if grep -qiE '(not empty|HTTP 409)' "$err"; then
+    rm -f "$err"
+    return "$remote_conflict_status"
+  fi
+  cat "$err" >&2
+  rm -f "$err"
+  return 1
+}
+
+acquire_local_lock_mutex() {
+  mkdir -p "$lock_state_dir"
+  local spins=0
+  while ! mkdir "$lock_state_mutex" 2>/dev/null; do
+    spins=$((spins + 1))
+    if [ "$spins" -ge 600 ]; then
+      return 1
+    fi
+    sleep 0.05
+  done
+}
+
+release_local_lock_mutex() {
+  rmdir "$lock_state_mutex" 2>/dev/null || true
+}
+
+start_archive_lock_heartbeat() {
+  if [ "$lock_renew_seconds" -eq 0 ]; then
+    return 0
+  fi
+
+  rm -f "$lock_stop_file"
+  (
+    exec >/dev/null 2>&1
+    set +e
+    sleep_pid=""
+    trap '[ -n "$sleep_pid" ] && kill "$sleep_pid" 2>/dev/null || true; exit 0' TERM INT
+    while [ ! -f "$lock_stop_file" ]; do
+      sleep "$lock_renew_seconds" &
+      sleep_pid=$!
+      wait "$sleep_pid" 2>/dev/null
+      sleep_pid=""
+      [ -f "$lock_stop_file" ] && exit 0
+      acquire_local_lock_mutex || exit 0
+      if [ -f "$lock_stop_file" ] || [ ! -f "$lock_lease_file" ]; then
+        release_local_lock_mutex
+        exit 0
+      fi
+      cur_lease="$(cat "$lock_lease_file" 2>/dev/null || true)"
+      if [ -z "$cur_lease" ]; then
+        release_local_lock_mutex
+        exit 0
+      fi
+      new_exp=$(( $(date -u '+%s') + lock_ttl_seconds ))
+      new_lease="lease.${new_exp}.${lock_owner_id}"
+      if [ "$new_lease" != "$cur_lease" ]; then
+        if remote_mv "${archive_lock_path}/${cur_lease}" "${archive_lock_path}/${new_lease}" 2>/dev/null; then
+          printf '%s\n' "$new_lease" >"${lock_lease_file}.tmp"
+          mv "${lock_lease_file}.tmp" "$lock_lease_file"
+        else
+          # Lease lost or transient error; foreground fencing check will verify.
+          release_local_lock_mutex
+          exit 0
+        fi
+      fi
+      release_local_lock_mutex
+    done
+  ) &
+  lock_heartbeat_pid=$!
+}
+
+verify_exclusive_lease_entry() {
+  local expected_lease=$1
+  local ls_out="${lock_state_dir}/verify-ls.txt"
+  local entry name found_expected=0 other_count=0
+  if ! remote_ls "$archive_lock_path" "$ls_out"; then
+    return 1
+  fi
+  while IFS= read -r entry; do
+    entry="${entry%$'\r'}"
+    [ -n "$entry" ] || continue
+    name="${entry%/}"
+    if [ "$name" = "$expected_lease" ]; then
+      found_expected=1
+    else
+      other_count=$((other_count + 1))
+    fi
+  done <"$ls_out"
+  rm -f "$ls_out"
+  [ "$found_expected" -eq 1 ] && [ "$other_count" -eq 0 ]
+}
+
+acquire_archive_lock() {
+  local deadline now rc ls_out entry name rest exp owner
+  local active_found active_desc expired_entry mtime age new_exp lease_name
+  local logged_wait=0
+
+  mkdir -p "$lock_state_dir"
+  rm -f "$lock_stop_file" "$lock_lease_file"
+  deadline=$(( $(date -u '+%s') + lock_wait_seconds ))
+  ls_out="${lock_state_dir}/lock-ls.txt"
+
+  while true; do
+    remote_mkdir "$archive_root" >/dev/null 2>&1 || true
+
+    if remote_mkdir_exclusive "$archive_lock_path"; then
+      new_exp=$(( $(date -u '+%s') + lock_ttl_seconds ))
+      lease_name="lease.${new_exp}.${lock_owner_id}"
+      if remote_mkdir_exclusive "${archive_lock_path}/${lease_name}"; then
+        if verify_exclusive_lease_entry "$lease_name"; then
+          printf '%s\n' "$lease_name" >"$lock_lease_file"
+          lock_held=1
+          info "acquired archive lock ${archive_lock_path} (owner=${lock_owner_id}, ttl=${lock_ttl_seconds}s)"
+          start_archive_lock_heartbeat
+          return 0
+        fi
+        remote_rm_empty_dir "${archive_lock_path}/${lease_name}" >/dev/null 2>&1 || true
+      fi
+    else
+      rc=$?
+      if [ "$rc" -ne "$remote_conflict_status" ]; then
+        die "failed to acquire archive lock ${archive_lock_path}"
+      fi
+    fi
+
+    # Lock directory already exists; inspect its lease entries.
+    if remote_ls "$archive_lock_path" "$ls_out"; then
+      now="$(date -u '+%s')"
+      active_found=0
+      active_desc=""
+      expired_entry=""
+
+      while IFS= read -r entry; do
+        entry="${entry%$'\r'}"
+        [ -n "$entry" ] || continue
+        name="${entry%/}"
+        case "$name" in
+        lease.*)
+          rest="${name#lease.}"
+          exp="${rest%%.*}"
+          owner="${rest#*.}"
+          if [[ "$exp" =~ ^[0-9]+$ ]] && [ -n "$owner" ] && [ "$owner" != "$rest" ]; then
+            if [ "$now" -lt "$exp" ]; then
+              active_found=1
+              active_desc="owner=${owner} expires=${exp}"
+            elif [ -z "$expired_entry" ]; then
+              expired_entry="$name"
+            fi
+          fi
+          ;;
+        esac
+      done <"$ls_out"
+      rm -f "$ls_out"
+
+      if [ "$active_found" -eq 0 ] && [ -n "$expired_entry" ]; then
+        new_exp=$(( $(date -u '+%s') + lock_ttl_seconds ))
+        lease_name="lease.${new_exp}.${lock_owner_id}"
+        info "reclaiming expired archive lock entry ${expired_entry}"
+        if remote_mv "${archive_lock_path}/${expired_entry}" "${archive_lock_path}/${lease_name}"; then
+          if verify_exclusive_lease_entry "$lease_name"; then
+            printf '%s\n' "$lease_name" >"$lock_lease_file"
+            lock_held=1
+            info "acquired archive lock ${archive_lock_path} via expired lease reclaim (owner=${lock_owner_id}, ttl=${lock_ttl_seconds}s)"
+            start_archive_lock_heartbeat
+            return 0
+          fi
+          remote_rm_empty_dir "${archive_lock_path}/${lease_name}" >/dev/null 2>&1 || true
+        fi
+        continue
+      fi
+
+      if [ "$active_found" -eq 0 ] && [ -z "$expired_entry" ]; then
+        # Empty lock directory: either an in-flight acquire or an orphaned dir from a crash.
+        if mtime="$(remote_stat_mtime "$archive_lock_path")"; then
+          age=$((now - mtime))
+          if [ "$age" -ge "$lock_ttl_seconds" ]; then
+            info "removing orphaned empty archive lock ${archive_lock_path} (age=${age}s)"
+            remote_rm_empty_dir "$archive_lock_path" >/dev/null 2>&1 || true
+            continue
+          fi
+        fi
+        active_desc="initializing"
+      fi
+    else
+      rc=$?
+      if [ "$rc" -eq "$remote_missing_status" ]; then
+        continue
+      fi
+      die "failed to inspect archive lock ${archive_lock_path}"
+    fi
+
+    now="$(date -u '+%s')"
+    if [ "$now" -ge "$deadline" ]; then
+      die "archive lock ${archive_lock_path} is held by another active publisher (${active_desc:-unknown}); timed out after ${lock_wait_seconds}s"
+    fi
+
+    if [ "$logged_wait" -eq 0 ]; then
+      info "waiting for archive lock ${archive_lock_path} (${active_desc:-active})"
+      logged_wait=1
+    fi
+    sleep "$lock_poll_seconds"
+  done
+}
+
+check_archive_lock_held() {
+  local cur_lease rest exp now stat_out stat_err
+
+  if [ "$lock_held" -ne 1 ]; then
+    return 1
+  fi
+
+  acquire_local_lock_mutex || return 1
+  cur_lease="$(cat "$lock_lease_file" 2>/dev/null || true)"
+  if [ -z "$cur_lease" ]; then
+    release_local_lock_mutex
+    lock_held=0
+    return 1
+  fi
+
+  rest="${cur_lease#lease.}"
+  exp="${rest%%.*}"
+  now="$(date -u '+%s')"
+  if ! [[ "$exp" =~ ^[0-9]+$ ]] || [ "$now" -ge "$exp" ]; then
+    release_local_lock_mutex
+    lock_held=0
+    return 1
+  fi
+
+  stat_out="${lock_state_dir}/fence-stat.out"
+  stat_err="${stat_out}.stderr"
+  if remote fs stat "$(remote_ref "${archive_lock_path}/${cur_lease}")" >"$stat_out" 2>"$stat_err"; then
+    rm -f "$stat_out" "$stat_err"
+    release_local_lock_mutex
+    return 0
+  fi
+
+  rm -f "$stat_out" "$stat_err"
+  release_local_lock_mutex
+  lock_held=0
+  return 1
+}
+
+assert_archive_lock_held() {
+  if ! check_archive_lock_held; then
+    die "lost archive lock ownership on ${archive_lock_path}; aborting to prevent concurrent archive corruption"
+  fi
+}
+
+release_archive_lock() {
+  local cur_lease ls_out entry name
+
+  if [ -n "${lock_heartbeat_pid:-}" ]; then
+    touch "$lock_stop_file" 2>/dev/null || true
+    kill "$lock_heartbeat_pid" 2>/dev/null || true
+    wait "$lock_heartbeat_pid" 2>/dev/null || true
+    lock_heartbeat_pid=""
+  fi
+  rmdir "$lock_state_mutex" 2>/dev/null || true
+
+  if [ "$lock_held" -eq 1 ]; then
+    cur_lease="$(cat "$lock_lease_file" 2>/dev/null || true)"
+    if [ -n "$cur_lease" ]; then
+      remote_rm_empty_dir "${archive_lock_path}/${cur_lease}" >/dev/null 2>&1 || true
+    fi
+    # Also remove any lease entry owned by this exact owner_id in case heartbeat rotated mid-exit.
+    ls_out="${lock_state_dir}/release-ls.txt"
+    if remote_ls "$archive_lock_path" "$ls_out" >/dev/null 2>&1; then
+      while IFS= read -r entry; do
+        entry="${entry%$'\r'}"
+        [ -n "$entry" ] || continue
+        name="${entry%/}"
+        case "$name" in
+        lease.*."${lock_owner_id}")
+          remote_rm_empty_dir "${archive_lock_path}/${name}" >/dev/null 2>&1 || true
+          ;;
+        esac
+      done <"$ls_out"
+      rm -f "$ls_out"
+    fi
+    remote_rm_empty_dir "$archive_lock_path" >/dev/null 2>&1 || true
+    lock_held=0
+  fi
+
+  rm -rf "$lock_state_dir" 2>/dev/null || true
+}
+
 remote_upload() {
   local local_path=$1
   local remote_path=$2
@@ -194,6 +561,7 @@ remote_upload() {
 
   info "upload ${remote_path}"
   while true; do
+    assert_archive_lock_held
     if remote fs cp "$local_path" "$(remote_ref "$remote_path")" 2>"$err"; then
       rm -f "$err"
       return 0
@@ -483,6 +851,8 @@ publish_commit() {
     return
   fi
 
+  assert_archive_lock_held
+
   remote_mkdir "$archive_root" || true
   remote_mkdir "${archive_root}/commits" || true
   remote_mkdir "$commit_path" || true
@@ -700,9 +1070,22 @@ is_sha_in_file() {
   [ -s "$file" ] && grep -Fxq "$needle" "$file"
 }
 
+prune_lock_fence() {
+  local lock_fatal=$1
+  if check_archive_lock_held; then
+    return 0
+  fi
+  if [ "$lock_fatal" -eq 1 ]; then
+    die "lost archive lock ownership on ${archive_lock_path}; aborting prune"
+  fi
+  warn "lost archive lock ownership on ${archive_lock_path}; aborting post-publish prune"
+  return 1
+}
+
 prune_remote_commits() {
   local keep_budget=$1
-  shift
+  local lock_fatal=$2
+  shift 2
   local protected_shas=("$@")
   local ls_out="${work_root}/remote-commits-ls.txt"
   local remote_shas_file="${work_root}/remote-commits-shas.txt"
@@ -724,6 +1107,8 @@ prune_remote_commits() {
     info "retention pruning disabled (DRIVE9_ARCHIVE_RETAIN_COMMITS=0)"
     return 0
   fi
+
+  prune_lock_fence "$lock_fatal" || return 0
 
   if remote_ls "${archive_root}/commits" "$ls_out"; then
     :
@@ -855,6 +1240,7 @@ prune_remote_commits() {
   if [ "$incomplete_target_count" -gt 0 ]; then
     while IFS= read -r sha; do
       [ -n "$sha" ] || continue
+      prune_lock_fence "$lock_fatal" || return 0
       info "remove ${archive_root}/commits/${sha} (incomplete target)"
       if remote_rm_rf "${archive_root}/commits/${sha}"; then
         pruned_any=1
@@ -869,6 +1255,7 @@ prune_remote_commits() {
   if [ "$incomplete_count" -gt 0 ]; then
     while IFS= read -r sha; do
       [ -n "$sha" ] || continue
+      prune_lock_fence "$lock_fatal" || return 0
       info "remove ${archive_root}/commits/${sha} (incomplete)"
       if remote_rm_rf "${archive_root}/commits/${sha}"; then
         pruned_any=1
@@ -884,6 +1271,7 @@ prune_remote_commits() {
     # Delete oldest expired commits first so an interrupted prune preserves the newest history.
     while IFS= read -r sha; do
       [ -n "$sha" ] || continue
+      prune_lock_fence "$lock_fatal" || return 0
       info "remove ${archive_root}/commits/${sha} (expired)"
       if remote_rm_rf "${archive_root}/commits/${sha}"; then
         pruned_any=1
@@ -916,6 +1304,13 @@ resolve_commits() {
   esac
 }
 
+cleanup_on_exit() {
+  local exit_code=$?
+  release_archive_lock || true
+  cleanup_active_worktree || true
+  exit "$exit_code"
+}
+
 main() {
   local raw_commits=()
   local commits=()
@@ -938,18 +1333,23 @@ main() {
     fi
   done
 
-  prune_remote_commits "$retain_commits" "${commits[@]}" || warn "pre-publish retention prune failed; continuing"
+  acquire_archive_lock
+
+  prune_remote_commits "$retain_commits" 1 "${commits[@]}"
 
   for sha in "${commits[@]}"; do
+    assert_archive_lock_held
     publish_commit "$sha"
     publish_latest_index "$sha"
   done
 
   if [ "$deferred_latest_prune" -eq 1 ]; then
-    prune_remote_commits "$retain_commits" "${commits[@]}" || warn "post-publish retention prune failed; publish already succeeded"
+    prune_remote_commits "$retain_commits" 0 "${commits[@]}"
   fi
 }
 
-trap cleanup_active_worktree EXIT
+trap cleanup_on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 main "$@"
