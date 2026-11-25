@@ -4,6 +4,7 @@ import (
 	"context"
 	"syscall"
 	"testing"
+	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/drive9/pkg/fs"
@@ -118,16 +119,18 @@ func TestDeferredUnlinkCrossingLeaseLossKeepsRemote(t *testing.T) {
 
 type preparedLeaseUnlink struct {
 	fs.HandlerFunc
-	prepared chan struct{}
-	finished chan bool
-	marked   bool
+	prepared   chan struct{}
+	finished   chan bool
+	marked     bool
+	retargeted bool
 }
 
 func (p *preparedLeaseUnlink) PreparePathUnlink(string, bool) func(bool) error {
 	close(p.prepared)
 	return func(commit bool) error { p.finished <- commit; return nil }
 }
-func (p *preparedLeaseUnlink) MarkPathUnlinked(string) { p.marked = true }
+func (p *preparedLeaseUnlink) RetargetPath(string, string) { p.retargeted = true }
+func (p *preparedLeaseUnlink) MarkPathUnlinked(string)     { p.marked = true }
 
 func TestLeaseLossBetweenUnlinkPreparationAndPublication(t *testing.T) {
 	core := newMemCore()
@@ -137,6 +140,9 @@ func TestLeaseLossBetweenUnlinkPreparationAndPublication(t *testing.T) {
 	var out gofuse.CreateOut
 	if st := f.Create(nil, exclusiveCreateInput(), "held", &out); st != gofuse.OK {
 		t.Fatal(st)
+	}
+	if !f.inodes.AddAlias(out.NodeId, "/survivor", "", 2, false, 0, time.Now()) {
+		t.Fatal("adding survivor alias failed")
 	}
 	b := &layerMountBinding{}
 	f.layerFence = b
@@ -151,11 +157,14 @@ func TestLeaseLossBetweenUnlinkPreparationAndPublication(t *testing.T) {
 	if st := <-result; st != gofuse.EIO {
 		t.Fatalf("unlink: %v", st)
 	}
-	if <-p.finished || p.marked || !f.openIdx.HasOpenPath("/held") || f.isDeferredUnlink("/held") {
+	if <-p.finished || p.marked || p.retargeted || !f.openIdx.HasOpenPath("/held") || f.isDeferredUnlink("/held") {
 		t.Fatal("rejected unlink left committed plane or handle flags")
 	}
 	if id, ok := f.inodes.GetInode("/held"); !ok || id != out.NodeId {
 		t.Fatal("name lost after fence")
+	}
+	if id, ok := f.inodes.GetInode("/survivor"); !ok || id != out.NodeId {
+		t.Fatal("survivor lost after fence")
 	}
 	releaseUnlinkFixture(f, out)
 	if _, ok := core.get("/held"); !ok {

@@ -795,6 +795,48 @@ func TestFencedReopenRetainsAcceptedNewFileAfterWriterRelease(t *testing.T) {
 	}
 }
 
+func TestFencedReaderOfReopenedPendingCreate(t *testing.T) {
+	ctx := context.Background()
+	b := testbackend.NewBackend()
+	chain, wb, cached := newWriteCacheStack(t, PolicyWriteBack, b)
+	const path = "/pending"
+	// The prior close staged a create. The terminal can resolve the name
+	// for the writable open, then loses remote visibility before the read.
+	if err := cached.Put(path, []byte("first"), 5, staging.PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	b.Seed(path, []byte("other"))
+	writer, err := chain.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: path, Flags: syscall.O_RDWR})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Handle.Write(ctx, 0, []byte("saved")); err != nil {
+		t.Fatal(err)
+	}
+	b.Remove(path)
+	wb.AbandonLayerForRollback()
+	heads := b.Requests()["HEAD /v1/fs/pending"]
+	reader, err := chain.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: path, Flags: syscall.O_RDONLY})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Handle.Release(ctx)
+	if err := writer.Handle.Release(ctx); !errors.Is(err, errLayerRolledBack) {
+		t.Fatalf("writer close: %v", err)
+	}
+	buf := make([]byte, 5)
+	n, err := reader.Handle.Read(ctx, 0, buf)
+	if err != nil || string(buf[:n]) != "saved" || reader.Attr.Size != 5 {
+		t.Fatalf("reader returned %q, size %d, error %v", buf[:n], reader.Attr.Size, err)
+	}
+	if b.Requests()["HEAD /v1/fs/pending"] != heads {
+		t.Fatal("read-only reopen probed the remote for a locally staged create")
+	}
+	if _, ok := b.Node(path); ok {
+		t.Fatal("fenced reopen published the staged create")
+	}
+}
+
 func TestRejectedLazyCreateDoesNotPublish(t *testing.T) {
 	ctx := context.Background()
 	b := testbackend.NewBackend()

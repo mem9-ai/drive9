@@ -6213,7 +6213,9 @@ func (h *bufferingHandle) openFencedReader(ctx context.Context, op *fs.Op, next 
 	h.mu.Unlock()
 
 	res := fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: mode}}
-	if !newFile {
+	if attr, ok := h.w.pendingAttr(op.Path); ok {
+		res.Attr = &attr
+	} else if !newFile {
 		var err error
 		res, err = next(ctx, op)
 		if err != nil {
