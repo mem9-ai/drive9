@@ -122,6 +122,11 @@ func TestParseFenceHeaderAndViewRoute(t *testing.T) {
 	require.Equal(t, "/v1/fs/dir/grep", inner.URL.Path)
 	require.Equal(t, "stat=1", inner.URL.RawQuery)
 
+	for _, incomplete := range []*http.Request{nil, {}} {
+		_, _, err := ParseViewRoute(incomplete)
+		require.ErrorIs(t, err, ErrInvalidViewRoute)
+	}
+
 	for _, badTarget := range []string{
 		"http://example.com/v1/views/" + validID + "/v1/views/" + validID + "/v1/fs/a",
 		"http://example.com/v1/views/" + validID + "/v1/views",
@@ -1018,4 +1023,27 @@ func TestViewDownloadHTTPS307ScrubsMTLSClientCertAndProxyAuth(t *testing.T) {
 	require.ErrorIs(t, proxyErr, ErrInvalidViewRedirect)
 	require.NotContains(t, proxyErr.Error(), "placeholder")
 	require.NotContains(t, proxyErr.Error(), "X-Amz-Signature")
+}
+
+func TestReservedTagPrefixPreservesKeyAndValueCase(t *testing.T) {
+	key, value, hasValue, isTag, err := ParseTagSelector("TaG:Team=DB")
+	require.NoError(t, err)
+	require.True(t, isTag)
+	require.True(t, hasValue)
+	require.Equal(t, "Team", key)
+	require.Equal(t, "DB", value)
+	_, _, _, _, err = ParseTagSelector("TAG:")
+	require.ErrorIs(t, err, ErrInvalidLayerRef)
+}
+
+func TestLayerNamesAndRefsUsePrintableUTF8(t *testing.T) {
+	for _, s := range []string{"a\u0091b", "a\u202eb", string([]byte{0xff})} {
+		_, err := NormalizeLayerName(s)
+		require.ErrorIs(t, err, ErrInvalidLayerName)
+		_, err = NormalizeLayerRef(s)
+		require.ErrorIs(t, err, ErrInvalidLayerRef)
+	}
+	name, err := NormalizeLayerName("研究")
+	require.NoError(t, err)
+	require.Equal(t, "研究", name)
 }
