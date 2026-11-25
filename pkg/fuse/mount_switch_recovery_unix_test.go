@@ -389,3 +389,30 @@ func TestPrepareMountViewReportsBusyLeaseToSupervisor(t *testing.T) {
 	assertMountExit(t, err, ExitLayerLeaseBusy, ExitReasonLayerLeaseBusy)
 	require.ErrorIs(t, err, client.ErrConflict)
 }
+
+func TestMountViewSwitchReplaysRevokedRecoveryAfterJournalReopen(t *testing.T) {
+	sw, fb, mp, _ := viewSwitchFixture(t)
+	fb.mu.Lock()
+	fb.onBind = func(id string) {
+		fb.layers[id].Info.Fence += 2
+		fb.layers[id].OwnerMountID = ""
+	}
+	fb.mu.Unlock()
+	ctx := t.Context()
+	req := mountcontrol.SwitchRequest{MountID: "mount-1", OperationID: "initial", ExpectedGeneration: 1, Layer: "L1"}
+	require.Equal(t, viewprotocol.CodeSwitchTargetRevoked, sw.apply(ctx, req).Code)
+	req = mountcontrol.SwitchRequest{MountID: "mount-1", OperationID: "recovery", ExpectedGeneration: 2, Layer: "L2", Recover: true}
+	revoked := sw.apply(ctx, req)
+	require.Equal(t, viewprotocol.CodeSwitchTargetRevoked, revoked.Code)
+	require.NotNil(t, revoked.Receipt)
+	require.NoError(t, sw.journal.Close())
+	journal, err := mountstate.OpenExistingSwitchJournal(filepath.Join(filepath.Dir(mp), "switch.journal"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = journal.Close() })
+	sw.journal = journal
+	replay := sw.apply(ctx, req)
+	require.Equal(t, revoked.Code, replay.Code)
+	require.Equal(t, revoked.Receipt, replay.Receipt)
+	req.Recover = false
+	require.Equal(t, viewprotocol.CodeConflict, sw.apply(ctx, req).Code)
+}

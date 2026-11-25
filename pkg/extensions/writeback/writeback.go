@@ -4553,9 +4553,12 @@ func (h *bufferingHandle) stagedLandingFence(path string) (supersedesGen, failur
 
 // waitQueuedCommit follows the open handle through renames. An unlinked
 // handle no longer owns the queue entry or terminal error at its old name.
-func (h *bufferingHandle) waitQueuedCommit() error {
+func (h *bufferingHandle) waitQueuedCommit(ctx context.Context) error {
 	deadline := time.Now().Add(uploadTimeout)
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		h.mu.Lock()
 		path, anonymous := h.path, h.unlinked
 		h.mu.Unlock()
@@ -4584,7 +4587,11 @@ func (h *bufferingHandle) waitQueuedCommit() error {
 			return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 		}
 		if same {
-			time.Sleep(50 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(50 * time.Millisecond):
+			}
 		}
 	}
 }
@@ -4650,7 +4657,7 @@ func (h *bufferingHandle) Flush(ctx context.Context) (err error) {
 			if err := h.stageAndEnqueueOpt(ctx, true, false, false); err != nil {
 				return err
 			}
-			return h.waitQueuedCommit()
+			return h.waitQueuedCommit(callerCtx)
 		}
 		// close-sync owes remote durability at close(2) itself (its
 		// defining contract): the .dat snapshot + a synchronous landing.
@@ -4672,7 +4679,7 @@ func (h *bufferingHandle) Flush(ctx context.Context) (err error) {
 					if err := h.stageAndEnqueueOpt(ctx, true, false, false); err != nil {
 						return err
 					}
-					return h.waitQueuedCommit()
+					return h.waitQueuedCommit(callerCtx)
 				}
 				return h.commitLocked(ctx)
 			}
@@ -4843,6 +4850,7 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 		}
 		h.mu.Lock()
 		h.closed = true
+		h.wakeStageNameWaitersLocked()
 		h.mu.Unlock()
 		flushUnlocked = true
 		h.flushMu.Unlock()
@@ -5088,6 +5096,7 @@ func (h *bufferingHandle) releaseMigrated(ctx context.Context, e fs.Handle) erro
 	defer func() {
 		h.mu.Lock()
 		h.closed = true
+		h.wakeStageNameWaitersLocked()
 		if h.migratedReleaseDone != nil {
 			close(h.migratedReleaseDone)
 			h.migratedReleaseDone = nil
@@ -8168,7 +8177,7 @@ func (h *bufferingHandle) commitLocked(ctx context.Context) error {
 			// The synchronous policies promise remote durability here, so a
 			// terminally failed upload must be reported rather than read as
 			// idle.
-			return h.waitQueuedCommit()
+			return h.waitQueuedCommit(ctx)
 		}
 		return nil
 	}

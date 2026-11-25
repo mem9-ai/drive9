@@ -189,12 +189,14 @@ func TestUnlinkWhileAppendRefreshReadsRemote(t *testing.T) {
 // An upload holds its pathname lock until its remote PUT finishes. A stage
 // already waiting on that lock must wake when its handle loses the name.
 func TestStageLockWakesOnNamespaceChange(t *testing.T) {
-	for _, change := range []string{"unlink", "rename"} {
+	for _, change := range []string{"unlink", "rename", "close", "close-migrated"} {
 		t.Run(change, func(t *testing.T) {
 			const oldPath = "/old"
-			chain, wb, _ := newSparseGrowthSuccessStack(t, nil)
-			fd := open(t, chain, oldPath)
-			require.NoError(t, fd.Write(t.Context(), 0, []byte("old")))
+			chain, wb, backend := newSparseGrowthSuccessStack(t, nil)
+			backend.Seed(oldPath, []byte("old"))
+			resp, err := chain.Dispatch(t.Context(), &fs.Op{Kind: fs.OpCreate, Path: oldPath, Flags: uint32(syscall.O_RDWR)})
+			require.NoError(t, err)
+			fd := resp.Handle
 			h := writebackHandleOf(fd)
 			unlockOld := wb.pathLocks.lock(oldPath)
 			defer unlockOld()
@@ -213,10 +215,18 @@ func TestStageLockWakesOnNamespaceChange(t *testing.T) {
 			}, 3*time.Second, time.Millisecond)
 
 			want := ""
-			if change == "rename" {
+			switch change {
+			case "close", "close-migrated":
+				if change == "close-migrated" {
+					h.mu.Lock()
+					h.extent = &noopExtentHandle{}
+					h.mu.Unlock()
+				}
+				require.NoError(t, fd.Release(t.Context()))
+			case "rename":
 				want = "/new"
 				wb.retarget(oldPath, want)
-			} else {
+			case "unlink":
 				wb.markUnlinked(oldPath, false)
 			}
 			select {
@@ -246,7 +256,7 @@ func TestQueuedFailureBelongsToCurrentName(t *testing.T) {
 		}
 	})
 	done := make(chan error, 1)
-	go func() { done <- writebackHandleOf(old).waitQueuedCommit() }()
+	go func() { done <- writebackHandleOf(old).waitQueuedCommit(t.Context()) }()
 	select {
 	case <-checking:
 	case <-time.After(3 * time.Second):
@@ -262,5 +272,38 @@ func TestQueuedFailureBelongsToCurrentName(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("old handle did not finish its queue check")
 	}
-	require.EqualValues(t, syscall.EIO, fs.StatusOf(writebackHandleOf(replacement).waitQueuedCommit()))
+	require.EqualValues(t, syscall.EIO, fs.StatusOf(writebackHandleOf(replacement).waitQueuedCommit(t.Context())))
+}
+
+func TestQueuedCommitWaitCancellationLeavesCommitInFlight(t *testing.T) {
+	chain, wb, _ := newSparseGrowthSuccessStack(t, nil)
+	const path = "/pending"
+	h := writebackHandleOf(open(t, chain, path))
+	entry := &CommitEntry{Path: path}
+	require.True(t, wb.queue.tryBeginInFlight(entry))
+	defer wb.queue.endInFlight(entry)
+	checking := make(chan struct{})
+	signal := sync.OnceFunc(func() { close(checking) })
+	installTestGateHook(t, wb, func(gate string) {
+		if gate == "flush:queueOutcome" {
+			signal()
+		}
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- h.waitQueuedCommit(ctx) }()
+	select {
+	case <-checking:
+	case <-time.After(3 * time.Second):
+		t.Fatal("queue wait did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(3 * time.Second):
+		t.Fatal("queue wait did not observe cancellation")
+	}
+	require.False(t, wb.queue.WaitPathTimeout(path, 0))
 }

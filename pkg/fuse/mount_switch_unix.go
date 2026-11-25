@@ -274,7 +274,7 @@ func (s *mountViewSwitch) apply(ctx context.Context, req mountcontrol.SwitchRequ
 	isMain, layerRef, _ := req.NormalizedTarget()
 
 	if prior, ok := s.journal.Operation(req.OperationID); ok {
-		if prior.FromGeneration != req.ExpectedGeneration || (req.Recover && prior.State == mountstate.SwitchTargetRevoked) {
+		if prior.FromGeneration != req.ExpectedGeneration || req.Recover != prior.Recovery {
 			return switchErrResp(req, viewprotocol.CodeConflict, "CONFLICT", mountstate.ErrSwitchConflict)
 		}
 		matched, matchErr := s.targetMatchesReplay(ctx, isMain, layerRef, prior)

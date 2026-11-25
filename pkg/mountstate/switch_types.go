@@ -75,6 +75,8 @@ func (u PendingUnbind) Validate() error {
 
 // SwitchReceipt describes a durable binding decision in SwitchJournal.
 type SwitchReceipt struct {
+	// Recovery is reconstructed from the preceding abort_pending journal record.
+	Recovery bool `json:"-"`
 	// RequestedLayerRef records the original selector locally for retries after a layer is deleted.
 	RequestedLayerRef string                     `json:"-"`
 	OperationID       string                     `json:"operation_id"`

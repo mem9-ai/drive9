@@ -167,6 +167,7 @@ func (j *SwitchJournal) applyRecordLocked(rec switchJournalRecord, first bool) e
 			return fmt.Errorf("decide while pending_unbinds non-empty")
 		}
 		rcpt := SwitchReceipt{
+			Recovery:          j.abortedPending,
 			RequestedLayerRef: rec.RequestedLayerRef,
 			OperationID:       rec.OperationID,
 			FromGeneration:    rec.FromGeneration,

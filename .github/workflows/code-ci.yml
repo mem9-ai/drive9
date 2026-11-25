@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - 'perf/**'
+      - dev1/v35-pr1-client-views
   workflow_dispatch:
 
 jobs:
