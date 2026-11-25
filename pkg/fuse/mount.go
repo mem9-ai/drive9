@@ -37,9 +37,9 @@ type ProfilingOptions = perf.ProfilingOptions
 
 // MountConfig carries the mount inputs the fuse stack accepts.
 type MountConfig struct {
-	Server     string
-	APIKey     string
-	Token      string
+	Server              string
+	APIKey              string
+	Token               string
 	MountPoint          string
 	RemoteRoot          string
 	RemoteRootDefaulted bool

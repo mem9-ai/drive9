@@ -480,8 +480,11 @@ func buildViewRuntime(
 	if sseExt != nil {
 		sseExt.Attach(f.Ctx.Inodes, f.Ctx.Notify)
 	}
-	if layerLease != nil && wb != nil {
-		layerLease.OnSelfFence(wb.AbandonLayerForRollback)
+	if layerLease != nil && layerLease.LayerID != "" {
+		f.layerFence = &layerLease.fenced
+		if wb != nil {
+			layerLease.OnSelfFence(wb.AbandonLayerForRollback)
+		}
 	}
 	return &mountRuntime{
 		binding:    binding,

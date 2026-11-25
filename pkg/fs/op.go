@@ -379,6 +379,21 @@ func (op *Op) KernelCreate() bool {
 	return ok
 }
 
+// MutatesFile reports whether an operation requests changes to file data,
+// metadata or namespace, including writable opens handled from a local cache.
+func (op *Op) MutatesFile() bool {
+	switch op.Kind {
+	case OpCreate:
+		return op.KernelCreate() || op.Flags&uint32(syscall.O_CREAT|syscall.O_TRUNC|syscall.O_WRONLY|syscall.O_RDWR) != 0
+	case OpWrite, OpSetAttr, OpFallocate, OpCopyFileRange,
+		OpMkdir, OpMknod, OpUnlink, OpRmdir, OpRename, OpLink, OpSymlink,
+		OpSetXattr, OpRemoveXattr:
+		return true
+	default:
+		return false
+	}
+}
+
 // KernelOpenExisting reports whether an OpCreate originates from a kernel
 // OPEN: the kernel resolved an existing dentry for it (an O_CREAT|O_TRUNC
 // open of a live file arrives this way). False for synthesized ops.
