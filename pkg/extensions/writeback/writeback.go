@@ -6200,7 +6200,8 @@ func (h *bufferingHandle) openFencedReader(ctx context.Context, op *fs.Op, next 
 	h.flushMu.Lock()
 	defer h.flushMu.Unlock()
 	h.mu.Lock()
-	if h.closed || h.releasing || h.unlinked || h.path != op.Path || !(h.dirty || h.isNew && !h.landed || h.trunc && !h.landed) {
+	hasLocalImage := h.dirty || (!h.landed && (h.isNew || h.trunc))
+	if h.closed || h.releasing || h.unlinked || h.path != op.Path || !hasLocalImage {
 		h.mu.Unlock()
 		return fs.Result{}, false, nil
 	}
