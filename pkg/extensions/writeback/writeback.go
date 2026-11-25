@@ -1159,18 +1159,27 @@ func (w *Writeback) Stop(ctx context.Context) error {
 	return nil
 }
 
+// WaitPathUnlinkUploads drains previously accepted transfers before the
+// facade excludes opens. Transfers submitted by a racing close are checked
+// again after the facade has acquired the name.
+func (w *Writeback) WaitPathUnlinkUploads(p string) { w.waitUploaderPath(p) }
+
 // PreparePathUnlink captures live readers and waits for active transfers
 // before the facade decides whether the name may be removed. The caller
 // must invoke finish exactly once, including when lease loss rejects unlink.
 func (w *Writeback) PreparePathUnlink(p string, hasSurvivor bool) func(bool) error {
 	var handles []*bufferingHandle
-	if !hasSurvivor {
-		handles, _ = w.snapshotUnlinkHandles(p, false, false)
-	}
+	var snapshotErr error
 	w.waitUploaderPath(p)
+	if !hasSurvivor {
+		handles, snapshotErr = w.snapshotUnlinkHandles(p, false, false)
+	}
 	return func(commit bool) error {
 		if !commit || w.rolledBack.Load() {
 			return errLayerRolledBack
+		}
+		if snapshotErr != nil {
+			return snapshotErr
 		}
 		var marked []*bufferingHandle
 		for _, h := range handles {
