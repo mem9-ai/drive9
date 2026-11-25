@@ -1408,7 +1408,7 @@ func mountWithConfig(cfg MountConfig) error {
 		sseExt.Attach(f.Ctx.Inodes, f.Ctx.Notify)
 	}
 	if layerBinding.LayerID != "" {
-		f.layerFence = &layerBinding.fenced
+		f.layerFence = layerBinding
 		if wb != nil {
 			layerBinding.OnSelfFence(wb.AbandonLayerForRollback)
 		}

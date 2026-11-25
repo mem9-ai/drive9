@@ -385,10 +385,10 @@ func (g *unlinkMarkGate) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Re
 	return next(ctx, op)
 }
 
-func (g *unlinkMarkGate) MarkPathUnlinked(string, func() bool) error {
+func (g *unlinkMarkGate) PreparePathUnlink(string, bool) func(bool) error {
 	close(g.entered)
 	<-g.proceed
-	return nil
+	return func(bool) error { return nil }
 }
 
 func TestDeferredUnlinkLastCloseBeforeRegistration(t *testing.T) {

@@ -35,7 +35,7 @@ func TestLeaseFenceAppliesToRawHandle(t *testing.T) {
 	core.paths["/f"] = &memEntry{data: []byte("held"), mode: 0644}
 	f := newTestFS(t, core)
 	binding := &layerMountBinding{}
-	f.layerFence = &binding.fenced
+	f.layerFence = binding
 	id := lookupForTest(t, f, "/f").NodeId
 	header := gofuse.InHeader{NodeId: id}
 	raw := &leaseTestHandle{}
@@ -77,7 +77,7 @@ func TestFencedMetadataAndOpenUnlink(t *testing.T) {
 		t.Fatal(st)
 	}
 	binding := &layerMountBinding{}
-	f.layerFence = &binding.fenced
+	f.layerFence = binding
 	binding.triggerSelfFence("lease expired")
 	old, _ := f.inodes.GetEntry(out.NodeId)
 	input := &gofuse.SetAttrIn{}
@@ -108,10 +108,57 @@ func TestDeferredUnlinkCrossingLeaseLossKeepsRemote(t *testing.T) {
 		t.Fatal(st)
 	}
 	binding := &layerMountBinding{}
-	f.layerFence = &binding.fenced
+	f.layerFence = binding
 	binding.triggerSelfFence("lease expired before last close")
 	releaseUnlinkFixture(f, out)
 	if _, ok := core.get("/held"); !ok || !f.isDeferredUnlink("/held") {
 		t.Fatal("deferred unlink lost remote object or its pending cleanup")
+	}
+}
+
+type preparedLeaseUnlink struct {
+	fs.HandlerFunc
+	prepared chan struct{}
+	finished chan bool
+	marked   bool
+}
+
+func (p *preparedLeaseUnlink) PreparePathUnlink(string, bool) func(bool) error {
+	close(p.prepared)
+	return func(commit bool) error { p.finished <- commit; return nil }
+}
+func (p *preparedLeaseUnlink) MarkPathUnlinked(string) { p.marked = true }
+
+func TestLeaseLossBetweenUnlinkPreparationAndPublication(t *testing.T) {
+	core := newMemCore()
+	p := &preparedLeaseUnlink{prepared: make(chan struct{}), finished: make(chan bool, 1)}
+	p.HandlerFunc = func(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) { return next(ctx, op) }
+	f := newTestFS(t, core, p)
+	var out gofuse.CreateOut
+	if st := f.Create(nil, exclusiveCreateInput(), "held", &out); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	b := &layerMountBinding{}
+	f.layerFence = b
+	// Hold the same mutex used by the renewer while the facade prepares.
+	// Once preparation returns, the lease loss wins the publication race.
+	b.fenceMu.Lock()
+	result := make(chan gofuse.Status, 1)
+	go func() { result <- f.Unlink(nil, rootHeader(), "held") }()
+	<-p.prepared
+	b.fenced.Store(true)
+	b.fenceMu.Unlock()
+	if st := <-result; st != gofuse.EIO {
+		t.Fatalf("unlink: %v", st)
+	}
+	if <-p.finished || p.marked || !f.openIdx.HasOpenPath("/held") || f.isDeferredUnlink("/held") {
+		t.Fatal("rejected unlink left committed plane or handle flags")
+	}
+	if id, ok := f.inodes.GetInode("/held"); !ok || id != out.NodeId {
+		t.Fatal("name lost after fence")
+	}
+	releaseUnlinkFixture(f, out)
+	if _, ok := core.get("/held"); !ok {
+		t.Fatal("rejected unlink removed remote file")
 	}
 }

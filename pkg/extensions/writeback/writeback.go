@@ -1159,79 +1159,69 @@ func (w *Writeback) Stop(ctx context.Context) error {
 	return nil
 }
 
-// MarkPathUnlinked marks every live handle of p anonymous (survivor
-// bookkeeping) without touching the remote: the facade defers the actual
-// deletion to the last close of an open file. It reports an error when the
-// path's staged state provably stays replayable (WAL marker failed AND the
-// fallback cleanup could not remove the recovery source): the facade must
-// then fail the unlink instead of acknowledging a deletion that a restart
-// would undo. The anonymous marking is rolled back on that path.
-func (w *Writeback) MarkPathUnlinked(p string, leaseLost func() bool) error {
-	fenced := func() bool { return w.rolledBack.Load() || (leaseLost != nil && leaseLost()) }
-	if fenced() {
-		return errLayerRolledBack
+// PreparePathUnlink captures live readers and waits for active transfers
+// before the facade decides whether the name may be removed. The caller
+// must invoke finish exactly once, including when lease loss rejects unlink.
+func (w *Writeback) PreparePathUnlink(p string, hasSurvivor bool) func(bool) error {
+	var handles []*bufferingHandle
+	if !hasSurvivor {
+		handles, _ = w.snapshotUnlinkHandles(p, false, false)
 	}
-	marked, _ := w.markUnlinkedSnapshot(p, false)
 	w.waitUploaderPath(p)
-	if fenced() {
-		restoreMarked(marked)
-		return errLayerRolledBack
+	return func(commit bool) error {
+		if !commit || w.rolledBack.Load() {
+			return errLayerRolledBack
+		}
+		var marked []*bufferingHandle
+		for _, h := range handles {
+			h.mu.Lock()
+			if !h.unlinked && !h.closed && h.path == p {
+				h.unlinked = true
+				marked = append(marked, h)
+			}
+			h.mu.Unlock()
+		}
+		err := w.commitOpenUnlink(p, marked)
+		if err != nil {
+			w.submitOrphanedCacheForRollback(p, false)
+		}
+		return err
 	}
+}
+
+func (w *Writeback) commitOpenUnlink(p string, marked []*bufferingHandle) error {
 	// The name is going away NOW (the facade invokes this before FS.Unlink
 	// replies OK): the pending overlays must stop answering lookups for it,
 	// or a re-creator racing the deferred remote DELETE reads the old entry
-	// (unlink/14 row 4's EEXIST against the resurrected name). The open
-	// fds keep their image: the staged bytes move to the unlink
-	// snapshot before the pending entries die.
+	// (unlink/14 row 4's EEXIST against the resurrected name). Open handles retain a pin on their staged generation.
 	ledger := w.opts.Staging != nil && w.queue != nil
 	if ledger {
-		if meta, ok := w.pendingMeta(p); ok && meta != nil {
-			if data, kok := readShadowGenerationFenced(w.opts.Staging.Shadow, p, meta.Size); kok {
-				if err := w.opts.Staging.Shadow.WriteFull(p, data, 0); err == nil {
-					contentGen := w.opts.Staging.Shadow.ActiveGeneration(p)
-					var pin staging.PinGen
-					w.unlinkedMu.Lock()
-					if _, pinned := w.unlinkedShadowPin[p]; !pinned {
-						w.unlinkedMu.Unlock()
-						pin = w.opts.Staging.Shadow.Pin(p)
-					} else {
-						w.unlinkedMu.Unlock()
-					}
-					w.recordUnlinkedSnapshot(p, contentGen, pin)
-				}
+		shadow := w.opts.Staging.Shadow
+		if _, ok := w.pendingMeta(p); ok && shadow.Has(p) {
+			generation := shadow.ActiveGeneration(p)
+			var pin staging.PinGen
+			if w.unlinkedShadowPinFor(p) == 0 {
+				pin = shadow.Pin(p)
 			}
+			w.recordUnlinkedSnapshot(p, generation, pin)
 		}
 		// CancelPathPreserveLocal: a plain CancelPath also deletes the
-		// shadow the snapshot above just wrote, so the anonymous fd fell
+		// shadow pinned above, so the anonymous fd fell
 		// through to the recreated same-name file's bytes.
-		if fenced() {
-			restoreMarked(marked)
-			return errLayerRolledBack
-		}
-		if err := w.queue.cancelPath(p, true, fenced); err != nil {
+		if err := w.queue.CancelPathPreserveLocal(p); err != nil {
 			// The unlink is failing: the descriptors must go on serving
 			// their name, and — the failed premise being that the durable
 			// staging survived — the replayable frames now correctly
 			// describe a file that was never unlinked.
 			restoreMarked(marked)
-			if !errors.Is(err, errLayerRolledBack) {
-				w.submitOrphanedCacheForRollback(p, false)
-			}
 			return err
 		}
 	}
 	if w.wbCache != nil {
-		pUnlock := w.pathLocks.lock(p)
-		// With a ledger the journal admission above already committed the unlink.
-		if !ledger && fenced() {
-			pUnlock()
-			restoreMarked(marked)
-			return errLayerRolledBack
-		}
+		unlock := w.pathLocks.lock(p)
 		w.wbCache.Remove(p)
-		pUnlock()
+		unlock()
 	}
-	// The landed table's rescue window must not resurrect it either.
 	w.forgetLanded(p)
 	return nil
 }
@@ -5966,6 +5956,10 @@ func restoreMarked(marked []*bufferingHandle) {
 // roll back: otherwise the descriptors silently switch to the replacement's
 // bytes.
 func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHandle, error) {
+	return w.snapshotUnlinkHandles(p, under, true)
+}
+
+func (w *Writeback) snapshotUnlinkHandles(p string, under, mark bool) ([]*bufferingHandle, error) {
 	prefix := strings.TrimSuffix(p, "/") + "/"
 	var clean, marked []*bufferingHandle
 	var submitting []chan struct{}
@@ -5980,7 +5974,9 @@ func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHand
 		// snapshot: it must not be re-marked (and its stale, shorter
 		// snapshot must not make this operation's target look read-only).
 		if match && !h.unlinked {
-			h.unlinked = true
+			if mark {
+				h.unlinked = true
+			}
 			marked = append(marked, h)
 			if h.buf == nil && !h.isNew && !h.dirty {
 				clean = append(clean, h)
