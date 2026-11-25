@@ -9,11 +9,11 @@ name: Secret Scan
 # `pull_request_target` loads this definition from the default branch, not from
 # the pull request, so the gate cannot be weakened by the change it is meant to
 # inspect. Nothing from the pull request is ever executed: the scanner is
-# installed from the version pinned below into a per-run directory outside the
-# workspace, the allowlist comes from the merge base, and the PR checkout is read
-# only for its git objects. Allowlist additions therefore take effect only once
-# they are merged, and the scanner ignores any `.gitleaksignore` shipped by the
-# PR.
+# downloaded from the release pinned below, digest-verified, and unpacked into a
+# per-run directory outside the workspace; the allowlist comes from the merge
+# base, and the PR checkout is read only for its git objects. Allowlist additions
+# therefore take effect only once they are merged, and the scanner ignores any
+# `.gitleaksignore` shipped by the PR.
 #
 # Bootstrap: `pull_request_target` only runs when this file already exists on the
 # default branch, so the PR that introduces it is not itself gated — every later
@@ -35,7 +35,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GITLEAKS_VERSION: v8.30.1
+  # The release digests for this version are pinned below; bump them together
+  # with the version, never one without the other.
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_LINUX_X64_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  GITLEAKS_LINUX_ARM64_SHA256: e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080
 
 jobs:
   gitleaks:
@@ -53,38 +57,49 @@ jobs:
           # The scan never pushes; do not leave the token in .git/config.
           persist-credentials: false
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-
       - name: Install gitleaks
         # The scanner must not be read from the checkout: a pull request could
         # commit a binary that reports the same version and have this job run it.
-        # Install into a per-run directory outside the workspace, never reuse a
-        # pre-existing or cached binary, and verify the module path as well as
-        # the version.
-        working-directory: ${{ runner.temp }}
-        env:
-          GOBIN: ${{ runner.temp }}/gitleaks-bin
+        # Download the pinned release into a per-run directory outside the
+        # workspace, never reuse a pre-existing or cached binary, and verify the
+        # pinned digest as well as the reported version.
         run: |
           set -euo pipefail
-          go install "github.com/zricethezav/gitleaks/v8@${GITLEAKS_VERSION}"
-          info="$(go version -m "$GOBIN/gitleaks")"
-          module="$(printf '%s\n' "$info" | awk '$1 == "path" { print $2 }')"
-          version="$(printf '%s\n' "$info" | awk '$1 == "mod" { print $3 }')"
-          if [ "$module" != "github.com/zricethezav/gitleaks/v8" ] || [ "$version" != "$GITLEAKS_VERSION" ]; then
-            echo "refusing to run an unexpected scanner build: path=$module version=$version" >&2
-            exit 1
-          fi
-          case "$GOBIN/gitleaks" in
+          install_dir="$RUNNER_TEMP/gitleaks-bin"
+          mkdir -p "$install_dir"
+          case "$(uname -m)" in
+            x86_64)
+              arch=x64
+              expected_sha="$GITLEAKS_LINUX_X64_SHA256"
+              ;;
+            aarch64)
+              arch=arm64
+              expected_sha="$GITLEAKS_LINUX_ARM64_SHA256"
+              ;;
+            *)
+              echo "unsupported runner architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_${arch}.tar.gz"
+          printf '%s  %s\n' "$expected_sha" "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$install_dir" gitleaks
+          rm -f "$archive"
+          scanner="$install_dir/gitleaks"
+          case "$scanner" in
             "$GITHUB_WORKSPACE"/*)
               echo "refusing to run a scanner from the checkout" >&2
               exit 1
               ;;
           esac
-          echo "scanner: $GOBIN/gitleaks ($module $version)"
+          reported="$("$scanner" version)"
+          if [ "$reported" != "$GITLEAKS_VERSION" ]; then
+            echo "refusing to run an unexpected scanner build: version=$reported" >&2
+            exit 1
+          fi
+          echo "scanner: $scanner (gitleaks $reported)"
 
       - name: Scan
         env:
