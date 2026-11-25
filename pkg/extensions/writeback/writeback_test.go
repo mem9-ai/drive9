@@ -541,3 +541,34 @@ func TestCleanPathTruncateMissingPathFallsThrough(t *testing.T) {
 		t.Fatalf("missing-path truncate = %v, want ErrNotFound", err)
 	}
 }
+
+func TestFenceRejectsBufferedMutationsAndPreservesReads(t *testing.T) {
+	for _, policy := range []Policy{PolicyCloseSync, PolicyWriteBack} {
+		t.Run(policy.String(), func(t *testing.T) {
+			chain, wb := newStack(t, policy, testbackend.NewBackend())
+			h := open(t, chain, "/kept")
+			ctx := context.Background()
+			if err := h.Write(ctx, 0, []byte("before")); err != nil {
+				t.Fatal(err)
+			}
+			wb.AbandonLayerForRollback()
+			if err := h.Write(ctx, 0, []byte("after")); !errors.Is(err, errLayerRolledBack) {
+				t.Fatalf("write after lease loss: %v", err)
+			}
+			for _, op := range []*fs.Op{
+				{Kind: fs.OpSetAttr, Path: "/kept", Handle: h, HasSize: true, Size: 0},
+				{Kind: fs.OpCreate, Path: "/kept", Flags: syscall.O_TRUNC | syscall.O_RDWR},
+				{Kind: fs.OpCreate, Path: "/new", Flags: syscall.O_CREAT | syscall.O_RDWR},
+			} {
+				if _, err := chain.Dispatch(ctx, op); !errors.Is(err, errLayerRolledBack) {
+					t.Fatalf("op %v after lease loss: %v", op.Kind, err)
+				}
+			}
+			buf := make([]byte, 8)
+			n, err := h.Read(ctx, 0, buf)
+			if err != nil || string(buf[:n]) != "before" {
+				t.Fatalf("buffer after fence: %q, %v", buf[:n], err)
+			}
+		})
+	}
+}

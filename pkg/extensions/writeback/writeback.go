@@ -1419,6 +1419,18 @@ func (w *Writeback) ReexecRefusal() (string, int) {
 
 // Do implements fs.Handler.
 func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
+	if w.rolledBack.Load() {
+		switch op.Kind {
+		case fs.OpCreate:
+			if op.KernelCreate() || op.Flags&uint32(syscall.O_CREAT|syscall.O_TRUNC|syscall.O_WRONLY|syscall.O_RDWR) != 0 {
+				return fs.Result{}, errLayerRolledBack
+			}
+		case fs.OpWrite, fs.OpSetAttr, fs.OpFallocate, fs.OpCopyFileRange,
+			fs.OpMkdir, fs.OpMknod, fs.OpUnlink, fs.OpRmdir, fs.OpRename, fs.OpLink, fs.OpSymlink,
+			fs.OpSetXattr, fs.OpRemoveXattr:
+			return fs.Result{}, errLayerRolledBack
+		}
+	}
 	switch op.Kind {
 	case fs.OpLookup, fs.OpGetAttr:
 		// pendingIndex overlay: a lazily created file exists from Create
@@ -3592,6 +3604,9 @@ func (h *bufferingHandle) readLiveWriter(ctx context.Context, off int64, dest []
 
 // Write implements fs.Handle.
 func (h *bufferingHandle) Write(ctx context.Context, off int64, data []byte) error {
+	if h.w.rolledBack.Load() {
+		return errLayerRolledBack
+	}
 	// The plane choice and the buffer mutation share ONE critical section.
 	// Adoption takes h.mu, so a write either observes the migration and
 	// forwards to the engine, or it completes on the buffer BEFORE adoption

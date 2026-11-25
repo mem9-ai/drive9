@@ -10,6 +10,13 @@ import (
 	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
+func (c *Client) validateViewDescription(description string) error {
+	if c.view.LayerID != "" && description != "" {
+		return viewprotocol.ErrUnsupportedInLayerView
+	}
+	return nil
+}
+
 func (c *Client) rewriteRequestForView(req *http.Request) (*http.Request, error) {
 	if c == nil || c.view.LayerID == "" {
 		return req, nil
@@ -38,8 +45,8 @@ func (c *Client) rewriteRequestForView(req *http.Request) (*http.Request, error)
 				return nil, err
 			}
 		}
-		if req.Header.Get("X-Dat9-Description") != "" {
-			return nil, viewprotocol.ErrUnsupportedInLayerView
+		if err := c.validateViewDescription(req.Header.Get("X-Dat9-Description")); err != nil {
+			return nil, err
 		}
 		viewEscaped, err := viewprotocol.FormatViewPath(c.view.LayerID, innerEscaped)
 		if err != nil {

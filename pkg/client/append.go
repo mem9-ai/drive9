@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/mem9-ai/drive9/pkg/s3client"
+	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 // AppendPlan mirrors the server's response for an append-initiate request.
@@ -24,6 +25,9 @@ type AppendPlan struct {
 // existing files fall back to read-modify-write, and large S3-backed files use
 // the incremental append upload flow.
 func (c *Client) AppendStream(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc) error {
+	if c.view.LayerID != "" {
+		return viewprotocol.ErrUnsupportedInLayerView
+	}
 	if size < 0 {
 		return fmt.Errorf("append size must be non-negative")
 	}

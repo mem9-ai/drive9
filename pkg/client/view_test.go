@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/mem9-ai/drive9/pkg/viewprotocol"
@@ -219,4 +221,26 @@ func TestWatchViewEventsReportsUnsupportedOnce(t *testing.T) {
 		cancel()
 	}})
 	require.Equal(t, 1, calls)
+}
+
+func TestLayerRejectsAppendAndDescriptionsBeforeIO(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.Error(w, "unexpected request", http.StatusBadRequest)
+	}))
+	defer srv.Close()
+	c, err := New(srv.URL, "").WithView(ViewBinding{LayerID: "layer_01j8z4r9w3m5n7p9q2s4t6v8xz", Fence: 3})
+	require.NoError(t, err)
+	ctx := context.Background()
+	for _, size := range []int64{0, 1, 8 << 20} {
+		require.ErrorIs(t, c.AppendStream(ctx, "/file", strings.NewReader(""), size, nil), viewprotocol.ErrUnsupportedInLayerView)
+		_, err := c.WriteStreamWithSummary(ctx, "/file", strings.NewReader(""), size, nil, WithDescription("desc"))
+		require.ErrorIs(t, err, viewprotocol.ErrUnsupportedInLayerView)
+	}
+	err = c.WriteStreamConditionalWithOptions(ctx, "/file", strings.NewReader("x"), 1, nil, 0, WithDescription("desc"), WithContentLayout(ContentLayoutExtent))
+	require.ErrorIs(t, err, viewprotocol.ErrUnsupportedInLayerView)
+	sw := c.NewStreamWriterWithDescription(ctx, "/file", 1, "desc")
+	require.ErrorIs(t, sw.WritePart(ctx, 1, []byte("x")), viewprotocol.ErrUnsupportedInLayerView)
+	require.Zero(t, requests.Load())
 }
