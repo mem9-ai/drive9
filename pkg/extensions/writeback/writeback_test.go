@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/mem9-ai/drive9/internal/testbackend"
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -570,5 +572,102 @@ func TestFenceRejectsBufferedMutationsAndPreservesReads(t *testing.T) {
 				t.Fatalf("buffer after fence: %q, %v", buf[:n], err)
 			}
 		})
+	}
+}
+
+func TestFenceWhileAppendRefreshIsWaiting(t *testing.T) {
+	chain, wb := newStack(t, PolicyCloseSync, testbackend.NewBackend())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	opened, err := chain.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/log", Flags: syscall.O_CREAT | syscall.O_RDWR | syscall.O_APPEND, Mode: 0644})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := opened.Handle
+	if err = h.Write(ctx, 0, []byte("prior")); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	resume := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		select {
+		case <-resume:
+		case <-r.Context().Done():
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	wb.opts.Client = client.New(srv.URL, "")
+	wb.landedAt("/log", 2, 5, 0, nil)
+	done := make(chan error, 1)
+	go func() { done <- h.Write(ctx, 0, []byte("late")) }()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("append did not reach the refresh request")
+	}
+	wb.AbandonLayerForRollback()
+	close(resume)
+	if err := <-done; !errors.Is(err, errLayerRolledBack) {
+		t.Fatalf("append crossing fence: %v", err)
+	}
+	buf := make([]byte, 12)
+	n, err := h.Read(ctx, 0, buf)
+	if err != nil || string(buf[:n]) != "prior" {
+		t.Fatalf("retained image: %q, %v", buf[:n], err)
+	}
+}
+
+func TestFenceDuringMutationDispatch(t *testing.T) {
+	w := &Writeback{}
+	_, err := w.Do(context.Background(), &fs.Op{Kind: fs.OpMkdir, Path: "/dir"}, func(context.Context, *fs.Op) (fs.Result, error) {
+		w.AbandonLayerForRollback()
+		return fs.Result{}, nil
+	})
+	if !errors.Is(err, errLayerRolledBack) {
+		t.Fatalf("mkdir crossing fence: %v", err)
+	}
+}
+
+func TestFencedWritebackCloseRetainsRecoveryImage(t *testing.T) {
+	backend := testbackend.NewBackend()
+	chain, wb, cache := newWriteCacheStack(t, PolicyWriteBack, backend)
+	h := open(t, chain, "/recover")
+	ctx := context.Background()
+	if err := h.Write(ctx, 0, []byte("accepted")); err != nil {
+		t.Fatal(err)
+	}
+	wb.AbandonLayerForRollback()
+	if err := h.Flush(ctx); !errors.Is(err, errLayerRolledBack) {
+		t.Fatalf("flush: %v", err)
+	}
+	if err := h.Release(ctx); !errors.Is(err, errLayerRolledBack) {
+		t.Fatalf("release: %v", err)
+	}
+	data, ok := cache.Get("/recover")
+	if !ok || string(data) != "accepted" {
+		t.Fatalf("recovery cache: %q, %v", data, ok)
+	}
+	if _, ok := backend.Node("/recover"); ok {
+		t.Fatal("fenced image was uploaded")
+	}
+}
+
+func TestFencedInteractiveSyncReturnsError(t *testing.T) {
+	backend := testbackend.NewBackend()
+	chain, wb := newStagedStack(t, PolicyWriteBack, backend)
+	wb.interactive = true
+	h := open(t, chain, "/pending")
+	ctx := context.Background()
+	if err := h.Write(ctx, 0, []byte("accepted")); err != nil {
+		t.Fatal(err)
+	}
+	wb.AbandonLayerForRollback()
+	if err := h.Sync(ctx); err == nil {
+		t.Fatal("fenced fsync returned success")
+	}
+	if _, ok := backend.Node("/pending"); ok {
+		t.Fatal("fenced image was uploaded")
 	}
 }

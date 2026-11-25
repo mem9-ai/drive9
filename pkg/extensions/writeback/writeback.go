@@ -1419,18 +1419,37 @@ func (w *Writeback) ReexecRefusal() (string, int) {
 
 // Do implements fs.Handler.
 func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
-	if w.rolledBack.Load() {
-		switch op.Kind {
-		case fs.OpCreate:
-			if op.KernelCreate() || op.Flags&uint32(syscall.O_CREAT|syscall.O_TRUNC|syscall.O_WRONLY|syscall.O_RDWR) != 0 {
-				return fs.Result{}, errLayerRolledBack
-			}
-		case fs.OpWrite, fs.OpSetAttr, fs.OpFallocate, fs.OpCopyFileRange,
-			fs.OpMkdir, fs.OpMknod, fs.OpUnlink, fs.OpRmdir, fs.OpRename, fs.OpLink, fs.OpSymlink,
-			fs.OpSetXattr, fs.OpRemoveXattr:
-			return fs.Result{}, errLayerRolledBack
-		}
+	if w.fencesMutation(op) {
+		return fs.Result{}, errLayerRolledBack
 	}
+	result, err := w.dispatch(ctx, op, next)
+	if err == nil && w.fencesMutation(op) {
+		// A slow operation crossed lease loss. A rejected open will never get a kernel Release.
+		if result.Handle != nil {
+			_ = result.Handle.Release(ctx)
+		}
+		return fs.Result{}, errLayerRolledBack
+	}
+	return result, err
+}
+
+func (w *Writeback) fencesMutation(op *fs.Op) bool {
+	if !w.rolledBack.Load() {
+		return false
+	}
+	switch op.Kind {
+	case fs.OpCreate:
+		return op.KernelCreate() || op.Flags&uint32(syscall.O_CREAT|syscall.O_TRUNC|syscall.O_WRONLY|syscall.O_RDWR) != 0
+	case fs.OpWrite, fs.OpSetAttr, fs.OpFallocate, fs.OpCopyFileRange,
+		fs.OpMkdir, fs.OpMknod, fs.OpUnlink, fs.OpRmdir, fs.OpRename, fs.OpLink, fs.OpSymlink,
+		fs.OpSetXattr, fs.OpRemoveXattr:
+		return true
+	default:
+		return false
+	}
+}
+
+func (w *Writeback) dispatch(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
 	switch op.Kind {
 	case fs.OpLookup, fs.OpGetAttr:
 		// pendingIndex overlay: a lazily created file exists from Create
@@ -3607,6 +3626,14 @@ func (h *bufferingHandle) Write(ctx context.Context, off int64, data []byte) err
 	if h.w.rolledBack.Load() {
 		return errLayerRolledBack
 	}
+	err := h.write(ctx, off, data)
+	if err == nil && h.w.rolledBack.Load() {
+		return errLayerRolledBack
+	}
+	return err
+}
+
+func (h *bufferingHandle) write(ctx context.Context, off int64, data []byte) error {
 	// The plane choice and the buffer mutation share ONE critical section.
 	// Adoption takes h.mu, so a write either observes the migration and
 	// forwards to the engine, or it completes on the buffer BEFORE adoption
@@ -3637,30 +3664,25 @@ func (h *bufferingHandle) Write(ctx context.Context, off int64, data []byte) err
 		if err != nil {
 			return err
 		}
-		if image != nil {
-			h.mu.Lock()
-			// A migration may have completed while the refresh ran: it
-			// released h.mu. Composing onto the buffer after adoption would
-			// strand these bytes, because the descriptor publishes through
-			// the engine from then on.
-			if e := h.migratedLocked(); e != nil {
-				h.mu.Unlock()
-				return e.Write(ctx, off, data)
-			}
-			cur := append([]byte(nil), h.buf.Bytes()...)
-			if !bytes.Equal(image, cur) || landedRev > h.baseRev {
-				if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
-					h.mu.Unlock()
-					return err
-				}
-			}
-			h.mu.Unlock()
-		}
 		h.mu.Lock()
+		if h.w.rolledBack.Load() {
+			h.mu.Unlock()
+			return errLayerRolledBack
+		}
 		if e := h.migratedLocked(); e != nil {
 			h.mu.Unlock()
 			return e.Write(ctx, off, data)
 		}
+		if image != nil && (!bytes.Equal(image, h.buf.Bytes()) || landedRev > h.baseRev) {
+			if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
+				h.mu.Unlock()
+				return err
+			}
+		}
+	}
+	if h.w.rolledBack.Load() {
+		h.mu.Unlock()
+		return errLayerRolledBack
 	}
 	// O_APPEND: the kernel may deliver off=0; the write lands at the
 	// buffer tail (append semantics for buffered handles).
@@ -4462,8 +4484,17 @@ func (w *Writeback) recordTransferFailure(path string, err error) {
 	}
 }
 
+// Finish local staging and descriptor cleanup even on a fenced mount. A
+// writable handle cannot report that boundary as successful after lease loss.
+func (h *bufferingHandle) reportFencedBoundary(err *error) {
+	if *err == nil && h.w.rolledBack.Load() && h.flags&uint32(syscall.O_WRONLY|syscall.O_RDWR|syscall.O_CREAT|syscall.O_TRUNC) != 0 {
+		*err = errLayerRolledBack
+	}
+}
+
 // Sync implements fs.Handle.
-func (h *bufferingHandle) Sync(ctx context.Context) error {
+func (h *bufferingHandle) Sync(ctx context.Context) (boundaryErr error) {
+	defer h.reportFencedBoundary(&boundaryErr)
 	// Migrated: fsync publishes through the engine (JuiceFS close-to-open).
 	if e := h.extentHandle(); e != nil {
 		if err := e.Sync(ctx); err != nil {
@@ -4613,6 +4644,7 @@ func (h *bufferingHandle) waitQueuedCommit(ctx context.Context) error {
 
 // Flush implements fs.Handle.
 func (h *bufferingHandle) Flush(ctx context.Context) (err error) {
+	defer h.reportFencedBoundary(&err)
 	// Migrated: a flush is the engine's flush, which publishes the slices
 	// the community writer has frozen. Reimplementing the close-to-open
 	// boundary here would upload the image a second time. If adoption installs
@@ -4835,7 +4867,8 @@ func (h *bufferingHandle) Flush(ctx context.Context) (err error) {
 }
 
 // Release implements fs.Handle.
-func (h *bufferingHandle) Release(ctx context.Context) error {
+func (h *bufferingHandle) Release(ctx context.Context) (boundaryErr error) {
+	defer h.reportFencedBoundary(&boundaryErr)
 	// Migrated: the engine handle owns the bytes, but THIS plane still owns
 	// the descriptor's lifecycle. Returning early here skipped the ledger
 	// unpin, the core terminal release and — worst — untrackAndLast, which
