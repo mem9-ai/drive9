@@ -5,6 +5,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -21,7 +22,6 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/mountcontrol"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
-	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 func TestUmountAndPackUnpackFollowPostSwitchControlStatus(t *testing.T) {
@@ -88,7 +88,7 @@ func TestUmountAndPackUnpackFollowPostSwitchControlStatus(t *testing.T) {
 
 	var (
 		statusMu sync.Mutex
-		binding  = viewprotocol.SwitchBinding{LayerID: layerID, BaseRootPath: "/repo", Fence: 1}
+		binding  = mountstate.SwitchBinding{LayerID: layerID, BaseRootPath: "/repo", Fence: 1}
 		remRoot  = "/repo"
 	)
 	sockPath := startFakeMountStatusSocket(t, func() mountcontrol.StatusResponse {
@@ -142,7 +142,7 @@ func TestUmountAndPackUnpackFollowPostSwitchControlStatus(t *testing.T) {
 	srvMu.Unlock()
 
 	statusMu.Lock()
-	binding = viewprotocol.SwitchBinding{LayerID: layerID, BaseRootPath: "/repo", ReadOnly: true}
+	binding = mountstate.SwitchBinding{LayerID: layerID, BaseRootPath: "/repo", ReadOnly: true}
 	statusMu.Unlock()
 	err = Pack(baseClient, []string{"--mount", mp, ":/repo/ro.pack", "dist"})
 	require.ErrorContains(t, err, "selected layer mount is read-only")
@@ -172,7 +172,7 @@ func TestUmountAndPackUnpackFollowPostSwitchControlStatus(t *testing.T) {
 	require.NoError(t, err)
 
 	statusMu.Lock()
-	binding = viewprotocol.SwitchBinding{}
+	binding = mountstate.SwitchBinding{}
 	remRoot = "/"
 	statusMu.Unlock()
 	srvMu.Lock()
@@ -194,7 +194,7 @@ func TestMountSwitchCLIPlainTextOutputWhenJSONFalse(t *testing.T) {
 			return mountstate.ProcessState{MountKind: mountstate.MountKindFUSE, ControlSocket: "/tmp/fake.sock"}, "/tmp/pid", nil
 		},
 		queryStatus: func(context.Context, string, time.Duration) (*mountcontrol.StatusResponse, error) {
-			b := viewprotocol.SwitchBinding{}
+			b := mountstate.SwitchBinding{}
 			return &mountcontrol.StatusResponse{OK: true, ViewSwitch: true, MountID: "mnt_txt", Generation: 1, Binding: &b}, nil
 		},
 		newOpID: func() (string, error) { return "op_txt_1", nil },
@@ -204,7 +204,7 @@ func TestMountSwitchCLIPlainTextOutputWhenJSONFalse(t *testing.T) {
 				State:          mountstate.SwitchDone,
 				FromGeneration: req.ExpectedGeneration,
 				Generation:     req.ExpectedGeneration + 1,
-				Target:         viewprotocol.SwitchBinding{LayerID: "layer_01j00000000000000000000001", BaseRootPath: "/", Fence: 1},
+				Target:         mountstate.SwitchBinding{LayerID: "layer_01j00000000000000000000001", BaseRootPath: "/", Fence: 1},
 			}
 			return &mountcontrol.SwitchResponse{MountID: req.MountID, OperationID: req.OperationID, Receipt: &rcpt}, nil
 		},
@@ -223,12 +223,21 @@ func TestArchiveCommandsRequireAConfirmedMountView(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", root)
 	t.Setenv("HOME", root)
+	const layerID = "layer_01j00000000000000000000001"
+	revoked := mountstate.SwitchBinding{LayerID: layerID, BaseRootPath: "/", Fence: 1}
 	for _, tc := range []struct {
 		name   string
 		status mountcontrol.StatusResponse
 		want   string
 	}{
 		{"uncertain", mountcontrol.StatusResponse{Error: "journal uncertain"}, "journal uncertain"},
+		{"revoked", mountcontrol.StatusResponse{
+			OK: true, ViewSwitch: true, MountID: "mnt_revoked", Generation: 2, Binding: &revoked,
+			Pending: &mountstate.SwitchReceipt{
+				OperationID: "op_revoked", State: mountstate.SwitchTargetRevoked,
+				FromGeneration: 1, Generation: 2, Target: revoked,
+			},
+		}, "recovering"},
 		{"recovering", mountcontrol.StatusResponse{OK: true, Recovering: true}, "recovering"},
 		{"missing_binding", mountcontrol.StatusResponse{OK: true, ViewSwitch: true}, "cannot identify"},
 		{"empty_status", mountcontrol.StatusResponse{OK: true}, "cannot identify"},
@@ -243,7 +252,10 @@ func TestArchiveCommandsRequireAConfirmedMountView(t *testing.T) {
 			} else if tc.name != "unavailable" {
 				socket = startFakeMountStatusSocket(t, func() mountcontrol.StatusResponse { return tc.status })
 			}
-			state := mountstate.ProcessState{PID: os.Getpid(), MountKind: mountstate.MountKindFUSE, MountPoint: mp, LayerID: "layer_01j00000000000000000000001", RemoteRoot: "/", LocalRoot: root, ControlSocket: socket, PackPaths: []string{"dist"}}
+			state := mountstate.ProcessState{PID: os.Getpid(), MountKind: mountstate.MountKindFUSE, MountPoint: mp, RemoteRoot: "/", LocalRoot: root, ControlSocket: socket, PackPaths: []string{"dist"}}
+			if tc.name == "empty_status" {
+				state.LayerID = layerID // A daemon without layer reporting cannot confirm a recorded layer.
+			}
 			_, err := mountstate.WriteProcessState(mp, state)
 			require.NoError(t, err)
 			c := client.New("http://127.0.0.1:1", "unused")
@@ -251,8 +263,27 @@ func TestArchiveCommandsRequireAConfirmedMountView(t *testing.T) {
 			require.ErrorContains(t, Unpack(c, []string{"--mount", mp, ":/file.pack"}), tc.want)
 			_, gitErr := resolveMountedGitTarget(mp)
 			require.ErrorContains(t, gitErr, tc.want)
-			deps := umountDeps{goos: "linux", readProcessState: mountstate.ReadProcessState, requestStatus: mountcontrol.RequestStatus}
-			require.ErrorContains(t, runUmount([]string{mp}, deps), tc.want)
+			var warnings bytes.Buffer
+			detached := false
+			deps := umountDeps{
+				goos:             "linux",
+				readProcessState: mountstate.ReadProcessState,
+				requestStatus:    mountcontrol.RequestStatus,
+				lookPath:         fakeLookPath(map[string]bool{"fusermount3": true}),
+				run:              func([]string) error { detached = true; return nil },
+				printErrf:        func(format string, args ...any) { fmt.Fprintf(&warnings, format, args...) },
+				packAfterUnmount: func(context.Context, mountstate.ProcessState, []string, []string) error {
+					t.Fatal("attempted to pack an unconfirmed view")
+					return nil
+				},
+			}
+			require.ErrorContains(t, runUmount([]string{"--pack", ":/file.pack", mp}, deps), tc.want)
+			require.ErrorContains(t, runUmount([]string{"--pack-path", "dist", mp}, deps), tc.want)
+			require.False(t, detached)
+			require.NoError(t, runUmount([]string{"--timeout=0", mp}, deps))
+			require.True(t, detached)
+			require.Contains(t, warnings.String(), "skipping automatic pack")
+			require.Contains(t, warnings.String(), tc.want)
 		})
 	}
 }

@@ -9,7 +9,6 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/mountcontrol"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
-	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 func refreshMountedView(state *mountstate.ProcessState, request func(context.Context, string, time.Duration) (*mountcontrol.StatusResponse, error), timeout time.Duration) error {
@@ -38,8 +37,15 @@ func refreshMountedView(state *mountstate.ProcessState, request func(context.Con
 	if snap != nil {
 		state.LayerID = snap.Binding.LayerID
 		state.LayerReadOnly = snap.Binding.LayerID != "" && snap.Binding.ReadOnly
-	} else if status.ViewSwitch || status.Layer == nil || *status.Layer != state.LayerID {
-		return errors.New("cannot identify the active mount view")
+	} else {
+		// Pre-layer daemons serve main and omit Layer from their status.
+		reportedLayer := ""
+		if status.Layer != nil {
+			reportedLayer = *status.Layer
+		}
+		if status.ViewSwitch || reportedLayer != state.LayerID {
+			return errors.New("cannot identify the active mount view")
+		}
 	}
 	if strings.TrimSpace(status.RemoteRoot) != "" {
 		state.RemoteRoot = status.RemoteRoot
@@ -60,7 +66,7 @@ func fixedMountStatus(status *mountcontrol.StatusResponse) (*mountstate.SwitchSn
 	if status.MountID == "" && status.Generation == 0 && status.Binding == nil {
 		return nil, nil
 	}
-	if viewprotocol.ValidateOperationID(status.MountID) != nil || status.Generation == 0 || status.Binding == nil || status.Binding.Validate() != nil {
+	if mountstate.ValidateOperationID(status.MountID) != nil || status.Generation == 0 || status.Binding == nil || status.Binding.Validate() != nil {
 		return nil, errors.New("invalid mount view identity")
 	}
 	out := &mountstate.SwitchSnapshot{
@@ -70,7 +76,7 @@ func fixedMountStatus(status *mountcontrol.StatusResponse) (*mountstate.SwitchSn
 		Recovering: status.Recovering,
 	}
 	if p := status.Pending; p != nil {
-		if viewprotocol.ValidateOperationID(p.OperationID) != nil ||
+		if mountstate.ValidateOperationID(p.OperationID) != nil ||
 			(p.State != mountstate.SwitchRecovering && p.State != mountstate.SwitchTargetRevoked) ||
 			p.Generation != status.Generation || p.FromGeneration == 0 ||
 			p.FromGeneration+1 != p.Generation || p.From.Validate() != nil || p.Target != *status.Binding {

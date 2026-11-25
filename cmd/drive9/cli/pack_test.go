@@ -6,8 +6,6 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
-	"github.com/mem9-ai/drive9/pkg/mountcontrol"
-	"github.com/stretchr/testify/require"
 	"io"
 	"net"
 	"net/http"
@@ -20,7 +18,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/mountcontrol"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
 
@@ -898,7 +899,7 @@ func TestRunUmountPacksAfterUnmount(t *testing.T) {
 	}
 }
 
-func TestRunUmountAutoPacksCodingAgentMount(t *testing.T) {
+func TestRunUmountAutoPacksLegacyMainMount(t *testing.T) {
 	state := mountstate.ProcessState{
 		ControlSocket: "fixture.sock",
 		PID:           1234,
@@ -910,10 +911,12 @@ func TestRunUmountAutoPacksCodingAgentMount(t *testing.T) {
 	}
 	var gotArchives []string
 	deps := umountDeps{
-		requestStatus: fixedArchiveStatus(""),
-		goos:          "linux",
-		lookPath:      fakeLookPath(map[string]bool{"fusermount3": true}),
-		run:           func(argv []string) error { return nil },
+		requestStatus: func(context.Context, string, time.Duration) (*mountcontrol.StatusResponse, error) {
+			return &mountcontrol.StatusResponse{OK: true, MountPoint: state.MountPoint, PID: state.PID}, nil
+		},
+		goos:     "linux",
+		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
+		run:      func(argv []string) error { return nil },
 		readProcessState: func(string) (mountstate.ProcessState, string, error) {
 			return state, "/tmp/drive9.pid", nil
 		},

@@ -5,15 +5,13 @@ package mountstate
 import (
 	"context"
 	"errors"
-
-	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 var errSwitchJournalUnsupported = errors.New("mount switch journal is unsupported on windows")
 
 type SwitchJournal struct{}
 
-func OpenSwitchJournal(string, string, string, viewprotocol.SwitchBinding) (*SwitchJournal, error) {
+func OpenSwitchJournal(string, string, string, SwitchBinding) (*SwitchJournal, error) {
 	return nil, errSwitchJournalUnsupported
 }
 
@@ -27,13 +25,13 @@ func (j *SwitchJournal) Snapshot() SwitchSnapshot               { return SwitchS
 func (j *SwitchJournal) Operation(string) (SwitchReceipt, bool) { return SwitchReceipt{}, false }
 func (j *SwitchJournal) AppendBindIntent(PendingUnbind) error   { return errSwitchJournalUnsupported }
 func (j *SwitchJournal) AppendUnbindDone(PendingUnbind) error   { return errSwitchJournalUnsupported }
-func (j *SwitchJournal) BindInitial(viewprotocol.SwitchBinding, string) error {
+func (j *SwitchJournal) BindInitial(SwitchBinding, string) error {
 	return errSwitchJournalUnsupported
 }
-func (j *SwitchJournal) Decide(string, uint64, viewprotocol.SwitchBinding) (SwitchReceipt, bool, error) {
+func (j *SwitchJournal) Decide(string, uint64, SwitchBinding) (SwitchReceipt, bool, error) {
 	return SwitchReceipt{}, false, errSwitchJournalUnsupported
 }
-func (j *SwitchJournal) DecideWithLayerRef(string, uint64, viewprotocol.SwitchBinding, string) (SwitchReceipt, bool, error) {
+func (j *SwitchJournal) DecideWithLayerRef(string, uint64, SwitchBinding, string) (SwitchReceipt, bool, error) {
 	return SwitchReceipt{}, false, errSwitchJournalUnsupported
 }
 func (j *SwitchJournal) MarkTargetRevoked(string) (SwitchReceipt, error) {

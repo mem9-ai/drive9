@@ -5,13 +5,13 @@ package mountstate
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
-
-	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 func TestSwitchJournalRecoversTornTrailingFrameAndRejectsMidFileCorruption(t *testing.T) {
@@ -51,12 +51,12 @@ func TestSwitchJournalRecoversTornTrailingFrameAndRejectsMidFileCorruption(t *te
 			priorPath, err := SwitchScopedJournalPath(scope, "mnt-prior")
 			require.NoError(t, err)
 
-			j, err := OpenSwitchJournal(priorPath, "mnt-prior", scope, viewprotocol.SwitchBinding{})
+			j, err := OpenSwitchJournal(priorPath, "mnt-prior", scope, SwitchBinding{})
 			require.NoError(t, err)
 			require.NoError(t, j.AppendBindIntent(PendingUnbind{
 				LayerID: testLayerA, MountID: "mnt-prior", Kind: UnbindKindOp, OperationID: "op-init", Fence: 0,
 			}))
-			require.NoError(t, j.BindInitial(viewprotocol.SwitchBinding{
+			require.NoError(t, j.BindInitial(SwitchBinding{
 				LayerID: testLayerA, Fence: 1, BaseRootPath: "/workspace",
 			}, "op-init"))
 			validRaw, err := os.ReadFile(priorPath)
@@ -70,10 +70,16 @@ func TestSwitchJournalRecoversTornTrailingFrameAndRejectsMidFileCorruption(t *te
 			fullRaw, err := os.ReadFile(priorPath)
 			require.NoError(t, err)
 			require.Greater(t, len(fullRaw), len(validRaw)+8)
-			require.NoError(t, os.WriteFile(priorPath, tc.mutate(validRaw, fullRaw), 0o600))
+			damaged := tc.mutate(validRaw, fullRaw)
+			require.NoError(t, os.WriteFile(priorPath, damaged, 0o600))
+			var diagnostic bytes.Buffer
+			writer := log.Writer()
+			log.SetOutput(&diagnostic)
+			t.Cleanup(func() { log.SetOutput(writer) })
 
 			reopened, err := OpenExistingSwitchJournal(priorPath)
 			require.NoError(t, err)
+			require.Contains(t, diagnostic.String(), fmt.Sprintf("discarded %d bytes from a torn mount switch journal tail", len(damaged)-len(validRaw)))
 			st, err := os.Stat(priorPath)
 			require.NoError(t, err)
 			require.Equal(t, int64(len(validRaw)), st.Size())
@@ -102,7 +108,7 @@ func TestSwitchJournalRecoversTornTrailingFrameAndRejectsMidFileCorruption(t *te
 	jPath := filepath.Join(dir, "drive9-view-corrupt-mid.log")
 	scope, err := SwitchScope("http://127.0.0.1:9009", "api_key:test", "/workspace", filepath.Join(dir, "mnt"))
 	require.NoError(t, err)
-	j, err := OpenSwitchJournal(jPath, "mnt-mid", scope, viewprotocol.SwitchBinding{})
+	j, err := OpenSwitchJournal(jPath, "mnt-mid", scope, SwitchBinding{})
 	require.NoError(t, err)
 	firstFrameRaw, err := os.ReadFile(jPath)
 	require.NoError(t, err)
@@ -132,7 +138,7 @@ func TestSwitchJournalClosedGuardAndExpireUnbindValidation(t *testing.T) {
 	jPath := filepath.Join(dir, "drive9-view-closed.log")
 	scope, err := SwitchScope("http://127.0.0.1:9009", "api_key:test", "/workspace", filepath.Join(dir, "mnt"))
 	require.NoError(t, err)
-	j, err := OpenSwitchJournal(jPath, "mnt-closed", scope, viewprotocol.SwitchBinding{})
+	j, err := OpenSwitchJournal(jPath, "mnt-closed", scope, SwitchBinding{})
 	require.NoError(t, err)
 	item := PendingUnbind{LayerID: testLayerA, MountID: "mnt-closed", Kind: UnbindKindOp, OperationID: "op-closed", Fence: 0}
 	require.NoError(t, j.AppendBindIntent(item))

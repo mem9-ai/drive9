@@ -22,7 +22,6 @@ import (
 	"github.com/mem9-ai/drive9/pkg/fusecomp/membudget"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/perf"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
-	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 type fakeLayerState struct {
@@ -34,9 +33,9 @@ type fakeLayerState struct {
 }
 
 type fakeSwitchBackend struct {
-	mu        sync.Mutex
-	mainFiles map[string][]byte
-	layers    map[string]*fakeLayerState
+	mu         sync.Mutex
+	mainFiles  map[string][]byte
+	layers     map[string]*fakeLayerState
 	bindCalls  int
 	unbindOps  []client.LayerMountUnbindRequest
 	renewCnt   int
@@ -158,14 +157,14 @@ func viewSwitchFixture(t *testing.T) (*mountViewSwitch, *fakeSwitchBackend, stri
 	baseClient := client.New(srv.URL, cfg.APIKey)
 	scope, err := mountstate.SwitchScope(cfg.Server, "api_key:test", "/", mp)
 	require.NoError(t, err)
-	j, err := mountstate.OpenSwitchJournal(filepath.Join(shortDir, "switch.journal"), "mount-1", scope, viewprotocol.SwitchBinding{})
+	j, err := mountstate.OpenSwitchJournal(filepath.Join(shortDir, "switch.journal"), "mount-1", scope, mountstate.SwitchBinding{})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = j.Close() })
 
 	mb := membudget.New(64<<20, membudget.ModeEnforce, nil)
 	counters := perf.NewCounters(false)
 	var sharedExt *extent.Engine
-	rt, err := buildViewRuntime(cfg, baseClient, "/", "mount-1", viewprotocol.SwitchBinding{}, nil, mb, counters, &sharedExt)
+	rt, err := buildViewRuntime(cfg, baseClient, "/", "mount-1", mountstate.SwitchBinding{}, nil, mb, counters, &sharedExt)
 	require.NoError(t, err)
 	rt.fs.Init2(context.Background())
 	t.Cleanup(func() { _ = rt.stop(context.Background()) })
@@ -185,7 +184,7 @@ func viewSwitchFixture(t *testing.T) (*mountViewSwitch, *fakeSwitchBackend, stri
 		fence:      func(context.Context) error { return nil },
 		timing:     layerLeaseTiming{renewInterval: 5 * time.Second, callTimeout: 500 * time.Millisecond},
 	}
-	sw.buildRuntime = func(_ context.Context, target viewprotocol.SwitchBinding, lease *layerMountBinding) (*mountRuntime, error) {
+	sw.buildRuntime = func(_ context.Context, target mountstate.SwitchBinding, lease *layerMountBinding) (*mountRuntime, error) {
 		vc := baseClient
 		if target.LayerID != "" && lease != nil && lease.ViewClient != nil {
 			vc = lease.ViewClient

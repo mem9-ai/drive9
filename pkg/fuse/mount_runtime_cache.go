@@ -1,10 +1,10 @@
 package fuse
 
 import (
-	"github.com/mem9-ai/drive9/pkg/viewprotocol"
+	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
 
-func mountRuntimeCacheHashes(cfg MountConfig, remoteRoot string, binding viewprotocol.SwitchBinding) (string, string, error) {
+func mountRuntimeCacheHashes(cfg MountConfig, remoteRoot string, binding mountstate.SwitchBinding) (string, string, error) {
 	if err := binding.Validate(); err != nil {
 		return "", "", err
 	}

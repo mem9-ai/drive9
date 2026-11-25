@@ -11,7 +11,6 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/mountcontrol"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
-	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 func TestMountSwitchCLIFreshAutoInitAndExplicitRetry(t *testing.T) {
@@ -22,7 +21,7 @@ func TestMountSwitchCLIFreshAutoInitAndExplicitRetry(t *testing.T) {
 			return mountstate.ProcessState{MountKind: mountstate.MountKindFUSE, ControlSocket: "/tmp/fake.sock"}, "/tmp/pid", nil
 		},
 		queryStatus: func(context.Context, string, time.Duration) (*mountcontrol.StatusResponse, error) {
-			b := viewprotocol.SwitchBinding{}
+			b := mountstate.SwitchBinding{}
 			return &mountcontrol.StatusResponse{OK: true, ViewSwitch: true, MountID: "mnt_abc", Generation: 3, Binding: &b}, nil
 		},
 		newOpID: func() (string, error) { return "op_generated_1", nil },
@@ -33,7 +32,7 @@ func TestMountSwitchCLIFreshAutoInitAndExplicitRetry(t *testing.T) {
 				State:          mountstate.SwitchDone,
 				FromGeneration: req.ExpectedGeneration,
 				Generation:     req.ExpectedGeneration + 1,
-				Target:         viewprotocol.SwitchBinding{LayerID: "layer_01j00000000000000000000001", BaseRootPath: "/", Fence: 1},
+				Target:         mountstate.SwitchBinding{LayerID: "layer_01j00000000000000000000001", BaseRootPath: "/", Fence: 1},
 			}
 			return &mountcontrol.SwitchResponse{MountID: req.MountID, OperationID: req.OperationID, Receipt: &rcpt}, nil
 		},

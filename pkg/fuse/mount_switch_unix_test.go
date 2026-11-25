@@ -103,7 +103,7 @@ func TestMountViewSwitchPrePauseGatesAndExpiredLeaseRecovery(t *testing.T) {
 	})
 	var swErr *mountcontrol.SwitchError
 	require.ErrorAs(t, err, &swErr)
-	require.Equal(t, viewprotocol.CodeSwitchUnsupported, swErr.Code)
+	require.Equal(t, mountcontrol.CodeSwitchUnsupported, swErr.Code)
 
 	sw.mu.Lock()
 	sw.goos = "linux"

@@ -79,7 +79,7 @@ func (j *SwitchJournal) applyRecordLocked(rec switchJournalRecord, first bool) e
 	}
 	switch rec.Type {
 	case "init":
-		if err := viewprotocol.ValidateOperationID(rec.MountID); err != nil {
+		if err := ValidateOperationID(rec.MountID); err != nil {
 			return err
 		}
 		if rec.Scope == "" || rec.Generation != 1 {
@@ -138,7 +138,7 @@ func (j *SwitchJournal) applyRecordLocked(rec switchJournalRecord, first bool) e
 		if j.pending != nil || rec.FromGeneration != j.generation || rec.Generation != j.generation+1 {
 			return fmt.Errorf("invalid decide generation transition")
 		}
-		if err := viewprotocol.ValidateOperationID(rec.OperationID); err != nil {
+		if err := ValidateOperationID(rec.OperationID); err != nil {
 			return err
 		}
 		if err := rec.Target.Validate(); err != nil {
@@ -220,7 +220,7 @@ func (j *SwitchJournal) applyRecordLocked(rec switchJournalRecord, first bool) e
 		aborted := *j.pending
 		aborted.State = SwitchAborted
 		nextUnbinds := append([]PendingUnbind(nil), j.pendingUnbinds...)
-		for _, b := range [2]viewprotocol.SwitchBinding{aborted.From, aborted.Target} {
+		for _, b := range [2]SwitchBinding{aborted.From, aborted.Target} {
 			if b.LayerID != "" && !b.ReadOnly {
 				var err error
 				nextUnbinds, err = addPendingUnbindBounded(nextUnbinds, PendingUnbind{
@@ -237,7 +237,7 @@ func (j *SwitchJournal) applyRecordLocked(rec switchJournalRecord, first bool) e
 		j.pendingUnbinds = nextUnbinds
 		j.pending = nil
 		j.abortedPending = true
-		j.binding = viewprotocol.SwitchBinding{ReadOnly: aborted.From.ReadOnly && aborted.Target.ReadOnly}
+		j.binding = SwitchBinding{ReadOnly: aborted.From.ReadOnly && aborted.Target.ReadOnly}
 		j.history[aborted.OperationID] = aborted
 		return nil
 	case "queue_unbind":
@@ -256,7 +256,7 @@ func (j *SwitchJournal) applyRecordLocked(rec switchJournalRecord, first bool) e
 			}
 			j.pendingUnbinds = next
 		}
-		j.binding = viewprotocol.SwitchBinding{ReadOnly: j.binding.ReadOnly}
+		j.binding = SwitchBinding{ReadOnly: j.binding.ReadOnly}
 		return nil
 	default:
 		return fmt.Errorf("unknown switch journal record %q", rec.Type)

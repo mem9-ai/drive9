@@ -16,6 +16,17 @@ import (
 	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
+const (
+	// Local FUSE mount switch machine error codes (v36 §6.3 #2–#4).
+	CodeSwitchUnsupported          = "UNSUPPORTED"
+	CodeSwitchBusy                 = "EBUSY"
+	CodeSwitchPrepareFailed        = "PREPARE_FAILED"
+	CodeSwitchBindCleanupPending   = "BIND_CLEANUP_PENDING"
+	CodeSwitchUnbindCleanupPending = "UNBIND_CLEANUP_PENDING"
+	CodeSwitchTargetRevoked        = "TARGET_REVOKED"
+	CodeSwitchRecovering           = "RECOVERING"
+)
+
 var (
 	ErrSwitchUnsupported = errors.New("mount does not support in-place view switching")
 	ErrSwitchRecovering  = errors.New("mount switch is recovering")
@@ -44,10 +55,10 @@ func (r SwitchRequest) NormalizedTarget() (isMain bool, layerRef string, err err
 }
 
 func (r SwitchRequest) Validate() error {
-	if err := viewprotocol.ValidateOperationID(r.MountID); err != nil {
+	if err := mountstate.ValidateOperationID(r.MountID); err != nil {
 		return err
 	}
-	if err := viewprotocol.ValidateOperationID(r.OperationID); err != nil {
+	if err := mountstate.ValidateOperationID(r.OperationID); err != nil {
 		return err
 	}
 	if r.ExpectedGeneration == 0 || r.ExpectedGeneration == math.MaxUint64 {
@@ -148,7 +159,7 @@ func exchangeSwitch(ctx context.Context, socketPath, op string, req SwitchReques
 	if err := json.Unmarshal(statusFrame, &status); err != nil {
 		return nil, &SwitchError{MountID: req.MountID, OperationID: req.OperationID, Unknown: true, Cause: err}
 	}
-	if !status.OK {
+	if !status.OK && (status.ViewSwitch || status.Recovering || status.MountID != "") {
 		msg := status.Error
 		if msg == "" {
 			msg = "mount control status not ok"
@@ -156,13 +167,13 @@ func exchangeSwitch(ctx context.Context, socketPath, op string, req SwitchReques
 		return nil, &SwitchError{
 			MountID:     req.MountID,
 			OperationID: req.OperationID,
-			Code:        viewprotocol.CodeSwitchRecovering,
+			Code:        CodeSwitchRecovering,
 			Unknown:     true,
 			Cause:       fmt.Errorf("%w: %s", ErrSwitchRecovering, msg),
 		}
 	}
 	if !status.ViewSwitch {
-		return nil, &SwitchError{MountID: req.MountID, OperationID: req.OperationID, Code: viewprotocol.CodeSwitchUnsupported, Unknown: false, Cause: ErrSwitchUnsupported}
+		return nil, &SwitchError{MountID: req.MountID, OperationID: req.OperationID, Code: CodeSwitchUnsupported, Unknown: false, Cause: ErrSwitchUnsupported}
 	}
 	if status.MountID != req.MountID {
 		return nil, &SwitchError{MountID: req.MountID, OperationID: req.OperationID, Code: viewprotocol.CodeConflict, Unknown: false, Cause: errors.New("mount incarnation changed")}
@@ -203,7 +214,7 @@ func exchangeSwitch(ctx context.Context, socketPath, op string, req SwitchReques
 		return &resp, &SwitchError{MountID: req.MountID, OperationID: req.OperationID, Code: code, Unknown: unknown, Cause: fmt.Errorf("%s: %s", code, resp.Error)}
 	}
 	if op == "switch" && resp.Receipt != nil && resp.Receipt.State == mountstate.SwitchRecovering {
-		return &resp, &SwitchError{MountID: req.MountID, OperationID: req.OperationID, Code: viewprotocol.CodeSwitchRecovering, Unknown: true, Cause: ErrSwitchRecovering}
+		return &resp, &SwitchError{MountID: req.MountID, OperationID: req.OperationID, Code: CodeSwitchRecovering, Unknown: true, Cause: ErrSwitchRecovering}
 	}
 	return &resp, nil
 }

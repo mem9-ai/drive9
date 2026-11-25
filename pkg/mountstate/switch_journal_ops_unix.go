@@ -5,8 +5,6 @@ package mountstate
 import (
 	"context"
 	"fmt"
-
-	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 func (j *SwitchJournal) AppendBindIntent(item PendingUnbind) error {
@@ -56,7 +54,7 @@ func (j *SwitchJournal) AppendUnbindDone(item PendingUnbind) error {
 	return j.appendAndApplyLocked(switchJournalRecord{Type: "unbind_done", Unbind: &cp})
 }
 
-func (j *SwitchJournal) BindInitial(target viewprotocol.SwitchBinding, operationID string) error {
+func (j *SwitchJournal) BindInitial(target SwitchBinding, operationID string) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.uncertain {
@@ -66,7 +64,7 @@ func (j *SwitchJournal) BindInitial(target viewprotocol.SwitchBinding, operation
 		return fmt.Errorf("%w: invalid initial layer target", ErrSwitchInvalid)
 	}
 	if !target.ReadOnly {
-		if err := viewprotocol.ValidateOperationID(operationID); err != nil {
+		if err := ValidateOperationID(operationID); err != nil {
 			return fmt.Errorf("%w: %v", ErrSwitchInvalid, err)
 		}
 	}
@@ -77,17 +75,17 @@ func (j *SwitchJournal) BindInitial(target viewprotocol.SwitchBinding, operation
 	})
 }
 
-func (j *SwitchJournal) Decide(operationID string, expectedGeneration uint64, target viewprotocol.SwitchBinding) (SwitchReceipt, bool, error) {
+func (j *SwitchJournal) Decide(operationID string, expectedGeneration uint64, target SwitchBinding) (SwitchReceipt, bool, error) {
 	return j.DecideWithLayerRef(operationID, expectedGeneration, target, target.LayerID)
 }
 
-func (j *SwitchJournal) DecideWithLayerRef(operationID string, expectedGeneration uint64, target viewprotocol.SwitchBinding, layerRef string) (SwitchReceipt, bool, error) {
+func (j *SwitchJournal) DecideWithLayerRef(operationID string, expectedGeneration uint64, target SwitchBinding, layerRef string) (SwitchReceipt, bool, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.uncertain {
 		return SwitchReceipt{}, false, ErrSwitchUncertain
 	}
-	if err := viewprotocol.ValidateOperationID(operationID); err != nil {
+	if err := ValidateOperationID(operationID); err != nil {
 		return SwitchReceipt{}, false, fmt.Errorf("%w: %v", ErrSwitchInvalid, err)
 	}
 	if err := target.Validate(); err != nil {

@@ -31,8 +31,8 @@ type mountViewSwitch struct {
 	notifier     viewCacheNotifier
 	fence        func(context.Context) error
 	timing       layerLeaseTiming
-	buildRuntime func(context.Context, viewprotocol.SwitchBinding, *layerMountBinding) (*mountRuntime, error)
-	onSwitchDone func(viewprotocol.SwitchBinding)
+	buildRuntime func(context.Context, mountstate.SwitchBinding, *layerMountBinding) (*mountRuntime, error)
+	onSwitchDone func(mountstate.SwitchBinding)
 
 	pendingPause     *viewPause
 	pendingPlan      viewCacheInvalidation
@@ -195,7 +195,7 @@ func (s *mountViewSwitch) query(req mountcontrol.SwitchRequest) mountcontrol.Swi
 		return switchErrResp(req, viewprotocol.CodeInvalidArgument, "INVALID", err)
 	}
 	if s.journal.Uncertain() {
-		return switchErrResp(req, viewprotocol.CodeSwitchRecovering, "RECOVERING", mountstate.ErrSwitchUncertain)
+		return switchErrResp(req, mountcontrol.CodeSwitchRecovering, "RECOVERING", mountstate.ErrSwitchUncertain)
 	}
 	snap := s.journal.Snapshot()
 	if req.MountID != snap.MountID {
@@ -210,7 +210,7 @@ func (s *mountViewSwitch) query(req mountcontrol.SwitchRequest) mountcontrol.Swi
 			MountID:     snap.MountID,
 			OperationID: req.OperationID,
 			Receipt:     &prior,
-			Code:        viewprotocol.CodeSwitchTargetRevoked,
+			Code:        mountcontrol.CodeSwitchTargetRevoked,
 			ErrorKind:   "TARGET_REVOKED",
 			Error:       "target layer or lease was revoked",
 		}
@@ -262,14 +262,14 @@ func (s *mountViewSwitch) apply(ctx context.Context, req mountcontrol.SwitchRequ
 		return switchErrResp(req, viewprotocol.CodeInvalidArgument, "INVALID", err)
 	}
 	if s.journal.Uncertain() {
-		return switchErrResp(req, viewprotocol.CodeSwitchRecovering, "RECOVERING", mountstate.ErrSwitchUncertain)
+		return switchErrResp(req, mountcontrol.CodeSwitchRecovering, "RECOVERING", mountstate.ErrSwitchUncertain)
 	}
 	snap := s.journal.Snapshot()
 	if req.MountID != snap.MountID {
 		return switchErrResp(req, viewprotocol.CodeConflict, "CONFLICT", errors.New("mount incarnation mismatch"))
 	}
 	if !s.supported() {
-		return switchErrResp(req, viewprotocol.CodeSwitchUnsupported, "UNSUPPORTED", mountcontrol.ErrSwitchUnsupported)
+		return switchErrResp(req, mountcontrol.CodeSwitchUnsupported, "UNSUPPORTED", mountcontrol.ErrSwitchUnsupported)
 	}
 	isMain, layerRef, _ := req.NormalizedTarget()
 
@@ -279,13 +279,13 @@ func (s *mountViewSwitch) apply(ctx context.Context, req mountcontrol.SwitchRequ
 		}
 		matched, matchErr := s.targetMatchesReplay(ctx, isMain, layerRef, prior)
 		if matchErr != nil {
-			return switchErrResp(req, viewprotocol.CodeSwitchRecovering, "RECOVERING", matchErr)
+			return switchErrResp(req, mountcontrol.CodeSwitchRecovering, "RECOVERING", matchErr)
 		}
 		if !matched {
 			return switchErrResp(req, viewprotocol.CodeConflict, "CONFLICT", mountstate.ErrSwitchConflict)
 		}
 		if prior.State == mountstate.SwitchTargetRevoked {
-			return mountcontrol.SwitchResponse{MountID: snap.MountID, OperationID: req.OperationID, Receipt: &prior, Code: viewprotocol.CodeSwitchTargetRevoked, ErrorKind: "TARGET_REVOKED", Error: "target layer or lease was revoked"}
+			return mountcontrol.SwitchResponse{MountID: snap.MountID, OperationID: req.OperationID, Receipt: &prior, Code: mountcontrol.CodeSwitchTargetRevoked, ErrorKind: "TARGET_REVOKED", Error: "target layer or lease was revoked"}
 		}
 		if prior.State == mountstate.SwitchRecovering && snap.Pending != nil && snap.Pending.OperationID == req.OperationID {
 			return s.finishPendingLocked(ctx, req.OperationID)
@@ -308,7 +308,7 @@ func (s *mountViewSwitch) apply(ctx context.Context, req mountcontrol.SwitchRequ
 			if s.pendingPause == nil {
 				p, perr := s.adapter.admission.pause()
 				if perr != nil {
-					return switchErrResp(req, viewprotocol.CodeSwitchRecovering, "RECOVERING", perr)
+					return switchErrResp(req, mountcontrol.CodeSwitchRecovering, "RECOVERING", perr)
 				}
 				s.pendingPause = p
 			}
@@ -327,7 +327,7 @@ func (s *mountViewSwitch) apply(ctx context.Context, req mountcontrol.SwitchRequ
 					s.outgoingStopped = false
 				} else {
 					if serr := s.pendingTarget.stop(ctx); serr != nil {
-						return switchErrResp(req, viewprotocol.CodeSwitchRecovering, "RECOVERING", serr)
+						return switchErrResp(req, mountcontrol.CodeSwitchRecovering, "RECOVERING", serr)
 					}
 					s.pendingTarget = nil
 				}
@@ -335,7 +335,7 @@ func (s *mountViewSwitch) apply(ctx context.Context, req mountcontrol.SwitchRequ
 			s.pendingInstalled = false
 			if _, aerr := s.journal.AbortPendingForRecover(snap.Pending.OperationID); aerr != nil {
 				if errors.Is(aerr, mountstate.ErrSwitchUncertain) {
-					return switchErrResp(req, viewprotocol.CodeSwitchRecovering, "RECOVERING", aerr)
+					return switchErrResp(req, mountcontrol.CodeSwitchRecovering, "RECOVERING", aerr)
 				}
 				return switchErrResp(req, viewprotocol.CodeConflict, "CONFLICT", aerr)
 			}
@@ -347,10 +347,10 @@ func (s *mountViewSwitch) apply(ctx context.Context, req mountcontrol.SwitchRequ
 		}
 	} else if snap.Pending != nil || recoveringFromRevoked {
 		if recoveringFromRevoked || snap.Pending != nil && snap.Pending.State == mountstate.SwitchTargetRevoked {
-			return switchErrResp(req, viewprotocol.CodeSwitchTargetRevoked, "TARGET_REVOKED",
+			return switchErrResp(req, mountcontrol.CodeSwitchTargetRevoked, "TARGET_REVOKED",
 				errors.New("pending switch target was revoked; use --recover or unmount"))
 		}
-		return switchErrResp(req, viewprotocol.CodeSwitchRecovering, "RECOVERING",
+		return switchErrResp(req, mountcontrol.CodeSwitchRecovering, "RECOVERING",
 			errors.New("another switch operation is recovering"))
 	}
 
@@ -359,7 +359,7 @@ func (s *mountViewSwitch) apply(ctx context.Context, req mountcontrol.SwitchRequ
 	}
 	if err := s.drainPendingUnbindsLocked(ctx); err != nil || len(s.journal.Snapshot().PendingUnbinds) > 0 {
 		s.kickAsyncDrainUnbinds()
-		return switchErrResp(req, viewprotocol.CodeSwitchUnbindCleanupPending, "CLEANUP_PENDING", mountstate.ErrSwitchUnbindPending)
+		return switchErrResp(req, mountcontrol.CodeSwitchUnbindCleanupPending, "CLEANUP_PENDING", mountstate.ErrSwitchUnbindPending)
 	}
 	return s.executeSwitchPrecheckedLocked(ctx, req, snap, isMain, layerRef, recoveringFromRevoked)
 }
@@ -465,7 +465,7 @@ func (s *mountViewSwitch) executeSwitchPrecheckedLocked(
 		if pause == nil {
 			p, perr := s.adapter.admission.pause()
 			if perr != nil {
-				return switchErrResp(req, viewprotocol.CodeSwitchRecovering, "RECOVERING", perr)
+				return switchErrResp(req, mountcontrol.CodeSwitchRecovering, "RECOVERING", perr)
 			}
 			pause = p
 			s.pendingPause = p
@@ -475,7 +475,7 @@ func (s *mountViewSwitch) executeSwitchPrecheckedLocked(
 			var perr error
 			plan, perr = prepareViewCacheInvalidation(s.current.fs.inodes.Snapshot())
 			if perr != nil {
-				return switchErrResp(req, viewprotocol.CodeSwitchPrepareFailed, "PREPARE_FAILED", perr)
+				return switchErrResp(req, mountcontrol.CodeSwitchPrepareFailed, "PREPARE_FAILED", perr)
 			}
 		}
 	} else {
@@ -496,17 +496,17 @@ func (s *mountViewSwitch) executeSwitchPrecheckedLocked(
 		}
 		if s.journal.Uncertain() {
 			s.pendingPause = pause
-			return switchErrResp(req, viewprotocol.CodeSwitchRecovering, "RECOVERING", mountstate.ErrSwitchUncertain)
+			return switchErrResp(req, mountcontrol.CodeSwitchRecovering, "RECOVERING", mountstate.ErrSwitchUncertain)
 		}
 		if derr != nil || stillPending {
 			s.kickAsyncDrainUnbinds()
-			return switchErrResp(req, viewprotocol.CodeSwitchBindCleanupPending, "CLEANUP_PENDING",
+			return switchErrResp(req, mountcontrol.CodeSwitchBindCleanupPending, "CLEANUP_PENDING",
 				fmt.Errorf("rollback unbind pending after %v", cause))
 		}
 		return classifyPreDecisionError(req, cause)
 	}
 
-	targetBinding := viewprotocol.SwitchBinding{ReadOnly: s.cfg.ReadOnly}
+	targetBinding := mountstate.SwitchBinding{ReadOnly: s.cfg.ReadOnly}
 	var newLease *layerMountBinding
 	if !isMain {
 		targetBinding.LayerID = targetInfo.LayerID
@@ -521,7 +521,7 @@ func (s *mountViewSwitch) executeSwitchPrecheckedLocked(
 			}); ierr != nil {
 				if errors.Is(ierr, mountstate.ErrSwitchUncertain) {
 					s.pendingPause = pause
-					return switchErrResp(req, viewprotocol.CodeSwitchRecovering, "RECOVERING", ierr)
+					return switchErrResp(req, mountcontrol.CodeSwitchRecovering, "RECOVERING", ierr)
 				}
 				if !recoveringFromRevoked {
 					_ = pause.resume()
@@ -579,7 +579,7 @@ func (s *mountViewSwitch) executeSwitchPrecheckedLocked(
 		}
 		if errors.Is(idleErr, mountstate.ErrSwitchUncertain) || s.journal.Uncertain() {
 			s.pendingPause = pause
-			return switchErrResp(req, viewprotocol.CodeSwitchRecovering, "RECOVERING", idleErr)
+			return switchErrResp(req, mountcontrol.CodeSwitchRecovering, "RECOVERING", idleErr)
 		}
 		return rollbackPreDecision(idleErr)
 	}

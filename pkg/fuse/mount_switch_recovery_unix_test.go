@@ -32,7 +32,7 @@ func TestMountViewSwitchPreflightBusyAndPendingUnbindGate(t *testing.T) {
 	})
 	var swErr *mountcontrol.SwitchError
 	require.ErrorAs(t, err, &swErr)
-	require.Equal(t, viewprotocol.CodeSwitchBusy, swErr.Code)
+	require.Equal(t, mountcontrol.CodeSwitchBusy, swErr.Code)
 	require.Empty(t, sw.journal.Snapshot().PendingUnbinds)
 	fb.mu.Lock()
 	require.Equal(t, int64(0), fb.layers["layer_01j00000000000000000000001"].Info.Fence)
@@ -52,7 +52,7 @@ func TestMountViewSwitchPreflightBusyAndPendingUnbindGate(t *testing.T) {
 		MountID: "mount-1", OperationID: "op_postbind_busy", ExpectedGeneration: 1, Layer: "L1",
 	})
 	require.ErrorAs(t, err, &swErr)
-	require.Equal(t, viewprotocol.CodeSwitchBusy, swErr.Code)
+	require.Equal(t, mountcontrol.CodeSwitchBusy, swErr.Code)
 	require.Empty(t, sw.journal.Snapshot().PendingUnbinds)
 	fb.mu.Lock()
 	require.Equal(t, int64(2), fb.layers["layer_01j00000000000000000000001"].Info.Fence)
@@ -64,14 +64,14 @@ func TestMountViewSwitchPreflightBusyAndPendingUnbindGate(t *testing.T) {
 		MountID: "mount-1", OperationID: "op_cleanup_pend", ExpectedGeneration: 1, Layer: "L1",
 	})
 	require.ErrorAs(t, err, &swErr)
-	require.Equal(t, viewprotocol.CodeSwitchBindCleanupPending, swErr.Code)
+	require.Equal(t, mountcontrol.CodeSwitchBindCleanupPending, swErr.Code)
 	require.Len(t, sw.journal.Snapshot().PendingUnbinds, 1)
 
 	_, err = mountcontrol.RequestSwitch(ctx, ctrl.SocketPath(), mountcontrol.SwitchRequest{
 		MountID: "mount-1", OperationID: "op_blocked_by_unbind", ExpectedGeneration: 1, Layer: "L2",
 	})
 	require.ErrorAs(t, err, &swErr)
-	require.Equal(t, viewprotocol.CodeSwitchUnbindCleanupPending, swErr.Code)
+	require.Equal(t, mountcontrol.CodeSwitchUnbindCleanupPending, swErr.Code)
 
 	// Clear injected busy state (root ino 1 lookup is allowed!) and let unbind succeed.
 	fb.mu.Lock()
@@ -115,7 +115,7 @@ func TestMountViewSwitchTargetRevokedDeterministicExits(t *testing.T) {
 		})
 		var swErr *mountcontrol.SwitchError
 		require.ErrorAs(t, err, &swErr)
-		require.Equal(t, viewprotocol.CodeSwitchTargetRevoked, swErr.Code)
+		require.Equal(t, mountcontrol.CodeSwitchTargetRevoked, swErr.Code)
 		require.NotNil(t, sw.journal.Snapshot().Pending)
 		require.Equal(t, mountstate.SwitchTargetRevoked, sw.journal.Snapshot().Pending.State)
 
@@ -128,7 +128,7 @@ func TestMountViewSwitchTargetRevokedDeterministicExits(t *testing.T) {
 			MountID: "mount-1", OperationID: "op_no_recover", ExpectedGeneration: 3, Layer: "main",
 		})
 		require.ErrorAs(t, err, &swErr)
-		require.Equal(t, viewprotocol.CodeSwitchTargetRevoked, swErr.Code)
+		require.Equal(t, mountcontrol.CodeSwitchTargetRevoked, swErr.Code)
 
 		// Deterministic Exit #2: mount switch --recover --layer main
 		recResp, err := mountcontrol.RequestSwitch(ctx, ctrl.SocketPath(), mountcontrol.SwitchRequest{
@@ -166,7 +166,7 @@ func TestMountViewSwitchTargetRevokedDeterministicExits(t *testing.T) {
 		})
 		var swErr *mountcontrol.SwitchError
 		require.ErrorAs(t, err, &swErr)
-		require.Equal(t, viewprotocol.CodeSwitchTargetRevoked, swErr.Code)
+		require.Equal(t, mountcontrol.CodeSwitchTargetRevoked, swErr.Code)
 
 		drainResp := mv.drainShutdownResponse(ctx)
 		require.True(t, drainResp.OK)
@@ -210,7 +210,7 @@ func TestPrepareMountViewDrainsCrashedPriorIncarnationJournalAndPreservesOtherSc
 	require.NoError(t, err)
 	otherJPath, err := mountstate.SwitchJournalPath("mount-other")
 	require.NoError(t, err)
-	otherJ, err := mountstate.OpenSwitchJournal(otherJPath, "mount-other", otherScope, viewprotocol.SwitchBinding{})
+	otherJ, err := mountstate.OpenSwitchJournal(otherJPath, "mount-other", otherScope, mountstate.SwitchBinding{})
 	require.NoError(t, err)
 	require.NoError(t, otherJ.Close())
 	fCorruptOther, err := os.OpenFile(otherJPath, os.O_WRONLY|os.O_APPEND, 0o600)
@@ -233,7 +233,7 @@ func TestPrepareMountViewDrainsCrashedPriorIncarnationJournalAndPreservesOtherSc
 	require.NoError(t, err)
 	crashedJPath, err := mountstate.SwitchScopedJournalPath(sameScope, "mount-crashed")
 	require.NoError(t, err)
-	crashedJ, err := mountstate.OpenSwitchJournal(crashedJPath, "mount-crashed", sameScope, viewprotocol.SwitchBinding{})
+	crashedJ, err := mountstate.OpenSwitchJournal(crashedJPath, "mount-crashed", sameScope, mountstate.SwitchBinding{})
 	require.NoError(t, err)
 	const l1 = "layer_01j00000000000000000000001"
 	require.NoError(t, crashedJ.AppendBindIntent(mountstate.PendingUnbind{
@@ -319,7 +319,7 @@ func TestMountViewSwitchRecoverStopsOutgoingLeaseQueryAbortedAndReplaysIdempoten
 	})
 	var swErr *mountcontrol.SwitchError
 	require.ErrorAs(t, err, &swErr)
-	require.Equal(t, viewprotocol.CodeSwitchTargetRevoked, swErr.Code)
+	require.Equal(t, mountcontrol.CodeSwitchTargetRevoked, swErr.Code)
 
 	// 3. Verify no L1 renew races with L1 unbind DURING drainPendingUnbindsLocked (before finishPendingLocked),
 	// QuerySwitch sees ABORTED on op_rev_l2, and retrying --recover replays SwitchDone idempotently!
@@ -400,10 +400,10 @@ func TestMountViewSwitchReplaysRevokedRecoveryAfterJournalReopen(t *testing.T) {
 	fb.mu.Unlock()
 	ctx := t.Context()
 	req := mountcontrol.SwitchRequest{MountID: "mount-1", OperationID: "initial", ExpectedGeneration: 1, Layer: "L1"}
-	require.Equal(t, viewprotocol.CodeSwitchTargetRevoked, sw.apply(ctx, req).Code)
+	require.Equal(t, mountcontrol.CodeSwitchTargetRevoked, sw.apply(ctx, req).Code)
 	req = mountcontrol.SwitchRequest{MountID: "mount-1", OperationID: "recovery", ExpectedGeneration: 2, Layer: "L2", Recover: true}
 	revoked := sw.apply(ctx, req)
-	require.Equal(t, viewprotocol.CodeSwitchTargetRevoked, revoked.Code)
+	require.Equal(t, mountcontrol.CodeSwitchTargetRevoked, revoked.Code)
 	require.NotNil(t, revoked.Receipt)
 	require.NoError(t, sw.journal.Close())
 	journal, err := mountstate.OpenExistingSwitchJournal(filepath.Join(filepath.Dir(mp), "switch.journal"))

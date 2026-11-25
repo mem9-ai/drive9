@@ -21,61 +21,6 @@ func ValidateLayerID(id string) error {
 	return nil
 }
 
-// ValidateOperationID validates a local mount_id or operation_id token (1..64 ASCII bytes).
-func ValidateOperationID(id string) error {
-	if id == "" || len(id) > MaxMountIDBytes {
-		return fmt.Errorf("%w: %q", ErrInvalidOperationID, id)
-	}
-	for i := 0; i < len(id); i++ {
-		c := id[i]
-		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-			c == '-' || c == '_' || c == '.' || c == ':'
-		if !ok {
-			return fmt.Errorf("%w: %q", ErrInvalidOperationID, id)
-		}
-	}
-	return nil
-}
-
-// SwitchBinding describes a FUSE mount's active view binding in SwitchJournal
-// and local control responses. LayerID is empty for main and MUST be a
-// canonical server-generated layer_id (never a name or tag ref) otherwise.
-type SwitchBinding struct {
-	LayerID      string `json:"layer_id,omitempty"`
-	Fence        int64  `json:"fence,omitempty"`
-	BaseRootPath string `json:"base_root_path,omitempty"`
-	ReadOnly     bool   `json:"read_only,omitempty"`
-}
-
-// Validate checks v36 §6.3/§6.5 invariants on a persisted or wire SwitchBinding.
-func (b SwitchBinding) Validate() error {
-	if b.LayerID == "" {
-		if b.Fence != 0 || b.BaseRootPath != "" {
-			return fmt.Errorf("%w: main binding must not carry layer fence or base_root_path", ErrInvalidFence)
-		}
-		return nil
-	}
-	if err := ValidateLayerID(b.LayerID); err != nil {
-		return err
-	}
-	if b.BaseRootPath != "" {
-		canon, err := CanonicalizeViewPath(b.BaseRootPath)
-		if err != nil || canon != b.BaseRootPath {
-			return fmt.Errorf("invalid canonical base_root_path %q", b.BaseRootPath)
-		}
-	}
-	if b.ReadOnly {
-		if b.Fence != 0 {
-			return fmt.Errorf("%w: read-only layer binding must have fence 0", ErrInvalidFence)
-		}
-		return nil
-	}
-	if b.Fence <= 0 || b.Fence%2 == 0 {
-		return fmt.Errorf("%w: writable layer binding requires positive odd fence, got %d", ErrInvalidFence, b.Fence)
-	}
-	return nil
-}
-
 // NormalizeLayerName trims and validates an optional human-facing layer name.
 // Names stay disjoint from "main", "tag:" selectors, and "layer_" IDs.
 func NormalizeLayerName(raw string) (string, error) {

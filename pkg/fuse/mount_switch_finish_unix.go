@@ -33,7 +33,7 @@ func (s *mountViewSwitch) finishPendingLocked(ctx context.Context, opID string) 
 	snap := s.journal.Snapshot()
 	req := mountcontrol.SwitchRequest{MountID: snap.MountID, OperationID: opID}
 	if s.journal.Uncertain() {
-		return switchErrResp(req, viewprotocol.CodeSwitchRecovering, "RECOVERING", mountstate.ErrSwitchUncertain)
+		return switchErrResp(req, mountcontrol.CodeSwitchRecovering, "RECOVERING", mountstate.ErrSwitchUncertain)
 	}
 	if snap.Pending == nil || snap.Pending.OperationID != opID {
 		if done, ok := s.journal.Operation(opID); ok && done.State == mountstate.SwitchDone {
@@ -47,7 +47,7 @@ func (s *mountViewSwitch) finishPendingLocked(ctx context.Context, opID string) 
 			MountID:     snap.MountID,
 			OperationID: opID,
 			Receipt:     &dec,
-			Code:        viewprotocol.CodeSwitchTargetRevoked,
+			Code:        mountcontrol.CodeSwitchTargetRevoked,
 			ErrorKind:   "TARGET_REVOKED",
 			Error:       "target layer or lease was revoked",
 		}
@@ -250,7 +250,7 @@ func (s *mountViewSwitch) markRevokedLocked(dec mountstate.SwitchReceipt, cause 
 		MountID:     s.journal.Snapshot().MountID,
 		OperationID: dec.OperationID,
 		Receipt:     &rev,
-		Code:        viewprotocol.CodeSwitchTargetRevoked,
+		Code:        mountcontrol.CodeSwitchTargetRevoked,
 		ErrorKind:   "TARGET_REVOKED",
 		Error:       cause.Error(),
 	}
@@ -270,7 +270,7 @@ func (s *mountViewSwitch) recoveringResp(dec mountstate.SwitchReceipt, cause err
 		MountID:     snap.MountID,
 		OperationID: dec.OperationID,
 		Receipt:     &rcpt,
-		Code:        viewprotocol.CodeSwitchRecovering,
+		Code:        mountcontrol.CodeSwitchRecovering,
 		ErrorKind:   "RECOVERING",
 		Error:       msg,
 	}
@@ -292,10 +292,10 @@ func isRevokedTargetError(err error) bool {
 
 func classifyPreDecisionError(req mountcontrol.SwitchRequest, err error) mountcontrol.SwitchResponse {
 	if errors.Is(err, errViewPrepareFailed) {
-		return switchErrResp(req, viewprotocol.CodeSwitchPrepareFailed, "PREPARE_FAILED", err)
+		return switchErrResp(req, mountcontrol.CodeSwitchPrepareFailed, "PREPARE_FAILED", err)
 	}
 	if errors.Is(err, syscall.EBUSY) {
-		return switchErrResp(req, viewprotocol.CodeSwitchBusy, "BUSY", err)
+		return switchErrResp(req, mountcontrol.CodeSwitchBusy, "BUSY", err)
 	}
 	var st *client.StatusError
 	if errors.As(err, &st) {
@@ -323,7 +323,7 @@ func classifyPreDecisionError(req mountcontrol.SwitchRequest, err error) mountco
 			return switchErrResp(req, code, "INVALID", err)
 		case http.StatusNotImplemented:
 			if code == "" {
-				code = viewprotocol.CodeSwitchUnsupported
+				code = mountcontrol.CodeSwitchUnsupported
 			}
 			return switchErrResp(req, code, "UNSUPPORTED", err)
 		}
@@ -337,5 +337,5 @@ func classifyPreDecisionError(req mountcontrol.SwitchRequest, err error) mountco
 	if errors.Is(err, client.ErrConflict) {
 		return switchErrResp(req, viewprotocol.CodeConflict, "CONFLICT", err)
 	}
-	return switchErrResp(req, viewprotocol.CodeSwitchPrepareFailed, "PREPARE_FAILED", err)
+	return switchErrResp(req, mountcontrol.CodeSwitchPrepareFailed, "PREPARE_FAILED", err)
 }

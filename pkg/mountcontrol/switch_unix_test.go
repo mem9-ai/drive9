@@ -14,7 +14,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/mem9-ai/drive9/pkg/mountstate"
-	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 func shortUnixSocketDir(t *testing.T) string {
@@ -49,7 +48,7 @@ func TestRequestSwitchNegotiationUnsupportedAndDone(t *testing.T) {
 	_, err = RequestSwitch(ctx, sock1, req)
 	var se *SwitchError
 	require.ErrorAs(t, err, &se)
-	require.Equal(t, viewprotocol.CodeSwitchUnsupported, se.Code)
+	require.Equal(t, CodeSwitchUnsupported, se.Code)
 	require.False(t, se.Unknown)
 
 	// 2. Daemon with ViewSwitch=true negotiates ping -> switch on the same stream and returns DONE receipt.
@@ -57,7 +56,7 @@ func TestRequestSwitchNegotiationUnsupportedAndDone(t *testing.T) {
 	ln2, err := net.Listen("unix", sock2)
 	require.NoError(t, err)
 	defer func() { _ = ln2.Close() }()
-	target := viewprotocol.SwitchBinding{
+	target := mountstate.SwitchBinding{
 		LayerID:      "layer_01j8z4r9w3m5n7p9q2s4t6v8xz",
 		Fence:        1,
 		BaseRootPath: "/workspace",
@@ -96,7 +95,7 @@ func TestRequestSwitchNegotiationUnsupportedAndDone(t *testing.T) {
 }
 
 func TestValidateSwitchResponseRecoverAndQueryAborted(t *testing.T) {
-	target := viewprotocol.SwitchBinding{
+	target := mountstate.SwitchBinding{
 		LayerID:      "layer_01j8z4r9w3m5n7p9q2s4t6v8xz",
 		Fence:        1,
 		BaseRootPath: "/workspace",
@@ -144,4 +143,41 @@ func TestValidateSwitchResponseRecoverAndQueryAborted(t *testing.T) {
 	badOpReceipt.OperationID = "other-op"
 	badOpResp.Receipt = &badOpReceipt
 	require.Error(t, validateSwitchResponse("switch", recReq, badOpResp))
+}
+
+func TestRequestSwitchFailedPing(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  StatusResponse
+		code    string
+		unknown bool
+	}{
+		{"pre_ping_daemon", StatusResponse{Error: "unknown operation"}, CodeSwitchUnsupported, false},
+		{"switch_advertised", StatusResponse{ViewSwitch: true}, CodeSwitchRecovering, true},
+		{"mount_identified", StatusResponse{MountID: "m1"}, CodeSwitchRecovering, true},
+		{"recovering", StatusResponse{Recovering: true}, CodeSwitchRecovering, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			socket := filepath.Join(shortUnixSocketDir(t), "ping.sock")
+			listener, err := net.Listen("unix", socket)
+			require.NoError(t, err)
+			defer func() { _ = listener.Close() }()
+			go func() {
+				conn, err := listener.Accept()
+				if err != nil {
+					return
+				}
+				defer func() { _ = conn.Close() }()
+				var ping DrainRequest
+				if err := json.NewDecoder(conn).Decode(&ping); err == nil && ping.Op == "ping" {
+					_ = json.NewEncoder(conn).Encode(tc.status)
+				}
+			}()
+			_, err = RequestSwitch(context.Background(), socket, SwitchRequest{MountID: "m1", OperationID: "op-1", ExpectedGeneration: 1, Layer: "main"})
+			var se *SwitchError
+			require.ErrorAs(t, err, &se)
+			require.Equal(t, tc.code, se.Code)
+			require.Equal(t, tc.unknown, se.Unknown)
+		})
+	}
 }

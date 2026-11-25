@@ -9,8 +9,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-
-	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 const (
@@ -24,7 +22,7 @@ func TestSwitchJournalLifecycleReplayAndPendingUnbinds(t *testing.T) {
 	scope, err := SwitchScope("http://127.0.0.1:9009", "tenant-1", "/workspace", filepath.Join(dir, "mnt"))
 	require.NoError(t, err)
 
-	j, err := OpenSwitchJournal(jPath, "mnt-1", scope, viewprotocol.SwitchBinding{})
+	j, err := OpenSwitchJournal(jPath, "mnt-1", scope, SwitchBinding{})
 	require.NoError(t, err)
 	defer func() { _ = j.Close() }()
 
@@ -40,7 +38,7 @@ func TestSwitchJournalLifecycleReplayAndPendingUnbinds(t *testing.T) {
 	require.NoError(t, j.AppendBindIntent(PendingUnbind{
 		LayerID: testLayerA, MountID: "mnt-1", Kind: UnbindKindOp, OperationID: "op-1", Fence: 0,
 	}))
-	targetA := viewprotocol.SwitchBinding{LayerID: testLayerA, Fence: 1, BaseRootPath: "/workspace"}
+	targetA := SwitchBinding{LayerID: testLayerA, Fence: 1, BaseRootPath: "/workspace"}
 	_, _, err = j.DecideWithLayerRef("op-1", 1, targetA, testLayerB)
 	require.ErrorIs(t, err, ErrSwitchInvalid)
 	rcpt1, replayed, err := j.DecideWithLayerRef("op-1", 1, targetA, "work")
@@ -70,7 +68,7 @@ func TestSwitchJournalLifecycleReplayAndPendingUnbinds(t *testing.T) {
 	require.NoError(t, j.AppendBindIntent(PendingUnbind{
 		LayerID: testLayerB, MountID: "mnt-1", Kind: UnbindKindOp, OperationID: "op-2", Fence: 2,
 	}))
-	targetB := viewprotocol.SwitchBinding{LayerID: testLayerB, Fence: 3, BaseRootPath: "/workspace"}
+	targetB := SwitchBinding{LayerID: testLayerB, Fence: 3, BaseRootPath: "/workspace"}
 	_, _, err = j.Decide("op-2", 2, targetB)
 	require.NoError(t, err)
 	_, err = j.Complete("op-2")
@@ -83,7 +81,7 @@ func TestSwitchJournalLifecycleReplayAndPendingUnbinds(t *testing.T) {
 	}}, snap.PendingUnbinds)
 
 	// New switch is blocked with ErrSwitchUnbindPending until pending_unbinds drains!
-	_, _, err = j.Decide("op-3", 3, viewprotocol.SwitchBinding{})
+	_, _, err = j.Decide("op-3", 3, SwitchBinding{})
 	require.ErrorIs(t, err, ErrSwitchUnbindPending)
 
 	var drained []PendingUnbind
@@ -101,21 +99,21 @@ func TestSwitchJournalTargetRevokedDualExitAndCorruption(t *testing.T) {
 	scope, err := SwitchScope("http://127.0.0.1:9009", "tenant-1", "/workspace", filepath.Join(dir, "mnt2"))
 	require.NoError(t, err)
 
-	j, err := OpenSwitchJournal(jPath, "mnt-2", scope, viewprotocol.SwitchBinding{})
+	j, err := OpenSwitchJournal(jPath, "mnt-2", scope, SwitchBinding{})
 	require.NoError(t, err)
 
 	// Initial mount --layer via BindInitial, then switch L_A -> L_B hits TARGET_REVOKED.
 	require.NoError(t, j.AppendBindIntent(PendingUnbind{
 		LayerID: testLayerA, MountID: "mnt-2", Kind: UnbindKindOp, OperationID: "init-op", Fence: 0,
 	}))
-	require.NoError(t, j.BindInitial(viewprotocol.SwitchBinding{
+	require.NoError(t, j.BindInitial(SwitchBinding{
 		LayerID: testLayerA, Fence: 1, BaseRootPath: "/workspace",
 	}, "init-op"))
 
 	require.NoError(t, j.AppendBindIntent(PendingUnbind{
 		LayerID: testLayerB, MountID: "mnt-2", Kind: UnbindKindOp, OperationID: "op-rev", Fence: 0,
 	}))
-	_, _, err = j.Decide("op-rev", 1, viewprotocol.SwitchBinding{
+	_, _, err = j.Decide("op-rev", 1, SwitchBinding{
 		LayerID: testLayerB, Fence: 1, BaseRootPath: "/workspace",
 	})
 	require.NoError(t, err)

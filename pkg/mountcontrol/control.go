@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/mountstate"
-	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 const DefaultDrainTimeout = 30 * time.Second
@@ -23,20 +22,20 @@ type DrainRequest struct {
 }
 
 type StatusResponse struct {
-	OK         bool      `json:"ok"`
-	MountPoint string    `json:"mount_point,omitempty"`
-	RemoteRoot string    `json:"remote_root,omitempty"`
-	Op         string    `json:"op,omitempty"`
-	PID        int       `json:"pid,omitempty"`
-	StartedAt  time.Time `json:"started_at,omitempty"`
-	Layer      *string   `json:"layer,omitempty"`
-	Error      string    `json:"error,omitempty"`
-	ViewSwitch bool                        `json:"view_switch,omitempty"`
-	Recovering bool                        `json:"recovering,omitempty"`
-	MountID    string                      `json:"mount_id,omitempty"`
-	Generation uint64                      `json:"generation,omitempty"`
-	Binding    *viewprotocol.SwitchBinding `json:"binding,omitempty"`
-	Pending    *mountstate.SwitchReceipt   `json:"pending,omitempty"`
+	OK         bool                      `json:"ok"`
+	MountPoint string                    `json:"mount_point,omitempty"`
+	RemoteRoot string                    `json:"remote_root,omitempty"`
+	Op         string                    `json:"op,omitempty"`
+	PID        int                       `json:"pid,omitempty"`
+	StartedAt  time.Time                 `json:"started_at,omitempty"`
+	Layer      *string                   `json:"layer,omitempty"`
+	Error      string                    `json:"error,omitempty"`
+	ViewSwitch bool                      `json:"view_switch,omitempty"`
+	Recovering bool                      `json:"recovering,omitempty"`
+	MountID    string                    `json:"mount_id,omitempty"`
+	Generation uint64                    `json:"generation,omitempty"`
+	Binding    *mountstate.SwitchBinding `json:"binding,omitempty"`
+	Pending    *mountstate.SwitchReceipt `json:"pending,omitempty"`
 }
 
 func (r DrainRequest) Timeout() time.Duration {

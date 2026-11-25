@@ -9,8 +9,6 @@ import (
 
 	"github.com/pingcap/failpoint"
 	"github.com/stretchr/testify/require"
-
-	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 func TestSwitchJournalBeforeSyncFailpointLatchesUncertain(t *testing.T) {
@@ -19,7 +17,7 @@ func TestSwitchJournalBeforeSyncFailpointLatchesUncertain(t *testing.T) {
 	scope, err := SwitchScope("http://127.0.0.1:9009", "tenant-fp", "/workspace", filepath.Join(dir, "mnt"))
 	require.NoError(t, err)
 
-	j, err := OpenSwitchJournal(jPath, "mnt-fp", scope, viewprotocol.SwitchBinding{})
+	j, err := OpenSwitchJournal(jPath, "mnt-fp", scope, SwitchBinding{})
 	require.NoError(t, err)
 	defer func() { _ = j.Close() }()
 
@@ -38,7 +36,7 @@ func TestSwitchJournalBeforeSyncFailpointLatchesUncertain(t *testing.T) {
 
 	// Even after disabling the failpoint, the journal remains latched fail-closed!
 	require.NoError(t, failpoint.Disable("github.com/mem9-ai/drive9/pkg/mountstate/switchJournalBeforeSync"))
-	_, _, err = j.Decide("op-fp2", 1, viewprotocol.SwitchBinding{})
+	_, _, err = j.Decide("op-fp2", 1, SwitchBinding{})
 	require.ErrorIs(t, err, ErrSwitchUncertain)
 }
 
@@ -53,7 +51,7 @@ func TestSwitchJournalDirSyncOnPublishRemoveAndFailClosed(t *testing.T) {
 	require.NoError(t, failpoint.EnableCall("github.com/mem9-ai/drive9/pkg/mountstate/switchJournalBeforeDirSync", func(errp *error) {
 		*errp = errors.New("injected parent dir fsync error")
 	}))
-	_, err = OpenSwitchJournal(jPath, "mnt-ds-fail", scope, viewprotocol.SwitchBinding{})
+	_, err = OpenSwitchJournal(jPath, "mnt-ds-fail", scope, SwitchBinding{})
 	require.Error(t, err)
 	require.NoError(t, failpoint.Disable("github.com/mem9-ai/drive9/pkg/mountstate/switchJournalBeforeDirSync"))
 
@@ -73,7 +71,7 @@ func TestSwitchJournalDirSyncOnPublishRemoveAndFailClosed(t *testing.T) {
 		_ = failpoint.Disable("github.com/mem9-ai/drive9/pkg/mountstate/switchJournalBeforeDirSync")
 	}()
 
-	j, err := OpenSwitchJournal(jPath, "mnt-ds-ok", scope, viewprotocol.SwitchBinding{})
+	j, err := OpenSwitchJournal(jPath, "mnt-ds-ok", scope, SwitchBinding{})
 	require.NoError(t, err)
 	require.Equal(t, 1, dirSyncCalls)
 	require.NoError(t, j.Close())

@@ -35,18 +35,18 @@ func TestMountRuntimeDeterministicCachePathsAcrossSwitches(t *testing.T) {
 		WritePolicy: "writeback",
 	}
 
-	mainWriteA, mainReadA, err := mountRuntimeCacheHashes(cfg, "/repo", viewprotocol.SwitchBinding{})
+	mainWriteA, mainReadA, err := mountRuntimeCacheHashes(cfg, "/repo", mountstate.SwitchBinding{})
 	require.NoError(t, err)
-	mainWriteB, mainReadB, err := mountRuntimeCacheHashes(cfg, "/repo", viewprotocol.SwitchBinding{})
+	mainWriteB, mainReadB, err := mountRuntimeCacheHashes(cfg, "/repo", mountstate.SwitchBinding{})
 	require.NoError(t, err)
 	require.Equal(t, mainWriteA, mainWriteB)
 	require.Equal(t, mainReadA, mainReadB)
 	require.Equal(t, MountHash(cfg.Server, cfg.MountPoint, "/repo"), mainWriteA)
 
 	const l1 = "layer_01j00000000000000000000001"
-	layerWriteA, layerReadA, err := mountRuntimeCacheHashes(cfg, "/repo", viewprotocol.SwitchBinding{LayerID: l1, Fence: 1})
+	layerWriteA, layerReadA, err := mountRuntimeCacheHashes(cfg, "/repo", mountstate.SwitchBinding{LayerID: l1, Fence: 1})
 	require.NoError(t, err)
-	layerWriteB, layerReadB, err := mountRuntimeCacheHashes(cfg, "/repo", viewprotocol.SwitchBinding{LayerID: l1, Fence: 9})
+	layerWriteB, layerReadB, err := mountRuntimeCacheHashes(cfg, "/repo", mountstate.SwitchBinding{LayerID: l1, Fence: 9})
 	require.NoError(t, err)
 	require.Equal(t, layerWriteA, layerWriteB)
 	require.Equal(t, layerReadA, layerReadB)
@@ -89,7 +89,7 @@ func TestMountViewSwitchSelfFencedPendingLeaseAndControlResponsiveness(t *testin
 	failFirstBuild.Store(true)
 	origBuild := sw.buildRuntime
 	sw.mu.Lock()
-	sw.buildRuntime = func(bctx context.Context, target viewprotocol.SwitchBinding, lease *layerMountBinding) (*mountRuntime, error) {
+	sw.buildRuntime = func(bctx context.Context, target mountstate.SwitchBinding, lease *layerMountBinding) (*mountRuntime, error) {
 		if failFirstBuild.CompareAndSwap(true, false) {
 			return nil, errors.New("transient runtime build failure")
 		}
@@ -103,7 +103,7 @@ func TestMountViewSwitchSelfFencedPendingLeaseAndControlResponsiveness(t *testin
 	var swErr *mountcontrol.SwitchError
 	require.ErrorAs(t, err, &swErr)
 	require.True(t, swErr.Unknown)
-	require.Equal(t, viewprotocol.CodeSwitchRecovering, swErr.Code)
+	require.Equal(t, mountcontrol.CodeSwitchRecovering, swErr.Code)
 
 	sw.mu.Lock()
 	require.NotNil(t, sw.pendingLease)
@@ -210,14 +210,14 @@ func TestMountViewSwitchUncertainStatusAndRecoveringPausedGuard(t *testing.T) {
 		var swErr *mountcontrol.SwitchError
 		require.ErrorAs(t, err, &swErr)
 		require.True(t, swErr.Unknown)
-		require.Equal(t, viewprotocol.CodeSwitchRecovering, swErr.Code)
+		require.Equal(t, mountcontrol.CodeSwitchRecovering, swErr.Code)
 
 		_, err = mountcontrol.QuerySwitch(ctx, sockPath, mountcontrol.SwitchRequest{
 			MountID: "mount-1", OperationID: "op_uncertain", ExpectedGeneration: 2, Layer: "L1",
 		})
 		require.ErrorAs(t, err, &swErr)
 		require.True(t, swErr.Unknown)
-		require.Equal(t, viewprotocol.CodeSwitchRecovering, swErr.Code)
+		require.Equal(t, mountcontrol.CodeSwitchRecovering, swErr.Code)
 	})
 
 	t.Run("recover_replay_and_recovering_paused_gate", func(t *testing.T) {
@@ -230,7 +230,7 @@ func TestMountViewSwitchUncertainStatusAndRecoveringPausedGuard(t *testing.T) {
 		failBuild.Store(true)
 		origBuild := sw.buildRuntime
 		sw.mu.Lock()
-		sw.buildRuntime = func(bctx context.Context, target viewprotocol.SwitchBinding, lease *layerMountBinding) (*mountRuntime, error) {
+		sw.buildRuntime = func(bctx context.Context, target mountstate.SwitchBinding, lease *layerMountBinding) (*mountRuntime, error) {
 			if failBuild.Load() {
 				return nil, errors.New("runtime build stalled")
 			}
@@ -243,7 +243,7 @@ func TestMountViewSwitchUncertainStatusAndRecoveringPausedGuard(t *testing.T) {
 			MountID: "mount-1", OperationID: "op_revoked_target", ExpectedGeneration: 1, Layer: "L1",
 		})
 		require.ErrorAs(t, err, &swErr)
-		require.Equal(t, viewprotocol.CodeSwitchRecovering, swErr.Code)
+		require.Equal(t, mountcontrol.CodeSwitchRecovering, swErr.Code)
 
 		fb.mu.Lock()
 		savedL1 := *fb.layers[l1]
@@ -267,14 +267,14 @@ func TestMountViewSwitchUncertainStatusAndRecoveringPausedGuard(t *testing.T) {
 			MountID: "mount-1", OperationID: "op_revoked_target", ExpectedGeneration: 1, Layer: "L1",
 		})
 		require.ErrorAs(t, err, &swErr)
-		require.Equal(t, viewprotocol.CodeSwitchTargetRevoked, swErr.Code)
+		require.Equal(t, mountcontrol.CodeSwitchTargetRevoked, swErr.Code)
 
 		checkConflicts()
 		_, err = mountcontrol.RequestSwitch(ctx, ctrl.SocketPath(), mountcontrol.SwitchRequest{
 			MountID: "mount-1", OperationID: "op_revoked_target", ExpectedGeneration: 1, Layer: l1,
 		})
 		require.ErrorAs(t, err, &swErr)
-		require.Equal(t, viewprotocol.CodeSwitchTargetRevoked, swErr.Code)
+		require.Equal(t, mountcontrol.CodeSwitchTargetRevoked, swErr.Code)
 
 		_, err = mountcontrol.RequestSwitch(ctx, ctrl.SocketPath(), mountcontrol.SwitchRequest{
 			MountID: "mount-1", OperationID: "op_revoked_target", ExpectedGeneration: 1, Layer: l1, Recover: true,
@@ -289,13 +289,13 @@ func TestMountViewSwitchUncertainStatusAndRecoveringPausedGuard(t *testing.T) {
 			MountID: "mount-1", OperationID: "op_revoked_target", ExpectedGeneration: 1, Layer: "L1",
 		})
 		require.ErrorAs(t, err, &swErr)
-		require.Equal(t, viewprotocol.CodeSwitchTargetRevoked, swErr.Code)
+		require.Equal(t, mountcontrol.CodeSwitchTargetRevoked, swErr.Code)
 
 		_, err = mountcontrol.RequestSwitch(ctx, ctrl.SocketPath(), mountcontrol.SwitchRequest{
 			MountID: "mount-1", OperationID: "op_recover_retry", ExpectedGeneration: 2, Layer: "main", Recover: true,
 		})
 		require.ErrorAs(t, err, &swErr)
-		require.Equal(t, viewprotocol.CodeSwitchRecovering, swErr.Code)
+		require.Equal(t, mountcontrol.CodeSwitchRecovering, swErr.Code)
 
 		stPaused, err := mountcontrol.RequestStatus(ctx, ctrl.SocketPath(), time.Second)
 		require.NoError(t, err)
@@ -305,7 +305,7 @@ func TestMountViewSwitchUncertainStatusAndRecoveringPausedGuard(t *testing.T) {
 			MountID: "mount-1", OperationID: "op_ordinary_blocked", ExpectedGeneration: 2, Layer: "L1",
 		})
 		require.ErrorAs(t, err, &swErr)
-		require.Equal(t, viewprotocol.CodeSwitchTargetRevoked, swErr.Code)
+		require.Equal(t, mountcontrol.CodeSwitchTargetRevoked, swErr.Code)
 
 		failBuild.Store(false)
 		recDone, err := mountcontrol.RequestSwitch(ctx, ctrl.SocketPath(), mountcontrol.SwitchRequest{
@@ -326,7 +326,7 @@ func TestMountViewSwitchUncertainStatusAndRecoveringPausedGuard(t *testing.T) {
 		extCfg.Extensions = []string{"core", "writeback", "cache", "extent"}
 		counters := perf.NewCounters(false)
 		var sharedExt *extent.Engine
-		initRT, err := buildViewRuntime(extCfg, sw.baseClient, "/", "mount-1", viewprotocol.SwitchBinding{}, nil, mb, counters, &sharedExt)
+		initRT, err := buildViewRuntime(extCfg, sw.baseClient, "/", "mount-1", mountstate.SwitchBinding{}, nil, mb, counters, &sharedExt)
 		require.NoError(t, err)
 		initRT.fs.Init2(context.Background())
 		t.Cleanup(func() { _ = initRT.stop(context.Background()) })
@@ -338,7 +338,7 @@ func TestMountViewSwitchUncertainStatusAndRecoveringPausedGuard(t *testing.T) {
 		sw.current = initRT
 		sw.adapter.inner = initRT.fs
 		sw.adapter.selected.Store(&viewRequestTarget{fs: initRT.fs, generation: 1})
-		sw.buildRuntime = func(_ context.Context, target viewprotocol.SwitchBinding, lease *layerMountBinding) (*mountRuntime, error) {
+		sw.buildRuntime = func(_ context.Context, target mountstate.SwitchBinding, lease *layerMountBinding) (*mountRuntime, error) {
 			vc := sw.baseClient
 			if target.LayerID != "" && lease != nil && lease.ViewClient != nil {
 				vc = lease.ViewClient
@@ -370,7 +370,7 @@ func TestMountViewSwitchUncertainStatusAndRecoveringPausedGuard(t *testing.T) {
 			MountID: "mount-1", OperationID: "op_shared_extent_retry", ExpectedGeneration: 1, Layer: "L1",
 		})
 		require.ErrorAs(t, err, &swErr)
-		require.Equal(t, viewprotocol.CodeSwitchRecovering, swErr.Code)
+		require.Equal(t, mountcontrol.CodeSwitchRecovering, swErr.Code)
 
 		sw.mu.Lock()
 		require.True(t, sw.outgoingStopped)
@@ -435,7 +435,7 @@ func TestInodeBudgetSymmetryStartupClassificationAndLayerGitGate(t *testing.T) {
 	counters := perf.NewCounters(false)
 	var sharedExt *extent.Engine
 
-	rtMain, err := buildViewRuntime(cfg, baseClient, "/", "m1", viewprotocol.SwitchBinding{}, nil, mb, counters, &sharedExt)
+	rtMain, err := buildViewRuntime(cfg, baseClient, "/", "m1", mountstate.SwitchBinding{}, nil, mb, counters, &sharedExt)
 	require.NoError(t, err)
 	preMain := rtMain.fs.ReexecPreflight()
 	require.False(t, preMain.OK)
@@ -445,7 +445,7 @@ func TestInodeBudgetSymmetryStartupClassificationAndLayerGitGate(t *testing.T) {
 	const l1 = "layer_01j00000000000000000000001"
 	vc, err := baseClient.WithView(client.ViewBinding{LayerID: l1, Fence: 1})
 	require.NoError(t, err)
-	rtLayer, err := buildViewRuntime(cfg, vc, "/", "m1", viewprotocol.SwitchBinding{LayerID: l1, Fence: 1, BaseRootPath: "/"}, nil, mb, counters, &sharedExt)
+	rtLayer, err := buildViewRuntime(cfg, vc, "/", "m1", mountstate.SwitchBinding{LayerID: l1, Fence: 1, BaseRootPath: "/"}, nil, mb, counters, &sharedExt)
 	require.NoError(t, err)
 	preLayer := rtLayer.fs.ReexecPreflight()
 	require.True(t, preLayer.OK)

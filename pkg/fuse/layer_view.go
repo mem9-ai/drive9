@@ -7,15 +7,12 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
-	"github.com/mem9-ai/drive9/pkg/mountpath"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
-	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 const (
@@ -108,130 +105,6 @@ func (b *layerMountBinding) triggerSelfFence(reason string) {
 }
 
 var osStderr io.Writer = os.Stderr
-
-func resolveLayerMountView(
-	ctx context.Context,
-	baseClient *client.Client,
-	layerRef string,
-	rawRemoteRoot string,
-	remoteRootDefaulted bool,
-	mountID string,
-	readOnly bool,
-	timing layerLeaseTiming,
-) (*layerMountBinding, error) {
-	ref := strings.TrimSpace(layerRef)
-	if ref == "" {
-		rootInput := rawRemoteRoot
-		if strings.TrimSpace(rootInput) == "" {
-			rootInput = "/"
-		}
-		remoteRoot, err := mountpath.NormalizeRoot(rootInput)
-		if err != nil {
-			return nil, fmt.Errorf("fuse: normalize remote root: %w", err)
-		}
-		return &layerMountBinding{
-			BaseClient: baseClient,
-			ViewClient: baseClient,
-			RemoteRoot: remoteRoot,
-			MountID:    mountID,
-			ReadOnly:   readOnly,
-		}, nil
-	}
-
-	info, err := baseClient.GetLayer(ctx, ref)
-	if err != nil {
-		return nil, ClassifyLayerStartupError(fmt.Sprintf("resolve layer %q", ref), err)
-	}
-	if err := viewprotocol.ValidateLayerID(info.LayerID); err != nil {
-		return nil, ExitStartupPermanentErr("invalid layer identity returned by server", err)
-	}
-	baseRoot, remoteRoot, err := mountpath.LayerRoots(info.BaseRootPath, rawRemoteRoot, remoteRootDefaulted)
-	if err != nil {
-		return nil, ExitStartupPermanentErr(fmt.Sprintf("resolve root for layer %s: %v", info.LayerID, err), err)
-	}
-
-	if readOnly {
-		vc, verr := baseClient.WithView(client.ViewBinding{LayerID: info.LayerID, Fence: 0})
-		if verr != nil {
-			return nil, ExitStartupPermanentErr(fmt.Sprintf("bind read-only layer view %s", info.LayerID), verr)
-		}
-		return &layerMountBinding{
-			BaseClient:   baseClient,
-			ViewClient:   vc,
-			LayerID:      info.LayerID,
-			BaseRootPath: baseRoot,
-			RemoteRoot:   remoteRoot,
-			MountID:      mountID,
-			Fence:        0,
-			ReadOnly:     true,
-		}, nil
-	}
-
-	expectedFence := info.Fence
-	if expectedFence%2 == 1 {
-		if !info.MountExpired {
-			return nil, newMountExit(ExitLayerLeaseBusy, ExitReasonLayerLeaseBusy,
-				fmt.Sprintf("layer %s already has an active exclusive mount lease (fence=%d)", info.LayerID, info.Fence),
-				client.ErrConflict,
-			)
-		}
-		unb, uerr := baseClient.UnbindLayerMount(ctx, info.LayerID, client.LayerMountUnbindRequest{
-			MountID: mountID,
-			Kind:    "expire",
-		})
-		if uerr != nil {
-			return nil, classifyLayerBindError(fmt.Sprintf("expire stale mount lease on layer %s", info.LayerID), uerr)
-		}
-		if unb == nil || unb.Fence < 0 || unb.Fence%2 != 0 {
-			return nil, ExitStartupTransientErr(
-				fmt.Sprintf("expire stale mount lease on layer %s returned invalid fence", info.LayerID),
-				nil,
-			)
-		}
-		expectedFence = unb.Fence
-	}
-	if expectedFence < 0 || expectedFence%2 != 0 {
-		return nil, ExitStartupPermanentErr(
-			fmt.Sprintf("layer %s reported invalid fence %d", info.LayerID, expectedFence),
-			nil,
-		)
-	}
-
-	opID := "bind_" + generateMountID()
-	bindStart := time.Now()
-	lease, err := baseClient.BindLayerMount(ctx, info.LayerID, client.LayerMountBindRequest{
-		MountID:       mountID,
-		OperationID:   opID,
-		ExpectedFence: expectedFence,
-	})
-	if err != nil {
-		return nil, classifyLayerBindError(fmt.Sprintf("bind exclusive mount lease on layer %s", info.LayerID), err)
-	}
-
-	binding := &layerMountBinding{
-		BaseClient:   baseClient,
-		LayerID:      info.LayerID,
-		BaseRootPath: baseRoot,
-		RemoteRoot:   remoteRoot,
-		MountID:      mountID,
-		OperationID:  opID,
-		Fence:        lease.Fence,
-		ReadOnly:     false,
-	}
-	vc, verr := baseClient.WithView(client.ViewBinding{
-		LayerID:      info.LayerID,
-		Fence:        lease.Fence,
-		WriteGuard:   binding.checkWriteAllowed,
-		ReadUnfenced: binding.fenced.Load,
-	})
-	if verr != nil {
-		binding.Unbind(context.Background())
-		return nil, ExitStartupPermanentErr(fmt.Sprintf("bind writable layer view %s", info.LayerID), verr)
-	}
-	binding.ViewClient = vc
-	binding.startRenewLoop(bindStart, lease.MountLeaseTTLMS, timing)
-	return binding, nil
-}
 
 func (b *layerMountBinding) startRenewLoop(initialCallStart time.Time, initialTTLMS int64, timing layerLeaseTiming) {
 	if b == nil || b.ReadOnly || b.LayerID == "" || b.Fence <= 0 {

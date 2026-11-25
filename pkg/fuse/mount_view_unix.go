@@ -93,7 +93,7 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 	if err != nil {
 		return nil, fmt.Errorf("fuse: switch journal path: %w", err)
 	}
-	journal, err := mountstate.OpenSwitchJournal(jPath, actorID, scope, viewprotocol.SwitchBinding{ReadOnly: cfg.ReadOnly})
+	journal, err := mountstate.OpenSwitchJournal(jPath, actorID, scope, mountstate.SwitchBinding{ReadOnly: cfg.ReadOnly})
 	if err != nil {
 		return nil, fmt.Errorf("fuse: open switch journal: %w", err)
 	}
@@ -160,7 +160,7 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 	}
 
 	viewClient := baseClient
-	initialBinding := viewprotocol.SwitchBinding{ReadOnly: cfg.ReadOnly}
+	initialBinding := mountstate.SwitchBinding{ReadOnly: cfg.ReadOnly}
 	if targetInfo != nil {
 		initialBinding.LayerID = targetInfo.LayerID
 		initialBinding.BaseRootPath = baseRoot
@@ -188,7 +188,7 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 					MountID: actorID, Kind: mountstate.UnbindKindExpire,
 				})
 				if uerr != nil {
-					return nil, ClassifyLayerStartupError(fmt.Sprintf("expire stale mount lease on layer %s", targetInfo.LayerID), uerr)
+					return nil, classifyLayerBindError(fmt.Sprintf("expire stale mount lease on layer %s", targetInfo.LayerID), uerr)
 				}
 				if unb == nil || unb.Fence < 0 || unb.Fence%2 != 0 {
 					return nil, ExitStartupTransientErr(
@@ -217,7 +217,7 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 				MountID: actorID, OperationID: opID, ExpectedFence: expectedFence,
 			})
 			if berr != nil {
-				return nil, ClassifyLayerStartupError(fmt.Sprintf("bind exclusive mount lease on layer %s", targetInfo.LayerID), berr)
+				return nil, classifyLayerBindError(fmt.Sprintf("bind exclusive mount lease on layer %s", targetInfo.LayerID), berr)
 			}
 			var crashErr error
 			failpoint.InjectCall("prepareMountViewAfterInitialServerBind", &crashErr)
@@ -281,7 +281,7 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 		fence:       func(fctx context.Context) error { return fenceViewRootUpdates(fctx, mv) },
 		timing:      timing,
 	}
-	sw.buildRuntime = func(bctx context.Context, target viewprotocol.SwitchBinding, lease *layerMountBinding) (*mountRuntime, error) {
+	sw.buildRuntime = func(bctx context.Context, target mountstate.SwitchBinding, lease *layerMountBinding) (*mountRuntime, error) {
 		if err := bctx.Err(); err != nil {
 			return nil, err
 		}
@@ -406,7 +406,7 @@ func (v *mountView) bindProcessStateUpdater(fn func(string, bool)) {
 		sw.onSwitchDone = nil
 		return
 	}
-	sw.onSwitchDone = func(binding viewprotocol.SwitchBinding) {
+	sw.onSwitchDone = func(binding mountstate.SwitchBinding) {
 		fn(binding.LayerID, binding.LayerID != "" && binding.ReadOnly)
 	}
 	if sw.journal != nil && !sw.journal.Uncertain() {

@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/mem9-ai/drive9/pkg/mountpath"
-	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 func SwitchScope(server, credScope, remoteRoot, mountPoint string) (string, error) {
@@ -30,7 +29,7 @@ func SwitchScope(server, credScope, remoteRoot, mountPoint string) (string, erro
 
 // SwitchJournalPath returns the per-mount-incarnation journal path inside stateDir.
 func SwitchJournalPath(mountID string) (string, error) {
-	if err := viewprotocol.ValidateOperationID(mountID); err != nil {
+	if err := ValidateOperationID(mountID); err != nil {
 		return "", err
 	}
 	return filepath.Join(stateDir(), "drive9-view-"+mountID+".log"), nil
@@ -50,7 +49,7 @@ func SwitchScopedJournalPath(scope, mountID string) (string, error) {
 			return "", errors.New("invalid mount switch scope hex prefix")
 		}
 	}
-	if err := viewprotocol.ValidateOperationID(mountID); err != nil {
+	if err := ValidateOperationID(mountID); err != nil {
 		return "", err
 	}
 	return filepath.Join(stateDir(), "drive9-view-"+scope[:16]+"-"+mountID+".log"), nil

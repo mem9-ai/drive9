@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,23 +21,21 @@ import (
 
 	"github.com/pingcap/failpoint"
 	"golang.org/x/sys/unix"
-
-	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 const maxSwitchRecordLen = 64 << 10
 
 type switchJournalRecord struct {
-	RequestedLayerRef string                     `json:"requested_layer_ref,omitempty"`
-	Type              string                     `json:"type"`
-	MountID           string                     `json:"mount_id,omitempty"`
-	Scope             string                     `json:"scope,omitempty"`
-	OperationID       string                     `json:"operation_id,omitempty"`
-	FromGeneration    uint64                     `json:"from_generation,omitempty"`
-	Generation        uint64                     `json:"generation,omitempty"`
-	From              viewprotocol.SwitchBinding `json:"from,omitempty"`
-	Target            viewprotocol.SwitchBinding `json:"target,omitempty"`
-	Unbind            *PendingUnbind             `json:"unbind,omitempty"`
+	RequestedLayerRef string         `json:"requested_layer_ref,omitempty"`
+	Type              string         `json:"type"`
+	MountID           string         `json:"mount_id,omitempty"`
+	Scope             string         `json:"scope,omitempty"`
+	OperationID       string         `json:"operation_id,omitempty"`
+	FromGeneration    uint64         `json:"from_generation,omitempty"`
+	Generation        uint64         `json:"generation,omitempty"`
+	From              SwitchBinding  `json:"from,omitempty"`
+	Target            SwitchBinding  `json:"target,omitempty"`
+	Unbind            *PendingUnbind `json:"unbind,omitempty"`
 }
 
 // SwitchJournal persists local mount view bindings, pending switch decisions,
@@ -47,7 +46,7 @@ type SwitchJournal struct {
 	mountID        string
 	scope          string
 	generation     uint64
-	binding        viewprotocol.SwitchBinding
+	binding        SwitchBinding
 	pending        *SwitchReceipt
 	pendingUnbinds []PendingUnbind
 	history        map[string]SwitchReceipt
@@ -55,11 +54,11 @@ type SwitchJournal struct {
 	uncertain      bool
 }
 
-func OpenSwitchJournal(path, mountID, scope string, initial viewprotocol.SwitchBinding) (*SwitchJournal, error) {
+func OpenSwitchJournal(path, mountID, scope string, initial SwitchBinding) (*SwitchJournal, error) {
 	if !filepath.IsAbs(path) || scope == "" {
 		return nil, fmt.Errorf("%w: invalid journal path or scope", ErrSwitchInvalid)
 	}
-	if err := viewprotocol.ValidateOperationID(mountID); err != nil {
+	if err := ValidateOperationID(mountID); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrSwitchInvalid, err)
 	}
 	if err := initial.Validate(); err != nil {
@@ -72,10 +71,10 @@ func OpenExistingSwitchJournal(path string) (*SwitchJournal, error) {
 	if !filepath.IsAbs(path) {
 		return nil, fmt.Errorf("%w: path must be absolute", ErrSwitchInvalid)
 	}
-	return openSwitchJournalFile(path, "", "", viewprotocol.SwitchBinding{}, false)
+	return openSwitchJournalFile(path, "", "", SwitchBinding{}, false)
 }
 
-func openSwitchJournalFile(path, mountID, scope string, initial viewprotocol.SwitchBinding, create bool) (*SwitchJournal, error) {
+func openSwitchJournalFile(path, mountID, scope string, initial SwitchBinding, create bool) (*SwitchJournal, error) {
 	for attempt := 0; attempt < 4; attempt++ {
 		f, err := os.OpenFile(path, os.O_RDWR|unix.O_NOFOLLOW, 0o600)
 		if err != nil {
@@ -164,7 +163,7 @@ func openSwitchJournalFile(path, mountID, scope string, initial viewprotocol.Swi
 	return nil, fmt.Errorf("%w: concurrent journal creation contention at %s", ErrSwitchConflict, path)
 }
 
-func createAndInitSwitchJournalAtomic(path, mountID, scope string, initial viewprotocol.SwitchBinding) (*SwitchJournal, bool, error) {
+func createAndInitSwitchJournalAtomic(path, mountID, scope string, initial SwitchBinding) (*SwitchJournal, bool, error) {
 	var rnd [8]byte
 	_, _ = rand.Read(rnd[:])
 	tmpPath := filepath.Join(filepath.Dir(path), fmt.Sprintf(".drive9-view-init-%d-%s.tmp", os.Getpid(), hex.EncodeToString(rnd[:])))
@@ -304,14 +303,18 @@ func (j *SwitchJournal) appendAndApplyLocked(rec switchJournalRecord) error {
 	return j.applyRecordLocked(rec, j.generation == 0)
 }
 
-func (j *SwitchJournal) truncateTornTailLocked(validEnd int) error {
+func (j *SwitchJournal) truncateTornTailLocked(validEnd, removed int) error {
 	if err := j.file.Truncate(int64(validEnd)); err != nil {
 		return err
 	}
 	if _, err := j.file.Seek(int64(validEnd), io.SeekStart); err != nil {
 		return err
 	}
-	return j.file.Sync()
+	if err := j.file.Sync(); err != nil {
+		return err
+	}
+	log.Printf("drive9: discarded %d bytes from a torn mount switch journal tail", removed)
+	return nil
 }
 
 func (j *SwitchJournal) replayFileLocked() error {
@@ -329,12 +332,12 @@ func (j *SwitchJournal) replayFileLocked() error {
 		frameStart := len(raw) - r.Len()
 		if r.Len() < 4+sha256.Size {
 			if count > 0 {
-				return j.truncateTornTailLocked(validEnd)
+				return j.truncateTornTailLocked(validEnd, len(raw)-validEnd)
 			}
 			return fmt.Errorf("%w: truncated frame header", ErrSwitchCorrupt)
 		}
 		if count > 0 && len(bytes.TrimRight(raw[frameStart:], "\x00")) == 0 {
-			return j.truncateTornTailLocked(validEnd)
+			return j.truncateTornTailLocked(validEnd, len(raw)-validEnd)
 		}
 		var hdr [4]byte
 		_, _ = io.ReadFull(r, hdr[:])
@@ -344,7 +347,7 @@ func (j *SwitchJournal) replayFileLocked() error {
 		}
 		if r.Len() < n+sha256.Size {
 			if count > 0 {
-				return j.truncateTornTailLocked(validEnd)
+				return j.truncateTornTailLocked(validEnd, len(raw)-validEnd)
 			}
 			return fmt.Errorf("%w: truncated frame body %d", ErrSwitchCorrupt, n)
 		}

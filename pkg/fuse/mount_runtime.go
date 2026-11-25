@@ -28,11 +28,10 @@ import (
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
-	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 type mountRuntime struct {
-	binding    viewprotocol.SwitchBinding
+	binding    mountstate.SwitchBinding
 	layerLease *layerMountBinding
 	fs         *FS
 	writeback  *writeback.Writeback
@@ -114,7 +113,7 @@ func buildViewRuntime(
 	cfg MountConfig,
 	cl *client.Client,
 	remoteRoot, actorID string,
-	binding viewprotocol.SwitchBinding,
+	binding mountstate.SwitchBinding,
 	layerLease *layerMountBinding,
 	memoryBudget *membudget.Budget,
 	sharedCounters *perf.Counters,

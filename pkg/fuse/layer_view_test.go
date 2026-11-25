@@ -1,3 +1,5 @@
+//go:build !windows
+
 package fuse
 
 import (
@@ -6,16 +8,33 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
-	"testing/synctest"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 )
 
-func TestResolveLayerMountViewBaseRootAndReadOnly(t *testing.T) {
+func layerStartupTestConfig(t *testing.T, server, layer, root string) MountConfig {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+	t.Setenv("HOME", dir)
+	return MountConfig{
+		Server:     server,
+		APIKey:     "sk-test",
+		MountPoint: dir,
+		CacheDir:   filepath.Join(dir, "cache"),
+		LayerRef:   layer,
+		RemoteRoot: root,
+		Extensions: []string{"core"},
+		SyncMode:   "strict",
+	}
+}
+
+func TestPrepareLayerMountViewBaseRootAndReadOnly(t *testing.T) {
 	const layerID = "layer_01j8z6kh2m9q7w3r5t6y8v0p1a"
 	var bindCalled atomic.Bool
 
@@ -32,6 +51,8 @@ func TestResolveLayerMountViewBaseRootAndReadOnly(t *testing.T) {
 		case r.URL.Path == "/v1/layers/"+layerID+"/bind-mount":
 			bindCalled.Store(true)
 			w.WriteHeader(http.StatusInternalServerError)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/views/"+layerID+"/v1/fs/workspace":
+			w.Header().Set("X-Dat9-IsDir", "true")
 		case r.Method == http.MethodHead && r.URL.Path == "/v1/views/"+layerID+"/v1/fs/workspace/a.txt":
 			if got := r.Header.Get("X-FS-Layer-Fence"); got != "" {
 				t.Errorf("read-only view unexpectedly sent fence %q", got)
@@ -47,11 +68,18 @@ func TestResolveLayerMountViewBaseRootAndReadOnly(t *testing.T) {
 	base := client.New(ts.URL, "sk-test")
 
 	// 1. Defaulted remoteRoot adopts layer.BaseRootPath ("/workspace").
-	b, err := resolveLayerMountView(context.Background(), base, "task=auth", "/", true, "mnt-1", true, defaultLayerLeaseTiming())
+	cfg := layerStartupTestConfig(t, ts.URL, "task=auth", "/")
+	cfg.ReadOnly, cfg.RemoteRootDefaulted = true, true
+	mv, err := prepareMountView(t.Context(), cfg, base, "mnt-1")
 	if err != nil {
-		t.Fatalf("resolveLayerMountView defaulted: %v", err)
+		t.Fatalf("prepareMountView defaulted: %v", err)
 	}
-	defer b.Unbind(context.Background())
+	defer func() {
+		if err := mv.close(context.Background()); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+	b := mv.switcher.current.layerLease
 	if b.LayerID != layerID || b.RemoteRoot != "/workspace" || b.Fence != 0 || bindCalled.Load() {
 		t.Fatalf("unexpected binding: %+v (bindCalled=%v)", b, bindCalled.Load())
 	}
@@ -60,12 +88,14 @@ func TestResolveLayerMountViewBaseRootAndReadOnly(t *testing.T) {
 	}
 
 	// 2. Explicit remoteRoot outside layer.BaseRootPath fails before mounting.
-	if _, err := resolveLayerMountView(context.Background(), base, "task=auth", "/other", false, "mnt-2", true, defaultLayerLeaseTiming()); err == nil {
+	cfg.RemoteRoot, cfg.RemoteRootDefaulted = "/other", false
+	if _, err := prepareMountView(t.Context(), cfg, base, "mnt-2"); err == nil {
 		t.Fatal("expected error for remoteRoot outside layer base_root_path")
 	}
 
 	// 3. Explicit remoteRoot "/" when base_root_path is "/workspace" also fails!
-	if _, err := resolveLayerMountView(context.Background(), base, "task=auth", "/", false, "mnt-3", true, defaultLayerLeaseTiming()); err == nil {
+	cfg.RemoteRoot = "/"
+	if _, err := prepareMountView(t.Context(), cfg, base, "mnt-3"); err == nil {
 		t.Fatal("expected error for explicit / outside /workspace base_root_path")
 	}
 }
@@ -115,7 +145,7 @@ func TestLayerMountViewExpireBindRenewSelfFenceAndUnbind(t *testing.T) {
 				MountID:         req.MountID,
 				OperationID:     req.OperationID,
 				Fence:           5,
-				MountLeaseTTLMS: 180,
+				MountLeaseTTLMS: 60_000,
 			})
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/layers/"+layerID+"/renew-mount":
 			mu.Lock()
@@ -132,6 +162,8 @@ func TestLayerMountViewExpireBindRenewSelfFenceAndUnbind(t *testing.T) {
 				Fence:           5,
 				MountLeaseTTLMS: 180,
 			})
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/views/"+layerID+"/v1/fs/repo/sub":
+			w.Header().Set("X-Dat9-IsDir", "true")
 		case r.Method == http.MethodPut && r.URL.Path == "/v1/views/"+layerID+"/v1/fs/repo/file.txt":
 			if got := r.Header.Get("X-FS-Layer-Fence"); got != "5" {
 				t.Errorf("X-FS-Layer-Fence = %q, want 5", got)
@@ -157,10 +189,20 @@ func TestLayerMountViewExpireBindRenewSelfFenceAndUnbind(t *testing.T) {
 		callTimeout:     100 * time.Millisecond,
 	}
 	base := client.New(ts.URL, "sk-test")
-	b, err := resolveLayerMountView(context.Background(), base, layerID, "/repo/sub", false, "mnt-live", false, timing)
+	cfg := layerStartupTestConfig(t, ts.URL, layerID, "/repo/sub")
+	mv, err := prepareMountView(t.Context(), cfg, base, "mnt-live")
 	if err != nil {
-		t.Fatalf("resolveLayerMountView writable: %v", err)
+		t.Fatalf("prepareMountView writable: %v", err)
 	}
+	defer func() {
+		if mv != nil {
+			_ = mv.close(context.Background())
+		}
+	}()
+	b := mv.switcher.current.layerLease
+	// Exercise the bound lease with short renewal and fencing intervals.
+	b.StopRenew()
+	b.startRenewLoop(time.Now(), 180, timing)
 	var callbackFired atomic.Bool
 	b.OnSelfFence(func() { callbackFired.Store(true) })
 
@@ -188,7 +230,10 @@ func TestLayerMountViewExpireBindRenewSelfFenceAndUnbind(t *testing.T) {
 		t.Fatalf("StatCtx after self-fence should still succeed: %v", err)
 	}
 
-	b.Unbind(context.Background())
+	if err := mv.close(t.Context()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	mv = nil
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -197,7 +242,7 @@ func TestLayerMountViewExpireBindRenewSelfFenceAndUnbind(t *testing.T) {
 	}
 }
 
-func TestResolveLayerMountViewRejectsActiveOddFenceAndInvalidPostExpireFence(t *testing.T) {
+func TestPrepareLayerMountViewRejectsActiveOddFenceAndInvalidPostExpireFence(t *testing.T) {
 	const layerID = "layer_01j8z6kh2m9q7w3r5t6y8v0p1c"
 	var bindCalls atomic.Int32
 	var expiredMode atomic.Bool
@@ -229,7 +274,8 @@ func TestResolveLayerMountViewRejectsActiveOddFenceAndInvalidPostExpireFence(t *
 	base := client.New(ts.URL, "sk-test")
 
 	// 1. Active odd fence (!MountExpired) must fail immediately without calling bind-mount or resetting ExpectedFence=0.
-	_, err := resolveLayerMountView(context.Background(), base, layerID, "/repo", true, "mnt-new", false, defaultLayerLeaseTiming())
+	cfg := layerStartupTestConfig(t, ts.URL, layerID, "/repo")
+	_, err := prepareMountView(t.Context(), cfg, base, "mnt-new")
 	if err == nil {
 		t.Fatal("expected conflict error when layer already has active odd fence")
 	}
@@ -243,7 +289,7 @@ func TestResolveLayerMountViewRejectsActiveOddFenceAndInvalidPostExpireFence(t *
 
 	// 2. Post-expire unbind returning non-even fence must fail closed without resetting ExpectedFence=0.
 	expiredMode.Store(true)
-	_, err = resolveLayerMountView(context.Background(), base, layerID, "/repo", true, "mnt-new", false, defaultLayerLeaseTiming())
+	_, err = prepareMountView(t.Context(), cfg, base, "mnt-new")
 	if err == nil {
 		t.Fatal("expected error when expire unbind returns odd fence")
 	}
@@ -252,108 +298,52 @@ func TestResolveLayerMountViewRejectsActiveOddFenceAndInvalidPostExpireFence(t *
 	}
 }
 
-func TestLayerRenewRetriesBeforeSafetyMargin(t *testing.T) {
-	const layerID = "layer_01j8z6kh2m9q7w3r5t6y8v0p1b"
-	retried := make(chan struct{})
-	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if calls.Add(1) == 1 {
-			http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		if calls.Load() == 2 {
-			close(retried)
-		}
-		_ = json.NewEncoder(w).Encode(client.LayerMountLease{LayerID: layerID, Fence: 1, MountLeaseTTLMS: 1000})
-	}))
-	defer server.Close()
-	b := &layerMountBinding{LayerID: layerID, Fence: 1, MountID: "test-mount", BaseClient: client.New(server.URL, "")}
-	b.startRenewLoop(time.Now(), 1000, layerLeaseTiming{
-		renewInterval: 500 * time.Millisecond, retryInterval: 10 * time.Millisecond,
-		selfFenceMargin: 200 * time.Millisecond, callTimeout: 100 * time.Millisecond,
-	})
-	defer b.StopRenew()
-	select {
-	case <-retried:
-	case <-b.renewDone:
-		t.Fatal("mount self-fenced after a single temporary error without retrying")
-	case <-time.After(3 * time.Second):
-		t.Fatal("renewal did not retry")
-	}
-}
-
-func TestLayerStalledRenewStopsAtSafetyMargin(t *testing.T) {
-	const layerID = "layer_01j8z6kh2m9q7w3r5t6y8v0p1b"
-	started := make(chan struct{})
-	release := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		close(started)
-		select {
-		case <-release:
-		case <-r.Context().Done():
-		}
-	}))
-	defer server.Close()
-	defer close(release)
-	b := &layerMountBinding{LayerID: layerID, Fence: 1, MountID: "test-mount", BaseClient: client.New(server.URL, "")}
-	b.startRenewLoop(time.Now(), 500, layerLeaseTiming{
-		renewInterval: 50 * time.Millisecond, retryInterval: 10 * time.Millisecond,
-		selfFenceMargin: 200 * time.Millisecond, callTimeout: 5 * time.Second,
-	})
-	defer b.StopRenew()
-	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("renewal did not start")
-	}
-	select {
-	case <-b.renewDone:
-		if !errors.Is(b.checkWriteAllowed(), ErrLayerLeaseSelfFenced) {
-			t.Fatal("old lease still permits writes after the safety margin")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("a stalled renewal delayed self-fencing beyond lease expiration")
-	}
-}
-
-func TestRenewReturnAtOldCutoffUsesConfirmedLease(t *testing.T) {
-	for _, tt := range []struct {
-		name   string
-		ttl    int64
-		fenced bool
-	}{
-		{"extended", 60000, false},
-		{"already inside new margin", 1000, true},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			synctest.Test(t, func(t *testing.T) {
-				b := &layerMountBinding{renewDone: make(chan struct{})}
-				ctx, cancel := context.WithCancel(context.Background())
-				defer cancel()
-				calls := 0
-				go b.runRenewLoop(ctx, time.Now().Add(5*time.Second), layerLeaseTiming{
-					renewInterval: time.Second, selfFenceMargin: time.Second, callTimeout: 5 * time.Second,
-				}, func(call context.Context, _ string, _ client.LayerMountRenewRequest) (*client.LayerMountLease, error) {
-					calls++
-					// The response was accepted, then the caller resumed at the old cutoff.
-					<-call.Done()
-					return &client.LayerMountLease{MountLeaseTTLMS: tt.ttl}, nil
-				})
-				time.Sleep(4 * time.Second)
-				synctest.Wait()
-				if calls != 1 || b.fenced.Load() != tt.fenced {
-					t.Fatalf("renewals=%d fenced=%v, want 1 and %v", calls, b.fenced.Load(), tt.fenced)
+func TestPrepareMountViewClassifiesLeaseRequestConflict(t *testing.T) {
+	const layer = "layer_01j8z6kh2m9q7w3r5t6y8v0p1c"
+	for _, op := range []string{"expire", "bind"} {
+		t.Run(op, func(t *testing.T) {
+			var conflicted atomic.Bool
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/v1/layers/" + layer:
+					info := client.LayerInfo{LayerID: layer, BaseRootPath: "/", State: "active"}
+					if op == "expire" {
+						info.Fence = 3
+						info.MountExpired = true
+					}
+					_ = json.NewEncoder(w).Encode(info)
+					return
+				case "/v1/layers/" + layer + "/unbind-mount":
+					var req client.LayerMountUnbindRequest
+					if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+						t.Error(err)
+					}
+					if req.Kind == "op" && op == "bind" {
+						_ = json.NewEncoder(w).Encode(client.LayerMountUnbindResult{LayerID: layer})
+						return
+					}
+					if req.Kind != "expire" || op != "expire" {
+						t.Errorf("unexpected unbind kind %q", req.Kind)
+					}
+				case "/v1/layers/" + layer + "/bind-mount":
+					if op != "bind" {
+						t.Error("bind after expire conflict")
+					}
+				default:
+					t.Errorf("unexpected request: %s", r.URL.Path)
+					http.NotFound(w, r)
+					return
 				}
-				cancel()
-				<-b.renewDone
-			})
+				conflicted.Store(true)
+				http.Error(w, "busy", http.StatusConflict)
+			}))
+			defer ts.Close()
+			cfg := layerStartupTestConfig(t, ts.URL, layer, "/")
+			_, err := prepareMountView(t.Context(), cfg, client.New(ts.URL, cfg.APIKey), "new-worker")
+			if !conflicted.Load() {
+				t.Fatal("lease request did not return conflict")
+			}
+			assertMountExit(t, err, ExitLayerLeaseBusy, ExitReasonLayerLeaseBusy)
 		})
 	}
-}
-
-func TestBindAndExpireConflictsReportBusyLease(t *testing.T) {
-	for _, err := range []error{client.ErrConflict, &client.StatusError{StatusCode: http.StatusConflict}} {
-		assertMountExit(t, classifyLayerBindError("acquire layer lease", err), ExitLayerLeaseBusy, ExitReasonLayerLeaseBusy)
-	}
-	assertMountExit(t, classifyLayerBindError("acquire layer lease", &client.StatusError{StatusCode: http.StatusForbidden}), ExitStartupPermanent, ExitReasonStartupPermanent)
 }

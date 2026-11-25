@@ -2233,10 +2233,11 @@ func runUmount(args []string, deps umountDeps) error {
 
 	var packState mountstate.ProcessState
 	packStateOK := false
-	needPackState := len(packArchives) > 0 || len(packPaths) > 0 || !*noAutoPack
+	explicitPack := len(packArchives) > 0 || len(packPaths) > 0
+	needPackState := explicitPack || !*noAutoPack
 	if needPackState {
 		if deps.readProcessState == nil {
-			if len(packArchives) > 0 || len(packPaths) > 0 {
+			if explicitPack {
 				return fmt.Errorf("drive9 umount: pack requires mount process metadata")
 			}
 		} else if deps.goos == "windows" {
@@ -2244,14 +2245,14 @@ func runUmount(args []string, deps umountDeps) error {
 			var err error
 			st, _, err = deps.readProcessState(stateMountPoint)
 			if err != nil {
-				if len(packArchives) > 0 || len(packPaths) > 0 {
+				if explicitPack {
 					return fmt.Errorf("drive9 umount: read mount state for pack: %w", err)
 				}
 			} else {
 				packState, packStateOK = st, true
 			}
 		} else if preStopErr != nil {
-			if len(packArchives) > 0 || len(packPaths) > 0 {
+			if explicitPack {
 				return fmt.Errorf("drive9 umount: read mount state for pack: %w", preStopErr)
 			}
 		} else {
@@ -2259,14 +2260,20 @@ func runUmount(args []string, deps umountDeps) error {
 		}
 	}
 
-	archiveRequested := len(packArchives) > 0 || len(packPaths) > 0 || (!*noAutoPack && len(packState.PackPaths) > 0)
+	archiveRequested := explicitPack || (!*noAutoPack && len(packState.PackPaths) > 0)
 	if archiveRequested && packStateOK && deps.goos != "windows" {
 		if err := refreshMountedView(&packState, deps.requestStatus, 5*time.Second); err != nil {
-			return fmt.Errorf("drive9 umount: %w", err)
+			if explicitPack {
+				return fmt.Errorf("drive9 umount: %w", err)
+			}
+			packStateOK = false
+			if deps.printErrf != nil {
+				deps.printErrf("drive9 umount: warning: skipping automatic pack: %v\n", err)
+			}
 		}
 	}
 
-	if packState.LayerReadOnly && (len(packArchives) > 0 || len(packPaths) > 0) {
+	if packState.LayerReadOnly && explicitPack {
 		return fmt.Errorf("drive9 umount: cannot pack into a read-only layer")
 	}
 
@@ -2362,7 +2369,7 @@ func runUmount(args []string, deps umountDeps) error {
 
 	packArchiveArgs := append([]string(nil), packArchives...)
 	if packStateOK {
-		if len(packArchives) > 0 || len(packPaths) > 0 {
+		if explicitPack {
 			if err := validateUmountPackState(packState); err != nil {
 				return err
 			}

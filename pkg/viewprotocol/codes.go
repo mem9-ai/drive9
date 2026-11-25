@@ -46,15 +46,6 @@ const (
 	CodeControlPlaneCorrupt    = "ERR_CONTROL_PLANE_CORRUPT"
 	CodeCorruptUndoInode       = "ERR_CORRUPT_UNDO_INODE"
 	CodeCorruptUndoExtent      = "ERR_CORRUPT_UNDO_EXTENT"
-
-	// Local FUSE mount switch machine error codes (v36 §6.3 #2–#4).
-	CodeSwitchUnsupported          = "UNSUPPORTED"
-	CodeSwitchBusy                 = "EBUSY"
-	CodeSwitchPrepareFailed        = "PREPARE_FAILED"
-	CodeSwitchBindCleanupPending   = "BIND_CLEANUP_PENDING"
-	CodeSwitchUnbindCleanupPending = "UNBIND_CLEANUP_PENDING"
-	CodeSwitchTargetRevoked        = "TARGET_REVOKED"
-	CodeSwitchRecovering           = "RECOVERING"
 )
 
 var (
@@ -62,7 +53,6 @@ var (
 	ErrInvalidLayerName       = errors.New("invalid layer name")
 	ErrInvalidLayerRef        = errors.New("invalid layer ref")
 	ErrInvalidFence           = errors.New("invalid layer fence")
-	ErrInvalidOperationID     = errors.New("invalid mount or operation id")
 	ErrInvalidViewRoute       = errors.New("invalid layer view route")
 	ErrInvalidViewRedirect    = errors.New("redirect not allowed for layer view request")
 	ErrUnsupportedInLayerView = errors.New("operation unsupported in layer view")
