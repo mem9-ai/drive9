@@ -2,11 +2,17 @@ package fuse
 
 import (
 	"context"
+	"net/http/httptest"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/mem9-ai/drive9/internal/testbackend"
+	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/extensions/core"
+	"github.com/mem9-ai/drive9/pkg/extensions/writeback"
 	"github.com/mem9-ai/drive9/pkg/fs"
 )
 
@@ -169,5 +175,85 @@ func TestLeaseLossBetweenUnlinkPreparationAndPublication(t *testing.T) {
 	releaseUnlinkFixture(f, out)
 	if _, ok := core.get("/held"); !ok {
 		t.Fatal("rejected unlink removed remote file")
+	}
+}
+
+type unlinkUploadBarrier struct {
+	*writeback.Writeback
+	entered, proceed chan struct{}
+	once             sync.Once
+}
+
+func (b *unlinkUploadBarrier) wait() {
+	b.once.Do(func() { close(b.entered); <-b.proceed })
+}
+func (b *unlinkUploadBarrier) WaitPathUnlinkUploads(string) { b.wait() }
+
+func (b *unlinkUploadBarrier) PreparePathUnlink(path string, survivor bool) func(bool) error {
+	finish := b.Writeback.PreparePathUnlink(path, survivor)
+	b.wait()
+	return finish
+}
+
+func TestSecondOpenDuringUnlinkKeepsAnonymousImage(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/held", []byte("start"))
+	srv := httptest.NewServer(b)
+	t.Cleanup(srv.Close)
+	cl := client.New(srv.URL, "")
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb, err := writeback.New(writeback.Options{Policy: writeback.PolicyCloseSync, Client: cl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pause := &unlinkUploadBarrier{Writeback: wb, entered: make(chan struct{}), proceed: make(chan struct{})}
+	var resume sync.Once
+	unblock := func() { resume.Do(func() { close(pause.proceed) }) }
+	t.Cleanup(unblock)
+	f, err := New(Options{Extensions: []fs.Handler{pause, terminal}, DefaultPermissions: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inode := lookupFacade(t, f, "held")
+	header := gofuse.InHeader{NodeId: inode}
+	open := func(flags uint32) uint64 {
+		var out gofuse.OpenOut
+		if st := f.Open(nil, &gofuse.OpenIn{InHeader: header, Flags: flags}, &out); st != gofuse.OK {
+			t.Fatal(st)
+		}
+		return out.Fh
+	}
+	first := open(syscall.O_RDONLY)
+	unlinked := make(chan gofuse.Status, 1)
+	go func() { unlinked <- f.Unlink(nil, rootHeader(), "held") }()
+	awaitUnlinkTest(t, pause.entered)
+	second := open(syscall.O_RDWR)
+	if n, st := f.Write(nil, &gofuse.WriteIn{InHeader: header, Fh: second}, []byte("saved")); n != 5 || st != gofuse.OK {
+		t.Fatalf("write: %d %v", n, st)
+	}
+	unblock()
+	if st := awaitUnlinkTest(t, unlinked); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	buf := make([]byte, 5)
+	if _, st := f.Read(nil, &gofuse.ReadIn{InHeader: header, Fh: second, Size: 5}, buf); st != gofuse.OK || string(buf) != "saved" {
+		t.Fatalf("read: %q %v", buf, st)
+	}
+	if st := f.Flush(nil, &gofuse.FlushIn{InHeader: header, Fh: second}); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	f.Release(nil, &gofuse.ReleaseIn{InHeader: header, Fh: second})
+	if n, ok := b.Node("/held"); !ok || string(n.Data) != "start" {
+		t.Fatalf("anonymous close published %q", n.Data)
+	}
+	if st := f.Open(nil, &gofuse.OpenIn{InHeader: header, Flags: syscall.O_RDWR}, &gofuse.OpenOut{}); st != gofuse.ENOENT {
+		t.Fatalf("open of removed name: %v", st)
+	}
+	f.Release(nil, &gofuse.ReleaseIn{InHeader: header, Fh: first})
+	if _, ok := b.Node("/held"); ok {
+		t.Fatal("deleted name resurrected")
 	}
 }

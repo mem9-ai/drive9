@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"io"
 	"math"
 	"net"
@@ -115,6 +116,9 @@ type FS struct {
 	inodes  *InodeToPath
 	bypass  *kernelCacheBypassTable
 	openIdx *OpenHandleIndex
+	// Opens share a stripe until both the data plane and the facade have
+	// registered their handle. Unlink takes it exclusively for publication.
+	openNames [256]sync.RWMutex
 	// Entries remain registered until remote deletion and cache updates finish.
 	// Each entry serializes its last-close and same-name replacement callers.
 	deferredUnlinks map[string]*deferredUnlink
@@ -2045,6 +2049,12 @@ func (f *FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, o
 	return gofuse.OK
 }
 
+var openNameSeed = maphash.MakeSeed()
+
+func (f *FS) openNameLock(path string) *sync.RWMutex {
+	return &f.openNames[maphash.String(openNameSeed, path)%uint64(len(f.openNames))]
+}
+
 func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string) gofuse.Status {
 	child, st := f.childOf(header.NodeId, name)
 	if st != gofuse.OK {
@@ -2053,6 +2063,19 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 	if f.layerFenced() {
 		return gofuse.EIO
 	}
+	// Let existing transfers finish while a second open can still join the
+	// old name. Recheck the open set under the stripe before choosing how
+	// to unlink; an open already in dispatch must publish its handle first.
+	if f.openIdx.HasOpenPath(child) {
+		for _, h := range f.chain.Handlers() {
+			if waiter, ok := h.(interface{ WaitPathUnlinkUploads(string) }); ok {
+				waiter.WaitPathUnlinkUploads(child)
+			}
+		}
+	}
+	gate := f.openNameLock(child)
+	gate.Lock()
+	defer gate.Unlock()
 	f.debugf("unlink start path=%s parent_ino=%d name=%s", child, header.NodeId, name)
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
@@ -2665,6 +2688,9 @@ func (f *FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name string,
 	if st != gofuse.OK {
 		return st
 	}
+	gate := f.openNameLock(child)
+	gate.RLock()
+	defer gate.RUnlock()
 	if err := f.flushDeferredUnlink(child); err != nil {
 		return fs.StatusOf(err)
 	}
@@ -2710,6 +2736,20 @@ func (f *FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name string,
 
 func (f *FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.OpenOut) gofuse.Status {
 	path, ok := f.inodes.GetPath(input.NodeId)
+	for ok {
+		gate := f.openNameLock(path)
+		gate.RLock()
+		if ino, exists := f.inodes.GetInode(path); exists && ino == input.NodeId {
+			defer gate.RUnlock()
+			break
+		}
+		gate.RUnlock()
+		// A removed name can still be recorded for an anonymous descriptor.
+		// If the inode has another hardlink, open its surviving name.
+		previous := path
+		path, ok = f.inodes.GetPath(input.NodeId)
+		ok = ok && path != previous
+	}
 	if !ok {
 		return gofuse.ENOENT
 	}
