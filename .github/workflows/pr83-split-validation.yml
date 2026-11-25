@@ -1,0 +1,37 @@
+name: Verify independent Git and writeback changes on main
+on:
+  push:
+    branches: [dev2/pr83-client-split-check]
+permissions:
+  contents: read
+jobs:
+  packages:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: writeback
+            ref: c963239114c5f70465d5ee3582331e97bc32354c
+            packages: ./pkg/extensions/writeback
+          - name: git
+            ref: 6887b0c2db8970d96ed9fc19191489b026d735c7
+            packages: ./pkg/extensions/git ./pkg/extensions/localize
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Run package race tests and build the CLI
+        env:
+          EXPECTED_SHA: ${{ matrix.ref }}
+          PACKAGES: ${{ matrix.packages }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          go test -race $PACKAGES -count=1 -timeout=15m
+          go build -o "$RUNNER_TEMP/drive9" ./cmd/drive9
