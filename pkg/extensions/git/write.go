@@ -210,7 +210,7 @@ func (h *gitHandle) Release(ctx context.Context) error {
 	// commit (which reads the buffer) and on every early return.
 	defer h.releaseBuffer()
 	h.g.untrackHandle(h)
-	if h.unlinked {
+	if fs.IsRejectedOpen(ctx) || h.unlinked {
 		return nil
 	}
 	return h.commit(ctx)

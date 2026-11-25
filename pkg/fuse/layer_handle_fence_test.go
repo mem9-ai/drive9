@@ -68,3 +68,50 @@ func TestLeaseFenceAppliesToRawHandle(t *testing.T) {
 		t.Fatalf("read: %v %q", st, buf)
 	}
 }
+
+func TestFencedMetadataAndOpenUnlink(t *testing.T) {
+	core := newMemCore()
+	f := newTestFS(t, core)
+	var out gofuse.CreateOut
+	if st := f.Create(nil, exclusiveCreateInput(), "held", &out); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	binding := &layerMountBinding{}
+	f.layerFence = &binding.fenced
+	binding.triggerSelfFence("lease expired")
+	old, _ := f.inodes.GetEntry(out.NodeId)
+	input := &gofuse.SetAttrIn{}
+	input.NodeId, input.Valid, input.Mtime = out.NodeId, gofuse.FATTR_MTIME, 12345
+	if st := f.SetAttr(nil, input, &gofuse.AttrOut{}); st != gofuse.EIO {
+		t.Fatalf("setattr: %v", st)
+	}
+	current, _ := f.inodes.GetEntry(out.NodeId)
+	if current.Mtime != old.Mtime {
+		t.Fatal("rejected setattr changed mtime")
+	}
+	if st := f.Unlink(nil, rootHeader(), "held"); st != gofuse.EIO {
+		t.Fatalf("unlink: %v", st)
+	}
+	if id, ok := f.inodes.GetInode("/held"); !ok || id != out.NodeId || !f.openIdx.HasOpenPath("/held") || f.isDeferredUnlink("/held") {
+		t.Fatal("rejected unlink changed open path")
+	}
+}
+
+func TestDeferredUnlinkCrossingLeaseLossKeepsRemote(t *testing.T) {
+	core := newMemCore()
+	f := newTestFS(t, core)
+	var out gofuse.CreateOut
+	if st := f.Create(nil, exclusiveCreateInput(), "held", &out); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	if st := f.Unlink(nil, rootHeader(), "held"); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	binding := &layerMountBinding{}
+	f.layerFence = &binding.fenced
+	binding.triggerSelfFence("lease expired before last close")
+	releaseUnlinkFixture(f, out)
+	if _, ok := core.get("/held"); !ok || !f.isDeferredUnlink("/held") {
+		t.Fatal("deferred unlink lost remote object or its pending cleanup")
+	}
+}

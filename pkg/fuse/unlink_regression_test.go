@@ -385,7 +385,7 @@ func (g *unlinkMarkGate) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Re
 	return next(ctx, op)
 }
 
-func (g *unlinkMarkGate) MarkPathUnlinked(string) error {
+func (g *unlinkMarkGate) MarkPathUnlinked(string, func() bool) error {
 	close(g.entered)
 	<-g.proceed
 	return nil

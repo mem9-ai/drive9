@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/extensions/cache"
 	"github.com/mem9-ai/drive9/pkg/extensions/core"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 )
 
 func newStack(t *testing.T, policy Policy, b *testbackend.Backend) (*fs.Chain, *Writeback) {
@@ -669,5 +672,153 @@ func TestFencedInteractiveSyncReturnsError(t *testing.T) {
 	}
 	if _, ok := backend.Node("/pending"); ok {
 		t.Fatal("fenced image was uploaded")
+	}
+}
+
+type rejectedOpenHandle struct {
+	fs.Handle
+	discarded bool
+}
+
+func (h *rejectedOpenHandle) Release(ctx context.Context) error {
+	h.discarded = fs.IsRejectedOpen(ctx)
+	return nil
+}
+
+func TestRejectedTruncateKeepsPreviousRecovery(t *testing.T) {
+	_, wb, cache := newWriteCacheStack(t, PolicyWriteBack, testbackend.NewBackend())
+	inner := &rejectedOpenHandle{}
+	const path = "/held"
+	_, err := wb.Do(context.Background(), &fs.Op{Kind: fs.OpCreate, Path: path, Flags: syscall.O_TRUNC | syscall.O_RDWR},
+		func(context.Context, *fs.Op) (fs.Result, error) {
+			if err := cache.Put(path, []byte("prior"), 5, staging.PendingOverwrite); err != nil {
+				t.Fatal(err)
+			}
+			wb.AbandonLayerForRollback()
+			return fs.Result{Attr: &fs.Attr{Size: 5, Rev: 1}, Handle: inner}, nil
+		})
+	if !errors.Is(err, errLayerRolledBack) || !inner.discarded || wb.handleFor(path) != nil {
+		t.Fatalf("rejected truncate: err %v, discarded %v, tracked %v", err, inner.discarded, wb.handleFor(path) != nil)
+	}
+	if data, ok := cache.Get(path); !ok || string(data) != "prior" {
+		t.Fatalf("rejected truncate replaced recovery: %q, present %v", data, ok)
+	}
+}
+
+func TestDeferredUnlinkLosingLeasePreservesStagedImage(t *testing.T) {
+	ctx := context.Background()
+	chain, wb, cache := newWriteCacheStack(t, PolicyWriteBack, testbackend.NewBackend())
+	h := open(t, chain, "/held").(*bufferingHandle)
+	if err := h.Write(ctx, 0, []byte("prior")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	h.mu.Lock()
+	h.submitDone = release
+	h.mu.Unlock()
+	entered := make(chan struct{})
+	var once sync.Once
+	var fenced atomic.Bool
+	done := make(chan error, 1)
+	go func() {
+		done <- wb.MarkPathUnlinked("/held", func() bool {
+			current := fenced.Load()
+			once.Do(func() { close(entered) })
+			return current
+		})
+	}()
+	<-entered
+	fenced.Store(true)
+	close(release)
+	if err := <-done; !errors.Is(err, errLayerRolledBack) {
+		t.Fatalf("unlink: %v", err)
+	}
+	h.mu.Lock()
+	unlinked := h.unlinked
+	h.submitDone = nil
+	h.mu.Unlock()
+	if data, ok := cache.Get("/held"); !ok || string(data) != "prior" || unlinked {
+		t.Fatalf("after rejected unlink: %q present %v anonymous %v", data, ok, unlinked)
+	}
+}
+
+func TestReadOnlyReopenAfterLeaseLoss(t *testing.T) {
+	ctx := context.Background()
+	b := testbackend.NewBackend()
+	b.Seed("/held", []byte("prior"))
+	chain, wb := newStack(t, PolicyCloseSync, b)
+	opened, err := chain.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/held", Flags: syscall.O_RDWR})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb.AbandonLayerForRollback()
+	res, err := chain.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/held", Flags: syscall.O_RDONLY})
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 5)
+	n, err := res.Handle.Read(ctx, 0, buf)
+	if err != nil || string(buf[:n]) != "prior" {
+		t.Fatalf("held read %q, %v", buf[:n], err)
+	}
+	if err := res.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Handle.Flush(ctx); !errors.Is(err, errLayerRolledBack) {
+		t.Fatalf("writer flush: %v", err)
+	}
+}
+
+func TestFencedReopenRetainsAcceptedNewFileAfterWriterRelease(t *testing.T) {
+	for _, policy := range []Policy{PolicyCloseSync, PolicyWriteBack} {
+		t.Run(policy.String(), func(t *testing.T) {
+			ctx := context.Background()
+			b := testbackend.NewBackend()
+			chain, wb := newStack(t, policy, b)
+			writer := open(t, chain, "/fresh")
+			if err := writer.Write(ctx, 0, []byte("first")); err != nil {
+				t.Fatal(err)
+			}
+			wb.AbandonLayerForRollback()
+			reader, err := chain.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/fresh", Flags: syscall.O_RDONLY})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := writer.Release(ctx); !errors.Is(err, errLayerRolledBack) {
+				t.Fatalf("writer close: %v", err)
+			}
+			buf := make([]byte, 5)
+			n, err := reader.Handle.Read(ctx, 0, buf)
+			if err != nil || string(buf[:n]) != "first" {
+				t.Fatalf("reader retained %q, %v", buf[:n], err)
+			}
+			if _, ok := b.Node("/fresh"); ok {
+				t.Fatal("read-only reopen published a file")
+			}
+			if err := reader.Handle.Release(ctx); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestRejectedLazyCreateDoesNotPublish(t *testing.T) {
+	ctx := context.Background()
+	b := testbackend.NewBackend()
+	chain, wb, cache := newWriteCacheStack(t, PolicyWriteBack, b)
+	res, err := chain.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/new", Flags: syscall.O_CREAT | syscall.O_RDWR})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The facade rejects before the writeback abandonment callback has run.
+	fs.ReleaseRejectedOpen(ctx, res.Handle)
+	if _, ok := b.Node("/new"); ok {
+		t.Fatal("rejected create published a remote file")
+	}
+	if _, ok := cache.GetMeta("/new"); ok || wb.handleFor("/new") != nil {
+		t.Fatal("rejected create retained staged or live ownership")
 	}
 }
