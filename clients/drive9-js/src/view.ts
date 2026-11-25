@@ -40,15 +40,12 @@ export function validateLayerId(id: string): void {
 }
 
 export function normalizeLayerRef(raw: string): string {
-  const ref = raw.trim();
+  const ref = raw.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, "");
   if (!ref || Buffer.byteLength(ref, "utf8") > MAX_LAYER_REF_BYTES || ref.toLowerCase() === "main") {
     throw new InvalidLayerViewRequestError(`invalid layer ref: ${JSON.stringify(raw)}`);
   }
-  for (let i = 0; i < ref.length; i++) {
-    const code = ref.charCodeAt(i);
-    if (code < 0x20 || code === 0x7f) {
-      throw new InvalidLayerViewRequestError("invalid layer ref: control character");
-    }
+  if (/[\p{Cc}\p{Bidi_Control}\p{Cs}]/u.test(ref)) {
+    throw new InvalidLayerViewRequestError("invalid layer ref: forbidden character");
   }
   return ref;
 }

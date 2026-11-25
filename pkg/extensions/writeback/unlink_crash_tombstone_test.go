@@ -210,7 +210,7 @@ func TestUnlinkOfOpenFileInsideFsyncWindowDoesNotResurrectAfterCrash(t *testing.
 
 	// close(2) returned; RELEASE is still in flight, so unlink(2) takes the
 	// unlink-of-open-file branch: the queued upload is canceled mid-flight.
-	if err := s.wb.MarkPathUnlinked(path); err != nil {
+	if err := s.wb.MarkPathUnlinked(path, nil); err != nil {
 		t.Fatalf("unlink-of-open-file marking: %v", err)
 	}
 
@@ -307,7 +307,7 @@ func TestFsyncRacingUnlinkOfOpenFileStagesNothing(t *testing.T) {
 	// check-to-enqueue window — the post-enqueue recheck that cancels the
 	// just-enqueued entry. Mark BEFORE the fsync runs: its guard must bar
 	// the staging outright.
-	if err := s.wb.MarkPathUnlinked(path); err != nil {
+	if err := s.wb.MarkPathUnlinked(path, nil); err != nil {
 		t.Fatalf("racing unlink marking: %v", err)
 	}
 	if err := h.Sync(ctx); err != nil {
@@ -350,7 +350,7 @@ func TestUnlinkMarkerFailureDropsPreservedState(t *testing.T) {
 	if err := s.ledger.Journal.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.wb.MarkPathUnlinked(path); err != nil {
+	if err := s.wb.MarkPathUnlinked(path, nil); err != nil {
 		t.Fatalf("marker failure with a working cleanup must not fail the unlink: %v", err)
 	}
 
@@ -443,7 +443,7 @@ func TestUnlinkMarkerAndCleanupFailureFailsUnlink(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = os.Chmod(shadowDir, 0o700) })
 
-			err := s.wb.MarkPathUnlinked(path)
+			err := s.wb.MarkPathUnlinked(path, nil)
 			if err == nil {
 				t.Fatal("marker + cleanup both failing must fail the unlink instead of acknowledging it")
 			}
@@ -539,7 +539,7 @@ func TestFsyncMarkedDuringStagingWindowSelfCancelsWithoutDeadlock(t *testing.T) 
 	// The staging parks on the held upload with the queue's path lock
 	// held; the marking (which takes no lock) lands in the window.
 	time.Sleep(100 * time.Millisecond)
-	if err := s.wb.MarkPathUnlinked(path); err != nil {
+	if err := s.wb.MarkPathUnlinked(path, nil); err != nil {
 		t.Fatalf("window marking: %v", err)
 	}
 	s.hold.Store(false)

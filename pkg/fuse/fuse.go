@@ -611,7 +611,7 @@ func (f *FS) runDeferredUnlink(pending *deferredUnlink, requireClosed bool) erro
 		// if the caller's original request has already been cancelled.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if _, err := f.chain.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: path}); err != nil && fs.StatusOf(err) != gofuse.ENOENT {
+		if _, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpUnlink, Path: path}); err != nil && fs.StatusOf(err) != gofuse.ENOENT {
 			return err
 		}
 		f.markNameNegative(path)
@@ -1819,6 +1819,9 @@ func (f *FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofus
 		}
 		return gofuse.ENOENT
 	}
+	if f.layerFenced() {
+		return gofuse.EIO
+	}
 	entry, _ := f.inodes.GetEntry(input.NodeId)
 	caller := fs.CallerFrom(input.InHeader)
 	ctx, cf := fuseCtx(cancel)
@@ -1833,6 +1836,9 @@ func (f *FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofus
 		if st := f.checkAncestorSearch(ctx, path, caller); st != gofuse.OK {
 			return st
 		}
+	}
+	if f.layerFenced() {
+		return gofuse.EIO
 	}
 	// v1: times and ownership are mount-local (the backend derives mtimes
 	// from writes and has no chown verb). Apply them before anything else
@@ -2044,6 +2050,9 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 	if st != gofuse.OK {
 		return st
 	}
+	if f.layerFenced() {
+		return gofuse.EIO
+	}
 	f.debugf("unlink start path=%s parent_ino=%d name=%s", child, header.NodeId, name)
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
@@ -2078,10 +2087,11 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 		var markErr error
 		for _, h := range f.chain.Handlers() {
 			if mu, ok := h.(interface {
-				MarkPathUnlinked(string) error
+				MarkPathUnlinked(string, func() bool) error
 			}); ok {
-				if err := mu.MarkPathUnlinked(child); err != nil && markErr == nil {
+				if err := mu.MarkPathUnlinked(child, f.layerFenced); err != nil {
 					markErr = err
+					break
 				}
 			}
 		}
@@ -3806,9 +3816,7 @@ func (f *FS) dispatchErr(ctx context.Context, op *fs.Op) (fs.Result, error) {
 	}
 	result, err := f.chain.Dispatch(ctx, op)
 	if err == nil && f.layerFenced() && op.MutatesFile() {
-		if result.Handle != nil {
-			_ = result.Handle.Release(ctx)
-		}
+		fs.ReleaseRejectedOpen(ctx, result.Handle)
 		return fs.Result{}, ErrLayerLeaseSelfFenced
 	}
 	return result, err

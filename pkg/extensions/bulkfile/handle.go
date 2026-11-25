@@ -634,7 +634,11 @@ func (h *streamHandle) Release(ctx context.Context) error {
 	// untracking first would leave a window where a re-open reads the
 	// stale remote rows while the freshest bytes exist only on this
 	// handle (read-your-writes across close).
-	pushErr := h.push(ctx)
+	var pushErr error
+	var inner fs.Handle
+	if !fs.IsRejectedOpen(ctx) {
+		pushErr = h.push(ctx)
+	}
 	keepTracked := false
 	h.mu.Lock()
 	keepTracked = h.refs > 1
@@ -642,9 +646,12 @@ func (h *streamHandle) Release(ctx context.Context) error {
 	if release && h.b != nil && !keepTracked {
 		h.b.untrack(h)
 	}
-	inner, serr := h.session(ctx)
-	if serr != nil && pushErr == nil {
-		pushErr = serr
+	if !fs.IsRejectedOpen(ctx) {
+		var serr error
+		inner, serr = h.session(ctx)
+		if serr != nil && pushErr == nil {
+			pushErr = serr
+		}
 	}
 	// The write descriptor's close COMMITS: the below handle's Release is
 	// what submits the writeback snapshot, so it must run now — deferring

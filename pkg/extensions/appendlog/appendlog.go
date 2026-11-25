@@ -858,7 +858,10 @@ func (a *AppendLog) emit(e fs.Event) {
 // facade has ALREADY postponed the remote delete (the name is gone from its
 // view), so the later flush dispatch performs it instead of deferring a
 // second time. The in-memory deferral cannot fail.
-func (a *AppendLog) MarkPathUnlinked(p string) error {
+func (a *AppendLog) MarkPathUnlinked(p string, fenced func() bool) error {
+	if fenced != nil && fenced() {
+		return syscall.EIO
+	}
 	if a.cl != nil {
 		a.facadeDeferred.Store(p, struct{}{})
 	}
@@ -1619,6 +1622,12 @@ func (h *Handle) Release(ctx context.Context) (err error) {
 	// path, like git and layer.
 	defer h.releaseBuffer()
 	h.a.untrack(h)
+	if fs.IsRejectedOpen(ctx) {
+		if h.inner != nil {
+			return h.inner.Release(ctx)
+		}
+		return nil
+	}
 	h.mu.Lock()
 	unlinked := h.unlinked
 	unlink := h.unlinkAtRelease

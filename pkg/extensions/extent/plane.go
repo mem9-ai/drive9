@@ -1356,6 +1356,10 @@ func (e *engineHandle) Release(ctx context.Context) error {
 	// produce exactly one owner of the final publication.
 	finalClose := e.plane.claimFinalClose(e)
 	defer unlockPath()
+	if fs.IsRejectedOpen(ctx) {
+		e.plane.release(e)
+		return nil
+	}
 	var landErr error
 	if finalClose {
 		landErr = e.plane.opts.Engine.FlushFileFinal(ctx, uint64(e.ino))

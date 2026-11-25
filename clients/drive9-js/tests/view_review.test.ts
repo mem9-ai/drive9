@@ -4,12 +4,20 @@ import {
   InvalidLayerViewRequestError,
   UnsupportedInLayerViewError,
   fetchViewObjectRedirect,
+  normalizeLayerRef,
   rewriteRequestForView,
   setClientViewBinding,
   validateViewBinding,
 } from "../src/view.js";
 
 describe("Layer view WriteGuard and redirect validation parity", () => {
+  it("matches the server's Unicode layer name validation", () => {
+    expect(normalizeLayerRef("\u0085分支🌱\u0085")).toBe("分支🌱");
+    for (const name of ["a\u0081b", "a\u061cb", "a\u2066b", "a\uD800b"]) {
+      expect(() => normalizeLayerRef(name)).toThrow(InvalidLayerViewRequestError);
+    }
+  });
+
   const layerId = "layer_01j8z4r9w3m5n7p9q2s4t6v8xz";
 
   it("invokes WriteGuard on GET /v1/uploads/{id}/resume but not on GET /v1/uploads list", () => {

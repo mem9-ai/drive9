@@ -44,6 +44,22 @@ type Handle interface {
 	Release(ctx context.Context) error
 }
 
+type rejectedOpenKey struct{}
+
+// ReleaseRejectedOpen retires a handle the caller never received. Decorators
+// propagate this context so close can release resources without publishing
+// an unacknowledged create or truncation.
+func ReleaseRejectedOpen(ctx context.Context, h Handle) {
+	if h != nil {
+		_ = h.Release(context.WithValue(ctx, rejectedOpenKey{}, true))
+	}
+}
+
+func IsRejectedOpen(ctx context.Context) bool {
+	rejected, _ := ctx.Value(rejectedOpenKey{}).(bool)
+	return rejected
+}
+
 // Optional handle capabilities. They stay out of the core Handle interface
 // so every decorator remains implementable; type-assert at assembly or use
 // sites.

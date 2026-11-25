@@ -788,7 +788,7 @@ func (cq *CommitQueue) WaitPrefixTimeout(prefix string, timeout time.Duration) b
 // config.lock) are not poisoned by an old cancellation. It reports an error
 // only when the path's local state could not be made non-replayable.
 func (cq *CommitQueue) CancelPath(path string) error {
-	return cq.cancelPath(path, false)
+	return cq.cancelPath(path, false, nil)
 }
 
 // CancelPathPreserveLocal cancels queued or in-flight uploads for path without
@@ -797,7 +797,7 @@ func (cq *CommitQueue) CancelPath(path string) error {
 // until the last close. The WAL done marker is still journaled (the name is
 // gone) so a crash before that close cannot replay the staged frames.
 func (cq *CommitQueue) CancelPathPreserveLocal(path string) error {
-	return cq.cancelPath(path, true)
+	return cq.cancelPath(path, true, nil)
 }
 
 // CancelEntryInFlight cancels EXACTLY the given entry — the targeted
@@ -1495,7 +1495,7 @@ func (cq *CommitQueue) cancelPathEntries(path string) []context.CancelFunc {
 // and a later reuse of the name (a renamed-in file) must not inherit an EIO
 // for data the recreator never wrote. The failure-free error return keeps the
 // record — the name survived, and so did its unlanded data.
-func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
+func (cq *CommitQueue) cancelPath(path string, preserveLocal bool, fenced func() bool) error {
 	// First pass without the path lock: an in-flight upload holds that lock
 	// for its whole transfer, and aborting it here is what releases it.
 	for _, cancel := range cq.cancelPathEntries(path) {
@@ -1509,6 +1509,9 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 	// publishes nothing (stageAndEnqueueOpt).
 	unlock := cq.lockPath(path)
 	defer unlock()
+	if fenced != nil && fenced() {
+		return errLayerRolledBack
+	}
 	for _, cancel := range cq.cancelPathEntries(path) {
 		cancel()
 	}

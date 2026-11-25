@@ -1169,16 +1169,25 @@ func (w *Writeback) Stop(ctx context.Context) error {
 // fallback cleanup could not remove the recovery source): the facade must
 // then fail the unlink instead of acknowledging a deletion that a restart
 // would undo. The anonymous marking is rolled back on that path.
-func (w *Writeback) MarkPathUnlinked(p string) error {
+func (w *Writeback) MarkPathUnlinked(p string, leaseLost func() bool) error {
+	fenced := func() bool { return w.rolledBack.Load() || (leaseLost != nil && leaseLost()) }
+	if fenced() {
+		return errLayerRolledBack
+	}
 	marked, _ := w.markUnlinkedSnapshot(p, false)
 	w.waitUploaderPath(p)
+	if fenced() {
+		restoreMarked(marked)
+		return errLayerRolledBack
+	}
 	// The name is going away NOW (the facade invokes this before FS.Unlink
 	// replies OK): the pending overlays must stop answering lookups for it,
 	// or a re-creator racing the deferred remote DELETE reads the old entry
 	// (unlink/14 row 4's EEXIST against the resurrected name). The open
 	// fds keep their image: the staged bytes move to the unlink
 	// snapshot before the pending entries die.
-	if w.opts.Staging != nil && w.queue != nil {
+	ledger := w.opts.Staging != nil && w.queue != nil
+	if ledger {
 		if meta, ok := w.pendingMeta(p); ok && meta != nil {
 			if data, kok := readShadowGenerationFenced(w.opts.Staging.Shadow, p, meta.Size); kok {
 				if err := w.opts.Staging.Shadow.WriteFull(p, data, 0); err == nil {
@@ -1198,20 +1207,32 @@ func (w *Writeback) MarkPathUnlinked(p string) error {
 		// CancelPathPreserveLocal: a plain CancelPath also deletes the
 		// shadow the snapshot above just wrote, so the anonymous fd fell
 		// through to the recreated same-name file's bytes.
-		if err := w.queue.CancelPathPreserveLocal(p); err != nil {
+		if fenced() {
+			restoreMarked(marked)
+			return errLayerRolledBack
+		}
+		if err := w.queue.cancelPath(p, true, fenced); err != nil {
 			// The unlink is failing: the descriptors must go on serving
 			// their name, and — the failed premise being that the durable
 			// staging survived — the replayable frames now correctly
 			// describe a file that was never unlinked.
 			restoreMarked(marked)
-			w.submitOrphanedCacheForRollback(p, false)
+			if !errors.Is(err, errLayerRolledBack) {
+				w.submitOrphanedCacheForRollback(p, false)
+			}
 			return err
 		}
 	}
 	if w.wbCache != nil {
 		pUnlock := w.pathLocks.lock(p)
-		pUnlock()
+		// With a ledger the journal admission above already committed the unlink.
+		if !ledger && fenced() {
+			pUnlock()
+			restoreMarked(marked)
+			return errLayerRolledBack
+		}
 		w.wbCache.Remove(p)
+		pUnlock()
 	}
 	// The landed table's rescue window must not resurrect it either.
 	w.forgetLanded(p)
@@ -1425,9 +1446,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 	result, err := w.dispatch(ctx, op, next)
 	if err == nil && w.fencesMutation(op) {
 		// A slow operation crossed lease loss. A rejected open will never get a kernel Release.
-		if result.Handle != nil {
-			_ = result.Handle.Release(ctx)
-		}
+		fs.ReleaseRejectedOpen(ctx, result.Handle)
 		return fs.Result{}, errLayerRolledBack
 	}
 	return result, err
@@ -1592,6 +1611,13 @@ func (w *Writeback) dispatch(ctx context.Context, op *fs.Op, next fs.Next) (fs.R
 			// turns a slow upload into an open failure (open/25: a 2GiB
 			// spill re-opened before the stream lands).
 			if flags&uint32(syscall.O_ACCMODE) == uint32(syscall.O_RDONLY) {
+				if w.rolledBack.Load() {
+					if writer := w.handleFor(op.Path); writer != nil {
+						if res, claimed, err := writer.openFencedReader(ctx, op, next); claimed {
+							return res, err
+						}
+					}
+				}
 				if attr, ok := w.pendingAttr(op.Path); ok {
 					h := &bufferingHandle{w: w, path: op.Path, flags: op.Flags,
 						baseSize: attr.Size, forceSync: hasSyncOpenFlag(op.Flags),
@@ -1667,8 +1693,11 @@ func (w *Writeback) dispatch(ctx context.Context, op *fs.Op, next fs.Next) (fs.R
 			// writer's bytes (git's index-pack preads the tmp_pack a
 			// concurrent fd just wrote). Flush the writer first so the
 			// pending serve below owns the path.
-			if h := w.handleFor(op.Path); h != nil && op.Flags&uint32(syscall.O_ACCMODE) == uint32(syscall.O_RDONLY) {
+			if h := w.handleFor(op.Path); h != nil && op.Flags&uint32(syscall.O_ACCMODE) == uint32(syscall.O_RDONLY) && !w.rolledBack.Load() {
 				if ferr := h.Flush(ctx); ferr != nil {
+					if errors.Is(ferr, errLayerRolledBack) && w.rolledBack.Load() {
+						return w.dispatch(ctx, op, next)
+					}
 					// The flush is what makes the writer's newest bytes
 					// visible to this read; continuing would serve the
 					// stale remote image as success (ENOSPC staging, a
@@ -4941,7 +4970,7 @@ func (h *bufferingHandle) Release(ctx context.Context) (boundaryErr error) {
 	// writer", move the remote name, and then publish this Release's
 	// captured image right back under the old name.
 
-	if h.w.debounce != nil {
+	if h.w.debounce != nil && !fs.IsRejectedOpen(ctx) {
 		h.w.debounce.Cancel(path)
 	}
 	// The last handle of an unlinked name releases its snapshot (v1
@@ -4978,6 +5007,12 @@ func (h *bufferingHandle) Release(ctx context.Context) (boundaryErr error) {
 		h.snapshotFile = nil
 	}
 	h.mu.Unlock()
+	if fs.IsRejectedOpen(ctx) {
+		if h.inner != nil {
+			return h.inner.Release(ctx)
+		}
+		return nil
+	}
 	// An O_CREAT claim that never landed must still materialize as a remote
 	// file (stages it in pendingIndex at Create): git probes the
 	// filesystem by creating and unlinking `.git/ä` with no writes, and a
@@ -5152,7 +5187,10 @@ func (h *bufferingHandle) releaseMigrated(ctx context.Context, e fs.Handle) erro
 		h.mu.Unlock()
 	}
 	path := h.infoSnapshot().path
-	modeErr := h.flushMigratedMode(ctx)
+	var modeErr error
+	if !fs.IsRejectedOpen(ctx) {
+		modeErr = h.flushMigratedMode(ctx)
+	}
 	err := e.Release(ctx)
 	if err == nil && modeErr != nil {
 		err = modeErr
@@ -6156,10 +6194,14 @@ func (w *Writeback) captureSnapshot(h *bufferingHandle, size int64) ([]byte, *os
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
 	defer cancel()
+	return captureHandleImage(ctx, h.inner, size)
+}
+
+func captureHandleImage(ctx context.Context, source fs.Handle, size int64) ([]byte, *os.File, error) {
 	if size <= unlinkedSnapshotMaxBytes {
 		buf := make([]byte, size)
 		if size > 0 {
-			n, err := h.inner.Read(ctx, 0, buf)
+			n, err := source.Read(ctx, 0, buf)
 			if err != nil || int64(n) != size {
 				if err == nil {
 					err = io.ErrUnexpectedEOF
@@ -6180,7 +6222,7 @@ func (w *Writeback) captureSnapshot(h *bufferingHandle, size int64) ([]byte, *os
 			chunk = size - off
 		}
 		part := make([]byte, chunk)
-		n, rerr := h.inner.Read(ctx, off, part)
+		n, rerr := source.Read(ctx, off, part)
 		if int64(n) != chunk || (rerr != nil && rerr != io.EOF) {
 			_ = tmp.Close()
 			if rerr != nil {
@@ -6195,6 +6237,50 @@ func (w *Writeback) captureSnapshot(h *bufferingHandle, size int64) ([]byte, *os
 		off += chunk
 	}
 	return nil, tmp, nil
+}
+
+// A fenced writer cannot publish for read visibility. Give the reader a
+// private copy of its accepted bytes before a concurrent close frees them.
+func (h *bufferingHandle) openFencedReader(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, bool, error) {
+	h.flushMu.Lock()
+	defer h.flushMu.Unlock()
+	h.mu.Lock()
+	if h.closed || h.releasing || h.unlinked || h.path != op.Path || !(h.dirty || h.isNew && !h.landed || h.trunc && !h.landed) {
+		h.mu.Unlock()
+		return fs.Result{}, false, nil
+	}
+	var size int64
+	if h.buf != nil {
+		size = h.buf.Size()
+	}
+	mode := uint32(0o644)
+	if h.hasPendingMode {
+		mode = h.pendingMode
+	}
+	newFile := h.isNew
+	h.mu.Unlock()
+
+	res := fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: mode}}
+	if !newFile {
+		var err error
+		res, err = next(ctx, op)
+		if err != nil {
+			return fs.Result{}, true, err
+		}
+	}
+	image, file, err := captureHandleImage(ctx, h, size)
+	if err != nil {
+		fs.ReleaseRejectedOpen(ctx, res.Handle)
+		return fs.Result{}, true, err
+	}
+	reader := &bufferingHandle{w: h.w, path: op.Path, inner: res.Handle, flags: op.Flags,
+		baseSize: size, pendingImage: image, pendingFile: file, pendingFileSize: size}
+	h.w.track(reader)
+	res.Handle = reader
+	if res.Attr != nil {
+		res.Attr.Size, res.Attr.Rev = size, 0
+	}
+	return res, true, nil
 }
 
 // snapshotUnlinkedClean stages one clean handle's remote image into the
@@ -6387,7 +6473,7 @@ func (w *Writeback) dropUnlinkedShadow(path string) {
 	// payload and terminally conflicted it). A zero content generation
 	// means nothing was ever written (empty snapshot): leave the store
 	// alone.
-	if contentGen == 0 {
+	if contentGen == 0 || (w.rolledBack.Load() && w.opts.Staging.Pending.HasPending(path)) {
 		return
 	}
 	w.opts.Staging.Shadow.RemoveIfGeneration(path, contentGen)
@@ -8162,6 +8248,12 @@ func (h *bufferingHandle) commitLocked(ctx context.Context) error {
 		}
 	}
 	if h.w.rolledBack.Load() {
+		h.mu.Lock()
+		readOnly := !h.isWritableCapableLocked() && !h.dirty && !h.hasPendingMode
+		h.mu.Unlock()
+		if readOnly {
+			return nil
+		}
 		return errLayerRolledBack
 	}
 	h.mu.Lock()
