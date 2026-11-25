@@ -627,6 +627,9 @@ func (c *Client) writeStreamConditionalWithSummaryAndPreCompleteCheck(ctx contex
 }
 
 func (c *Client) writeStreamConditionalWithOptionsAndSummary(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64, opts writeOptions, checksumSHA256 string, preCompleteCheck func() error) (*UploadSummary, error) {
+	if err := c.validateViewDescription(opts.description); err != nil {
+		return nil, err
+	}
 	// Validate before the threshold fetch and any checksum work so a bad
 	// path fails fast without a round trip or wasted CPU.
 	if err := validateFSPath(path); err != nil {

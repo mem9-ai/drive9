@@ -131,29 +131,20 @@ drive9 mount --mode=fuse :/ ./work
 
 ### LayerFS Attempts
 
-Run writable attempts over a read-only base. Failed attempts roll back without
-polluting the base; successful attempts commit back after Drive9 checks whether
-the base changed.
+Create a writable layer to try changes against a snapshot of a remote directory.
+The create command prints the layer ID. Use that ID to mount the layer and edit
+its files. Unmount it before merging the changes into the base directory.
 
 ```bash
-# Two agents start from the same base workspace.
-drive9 fs layer create :/repo --name fix-auth-a --tag agent=a
-drive9 fs layer create :/repo --name fix-auth-b --tag agent=b
-
-drive9 mount --mode=fuse --layer fix-auth-a :/repo ./attempt-a
-drive9 mount --mode=fuse --layer fix-auth-b :/repo ./attempt-b
-
-# Each agent edits, tests, and checkpoints independently.
-drive9 fs layer checkpoint fix-auth-a --label tests-pass
-drive9 fs layer checkpoint fix-auth-b --label alternative-pass
-
-# The first commit updates the base. The second is preserved if it conflicts.
-drive9 fs layer commit fix-auth-a
-drive9 fs layer commit fix-auth-b   # becomes conflicted if the base moved
+layer=$(drive9 fs layer create --name fix-auth :/repo)
+drive9 mount --mode=fuse --layer "$layer" :/repo ./attempt
+# Edit and test files under ./attempt.
+drive9 umount ./attempt
+drive9 fs layer merge "$layer"
 ```
 
-A conflicted layer is not silently overwritten or discarded. It stays available
-for review, diff, rollback, or manual resolution.
+To discard an unmounted attempt, run `drive9 fs layer rm "$layer"`.
+If the merge reports a conflict, inspect the layer with `drive9 fs layer inspect "$layer"`.
 
 ### Vault and Journal Surfaces
 

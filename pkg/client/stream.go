@@ -79,6 +79,9 @@ func (sw *StreamWriter) initLocked(ctx context.Context) error {
 	if sw.started {
 		return nil
 	}
+	if err := sw.client.validateViewDescription(sw.description); err != nil {
+		return err
+	}
 	plan, err := sw.client.initiateUploadV2(ctx, sw.path, sw.totalSize, sw.expectedRevision, sw.description)
 	if isExtentLayoutMismatchError(err) {
 		// Existing target uses sticky extent layout: open an extent sequential session.
