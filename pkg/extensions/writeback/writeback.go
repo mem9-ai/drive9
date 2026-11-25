@@ -1431,19 +1431,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 }
 
 func (w *Writeback) fencesMutation(op *fs.Op) bool {
-	if !w.rolledBack.Load() {
-		return false
-	}
-	switch op.Kind {
-	case fs.OpCreate:
-		return op.KernelCreate() || op.Flags&uint32(syscall.O_CREAT|syscall.O_TRUNC|syscall.O_WRONLY|syscall.O_RDWR) != 0
-	case fs.OpWrite, fs.OpSetAttr, fs.OpFallocate, fs.OpCopyFileRange,
-		fs.OpMkdir, fs.OpMknod, fs.OpUnlink, fs.OpRmdir, fs.OpRename, fs.OpLink, fs.OpSymlink,
-		fs.OpSetXattr, fs.OpRemoveXattr:
-		return true
-	default:
-		return false
-	}
+	return w.rolledBack.Load() && op.MutatesFile()
 }
 
 func (w *Writeback) dispatch(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {

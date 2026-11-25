@@ -103,6 +103,7 @@ type Options struct {
 // FS is the gofuse facade kernel: RawFilesystem translation, identity
 // tables, fs.Context, and dispatch into the op and handle chains.
 type FS struct {
+	layerFence           *atomic.Bool
 	gofuse.RawFileSystem // ENOSYS defaults for opcodes outside the fs vocabulary
 
 	chain *fs.Chain
@@ -2929,13 +2930,32 @@ func (f *FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte) (gof
 	return gofuse.ReadResultData(res.Data), gofuse.OK
 }
 
+func (f *FS) layerFenced() bool {
+	return f.layerFence != nil && f.layerFence.Load()
+}
+
+func (f *FS) writableHandleFenced(fh uint64) bool {
+	if !f.layerFenced() {
+		return false
+	}
+	h, ok := f.handles.get(fh)
+	return !ok || h.flags&uint32(syscall.O_WRONLY|syscall.O_RDWR|syscall.O_CREAT|syscall.O_TRUNC) != 0
+}
+
 func (f *FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []byte) (uint32, gofuse.Status) {
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	if h := f.openHandle(input.Fh); h != nil {
 		start := time.Now()
 		unlock := f.pathLocks.HandleLock(input.Fh)
+		if f.layerFenced() {
+			unlock()
+			return 0, gofuse.EIO
+		}
 		err := h.Write(ctx, int64(input.Offset), data)
+		if err == nil && f.layerFenced() {
+			err = ErrLayerLeaseSelfFenced
+		}
 		unlock()
 		f.recordHandleOp(fs.OpWrite, start, err, uint64(len(data)))
 		if err != nil {
@@ -3007,13 +3027,20 @@ func (f *FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.Status 
 		// F_UNLCK must target exactly this owner (dup + close of one
 		// descriptor), not whoever opened the handle.
 		start := time.Now()
+		// Flush still releases locks and preserves local recovery data on a fenced mount.
 		err := h.Flush(fs.WithFlushOwner(ctx, input.LockOwner))
+		if err == nil && f.writableHandleFenced(input.Fh) {
+			err = ErrLayerLeaseSelfFenced
+		}
 		unlock()
 		f.recordHandleOp(fs.OpFlush, start, err, 0)
 		return fs.StatusOf(err)
 	}
 	path, _ := f.dispatchPath(input.NodeId, input.Fh)
 	_, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpFlush, Path: path, Ino: input.NodeId, Fh: input.Fh, Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
+	if st == gofuse.OK && f.writableHandleFenced(input.Fh) {
+		return gofuse.EIO
+	}
 	return st
 }
 
@@ -3023,13 +3050,26 @@ func (f *FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) gofuse.Status 
 	if h := f.openHandle(input.Fh); h != nil {
 		start := time.Now()
 		unlock := f.pathLocks.HandleLock(input.Fh)
+		if f.writableHandleFenced(input.Fh) {
+			unlock()
+			return gofuse.EIO
+		}
 		err := h.Sync(ctx)
+		if err == nil && f.writableHandleFenced(input.Fh) {
+			err = ErrLayerLeaseSelfFenced
+		}
 		unlock()
 		f.recordHandleOp(fs.OpFsync, start, err, 0)
 		return fs.StatusOf(err)
 	}
+	if f.writableHandleFenced(input.Fh) {
+		return gofuse.EIO
+	}
 	path, _ := f.dispatchPath(input.NodeId, input.Fh)
 	_, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpFsync, Path: path, Ino: input.NodeId, Fh: input.Fh, Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
+	if st == gofuse.OK && f.writableHandleFenced(input.Fh) {
+		return gofuse.EIO
+	}
 	return st
 }
 
@@ -3711,7 +3751,7 @@ func fuseCtx(cancel <-chan struct{}) (context.Context, context.CancelFunc) {
 
 func (f *FS) dispatch(ctx context.Context, op *fs.Op) (fs.Result, gofuse.Status) {
 	start := time.Now()
-	res, err := f.chain.Dispatch(ctx, op)
+	res, err := f.dispatchErr(ctx, op)
 	st := gofuse.OK
 	if err != nil {
 		st = fs.StatusOf(err)
@@ -3767,7 +3807,17 @@ func opBytes(op *fs.Op, res fs.Result) uint64 {
 }
 
 func (f *FS) dispatchErr(ctx context.Context, op *fs.Op) (fs.Result, error) {
-	return f.chain.Dispatch(ctx, op)
+	if f.layerFenced() && op.MutatesFile() {
+		return fs.Result{}, ErrLayerLeaseSelfFenced
+	}
+	result, err := f.chain.Dispatch(ctx, op)
+	if err == nil && f.layerFenced() && op.MutatesFile() {
+		if result.Handle != nil {
+			_ = result.Handle.Release(ctx)
+		}
+		return fs.Result{}, ErrLayerLeaseSelfFenced
+	}
+	return result, err
 }
 
 // ArmBypass flags an inode for a short DIRECT_IO window on its next open

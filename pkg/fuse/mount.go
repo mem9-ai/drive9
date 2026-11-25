@@ -49,9 +49,9 @@ type ProfilingOptions = perf.ProfilingOptions
 
 // MountConfig carries the mount inputs the fuse stack accepts.
 type MountConfig struct {
-	Server     string
-	APIKey     string
-	Token      string
+	Server              string
+	APIKey              string
+	Token               string
 	MountPoint          string
 	RemoteRoot          string
 	RemoteRootDefaulted bool
@@ -1407,8 +1407,11 @@ func mountWithConfig(cfg MountConfig) error {
 	if sseExt != nil {
 		sseExt.Attach(f.Ctx.Inodes, f.Ctx.Notify)
 	}
-	if layerBinding.LayerID != "" && wb != nil {
-		layerBinding.OnSelfFence(wb.AbandonLayerForRollback)
+	if layerBinding.LayerID != "" {
+		f.layerFence = &layerBinding.fenced
+		if wb != nil {
+			layerBinding.OnSelfFence(wb.AbandonLayerForRollback)
+		}
 	}
 
 	// Control server + mount process state (v1 mount.go) run BEFORE the
