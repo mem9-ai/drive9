@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // IsCanonicalLayerID reports whether id matches the server-generated ULID form.
@@ -35,11 +37,8 @@ func NormalizeLayerName(raw string) (string, error) {
 	if strings.HasPrefix(lower, "tag:") || strings.HasPrefix(lower, "layer_") {
 		return "", fmt.Errorf("%w: %q uses reserved prefix", ErrInvalidLayerName, raw)
 	}
-	for i := 0; i < len(name); i++ {
-		c := name[i]
-		if c < 0x20 || c == 0x7f || c == '/' {
-			return "", fmt.Errorf("%w: %q contains forbidden character", ErrInvalidLayerName, raw)
-		}
+	if !validLayerText(name) || strings.ContainsRune(name, '/') {
+		return "", fmt.Errorf("%w: forbidden character", ErrInvalidLayerName)
 	}
 	return name, nil
 }
@@ -50,20 +49,25 @@ func NormalizeLayerRef(raw string) (string, error) {
 	if ref == "" || len(ref) > MaxLayerRefBytes || strings.EqualFold(ref, "main") {
 		return "", fmt.Errorf("%w: %q", ErrInvalidLayerRef, raw)
 	}
-	for i := 0; i < len(ref); i++ {
-		if ref[i] < 0x20 || ref[i] == 0x7f {
-			return "", fmt.Errorf("%w: control character in ref", ErrInvalidLayerRef)
-		}
+	if !validLayerText(ref) {
+		return "", fmt.Errorf("%w: forbidden character", ErrInvalidLayerRef)
 	}
 	return ref, nil
 }
 
+func validLayerText(s string) bool {
+	return utf8.ValidString(s) && strings.IndexFunc(s, func(r rune) bool {
+		return unicode.IsControl(r) || unicode.Is(unicode.Bidi_Control, r)
+	}) < 0
+}
+
 // ParseTagSelector parses "tag:<key>" or "tag:<key>=<value>".
 func ParseTagSelector(ref string) (key, value string, hasValue, isTag bool, err error) {
-	if !strings.HasPrefix(ref, "tag:") {
+	const prefix = "tag:"
+	if len(ref) < len(prefix) || !strings.EqualFold(ref[:len(prefix)], prefix) {
 		return "", "", false, false, nil
 	}
-	rest := strings.TrimPrefix(ref, "tag:")
+	rest := ref[len(prefix):]
 	if rest == "" {
 		return "", "", false, true, fmt.Errorf("%w: empty tag selector", ErrInvalidLayerRef)
 	}
@@ -98,6 +102,9 @@ func ParseFenceHeader(h http.Header) (fence int64, present bool, err error) {
 // ParseViewRoute strips "/v1/views/{layer_id}" from r and returns a cloned
 // request targeting the inner /v1/* or /v2/* endpoint along with layer_id.
 func ParseViewRoute(r *http.Request) (*http.Request, string, error) {
+	if r == nil || r.URL == nil {
+		return nil, "", ErrInvalidViewRoute
+	}
 	escaped := r.URL.EscapedPath()
 	if !strings.HasPrefix(escaped, RoutePrefix) {
 		return nil, "", ErrInvalidViewRoute
