@@ -820,7 +820,11 @@ func TestFencedReaderOfReopenedPendingCreate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer reader.Handle.Release(ctx)
+	t.Cleanup(func() {
+		if err := reader.Handle.Release(ctx); err != nil {
+			t.Errorf("reader close: %v", err)
+		}
+	})
 	if err := writer.Handle.Release(ctx); !errors.Is(err, errLayerRolledBack) {
 		t.Fatalf("writer close: %v", err)
 	}
