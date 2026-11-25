@@ -300,7 +300,7 @@ done
 			case <-time.After(time.Second):
 				t.Fatal("cancelled operation remained blocked")
 			}
-			node, ok := w.treeLookup("f")
+			node, _, ok := w.treeLookup("f")
 			require.True(t, ok)
 			require.EqualValues(t, -1, node.SizeBytes)
 			require.Empty(t, w.overlay)

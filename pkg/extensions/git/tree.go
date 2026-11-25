@@ -111,14 +111,10 @@ func sameOverlayEntry(a, b overlayEntry) bool {
 
 // loadTree fetches the workspace's HEAD tree (v1 ListGitTree → rt.nodes):
 // clean files resolve here before the base view.
-func (g *Git) loadTree(ctx context.Context, w *workspace) bool {
-	head := w.head()
-	if head == "" {
-		return false
-	}
+func (g *Git) loadTree(ctx context.Context, w *workspace, head string) {
 	nodes, err := g.cl.ListGitTree(ctx, w.id, head)
 	if err != nil {
-		return false
+		return
 	}
 	tree := make(map[string]client.GitTreeNode, len(nodes))
 	for _, n := range nodes {
@@ -128,20 +124,22 @@ func (g *Git) loadTree(ctx context.Context, w *workspace) bool {
 		tree[strings.TrimPrefix(n.Path, "/")] = n
 	}
 	w.mu.Lock()
-	w.tree = tree
+	if w.headCommit == head {
+		w.tree = tree
+		w.treeLoaded = head
+	}
 	w.mu.Unlock()
-	return true
 }
 
 // treeLookup resolves rel against the HEAD tree.
-func (w *workspace) treeLookup(rel string) (client.GitTreeNode, bool) {
+func (w *workspace) treeLookup(rel string) (client.GitTreeNode, string, bool) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	if w.tree == nil || rel == "" {
-		return client.GitTreeNode{}, false
+		return client.GitTreeNode{}, "", false
 	}
 	n, ok := w.tree[rel]
-	return n, ok
+	return n, w.treeLoaded, ok
 }
 
 // treeAttr projects a tree node onto the framework attr shape. mtime is
@@ -449,7 +447,7 @@ func (g *Git) resolveWorkspaceGitDir(w *workspace) string {
 // hydrate tree/blob cache first (`gitcache`), then the workspace's persistent
 // `git cat-file --batch` reader, falling back to one-shot `git cat-file blob`
 // when a partial clone needs an on-demand lazy fetch (`--hydrate=off`).
-func (g *Git) materializeTreeEntry(ctx context.Context, w *workspace, rel, sha string) ([]byte, error) {
+func (g *Git) materializeTreeEntry(ctx context.Context, w *workspace, head, rel, sha string) ([]byte, error) {
 	if !isGitObjectID(sha) {
 		return nil, fmt.Errorf("git: invalid tree node object ID")
 	}
@@ -460,7 +458,7 @@ func (g *Git) materializeTreeEntry(ctx context.Context, w *workspace, rel, sha s
 		if ctx == nil {
 			ctx = context.Background()
 		}
-		if head := w.head(); head != "" {
+		if head != "" {
 			if rel != "" {
 				if data, ok, err := gitcache.ReadTreeFile(ctx, g.localRoot, w.id, head, rel, 0, -1); err == nil && ok {
 					cacheBlob(w.id+":"+sha, data)
@@ -507,12 +505,12 @@ func (g *Git) materializeBlob(ctx context.Context, w *workspace, sha string) ([]
 
 // resolveTreeNodeSize resolves an unknown tree-node size (blobless -1) from
 // the local hydrate cache first, then the local object store.
-func (g *Git) resolveTreeNodeSize(ctx context.Context, w *workspace, rel, sha string) int64 {
+func (g *Git) resolveTreeNodeSize(ctx context.Context, w *workspace, head, rel, sha string) int64 {
 	if g.localRoot != "" {
 		if ctx == nil {
 			ctx = context.Background()
 		}
-		if head := w.head(); head != "" {
+		if head != "" {
 			if rel != "" {
 				if sz, ok, err := gitcache.StatTreeFile(ctx, g.localRoot, w.id, head, rel); err == nil && ok {
 					return sz

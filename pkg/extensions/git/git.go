@@ -139,13 +139,13 @@ func (w *workspace) releaseRestore() {
 // the first read resolves one, getattr answers a placeholder that git
 // status flags as phantom-modified. Recording the size lets the next
 // stat pass the index comparison and the status converge.
-func (w *workspace) noteTreeSize(rel string, size int64) {
+func (w *workspace) noteTreeSize(rel, sha string, size int64) {
 	if size < 0 {
 		return
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if n, ok := w.tree[rel]; ok && n.SizeBytes < 0 {
+	if n, ok := w.tree[rel]; ok && n.ObjectSHA == sha && n.SizeBytes < 0 {
 		// map values are copies: write the updated node back or every
 		// lookup re-resolves via cat-file and a later failure re-exposes
 		// the placeholder (review).
@@ -923,12 +923,7 @@ func (g *Git) refreshTree(ctx context.Context, w *workspace) {
 	// Latch only after a SUCCESSFUL install: a transient 503 used to mark
 	// the commit loaded forever, so every rescan skipped the retry and the
 	// fast-clone view kept missing (or serving the old) tree files.
-	if !g.loadTree(ctx, w) {
-		return
-	}
-	w.mu.Lock()
-	w.treeLoaded = head
-	w.mu.Unlock()
+	g.loadTree(ctx, w, head)
 }
 
 // workspaceFor returns the workspace whose root is the longest prefix of
