@@ -287,7 +287,7 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 			// every read EIOs. Claim it and serve the materialized blob.
 			if n, head, tok := w.treeLookup(rel); tok && n.Kind == "file" && n.ObjectSHA != "" {
 				h := &gitHandle{g: g, w: w, path: op.Path, rel: rel, flags: op.Flags,
-					treeSHA: n.ObjectSHA, treeHead: head, mode: parseMode(n.Mode)}
+					treeSHA: n.ObjectSHA, treeHead: head, treeRel: rel, mode: parseMode(n.Mode)}
 				if h.mode == 0 {
 					h.mode = 0o644
 				}

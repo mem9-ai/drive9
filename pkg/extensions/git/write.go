@@ -29,10 +29,11 @@ type gitHandle struct {
 	rel   string
 	flags uint32
 	mode  uint32
-	// treeSHA set on a clean-tree read handle: reads materialize the
-	// blob instead of falling to the (absent) base-plane entry.
+	// Capture the clean base at open. A rename may change rel, and a refresh
+	// may replace the tree before the first read or buffered write.
 	treeSHA  string
 	treeHead string
+	treeRel  string
 
 	mu       sync.Mutex
 	buf      *writebuffer.WriteBuffer
@@ -71,14 +72,12 @@ func (g *Git) claimWorkspaceOpen(w *workspace, path, rel string, flags uint32, m
 	if h.mode == 0 {
 		h.mode = mode & 0o777
 	}
-	if h.mode == 0 {
-		// An in-place modify of a clean tree file carries no create mode
-		// (append opens, O_TRUNC rewrites of existing names): the file
-		// keeps the tree node's mode — a stash/checkout restore that
-		// rewrites content in place must not regress an 0755 fixture
-		// file to 0644 in the published overlay entry.
-		if n, _, tok := w.treeLookup(rel); tok {
+	if n, head, ok := w.treeLookup(rel); ok {
+		if h.mode == 0 {
 			h.mode = parseMode(n.Mode)
+		}
+		if !hit && !fresh && n.Kind == "file" {
+			h.treeSHA, h.treeHead, h.treeRel = n.ObjectSHA, head, rel
 		}
 	}
 	if h.mode == 0 {
@@ -94,7 +93,8 @@ func (h *gitHandle) attr(ctx context.Context) fs.Attr {
 	defer h.mu.Unlock()
 	size := int64(0)
 	mtime := h.w.cleanTreeMtime()
-	if e, hit := h.w.lookup(h.rel); hit && e.Op == "upsert" {
+	e, hit := h.w.lookup(h.rel)
+	if hit && e.Op == "upsert" {
 		size = int64(len(e.Content))
 		if !e.mtime.IsZero() {
 			mtime = e.mtime
@@ -102,16 +102,26 @@ func (h *gitHandle) attr(ctx context.Context) fs.Attr {
 	}
 	if h.buf != nil {
 		size = h.buf.Size()
-	}
-	if size == 0 && h.treeSHA != "" {
+	} else if !hit && h.treeSHA != "" {
 		if n, _, ok := h.w.treeLookup(h.rel); ok && n.ObjectSHA == h.treeSHA && n.SizeBytes >= 0 {
 			size = n.SizeBytes
 		} else {
-			size = h.g.resolveTreeNodeSize(ctx, h.w, h.treeHead, h.rel, h.treeSHA)
+			size = h.g.resolveTreeNodeSize(ctx, h.w, h.treeHead, h.treeRel, h.treeSHA)
 			h.w.noteTreeSize(h.rel, h.treeSHA, size)
 		}
 	}
 	return fs.Attr{Kind: fs.KindFile, Mode: h.mode, Size: max(0, size), Mtime: mtime}
+}
+
+// A cold workspace may acquire its object database after the first attempt.
+func (h *gitHandle) loadTreeBlob(ctx context.Context, head, rel, sha string) ([]byte, error) {
+	data, err := h.g.materializeTreeEntry(ctx, h.w, head, rel, sha)
+	if err != nil && !gitReadInterrupted(err) {
+		if restoreErr := h.g.ensureWorkspaceState(ctx, h.w); restoreErr == nil {
+			return h.g.materializeTreeEntry(ctx, h.w, head, rel, sha)
+		}
+	}
+	return data, err
 }
 
 func (h *gitHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
@@ -119,15 +129,7 @@ func (h *gitHandle) Read(ctx context.Context, off int64, dest []byte) (int, erro
 	defer h.mu.Unlock()
 	if h.buf == nil && h.treeSHA != "" {
 		if _, hit := h.w.lookup(h.rel); !hit {
-			data, err := h.g.materializeTreeEntry(ctx, h.w, h.treeHead, h.rel, h.treeSHA)
-			if err != nil && !gitReadInterrupted(err) {
-				// The blob's local .git may simply not be here yet: the
-				// discovery-time restore ran before the CLI uploaded its
-				// checkpoint. Pull the state once, then retry.
-				if rerr := h.g.ensureWorkspaceState(ctx, h.w); rerr == nil {
-					data, err = h.g.materializeTreeEntry(ctx, h.w, h.treeHead, h.rel, h.treeSHA)
-				}
-			}
+			data, err := h.loadTreeBlob(ctx, h.treeHead, h.treeRel, h.treeSHA)
 			if err != nil {
 				return 0, err
 			}
@@ -376,13 +378,14 @@ func (h *gitHandle) ensureBufferLocked(ctx context.Context) (err error) {
 		buf.ClearDirty()
 		return nil
 	}
-	if n, head, ok := h.w.treeLookup(h.rel); ok && n.Kind == "file" && n.ObjectSHA != "" {
-		data, err := h.g.materializeTreeEntry(ctx, h.w, head, h.rel, n.ObjectSHA)
-		if err != nil && !gitReadInterrupted(err) {
-			if rerr := h.g.ensureWorkspaceState(ctx, h.w); rerr == nil {
-				data, err = h.g.materializeTreeEntry(ctx, h.w, head, h.rel, n.ObjectSHA)
-			}
+	head, rel, sha := h.treeHead, h.treeRel, h.treeSHA
+	if sha == "" {
+		if n, current, ok := h.w.treeLookup(h.rel); ok && n.Kind == "file" {
+			head, rel, sha = current, h.rel, n.ObjectSHA
 		}
+	}
+	if sha != "" {
+		data, err := h.loadTreeBlob(ctx, head, rel, sha)
 		if err == nil {
 			if _, werr := buf.Write(0, data); werr != nil {
 				return werr
@@ -390,7 +393,7 @@ func (h *gitHandle) ensureBufferLocked(ctx context.Context) (err error) {
 			buf.ClearDirty()
 			return nil
 		}
-		if gitReadInterrupted(err) {
+		if h.treeSHA != "" || gitReadInterrupted(err) {
 			return err
 		}
 		// Fall through to the remote base: the blob may be materializable

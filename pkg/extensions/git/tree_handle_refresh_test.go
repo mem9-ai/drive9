@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -29,9 +30,9 @@ func TestCleanGitHandleRetainsBlobAfterHeadRefresh(t *testing.T) {
 		require.NoError(t, os.MkdirAll(dir, 0755))
 		require.NoError(t, os.WriteFile(filepath.Join(dir, "readme"), []byte(data), 0644))
 	}
-	open := func() *gitHandle {
+	open := func(flags uint32) *gitHandle {
 		t.Helper()
-		res, err := g.Do(t.Context(), &fs.Op{Kind: fs.OpCreate, Path: "/repo/readme"}, nil)
+		res, err := g.Do(t.Context(), &fs.Op{Kind: fs.OpCreate, Path: "/repo/readme", Flags: flags}, nil)
 		require.NoError(t, err)
 		return res.Handle.(*gitHandle)
 	}
@@ -44,12 +45,33 @@ func TestCleanGitHandleRetainsBlobAfterHeadRefresh(t *testing.T) {
 	}
 
 	install("old-head", strings.Repeat("1", 40), "old")
-	old := open()
+	old := open(0)
+	editor := open(syscall.O_RDWR)
+	appender := open(syscall.O_WRONLY | syscall.O_APPEND)
+	defer editor.releaseBuffer()
+	defer appender.releaseBuffer()
 	install("new-head", strings.Repeat("2", 40), "replacement")
+	// Losing the old hydrated file must leave the handle retryable. The new
+	// commit already has content at the same path.
+	w.markRestoreLatched()
+	oldPath := filepath.Join(gitcache.TreeRoot(root, w.id, "old-head"), "readme")
+	require.NoError(t, os.Remove(oldPath))
+	require.Error(t, editor.Write(t.Context(), 0, []byte("g")))
+	require.Nil(t, editor.buf)
+	require.NoError(t, os.WriteFile(oldPath, []byte("old"), 0644))
+
 	require.EqualValues(t, 3, old.attr(t.Context()).Size)
 	require.Equal(t, "old", read(old))
 	require.EqualValues(t, -1, w.tree["readme"].SizeBytes)
-	current := open()
+	require.EqualValues(t, 3, editor.attr(t.Context()).Size)
+	require.Equal(t, "old", read(editor))
+	require.NoError(t, editor.Write(t.Context(), 0, []byte("g")))
+	require.Equal(t, "gld", read(editor))
+	require.NoError(t, appender.Write(t.Context(), 0, []byte("!")))
+	require.Equal(t, "old!", read(appender))
+	require.NoError(t, editor.truncate(t.Context(), 0))
+	require.Zero(t, editor.attr(t.Context()).Size)
+	current := open(0)
 	require.EqualValues(t, 11, current.attr(t.Context()).Size)
 	require.Equal(t, "replacement", read(current))
 }
