@@ -83,6 +83,7 @@ func TestMountViewSwitchSelfFencedPendingLeaseAndControlResponsiveness(t *testin
 	sw, fb, _, _ := viewSwitchFixture(t)
 	ctrl := startViewControlFixture(t, sw)
 	ctx := context.Background()
+	require.Nil(t, sw.currentRuntime().fs.layerFence)
 
 	const l1 = "layer_01j00000000000000000000001"
 	var failFirstBuild atomic.Bool
@@ -107,7 +108,8 @@ func TestMountViewSwitchSelfFencedPendingLeaseAndControlResponsiveness(t *testin
 
 	sw.mu.Lock()
 	require.NotNil(t, sw.pendingLease)
-	sw.pendingLease.triggerSelfFence("test self-fence")
+	firstLease := sw.pendingLease
+	firstLease.triggerSelfFence("test self-fence")
 	sw.mu.Unlock()
 
 	stRecovering, err := mountcontrol.RequestStatus(ctx, ctrl.SocketPath(), time.Second)
@@ -124,6 +126,9 @@ func TestMountViewSwitchSelfFencedPendingLeaseAndControlResponsiveness(t *testin
 
 	cur := sw.currentRuntime()
 	require.NotNil(t, cur.layerLease)
+	require.NotSame(t, firstLease, cur.layerLease)
+	require.Same(t, &cur.layerLease.fenced, cur.fs.layerFence)
+	require.False(t, cur.fs.layerFenced())
 	require.NoError(t, cur.layerLease.ViewClient.WriteCtx(ctx, "/after_rebuild.txt", []byte("ok")))
 
 	unbindEntered := make(chan struct{})
@@ -146,6 +151,7 @@ func TestMountViewSwitchSelfFencedPendingLeaseAndControlResponsiveness(t *testin
 	})
 	require.NoError(t, err)
 	require.Equal(t, mountstate.SwitchDone, toMain.Receipt.State)
+	require.Nil(t, sw.currentRuntime().fs.layerFence)
 
 	select {
 	case <-unbindEntered:
