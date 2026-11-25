@@ -103,7 +103,7 @@ type Options struct {
 // FS is the gofuse facade kernel: RawFilesystem translation, identity
 // tables, fs.Context, and dispatch into the op and handle chains.
 type FS struct {
-	layerFence           *atomic.Bool
+	layerFence           *layerMountBinding
 	gofuse.RawFileSystem // ENOSYS defaults for opcodes outside the fs vocabulary
 
 	chain *fs.Chain
@@ -2061,48 +2061,50 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 		// the open fd keeps reading its data, and the remote entry dies with
 		// the last close — deferring the delete keeps fd reads working in a
 		// sync core with no local data plane.
-		handles := f.openIdx.SnapshotPath(child)
-		f.openIdx.UnlinkPath(child)
-		// Capture the ino and a surviving alias before the preserve drops
-		// the byPath mapping: handles of a hardlinked inode may have been
-		// keyed at EITHER name at open (FUSE OPEN carries only the nodeid,
-		// so GetPath picks the inode's primary path), and a handle left
-		// keyed at the doomed name would serve the REPLACEMENT object's
-		// write state through the write plane's read-your-writers overlay
-		// once the name is recycled (#1029). Rebind them onto the survivor
-		// BEFORE the unlink marking: a survivor-keyed handle is an ordinary
-		// reader of a live name and needs no unlink snapshot at all.
 		ino, iok := f.inodes.GetInode(child)
-		if iok {
-			if survivor, sok := f.inodes.SurvivorOfInode(ino, child); sok {
-				for _, h := range f.chain.Handlers() {
-					if rt, ok := h.(interface {
-						RetargetPath(oldPath, newPath string)
-					}); ok {
-						rt.RetargetPath(child, survivor)
-					}
-				}
-			}
-		}
-		var markErr error
+		survivor, _ := f.inodes.SurvivorOfInode(ino, child)
+		// Preparation may block on an upload or a clean reader. Keep the
+		// name, open index and replayable staged writes intact meanwhile.
+		var finish func(bool) error
 		for _, h := range f.chain.Handlers() {
-			if mu, ok := h.(interface {
-				MarkPathUnlinked(string, func() bool) error
+			if prep, ok := h.(interface {
+				PreparePathUnlink(string, bool) func(bool) error
 			}); ok {
-				if err := mu.MarkPathUnlinked(child, f.layerFenced); err != nil {
-					markErr = err
-					break
-				}
+				finish = prep.PreparePathUnlink(child, survivor != "")
+				break
 			}
 		}
-		if markErr != nil {
-			// A handler could not make the path's staged state
-			// non-replayable (failing WAL plus failing cleanup): fail the
-			// unlink now, before any namespace mutation, and restore the
-			// open-path bookkeeping — the writeback rolls its own marking
-			// back.
-			f.openIdx.RelinkPath(child, handles)
-			return fs.StatusOf(markErr)
+		binding := f.layerFence
+		if binding != nil {
+			binding.fenceMu.Lock()
+			if binding.fenced.Load() {
+				binding.fenceMu.Unlock()
+				if finish != nil {
+					_ = finish(false)
+				}
+				return gofuse.EIO
+			}
+		}
+		// Commit the local unlink and its namespace publication on the same
+		// side of triggerSelfFence. Final close can retry the deferred delete.
+		if finish != nil {
+			if err := finish(true); err != nil {
+				if binding != nil {
+					binding.fenceMu.Unlock()
+				}
+				return fs.StatusOf(err)
+			}
+		}
+		f.openIdx.UnlinkPath(child)
+		for _, h := range f.chain.Handlers() {
+			if survivor != "" {
+				if rt, ok := h.(interface{ RetargetPath(string, string) }); ok {
+					rt.RetargetPath(child, survivor)
+				}
+			}
+			if mark, ok := h.(interface{ MarkPathUnlinked(string) }); ok {
+				mark.MarkPathUnlinked(child)
+			}
 		}
 		pending := &deferredUnlink{path: child, ino: ino}
 		pending.mu.Lock()
@@ -2112,11 +2114,14 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 			f.deferredUnlinks[child] = pending
 			f.mu.Unlock()
 		}
+		f.markNameNegative(child)
+		if binding != nil {
+			binding.fenceMu.Unlock()
+		}
 		f.touchParentMtime(header.NodeId)
 		f.mutated(fs.EventDelete, child)
-		f.markNameNegative(child)
 		pending.mu.Unlock()
-		// The last Release may have completed while MarkPathUnlinked was
+		// The last Release may have completed while PreparePathUnlink was
 		// preparing the anonymous handle state, before registration existed.
 		// Recheck after publication so that close cannot strand the delete.
 		if iok {
@@ -2931,7 +2936,7 @@ func (f *FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte) (gof
 }
 
 func (f *FS) layerFenced() bool {
-	return f.layerFence != nil && f.layerFence.Load()
+	return f.layerFence != nil && f.layerFence.fenced.Load()
 }
 
 func (f *FS) writableHandleFenced(fh uint64) bool {

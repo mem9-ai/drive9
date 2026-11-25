@@ -6,8 +6,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"sync"
-	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -719,19 +717,11 @@ func TestDeferredUnlinkLosingLeasePreservesStagedImage(t *testing.T) {
 	h.mu.Lock()
 	h.submitDone = release
 	h.mu.Unlock()
-	entered := make(chan struct{})
-	var once sync.Once
-	var fenced atomic.Bool
 	done := make(chan error, 1)
 	go func() {
-		done <- wb.MarkPathUnlinked("/held", func() bool {
-			current := fenced.Load()
-			once.Do(func() { close(entered) })
-			return current
-		})
+		finish := wb.PreparePathUnlink("/held", false)
+		done <- finish(false)
 	}()
-	<-entered
-	fenced.Store(true)
 	close(release)
 	if err := <-done; !errors.Is(err, errLayerRolledBack) {
 		t.Fatalf("unlink: %v", err)

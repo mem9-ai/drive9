@@ -127,7 +127,7 @@ func TestMountViewSwitchSelfFencedPendingLeaseAndControlResponsiveness(t *testin
 	cur := sw.currentRuntime()
 	require.NotNil(t, cur.layerLease)
 	require.NotSame(t, firstLease, cur.layerLease)
-	require.Same(t, &cur.layerLease.fenced, cur.fs.layerFence)
+	require.Same(t, cur.layerLease, cur.fs.layerFence)
 	require.False(t, cur.fs.layerFenced())
 	require.NoError(t, cur.layerLease.ViewClient.WriteCtx(ctx, "/after_rebuild.txt", []byte("ok")))
 

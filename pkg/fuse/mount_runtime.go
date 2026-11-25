@@ -481,7 +481,7 @@ func buildViewRuntime(
 		sseExt.Attach(f.Ctx.Inodes, f.Ctx.Notify)
 	}
 	if layerLease != nil && layerLease.LayerID != "" {
-		f.layerFence = &layerLease.fenced
+		f.layerFence = layerLease
 		if wb != nil {
 			layerLease.OnSelfFence(wb.AbandonLayerForRollback)
 		}
