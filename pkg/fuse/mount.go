@@ -1093,7 +1093,7 @@ func mountWithConfig(cfg MountConfig) error {
 			// v1 gitDirShouldBeLocalOverlay: a discovered workspace's .git
 			// routes to the local overlay (the restored .git state backs
 			// git's own file traffic, not the remote).
-			localizeOpts.DeclarativeLocal = gitExt.RoutesLocal
+			localizeOpts.DeclarativeLocal = gitExt.RoutesLocalCtx
 		}
 		if cacheBase != "" && !cfg.ReadOnly {
 			// SQLite WAL-index sidecars (-shm) are mount-local scratch:

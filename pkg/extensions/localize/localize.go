@@ -46,7 +46,7 @@ type Options struct {
 	// DeclarativeLocal marks view paths that another component has declared
 	// local (structural routing outside the pattern lists). It composes
 	// with the pattern lists as an OR.
-	DeclarativeLocal func(viewPath string) bool
+	DeclarativeLocal func(ctx context.Context, viewPath string) bool
 
 	// TransientRoot anchors the transient sidecar plane; blank disables it.
 	TransientRoot string
@@ -872,7 +872,7 @@ func (f *Localize) classifiesLocal(ctx context.Context, inner fs.Filesystem, vie
 	if f.policy.Classify(viewPath, oracle, dirHint) == LayerLocalOnly {
 		return true
 	}
-	return f.opts.DeclarativeLocal != nil && f.opts.DeclarativeLocal(viewPath)
+	return f.opts.DeclarativeLocal != nil && f.opts.DeclarativeLocal(ctx, viewPath)
 }
 
 // chtimes applies a timestamp update to an overlay file. The kernel flushes

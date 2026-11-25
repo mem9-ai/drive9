@@ -1,0 +1,773 @@
+#!/usr/bin/env bash
+# drive9 Git workspace smoke test against a live deployment.
+
+set -euo pipefail
+
+BASE="${SERVER:?missing simulator server}"
+API_KEY="${API_KEY:?missing simulator tenant key}"
+CLI_BIN="${CLI:?missing simulator CLI}"
+POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
+POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
+MOUNT_READY_TIMEOUT_S="${MOUNT_READY_TIMEOUT_S:-20}"
+MOUNT_READY_INTERVAL_S="${MOUNT_READY_INTERVAL_S:-1}"
+FUSE_MOUNT_ROOT="${FUSE_MOUNT_ROOT:-/tmp}"
+FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-60s}"
+FUSE_STRICT_PREREQS="${FUSE_STRICT_PREREQS:-0}"
+GIT_WORKSPACE_REPOS="${GIT_WORKSPACE_REPOS:-drive9=https://github.com/mem9-ai/drive9.git,kimi-cli=https://github.com/MoonshotAI/kimi-cli.git,kimi-code=https://github.com/MoonshotAI/kimi-code.git}"
+GIT_WORKSPACE_SCENARIOS="${GIT_WORKSPACE_SCENARIOS:-agent_edit_add_commit,agent_patch_apply,sandbox_restore,fast_worktree}"
+GIT_WORKSPACE_EXISTING_FILES="${GIT_WORKSPACE_EXISTING_FILES:-20}"
+GIT_WORKSPACE_NEW_FILES="${GIT_WORKSPACE_NEW_FILES:-20}"
+GIT_WORKSPACE_PATCH_FILES="${GIT_WORKSPACE_PATCH_FILES:-20}"
+GIT_WORKSPACE_CLONE_TIMEOUT_S="${GIT_WORKSPACE_CLONE_TIMEOUT_S:-600}"
+GIT_WORKSPACE_GIT_TIMEOUT_S="${GIT_WORKSPACE_GIT_TIMEOUT_S:-120}"
+GIT_WORKSPACE_HYDRATE="${GIT_WORKSPACE_HYDRATE:-sync}"
+GIT_WORKSPACE_ALLOW_OTHER="${GIT_WORKSPACE_ALLOW_OTHER:-0}"
+GIT_WORKSPACE_TRACE_GIT="${GIT_WORKSPACE_TRACE_GIT:-0}"
+GIT_WORKSPACE_LOG_AUDIT_PATTERN="${GIT_WORKSPACE_LOG_AUDIT_PATTERN:-panic|fatal error|short read|input/output error}"
+
+PASS=0
+FAIL=0
+TOTAL=0
+MOUNT_PID=""
+MOUNT_POINT=""
+MOUNT_LOG=""
+RUN_ROOT=""
+
+check_eq() {
+  local desc="$1" got="$2" want="$3"
+  TOTAL=$((TOTAL + 1))
+  if [ "$got" = "$want" ]; then
+    echo "PASS $desc (got=$got)"
+    PASS=$((PASS + 1))
+  else
+    echo "FAIL $desc (want=$want got=$got)"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+check_cmd() {
+  local desc="$1"
+  shift
+  TOTAL=$((TOTAL + 1))
+  if "$@"; then
+    echo "PASS $desc"
+    PASS=$((PASS + 1))
+  else
+    echo "FAIL $desc"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+skip() {
+  echo "SKIP $*"
+  exit 0
+}
+
+skip_or_fail() {
+  if [ "$FUSE_STRICT_PREREQS" = "1" ]; then
+    echo "FAIL $*" >&2
+    exit 1
+  fi
+  skip "$@"
+}
+
+is_mounted() {
+  local mount_point="$1"
+  local physical_mount_point
+  physical_mount_point="$(cd "$(dirname "$mount_point")" 2>/dev/null && pwd -P)/$(basename "$mount_point")"
+  if [ -r /proc/self/mountinfo ]; then
+    awk -v mp="$mount_point" -v pmp="$physical_mount_point" '$5 == mp || $5 == pmp { found=1 } END { exit !found }' /proc/self/mountinfo
+    return
+  fi
+  if command -v mountpoint >/dev/null 2>&1; then
+    mountpoint -q "$mount_point"
+    return
+  fi
+  mount | awk -v mp="$mount_point" -v pmp="$physical_mount_point" '{for(i=1;i<=NF;i++) if($i=="on" && ($(i+1)==mp || $(i+1)==pmp)) found=1} END{exit !found}'
+}
+
+run_with_timeout() {
+  local seconds="$1"
+  shift
+  python3 - "$seconds" "$@" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+import time
+
+seconds = float(sys.argv[1])
+cmd = sys.argv[2:]
+
+def exit_code(rc):
+    return rc if rc >= 0 else 128 + abs(rc)
+
+proc = subprocess.Popen(cmd, start_new_session=True)
+deadline = time.monotonic() + seconds
+while True:
+    rc = proc.poll()
+    if rc is not None:
+        raise SystemExit(exit_code(rc))
+    if time.monotonic() >= deadline:
+        break
+    time.sleep(0.2)
+
+rc = proc.poll()
+if rc is not None:
+    raise SystemExit(exit_code(rc))
+
+try:
+    os.killpg(proc.pid, signal.SIGTERM)
+except ProcessLookupError:
+    rc = proc.poll()
+    if rc is not None:
+        raise SystemExit(exit_code(rc))
+    raise SystemExit(124)
+
+deadline = time.monotonic() + 5
+while time.monotonic() < deadline:
+    if proc.poll() is not None:
+        raise SystemExit(124)
+    time.sleep(0.2)
+
+try:
+    os.killpg(proc.pid, signal.SIGKILL)
+except ProcessLookupError:
+    pass
+proc.wait()
+raise SystemExit(124)
+PY
+}
+
+curl_body_code() {
+  local method="$1"
+  local url="$2"
+  local auth="${3:-}"
+  local body_file
+  body_file="$(mktemp)"
+  local code
+  if [ -n "$auth" ]; then
+    code=$(curl -sS -o "$body_file" -w "%{http_code}" -X "$method" -H "Authorization: Bearer $auth" "$url")
+  else
+    code=$(curl -sS -o "$body_file" -w "%{http_code}" -X "$method" "$url")
+  fi
+  cat "$body_file"
+  echo
+  echo "__HTTP__${code}"
+  rm -f "$body_file"
+}
+
+http_code() { printf '%s' "$1" | awk -F'__HTTP__' 'NF>1{print $2}' | tr -d '\n'; }
+json_body() { printf '%s' "$1" | sed '/__HTTP__/d'; }
+
+wait_mount_state() {
+  local expect="$1"
+  local deadline=$(( $(date +%s) + MOUNT_READY_TIMEOUT_S ))
+  while :; do
+    if [ "$expect" = "mounted" ] && is_mounted "$MOUNT_POINT"; then
+      return 0
+    fi
+    if [ "$expect" = "unmounted" ] && ! is_mounted "$MOUNT_POINT"; then
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      return 1
+    fi
+    sleep "$MOUNT_READY_INTERVAL_S"
+  done
+}
+
+wait_mount_log_ready() {
+  local log_file="$1"
+  local deadline=$(( $(date +%s) + MOUNT_READY_TIMEOUT_S ))
+  while :; do
+    if [ -f "$log_file" ] && grep -q "drive9: mounted on " "$log_file"; then
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      return 1
+    fi
+    sleep "$MOUNT_READY_INTERVAL_S"
+  done
+}
+
+force_unmount() {
+  local mount_point="$1"
+  case "$(uname -s)" in
+    Darwin)
+      umount "$mount_point" >/dev/null 2>&1 || diskutil unmount force "$mount_point" >/dev/null 2>&1 || true
+      ;;
+    Linux)
+      fusermount3 -uz "$mount_point" >/dev/null 2>&1 || fusermount -uz "$mount_point" >/dev/null 2>&1 || umount -l "$mount_point" >/dev/null 2>&1 || true
+      ;;
+  esac
+}
+
+start_mount() {
+  local mount_point="$1"
+  local local_root="$2"
+  local mount_log="$3"
+  MOUNT_POINT="$mount_point"
+  MOUNT_LOG="$mount_log"
+  mkdir -p "$MOUNT_POINT" "$local_root"
+  {
+    echo "=== drive9 git workspace mount start time=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
+    echo "mount_point=$MOUNT_POINT"
+    echo "local_root=$local_root"
+  } >>"$MOUNT_LOG"
+
+  local perf_dir="${mount_log%.log}.perf"
+  local args=(
+    mount --foreground --mode=fuse --profile="${FUSE_PROFILE:-coding-agent}" --local-root "$local_root"
+    --durability=interactive
+    --perf-dir "$perf_dir"
+    --perf-interval 1h
+    --perf-cpu-duration 1ms
+    --perf-cpu-interval 1h
+    --perf-heap-interval 1h
+    --perf-max-sample-files 1
+    --perf-max-profile-files 1
+  )
+  if [ "$GIT_WORKSPACE_ALLOW_OTHER" = "1" ]; then
+    args+=(--allow-other)
+  fi
+  args+=( :/ "$MOUNT_POINT" )
+  DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" "${args[@]}" >>"$MOUNT_LOG" 2>&1 &
+  MOUNT_PID="$!"
+  wait_mount_state mounted
+  wait_mount_log_ready "$MOUNT_LOG"
+}
+
+stop_mount() {
+  local rc=0 forced=0 worker_rc=0
+  if [ -n "${MOUNT_POINT:-}" ] && is_mounted "$MOUNT_POINT"; then
+    drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$MOUNT_POINT" || rc=$?
+    wait_mount_state unmounted >/dev/null 2>&1 || true
+    if is_mounted "$MOUNT_POINT"; then
+      forced=1
+      force_unmount "$MOUNT_POINT" || true
+      wait_mount_state unmounted >/dev/null 2>&1 || true
+    fi
+  fi
+  if [ -n "${MOUNT_PID:-}" ]; then
+    # Kernel detach precedes the foreground worker's final Git checkpoints.
+    # Let normal shutdown finish before using a new local root.
+    if [ "$rc" -ne 0 ] || [ "$forced" -ne 0 ]; then
+      kill "$MOUNT_PID" >/dev/null 2>&1 || true
+    fi
+    local deadline=$((SECONDS + POLL_TIMEOUT_S))
+    while kill -0 "$MOUNT_PID" 2>/dev/null; do
+      if [ "$SECONDS" -ge "$deadline" ]; then
+        echo "mount worker did not exit within ${POLL_TIMEOUT_S}s" >&2
+        forced=1
+        kill -KILL "$MOUNT_PID" 2>/dev/null || true
+        break
+      fi
+      sleep 0.2
+    done
+    if kill -0 "$MOUNT_PID" 2>/dev/null; then
+      worker_rc=124
+    else
+      wait "$MOUNT_PID" || worker_rc=$?
+    fi
+    echo "umount: rc=$rc forced=$forced worker_rc=$worker_rc"
+  fi
+  MOUNT_PID=""
+  MOUNT_POINT=""
+  [ "$rc" -eq 0 ] && [ "$forced" -eq 0 ] && [ "$worker_rc" -eq 0 ]
+}
+
+dump_mount_log() {
+  local dumped=0
+  if [ -n "${RUN_ROOT:-}" ] && [ -d "$RUN_ROOT" ]; then
+    # Never traverse into live or residual FUSE mount trees ($RUN_ROOT/*/mount):
+    # match only known top-level and per-case mount*.log files.
+    local log_file
+    for log_file in "$RUN_ROOT"/*/mount*.log "$RUN_ROOT"/mount*.log; do
+      [ -f "$log_file" ] || continue
+      echo "=== drive9 mount log: $log_file ==="
+      cat "$log_file"
+      dumped=1
+    done
+    if [ "$dumped" -eq 1 ]; then
+      return
+    fi
+  fi
+  if [ -n "${MOUNT_LOG:-}" ] && [ -f "$MOUNT_LOG" ]; then
+    echo "=== drive9 mount log: $MOUNT_LOG ==="
+    cat "$MOUNT_LOG"
+  fi
+}
+
+audit_mount_log() {
+  local log_file="$1"
+  if [ ! -f "$log_file" ]; then
+    echo "mount log missing: $log_file" >&2
+    return 1
+  fi
+  if grep -Eina "$GIT_WORKSPACE_LOG_AUDIT_PATTERN" "$log_file"; then
+    echo "mount log contains git workspace failure pattern" >&2
+    return 1
+  fi
+  return 0
+}
+
+drive9() {
+  DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" "$@"
+}
+
+drive9_with_timeout() {
+  local seconds="$1"
+  shift
+  run_with_timeout "$seconds" env "DRIVE9_SERVER=$BASE" "DRIVE9_API_KEY=$API_KEY" "$CLI_BIN" "$@"
+}
+
+git_cmd() {
+  if [ "$GIT_WORKSPACE_TRACE_GIT" = "1" ]; then
+    {
+      printf '+ git'
+      printf ' %q' "$@"
+      printf '\n'
+    } >&2
+  fi
+  run_with_timeout "$GIT_WORKSPACE_GIT_TIMEOUT_S" git "$@"
+}
+
+clone_fast_blobless() {
+  local repo_url="$1"
+  local target="$2"
+  drive9_with_timeout "$GIT_WORKSPACE_CLONE_TIMEOUT_S" \
+    git clone --fast --blobless "--hydrate=$GIT_WORKSPACE_HYDRATE" "$repo_url" "$target"
+}
+
+fast_worktree_add() {
+  local base_repo="$1"
+  local worktree="$2"
+  local branch="$3"
+  local commitish="$4"
+  drive9_with_timeout "$GIT_WORKSPACE_CLONE_TIMEOUT_S" \
+    git worktree add --fast --blobless "--hydrate=$GIT_WORKSPACE_HYDRATE" -b "$branch" "$base_repo" "$worktree" "$commitish"
+}
+
+configure_git_identity() {
+  local repo="$1"
+  git_cmd -C "$repo" config user.email "drive9-e2e@example.test" || return
+  git_cmd -C "$repo" config user.name "Drive9 E2E" || return
+}
+
+select_and_append_existing() {
+  local repo="$1"
+  local count="$2"
+  local marker="$3"
+  local out_file="$4"
+  python3 - "$repo" "$count" "$marker" "$out_file" <<'PY'
+import os
+import subprocess
+import sys
+
+repo, count, marker, out_file = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+raw = subprocess.check_output(["git", "-C", repo, "ls-files", "-z"])
+selected = []
+for rel_b in raw.split(b"\0"):
+    if not rel_b:
+        continue
+    rel = rel_b.decode("utf-8", "surrogateescape")
+    path = os.path.join(repo, rel)
+    if not os.path.isfile(path) or os.path.islink(path):
+        continue
+    if os.path.getsize(path) > 256 * 1024:
+        continue
+    try:
+        with open(path, "rb") as f:
+            f.read(4096).decode("utf-8")
+    except UnicodeDecodeError:
+        continue
+    selected.append(rel)
+    if len(selected) >= count:
+        break
+if not selected:
+    raise SystemExit("no editable tracked files selected")
+for i, rel in enumerate(selected):
+    with open(os.path.join(repo, rel), "ab") as f:
+        f.write(("\n# drive9 git workspace e2e %s existing %04d\n" % (marker, i)).encode())
+with open(out_file, "w", encoding="utf-8") as f:
+    for rel in selected:
+        f.write(rel + "\n")
+print(len(selected))
+PY
+}
+
+write_new_files() {
+  local repo="$1"
+  local count="$2"
+  local marker="$3"
+  python3 - "$repo" "$count" "$marker" <<'PY'
+import os
+import sys
+
+repo, count, marker = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+root = os.path.join(repo, "agent-bench", "generated")
+os.makedirs(root, exist_ok=True)
+for i in range(count):
+    with open(os.path.join(root, "file-%04d.md" % i), "w", encoding="utf-8") as f:
+        f.write("# drive9 git workspace e2e\n\nmarker=%s\nindex=%04d\n" % (marker, i))
+print(count)
+PY
+}
+
+setup_ignored_local_only_probe() {
+  local repo="$1"
+  local marker="$2"
+  # The coding-agent overlay only routes a Rust `target/` directory to the local
+  # overlay, and only when a .gitignore in the same directory ignores it. Ensure
+  # the repository root's .gitignore carries `target/` before writing the probe.
+  if ! git_cmd -C "$repo" check-ignore -q target/local-only/cache.txt; then
+    printf '\ntarget/\n' >> "$repo/.gitignore" || return
+    git_cmd -C "$repo" add .gitignore || return
+    git_cmd -C "$repo" commit --no-verify -m "drive9 e2e ignore target" >/dev/null || return
+  fi
+  mkdir -p "$repo/target/local-only" || return
+  printf 'ignored local-only %s\n' "$marker" > "$repo/target/local-only/cache.txt" || return
+  git_cmd -C "$repo" check-ignore -q target/local-only/cache.txt
+}
+
+assert_clean_status() {
+  local repo="$1"
+  local out
+  out="$(git -C "$repo" status --porcelain=v1)" || return
+  [ -z "$out" ]
+}
+
+assert_repo_ready() {
+  local repo="$1"
+  test -e "$repo/.git" || return
+  git_cmd -C "$repo" rev-parse --is-inside-work-tree >/dev/null || return
+  git_cmd -C "$repo" log --oneline -1 >/dev/null || return
+  git_cmd -C "$repo" status --porcelain=v1 >/dev/null
+}
+
+commit_all() {
+  local repo="$1"
+  local message="$2"
+  git_cmd -C "$repo" status --porcelain=v1 >/dev/null || return
+  git_cmd -C "$repo" diff --stat >/dev/null || return
+  git_cmd -C "$repo" add -A || return
+  git_cmd -C "$repo" commit --no-verify -m "$message" >/dev/null || return
+  assert_clean_status "$repo"
+}
+
+run_agent_edit_add_commit() {
+  local slug="$1" repo_url="$2"
+  local scenario="agent_edit_add_commit"
+  local marker="${slug}-${scenario}-$(date +%s)"
+  local case_root="$RUN_ROOT/$slug-$scenario"
+  local mount_point="$case_root/mount"
+  local local_root="$case_root/local-root"
+  local log_file="$case_root/mount.log"
+  local repo="$mount_point/$slug-$scenario"
+  local selected="$case_root/selected.txt"
+  mkdir -p "$case_root"
+
+  echo "[repo=$slug scenario=$scenario] mount + fast blobless clone"
+  check_cmd "$slug $scenario mount starts" start_mount "$mount_point" "$local_root" "$log_file"
+  check_cmd "$slug $scenario fast blobless clone" clone_fast_blobless "$repo_url" "$repo"
+  check_cmd "$slug $scenario repo ready" assert_repo_ready "$repo"
+  configure_git_identity "$repo"
+  check_cmd "$slug $scenario ignored local-only probe" setup_ignored_local_only_probe "$repo" "$marker"
+
+  check_cmd "$slug $scenario append tracked files" select_and_append_existing "$repo" "$GIT_WORKSPACE_EXISTING_FILES" "$marker" "$selected"
+  check_cmd "$slug $scenario write new files" write_new_files "$repo" "$GIT_WORKSPACE_NEW_FILES" "$marker"
+  check_cmd "$slug $scenario git add commit" commit_all "$repo" "drive9 e2e $scenario"
+  check_cmd "$slug $scenario ignored file stays untracked" git_cmd -C "$repo" check-ignore -q target/local-only/cache.txt
+  check_cmd "$slug $scenario mount log audit" audit_mount_log "$log_file"
+  stop_mount
+}
+
+run_agent_patch_apply() {
+  local slug="$1" repo_url="$2"
+  local scenario="agent_patch_apply"
+  local marker="${slug}-${scenario}-$(date +%s)"
+  local case_root="$RUN_ROOT/$slug-$scenario"
+  local mount_point="$case_root/mount"
+  local local_root="$case_root/local-root"
+  local log_file="$case_root/mount.log"
+  local repo="$mount_point/$slug-$scenario"
+  local selected="$case_root/selected.txt"
+  local patch_file="$case_root/agent.patch"
+  mkdir -p "$case_root"
+
+  echo "[repo=$slug scenario=$scenario] mount + fast blobless clone"
+  check_cmd "$slug $scenario mount starts" start_mount "$mount_point" "$local_root" "$log_file"
+  check_cmd "$slug $scenario fast blobless clone" clone_fast_blobless "$repo_url" "$repo"
+  check_cmd "$slug $scenario repo ready" assert_repo_ready "$repo"
+  configure_git_identity "$repo"
+
+  check_cmd "$slug $scenario generate tracked patch" select_and_append_existing "$repo" "$GIT_WORKSPACE_PATCH_FILES" "$marker" "$selected"
+  git_cmd -C "$repo" diff --binary > "$patch_file"
+  check_cmd "$slug $scenario patch is nonempty" test -s "$patch_file"
+  git_cmd -C "$repo" checkout -- .
+  check_cmd "$slug $scenario clean before git apply" assert_clean_status "$repo"
+  check_cmd "$slug $scenario git apply" git_cmd -C "$repo" apply "$patch_file"
+  check_cmd "$slug $scenario git add commit" commit_all "$repo" "drive9 e2e $scenario"
+  check_cmd "$slug $scenario mount log audit" audit_mount_log "$log_file"
+  stop_mount
+}
+
+# Compare the checkpoint served after a normal worker exit with the index and
+# HEAD the worker had on disk. Keep archive contents out of the CI log.
+check_saved_git_state() {
+  local root="$1" admin="$2" json="$3" id
+  id=$(curl -fsS --max-time "$POLL_TIMEOUT_S" -H "Authorization: Bearer $API_KEY" "$BASE/v1/git-workspaces" |
+    jq -er --arg root "$root" '[.workspaces[] | select((.root_path | rtrimstr("/")) == $root) | .workspace_id] | if length == 1 then .[0] else error("expected one workspace for " + $root) end') || return 1
+  curl -fsS --max-time "$POLL_TIMEOUT_S" -H "Authorization: Bearer $API_KEY" "$BASE/v1/git-workspaces/$id/git-state" -o "$json" || return 1
+  python3 - "$json" "$admin" <<'CHECKPOINT'
+import base64, hashlib, io, json, pathlib, sys, tarfile
+
+state = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
+data = base64.b64decode(state["content"], validate=True)
+if len(data) != state["size_bytes"] or hashlib.sha256(data).hexdigest() != state["checksum_sha256"]:
+    sys.exit("checkpoint checksum or length mismatch")
+with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+    for name in ("HEAD", "index"):
+        entry = archive.getmember(name)
+        if not entry.isfile() or archive.extractfile(entry).read() != (pathlib.Path(sys.argv[2]) / name).read_bytes():
+            sys.exit(f"server checkpoint {name} differs from the final local {name}")
+print("checkpoint checksum, HEAD and index verified")
+CHECKPOINT
+}
+
+timed_lookup() {
+  local start=$SECONDS rc=0
+  run_with_timeout "$GIT_WORKSPACE_GIT_TIMEOUT_S" test "$@" || rc=$?
+  echo "cold lookup $2 elapsed=$((SECONDS-start))s rc=$rc"
+  return "$rc"
+}
+
+run_sandbox_restore() {
+  local slug="$1" repo_url="$2"
+  local scenario="sandbox_restore"
+  local marker="${slug}-${scenario}-$(date +%s)"
+  local case_root="$RUN_ROOT/$slug-$scenario"
+  local mount_point="$case_root/mount"
+  local local_root_a="$case_root/local-root-a"
+  local local_root_b="$case_root/local-root-b"
+  local log_a="$case_root/mount-a.log"
+  local log_b="$case_root/mount-b.log"
+  local repo="$mount_point/$slug-$scenario"
+  local selected="$case_root/selected.txt"
+  local status_before="$case_root/status-before.txt"
+  local status_after="$case_root/status-after.txt"
+  mkdir -p "$case_root"
+
+  echo "[repo=$slug scenario=$scenario] initial mount + dirty index"
+  check_cmd "$slug $scenario first mount starts" start_mount "$mount_point" "$local_root_a" "$log_a"
+  check_cmd "$slug $scenario fast blobless clone" clone_fast_blobless "$repo_url" "$repo"
+  check_cmd "$slug $scenario repo ready" assert_repo_ready "$repo"
+  configure_git_identity "$repo"
+  check_cmd "$slug $scenario append tracked files" select_and_append_existing "$repo" "$GIT_WORKSPACE_EXISTING_FILES" "$marker" "$selected"
+  check_cmd "$slug $scenario write new files" write_new_files "$repo" "$GIT_WORKSPACE_NEW_FILES" "$marker"
+  git_cmd -C "$repo" add -A
+  git_cmd -C "$repo" status --porcelain=v1 > "$status_before"
+  check_cmd "$slug $scenario dirty status before remount" test -s "$status_before"
+  check_cmd "$slug $scenario first mount log audit" audit_mount_log "$log_a"
+  stop_mount
+  check_cmd "$slug $scenario saved checkpoint" check_saved_git_state "/${repo##*/}" "$local_root_a/overlay/${repo##*/}/.git" "$case_root/state.json"
+
+  echo "[repo=$slug scenario=$scenario] remount with fresh local root"
+  check_cmd "$slug $scenario second mount starts" start_mount "$mount_point" "$local_root_b" "$log_b"
+  check_cmd "$slug $scenario .git restored" timed_lookup -d "$repo/.git"
+  git_cmd -C "$repo" status --porcelain=v1 > "$status_after"
+  check_cmd "$slug $scenario status restored after remount" cmp -s "$status_before" "$status_after"
+  check_cmd "$slug $scenario restored status contains generated files" grep -q "agent-bench/generated/file-0000.md" "$status_after"
+  while IFS= read -r rel; do
+    [ -z "$rel" ] && continue
+    check_cmd "$slug $scenario restored tracked file exists: $rel" test -f "$repo/$rel"
+    break
+  done < "$selected"
+  check_cmd "$slug $scenario second mount log audit" audit_mount_log "$log_b"
+  stop_mount
+}
+
+run_fast_worktree() {
+  local slug="$1" repo_url="$2"
+  local scenario="fast_worktree"
+  local marker="${slug}-${scenario}-$(date +%s)"
+  local case_root="$RUN_ROOT/$slug-$scenario"
+  local mount_point="$case_root/mount"
+  local local_root_a="$case_root/local-root-a"
+  local local_root_b="$case_root/local-root-b"
+  local log_a="$case_root/mount-a.log"
+  local log_b="$case_root/mount-b.log"
+  local base_repo="$mount_point/$slug-$scenario-base"
+  local worktree="$mount_point/$slug-$scenario-linked"
+  local branch="drive9-e2e-${slug}-${scenario}-$(date +%s)"
+  local selected_commit="$case_root/selected-commit.txt"
+  local selected_staged="$case_root/selected-staged.txt"
+  local status_before="$case_root/status-before.txt"
+  local status_after="$case_root/status-after.txt"
+  local cached_before="$case_root/cached-before.txt"
+  local cached_after="$case_root/cached-after.txt"
+  local commit_subject="drive9 e2e $scenario committed $marker"
+  local staged_rel
+  mkdir -p "$case_root"
+
+  echo "[repo=$slug scenario=$scenario] initial mount + fast linked worktree"
+  check_cmd "$slug $scenario first mount starts" start_mount "$mount_point" "$local_root_a" "$log_a"
+  check_cmd "$slug $scenario fast blobless clone base" clone_fast_blobless "$repo_url" "$base_repo"
+  check_cmd "$slug $scenario base repo ready" assert_repo_ready "$base_repo"
+  configure_git_identity "$base_repo"
+  check_cmd "$slug $scenario fast worktree add" fast_worktree_add "$base_repo" "$worktree" "$branch" "HEAD"
+  check_cmd "$slug $scenario linked worktree ready" assert_repo_ready "$worktree"
+  configure_git_identity "$worktree"
+  check_cmd "$slug $scenario base lists linked worktree" bash -c 'git -C "$1" worktree list --porcelain | grep -q "^worktree $2$"' _ "$base_repo" "$worktree"
+
+  check_cmd "$slug $scenario append commit files" select_and_append_existing "$worktree" "$GIT_WORKSPACE_EXISTING_FILES" "$marker-commit" "$selected_commit"
+  check_cmd "$slug $scenario write commit files" write_new_files "$worktree" "$GIT_WORKSPACE_NEW_FILES" "$marker-commit"
+  check_cmd "$slug $scenario linked worktree commit" commit_all "$worktree" "$commit_subject"
+  check_eq "$slug $scenario commit subject before remount" "$(git -C "$worktree" log -1 --pretty=%s)" "$commit_subject"
+
+  check_cmd "$slug $scenario append staged file" select_and_append_existing "$worktree" 1 "$marker-staged" "$selected_staged"
+  staged_rel="$(head -n 1 "$selected_staged")"
+  check_cmd "$slug $scenario git add staged file" git_cmd -C "$worktree" add -- "$staged_rel"
+  mkdir -p "$worktree/agent-bench/worktree"
+  printf 'unstaged linked worktree marker=%s\n' "$marker" > "$worktree/agent-bench/worktree/unstaged.txt"
+  git_cmd -C "$worktree" diff --cached --name-only > "$cached_before"
+  git_cmd -C "$worktree" status --porcelain=v1 > "$status_before"
+  check_cmd "$slug $scenario cached diff before remount" grep -Fxq "$staged_rel" "$cached_before"
+  check_cmd "$slug $scenario dirty status before remount" test -s "$status_before"
+  check_cmd "$slug $scenario first mount log audit" audit_mount_log "$log_a"
+  local linked_admin
+  linked_admin=$(git_cmd -C "$worktree" rev-parse --absolute-git-dir)
+  case "$linked_admin" in
+    "$mount_point"/*) linked_admin="$local_root_a/overlay/${linked_admin#"$mount_point"/}" ;;
+    "$local_root_a/overlay/"*) ;;
+    *) echo "unexpected linked gitdir $linked_admin" >&2; return 1 ;;
+  esac
+  stop_mount
+  check_cmd "$slug $scenario saved linked checkpoint" check_saved_git_state "/${worktree##*/}" "$linked_admin" "$case_root/state.json"
+
+  echo "[repo=$slug scenario=$scenario] remount with fresh local root"
+  check_cmd "$slug $scenario second mount starts" start_mount "$mount_point" "$local_root_b" "$log_b"
+  check_cmd "$slug $scenario linked .git restored as file" timed_lookup -f "$worktree/.git"
+  check_cmd "$slug $scenario base .git restored" timed_lookup -d "$base_repo/.git"
+  check_cmd "$slug $scenario base worktree list restored" bash -c 'git -C "$1" worktree list --porcelain | grep -q "^worktree $2$"' _ "$base_repo" "$worktree"
+  check_cmd "$slug $scenario linked worktree ready after remount" assert_repo_ready "$worktree"
+  check_eq "$slug $scenario commit subject after remount" "$(git -C "$worktree" log -1 --pretty=%s)" "$commit_subject"
+  git_cmd -C "$worktree" diff --cached --name-only > "$cached_after"
+  git_cmd -C "$worktree" status --porcelain=v1 > "$status_after"
+  check_cmd "$slug $scenario cached diff restored" cmp -s "$cached_before" "$cached_after"
+  check_cmd "$slug $scenario status restored" cmp -s "$status_before" "$status_after"
+  check_cmd "$slug $scenario unstaged file restored" grep -q "$marker" "$worktree/agent-bench/worktree/unstaged.txt"
+  check_cmd "$slug $scenario fast worktree remove" drive9 git worktree remove --fast --force "$worktree"
+  check_cmd "$slug $scenario linked worktree removed from git metadata" bash -c 'out=$(git -C "$1" worktree list --porcelain) && ! printf "%s\n" "$out" | grep -q "^worktree $2$"' _ "$base_repo" "$worktree"
+  check_cmd "$slug $scenario second mount log audit" audit_mount_log "$log_b"
+  stop_mount
+}
+
+run_repo_scenario() {
+  local slug="$1" repo_url="$2" scenario="$3"
+  case "$scenario" in
+    agent_edit_add_commit) run_agent_edit_add_commit "$slug" "$repo_url" ;;
+    agent_patch_apply) run_agent_patch_apply "$slug" "$repo_url" ;;
+    sandbox_restore) run_sandbox_restore "$slug" "$repo_url" ;;
+    fast_worktree) run_fast_worktree "$slug" "$repo_url" ;;
+    *)
+      echo "unknown GIT_WORKSPACE_SCENARIOS entry: $scenario" >&2
+      FAIL=$((FAIL + 1))
+      ;;
+  esac
+}
+
+cleanup() {
+  stop_mount
+  if [ -n "${RUN_ROOT:-}" ] && [ -d "$RUN_ROOT" ]; then
+    local mp
+    for mp in "$RUN_ROOT"/*/mount; do
+      if is_mounted "$mp"; then
+        echo "retaining $RUN_ROOT while $mp is mounted" >&2
+        return
+      fi
+    done
+    rm -rf "$RUN_ROOT"
+  fi
+}
+
+on_exit() {
+  local rc=$?
+  stop_mount || rc=1
+  if [ "$rc" -ne 0 ] || [ "${FAIL:-0}" -ne 0 ]; then
+    dump_mount_log
+  fi
+  cleanup
+  exit "$rc"
+}
+trap on_exit EXIT
+
+echo "=== drive9 Git workspace smoke test ==="
+echo "BASE=$BASE"
+echo "GIT_WORKSPACE_REPOS=$GIT_WORKSPACE_REPOS"
+echo "GIT_WORKSPACE_SCENARIOS=$GIT_WORKSPACE_SCENARIOS"
+echo "GIT_WORKSPACE_EXISTING_FILES=$GIT_WORKSPACE_EXISTING_FILES"
+echo "GIT_WORKSPACE_NEW_FILES=$GIT_WORKSPACE_NEW_FILES"
+echo "GIT_WORKSPACE_PATCH_FILES=$GIT_WORKSPACE_PATCH_FILES"
+echo "GIT_WORKSPACE_HYDRATE=$GIT_WORKSPACE_HYDRATE"
+
+check_cmd "jq is available" bash -c 'command -v jq >/dev/null'
+check_cmd "python3 is available" bash -c 'command -v python3 >/dev/null'
+check_cmd "git is available" bash -c 'command -v git >/dev/null'
+check_cmd "curl is available" bash -c 'command -v curl >/dev/null'
+
+if [ "$(uname -s)" != "Linux" ] && [ "$(uname -s)" != "Darwin" ]; then
+  skip_or_fail "unsupported OS for this smoke script"
+fi
+if [ "$(uname -s)" = "Linux" ]; then
+  if ! command -v fusermount >/dev/null 2>&1 && ! command -v fusermount3 >/dev/null 2>&1; then
+    skip_or_fail "fusermount/fusermount3 is required for Linux FUSE unmount"
+  fi
+  if [ ! -e /dev/fuse ]; then
+    skip_or_fail "/dev/fuse not available"
+  fi
+fi
+
+echo "[2] wait tenant active"
+deadline=$(( $(date +%s) + POLL_TIMEOUT_S ))
+state=""
+while :; do
+  sresp=$(curl_body_code GET "$BASE/v1/status" "$API_KEY")
+  scode=$(http_code "$sresp")
+  sbody=$(json_body "$sresp")
+  state=$(printf '%s' "$sbody" | jq -r '.status // empty')
+  echo "status=${scode}:${state}"
+  if [ "$scode" = "200" ] && [ "$state" = "active" ]; then
+    break
+  fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    break
+  fi
+  sleep "$POLL_INTERVAL_S"
+done
+check_eq "tenant becomes active" "$state" "active"
+
+check_cmd "drive9 binary ready" test -x "$CLI_BIN"
+
+RUN_ROOT="$(mktemp -d "$FUSE_MOUNT_ROOT/drive9-git-workspace-e2e.XXXXXX")"
+RUN_ROOT="$(cd "$RUN_ROOT" && pwd -P)"
+echo "RUN_ROOT=$RUN_ROOT"
+
+IFS=',' read -r -a repo_specs <<< "$GIT_WORKSPACE_REPOS"
+IFS=',' read -r -a scenarios <<< "$GIT_WORKSPACE_SCENARIOS"
+for spec in "${repo_specs[@]}"; do
+  slug="${spec%%=*}"
+  repo_url="${spec#*=}"
+  if [ -z "$slug" ] || [ -z "$repo_url" ] || [ "$slug" = "$repo_url" ]; then
+    echo "invalid repo spec: $spec (expected slug=url)" >&2
+    FAIL=$((FAIL + 1))
+    continue
+  fi
+  for scenario in "${scenarios[@]}"; do
+    run_repo_scenario "$slug" "$repo_url" "$scenario"
+  done
+done
+
+echo "RESULT: $PASS/$TOTAL passed, $FAIL failed"
+exit "$FAIL"

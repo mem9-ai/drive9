@@ -33,25 +33,18 @@ const (
 	gitLocalObjectMaxPackByte = 256 << 20
 
 	gitStateStorageTarGzNoObjects = "tar.gz-no-objects"
+
+	gitSubprocessWaitDelay = 500 * time.Millisecond
 )
 
-func gitCommandOutput(ctx context.Context, args ...string) ([]byte, error) {
+func newGitCommandContext(ctx context.Context, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "git", args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		msg := strings.TrimSpace(stderr.String())
-		if msg != "" {
-			return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, msg)
-		}
-		return nil, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
-	}
-	return out, nil
+	configureGitCommandGroup(cmd)
+	return cmd
 }
 
 func gitCommandOutputNoLazy(ctx context.Context, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := newGitCommandContext(ctx, args...)
 	setGitNoLazyEnv(cmd)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -121,7 +114,7 @@ func packGitObjects(ctx context.Context, gitDir string, objects map[string]struc
 	}
 	ids := mapKeys(objects)
 	sort.Strings(ids)
-	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "pack-objects", "--stdout")
+	cmd := newGitCommandContext(ctx, "--git-dir", gitDir, "pack-objects", "--stdout")
 	setGitNoLazyEnv(cmd)
 	cmd.Stdin = strings.NewReader(strings.Join(ids, "\n") + "\n")
 	var stdout bytes.Buffer
@@ -210,8 +203,9 @@ func collectLocalRefTips(ctx context.Context, gitDir string) ([]string, error) {
 }
 
 // collectLocalCommitObjects walks commits/trees from tip down to the
-// workspace's base (HeadCommit) cutoff, accumulating object IDs.
-func collectLocalCommitObjects(ctx context.Context, gitDir string, baseCommit, tip string, objects map[string]struct{}, seenCommits, seenTrees map[string]struct{}) (bool, error) {
+// workspace's base (HeadCommit) cutoff, accumulating object IDs that are not
+// already part of baseObjects.
+func collectLocalCommitObjects(ctx context.Context, gitDir string, baseCommit, tip string, objects map[string]struct{}, seenCommits, seenTrees, baseObjects map[string]struct{}) (bool, error) {
 	tip = strings.ToLower(strings.TrimSpace(tip))
 	if !isGitObjectID(tip) || tip == baseCommit {
 		return false, nil
@@ -221,6 +215,9 @@ func collectLocalCommitObjects(ctx context.Context, gitDir string, baseCommit, t
 		oid := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 		if oid == "" || oid == baseCommit {
+			continue
+		}
+		if _, inBase := baseObjects[oid]; inBase {
 			continue
 		}
 		if _, ok := seenCommits[oid]; ok {
@@ -242,7 +239,7 @@ func collectLocalCommitObjects(ctx context.Context, gitDir string, baseCommit, t
 				return false, err
 			}
 			if tree != "" {
-				if oversize, err := collectTreeObjectsNoLazy(ctx, gitDir, tree, "", objects, seenTrees); err != nil || oversize {
+				if oversize, err := collectTreeObjectsNoLazy(ctx, gitDir, tree, "", objects, seenTrees, baseObjects); err != nil || oversize {
 					return oversize, err
 				}
 			}
@@ -265,7 +262,7 @@ func collectLocalCommitObjects(ctx context.Context, gitDir string, baseCommit, t
 	return false, nil
 }
 
-func collectTreeObjectsNoLazy(ctx context.Context, gitDir, treeOID, relDir string, objects map[string]struct{}, seenTrees map[string]struct{}) (bool, error) {
+func collectTreeObjectsNoLazy(ctx context.Context, gitDir, treeOID, relDir string, objects map[string]struct{}, seenTrees, excludeObjects map[string]struct{}) (bool, error) {
 	treeOID = strings.ToLower(strings.TrimSpace(treeOID))
 	if !isGitObjectID(treeOID) {
 		return false, nil
@@ -274,7 +271,9 @@ func collectTreeObjectsNoLazy(ctx context.Context, gitDir, treeOID, relDir strin
 		return false, nil
 	}
 	seenTrees[treeOID] = struct{}{}
-	objects[treeOID] = struct{}{}
+	if _, excluded := excludeObjects[treeOID]; !excluded {
+		objects[treeOID] = struct{}{}
+	}
 
 	out, err := gitCommandOutputNoLazy(ctx, "--git-dir", gitDir, "ls-tree", "-z", treeOID)
 	if err != nil {
@@ -304,14 +303,56 @@ func collectTreeObjectsNoLazy(ctx context.Context, gitDir, treeOID, relDir strin
 			if relDir != "" {
 				sub = relDir + "/" + name
 			}
-			if oversize, err := collectTreeObjectsNoLazy(ctx, gitDir, oid, sub, objects, seenTrees); err != nil || oversize {
+			if oversize, err := collectTreeObjectsNoLazy(ctx, gitDir, oid, sub, objects, seenTrees, excludeObjects); err != nil || oversize {
 				return oversize, err
 			}
 		case "blob":
-			objects[oid] = struct{}{}
+			if _, excluded := excludeObjects[oid]; !excluded {
+				objects[oid] = struct{}{}
+			}
 		}
 	}
 	return false, nil
+}
+
+// collectBaseCommitObjectsNoLazy walks baseCommit's tree via ls-tree (reading
+// only tree objects, never blobs, so partial clones never lazy-fetch) to build
+// the set of base trees and blobs that remote restore already provides.
+func collectBaseCommitObjectsNoLazy(ctx context.Context, gitDir, baseCommit string) (baseObjects, baseTrees map[string]struct{}, err error) {
+	baseCommit = strings.ToLower(strings.TrimSpace(baseCommit))
+	if !isGitObjectID(baseCommit) {
+		return nil, nil, nil
+	}
+	treeOut, err := gitCommandOutputNoLazy(ctx, "--git-dir", gitDir, "rev-parse", "--verify", baseCommit+"^{tree}")
+	if err != nil {
+		if isMissingGitObjectError(err) {
+			return nil, nil, nil
+		}
+		return nil, nil, err
+	}
+	root := strings.TrimSpace(string(treeOut))
+	out, err := gitCommandOutputNoLazy(ctx, "--git-dir", gitDir, "ls-tree", "-r", "-t", "-z", root)
+	if err != nil {
+		return nil, nil, err
+	}
+	baseObjects = map[string]struct{}{baseCommit: {}, root: {}}
+	baseTrees = map[string]struct{}{root: {}}
+	for _, rec := range bytes.Split(out, []byte{0}) {
+		meta, _, ok := bytes.Cut(rec, []byte{'\t'})
+		fields := bytes.Fields(meta)
+		if !ok || len(fields) != 3 {
+			continue
+		}
+		oid := string(fields[2])
+		switch string(fields[1]) {
+		case "tree":
+			baseTrees[oid] = struct{}{}
+			baseObjects[oid] = struct{}{}
+		case "blob":
+			baseObjects[oid] = struct{}{}
+		}
+	}
+	return baseObjects, baseTrees, nil
 }
 
 type gitObjectInfo struct {
@@ -324,7 +365,7 @@ func gitObjectInfoBatch(ctx context.Context, gitDir string, ids []string) (map[s
 	if len(ids) == 0 {
 		return out, nil
 	}
-	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)", "--buffer")
+	cmd := newGitCommandContext(ctx, "--git-dir", gitDir, "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)", "--buffer")
 	setGitNoLazyEnv(cmd)
 	cmd.Stdin = strings.NewReader(strings.Join(ids, "\n") + "\n")
 	var stdout, stderr bytes.Buffer
@@ -349,20 +390,25 @@ func gitObjectInfoBatch(ctx context.Context, gitDir string, ids []string) (map[s
 	return out, nil
 }
 
-// buildLocalGitObjectPack packs ref objects + staged blobs with escalating
+// buildLocalGitObjectPack packs ref objects + staged blobs (excluding clean
+// baseCommit objects already provided by remote restore) with escalating
 // fallbacks against the pack budget. complete reports whether BOTH sets made
 // it into the returned pack: a checkpoint that archives the index/refs while
 // some of their objects were dropped publishes an unrestorable state (git
 // diff --cached then reports missing objects).
-func (g *Git) buildLocalGitObjectPack(ctx context.Context, gitDir, baseCommit string) (pack []byte, complete bool, err error) {
-	refObjects, refsOversize, err := collectLocalRefObjectSet(ctx, gitDir, baseCommit)
+func (g *Git) buildLocalGitObjectPack(ctx context.Context, gitDir, baseCommit string, tips []string) (pack []byte, complete bool, err error) {
+	baseObjects, baseTrees, err := collectBaseCommitObjectsNoLazy(ctx, gitDir, baseCommit)
+	if err != nil {
+		return nil, false, err
+	}
+	refObjects, refsOversize, err := collectLocalRefObjectSet(ctx, gitDir, baseCommit, tips, baseObjects, baseTrees)
 	if err != nil {
 		return nil, false, err
 	}
 	if refsOversize {
 		refObjects = nil
 	}
-	stagedObjects, err := collectStagedObjectSet(ctx, gitDir)
+	stagedObjects, err := collectStagedObjectSet(ctx, gitDir, baseObjects)
 	if err != nil {
 		return nil, false, err
 	}
@@ -402,19 +448,18 @@ func (g *Git) buildLocalGitObjectPack(ctx context.Context, gitDir, baseCommit st
 	return pack, refsCovered && stagedCovered, nil
 }
 
-func collectLocalRefObjectSet(ctx context.Context, gitDir, baseCommit string) (map[string]struct{}, bool, error) {
-	tips, err := collectLocalRefTips(ctx, gitDir)
-	if err != nil {
-		return nil, false, err
-	}
+func collectLocalRefObjectSet(ctx context.Context, gitDir, baseCommit string, tips []string, baseObjects, baseTrees map[string]struct{}) (map[string]struct{}, bool, error) {
 	if len(tips) == 0 {
 		return nil, false, nil
 	}
 	objects := make(map[string]struct{})
 	seenCommits := make(map[string]struct{})
-	seenTrees := make(map[string]struct{})
+	seenTrees := make(map[string]struct{}, len(baseTrees))
+	for treeOID := range baseTrees {
+		seenTrees[treeOID] = struct{}{}
+	}
 	for _, tip := range tips {
-		oversize, err := collectLocalCommitObjects(ctx, gitDir, baseCommit, tip, objects, seenCommits, seenTrees)
+		oversize, err := collectLocalCommitObjects(ctx, gitDir, baseCommit, tip, objects, seenCommits, seenTrees, baseObjects)
 		if err != nil {
 			return nil, false, err
 		}
@@ -425,11 +470,12 @@ func collectLocalRefObjectSet(ctx context.Context, gitDir, baseCommit string) (m
 	return objects, false, nil
 }
 
-func collectStagedObjectSet(ctx context.Context, gitDir string) (map[string]struct{}, error) {
-	out, err := gitCommandOutput(ctx, "--git-dir", gitDir, "ls-files", "-s", "-z")
+func collectStagedObjectSet(ctx context.Context, gitDir string, baseObjects map[string]struct{}) (map[string]struct{}, error) {
+	out, err := gitCommandOutputNoLazy(ctx, "--git-dir", gitDir, "ls-files", "-s", "-z")
 	if err != nil {
 		return nil, err
 	}
+	seenStaged := make(map[string]struct{})
 	var staged []string
 	for _, rec := range bytes.Split(out, []byte{0}) {
 		if len(rec) == 0 {
@@ -440,10 +486,21 @@ func collectStagedObjectSet(ctx context.Context, gitDir string) (map[string]stru
 			continue
 		}
 		meta := strings.Fields(string(rec[:tab]))
-		if len(meta) < 3 || meta[2] != "0" {
+		if len(meta) < 3 || meta[0] == "160000" {
 			continue
 		}
-		staged = append(staged, meta[1])
+		oid := strings.ToLower(meta[1])
+		if !isGitObjectID(oid) {
+			continue
+		}
+		if _, inBase := baseObjects[oid]; inBase {
+			continue
+		}
+		if _, dup := seenStaged[oid]; dup {
+			continue
+		}
+		seenStaged[oid] = struct{}{}
+		staged = append(staged, oid)
 	}
 	if len(staged) == 0 {
 		return nil, nil
@@ -454,9 +511,10 @@ func collectStagedObjectSet(ctx context.Context, gitDir string) (map[string]stru
 	}
 	objects := make(map[string]struct{})
 	for _, oid := range staged {
-		if object, ok := info[strings.ToLower(oid)]; ok && object.typ != "" && object.typ != "missing" {
-			objects[strings.ToLower(oid)] = struct{}{}
+		if object, ok := info[oid]; !ok || object.typ != "blob" {
+			return nil, fmt.Errorf("index object %s is unavailable", oid)
 		}
+		objects[oid] = struct{}{}
 	}
 	return objects, nil
 }
@@ -472,7 +530,8 @@ func shouldSkipGitObjectStatePath(rel string, _ fs.DirEntry) bool {
 	}
 	// objects/ and hooks/ are top-level .git directories. Matching the name at
 	// any depth used to drop legitimate content such as refs/heads/hooks.
-	return parts[0] == "objects" || parts[0] == "hooks"
+	return parts[0] == "objects" || parts[0] == "hooks" ||
+		(len(parts) == 2 && parts[0] == "worktrees" && strings.HasPrefix(parts[1], ".drive9-git-state-restore-"))
 }
 
 // archiveLocalGitStateDir tars+gzips the .git tree without objects/.
@@ -617,7 +676,7 @@ func gitDirLooksUsable(ctx context.Context, gitDir string) bool {
 	}
 	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(checkCtx, "git", "--git-dir", gitDir, "cat-file", "-e", "HEAD^{commit}")
+	cmd := newGitCommandContext(checkCtx, "--git-dir", gitDir, "cat-file", "-e", "HEAD^{commit}")
 	cmd.Env = append(os.Environ(), "GIT_NO_LAZY_FETCH=1")
 	return cmd.Run() == nil
 }
@@ -681,6 +740,11 @@ func (g *Git) scheduleGitStateCheckpoint(path string) {
 	if relSlash != ".git" && !strings.HasPrefix(relSlash, ".git/") {
 		return
 	}
+	g.backgroundMu.Lock()
+	defer g.backgroundMu.Unlock()
+	if g.stopping {
+		return
+	}
 	g.checkpoints.Schedule(gitDir, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), gitCheckpointTimeout)
 		defer cancel()
@@ -708,8 +772,27 @@ func (g *Git) checkpointWorkspace(ctx context.Context, w *workspace, gitDir stri
 	}
 	g.ckptMu.Lock()
 	defer g.ckptMu.Unlock()
+	if g.wasFreshRestored(gitDir) {
+		return nil
+	}
+	content, err := archiveLocalGitStateDir(gitDir)
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(content)
+	sumHex := hex.EncodeToString(sum[:])
 	baseCommit := strings.ToLower(strings.TrimSpace(w.head()))
-	pack, complete, err := g.buildLocalGitObjectPack(ctx, gitDir, baseCommit)
+	tips, err := collectLocalRefTips(ctx, gitDir)
+	if err != nil {
+		return err
+	}
+	// A linked worktree's refs live outside its admin archive. The inputs
+	// to its object pack include those tips, its base, and the archived index.
+	checkpoint := strings.Join(append([]string{sumHex, baseCommit}, tips...), ":")
+	if checkpoint == w.lastCheckpoint {
+		return nil
+	}
+	pack, complete, err := g.buildLocalGitObjectPack(ctx, gitDir, baseCommit, tips)
 	if err != nil {
 		return err
 	}
@@ -724,42 +807,46 @@ func (g *Git) checkpointWorkspace(ctx context.Context, w *workspace, gitDir stri
 			return err
 		}
 	}
-	content, err := archiveLocalGitStateDir(gitDir)
-	if err != nil {
-		return err
-	}
-	sum := sha256.Sum256(content)
 	_, err = g.cl.UpsertGitState(ctx, w.id, client.GitStateRequest{
 		CheckpointCommit: w.head(),
 		StorageType:      gitStateStorageTarGzNoObjects,
-		ChecksumSHA256:   hex.EncodeToString(sum[:]),
+		ChecksumSHA256:   sumHex,
 		SizeBytes:        int64(len(content)),
 		Content:          content,
 	})
+	if err == nil {
+		w.lastCheckpoint = checkpoint
+	}
 	return err
 }
 
 // checkpointAllGitWorkspaces flushes every workspace's state (the shutdown
 // boundary).
-func (g *Git) checkpointAllGitWorkspaces() {
+func (g *Git) checkpointAllGitWorkspaces(ctx context.Context) error {
 	if g == nil || g.localRoot == "" {
-		return
+		return nil
 	}
 	g.mu.RLock()
 	workspaces := make([]*workspace, 0, len(g.workspaces))
 	workspaces = append(workspaces, g.workspaces...)
 	g.mu.RUnlock()
-	ctx, cancel := context.WithTimeout(context.Background(), gitCheckpointTimeout)
-	defer cancel()
+	var errs []error
 	for _, w := range workspaces {
 		gitDir, ok := g.checkpointGitDir(w)
-		if !ok {
+		if !ok || g.wasFreshRestored(gitDir) {
 			continue
 		}
-		if err := g.checkpointWorkspace(ctx, w, gitDir); err != nil {
-			fmt.Fprintf(os.Stderr, "drive9: git state final checkpoint failed for workspace %s: %v\n", w.id, err)
+		if ctx.Err() != nil {
+			return errors.Join(ctx.Err(), errors.Join(errs...))
+		}
+		checkpointCtx, cancel := context.WithTimeout(ctx, gitCheckpointTimeout)
+		err := g.checkpointWorkspace(checkpointCtx, w, gitDir)
+		cancel()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("checkpoint workspace %s: %w", w.id, err))
 		}
 	}
+	return errors.Join(errs...)
 }
 
 // restoreWorkspaceState restores objects from the remote clone, then the
@@ -883,6 +970,9 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 	if !gitDirLooksUsable(ctx, tmpGitDir) {
 		return fmt.Errorf("restored git state is missing a usable HEAD")
 	}
+	g.ckptMu.Lock()
+	defer g.ckptMu.Unlock()
+	g.evictBatchReader(gitDir)
 	if err := os.RemoveAll(gitDir); err != nil {
 		return err
 	}
@@ -890,6 +980,9 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 		return err
 	}
 	if linkedCommonGitDir != "" {
+		g.mu.Lock()
+		delete(g.freshRestored, filepath.Clean(gitDir))
+		g.mu.Unlock()
 		return writeWorktreeGitPointer(g, w.rootPath(), gitDir)
 	}
 	g.markFreshRestored(gitDir)
@@ -998,7 +1091,7 @@ func (g *Git) restoreGitObjectsFromRemote(ctx context.Context, w *workspace, git
 		args = append(args, "--filter=blob:none")
 	}
 	args = append(args, repoURL, tmpWorktree)
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := newGitCommandContext(ctx, args...)
 	cmd.Env = append(gitSafeEnv(os.Environ()), "GIT_TERMINAL_PROMPT=0", "GIT_ALLOW_PROTOCOL="+gitcache.GitAllowedProtocols)
 	if gitcache.GitAllowLocalRepos() {
 		cmd.Env[len(cmd.Env)-1] = "GIT_ALLOW_PROTOCOL=" + gitcache.GitLocalAllowedProtocols
@@ -1048,7 +1141,7 @@ func (g *Git) restoreGitObjectPacks(ctx context.Context, w *workspace, gitDir st
 		if pack.ChecksumSHA256 != "" && !strings.EqualFold(pack.ChecksumSHA256, checksum) {
 			return fmt.Errorf("git object pack %s checksum mismatch", pack.PackID)
 		}
-		cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "unpack-objects", "-q")
+		cmd := newGitCommandContext(ctx, "--git-dir", gitDir, "unpack-objects", "-q")
 		cmd.Stdin = bytes.NewReader(pack.Content)
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
@@ -1063,10 +1156,52 @@ func (g *Git) restoreGitObjectPacks(ctx context.Context, w *workspace, gitDir st
 	return nil
 }
 
+// missingTreeObjectsNoLazy returns sorted, deduplicated missing object IDs
+// under treeOID without triggering partial-clone promisor lazy-fetch on any
+// Git version (`rev-list --objects --missing=print` suppresses lazy-fetch in
+// git's object walk itself, whereas older git ignored GIT_NO_LAZY_FETCH in
+// `cat-file --batch-check`).
+func missingTreeObjectsNoLazy(ctx context.Context, gitDir, treeOID string) ([]string, error) {
+	cmd := newGitCommandContext(ctx, "--git-dir", gitDir, "rev-list", "--objects", "--missing=print", treeOID)
+	cmd.Env = append(gitSafeEnv(os.Environ()), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_NO_LAZY_FETCH=1", "GIT_TERMINAL_PROMPT=0")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg != "" {
+			return nil, fmt.Errorf("git rev-list --missing=print: %w: %s", err, msg)
+		}
+		return nil, fmt.Errorf("git rev-list --missing=print: %w", err)
+	}
+	seen := make(map[string]struct{})
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "?") {
+			continue
+		}
+		fields := strings.Fields(line[1:])
+		if len(fields) == 0 {
+			continue
+		}
+		oid := strings.ToLower(fields[0])
+		if isGitObjectID(oid) {
+			seen[oid] = struct{}{}
+		}
+	}
+	if len(seen) == 0 {
+		return nil, nil
+	}
+	missing := mapKeys(seen)
+	sort.Strings(missing)
+	return missing, nil
+}
+
 // MaterializeHeadTree prefetches the HEAD tree's blobs for a restored
 // blobless workspace: git clones with --filter=blob:none leave blobs
 // remote; checkout and indexing need them local, so walk the tree and
-// hydrate every blob before the mount serves.
+// hydrate every missing blob in a single batched promisor fetch before
+// the mount serves.
 func (g *Git) MaterializeHeadTree(ctx context.Context, gitDir string) error {
 	if g.cl == nil {
 		return nil
@@ -1078,36 +1213,46 @@ func (g *Git) MaterializeHeadTree(ctx context.Context, gitDir string) error {
 		}
 		return err
 	}
-	out, err := gitCommandOutputNoLazy(ctx, "--git-dir", gitDir, "ls-tree", "-r", "-z", strings.TrimSpace(string(tree)))
+	treeOID := strings.TrimSpace(string(tree))
+	missing, err := missingTreeObjectsNoLazy(ctx, gitDir, treeOID)
+	if err != nil {
+		return fmt.Errorf("materialize head tree check local blobs: %w", err)
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+
+	remoteName, err := resolvePromisorRemote(ctx, gitDir, len(missing))
 	if err != nil {
 		return err
 	}
-	var blobs []string
-	for _, rec := range bytes.Split(out, []byte{0}) {
-		if len(rec) == 0 {
-			continue
-		}
-		tab := bytes.IndexByte(rec, '\t')
-		if tab < 0 {
-			continue
-		}
-		meta := strings.Fields(string(rec[:tab]))
-		// ls-tree records are `<mode> <type> <oid>`: the type is the
-		// second field and the object id the third — testing meta[0]
-		// (the mode, always 100644/100755/120000 here) matched nothing
-		// and hydration silently skipped every blob.
-		if len(meta) >= 3 && meta[1] == "blob" {
-			blobs = append(blobs, strings.ToLower(meta[2]))
-		}
+	allowProtocols := gitcache.GitAllowedProtocols
+	if gitcache.GitAllowLocalRepos() {
+		allowProtocols = gitcache.GitLocalAllowedProtocols
 	}
-	if len(blobs) == 0 {
-		return nil
-	}
-	// git cat-file --batch against a partial clone fetches each missing
-	// blob lazily (GIT_NO_LAZY_FETCH deliberately unset here).
-	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "cat-file", "--batch", "--buffer")
-	cmd.Stdin = strings.NewReader(strings.Join(blobs, "\n") + "\n")
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	// git cat-file --batch against a partial clone spawns one child `git fetch`
+	// per missing blob (O(N) network round-trips plus repeated auto-maintenance).
+	// Feeding all missing blob OIDs to a single promisor `git fetch --stdin`
+	// fetches one pack for the entire HEAD tree.
+	cmd := newGitCommandContext(ctx,
+		"--git-dir", gitDir,
+		"-c", "gc.auto=0",
+		"-c", "maintenance.auto=false",
+		"-c", "fetch.negotiationAlgorithm=noop",
+		"fetch",
+		remoteName,
+		"--no-tags",
+		"--no-write-fetch-head",
+		"--recurse-submodules=no",
+		"--filter=blob:none",
+		"--stdin",
+	)
+	cmd.Stdin = strings.NewReader(strings.Join(missing, "\n") + "\n")
+	cmd.Env = append(gitSafeEnv(os.Environ()),
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ALLOW_PROTOCOL="+allowProtocols,
+	)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -1117,7 +1262,173 @@ func (g *Git) MaterializeHeadTree(ctx context.Context, gitDir string) error {
 		}
 		return fmt.Errorf("materialize head tree: %w", err)
 	}
+
+	stillMissing, err := missingTreeObjectsNoLazy(ctx, gitDir, treeOID)
+	if err != nil {
+		return fmt.Errorf("materialize head tree verify blobs: %w", err)
+	}
+	if len(stillMissing) > 0 {
+		return fmt.Errorf("materialize head tree: %d of %d blob(s) still missing after fetch", len(stillMissing), len(missing))
+	}
 	return nil
+}
+
+type gitConfigNullEntry struct {
+	key      string
+	value    string
+	hasValue bool
+}
+
+func gitConfigRegexpNoLazy(ctx context.Context, gitDir, pattern string) ([]gitConfigNullEntry, error) {
+	cmd := newGitCommandContext(ctx, "--git-dir", gitDir, "config", "--null", "--get-regexp", pattern)
+	cmd.Env = append(gitSafeEnv(os.Environ()), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_NO_LAZY_FETCH=1", "GIT_TERMINAL_PROMPT=0")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && strings.TrimSpace(stderr.String()) == "" {
+			return nil, nil
+		}
+		msg := strings.TrimSpace(stderr.String())
+		if msg != "" {
+			return nil, fmt.Errorf("git config --get-regexp %s: %w: %s", pattern, err, msg)
+		}
+		return nil, fmt.Errorf("git config --get-regexp %s: %w", pattern, err)
+	}
+	raw := stdout.Bytes()
+	var entries []gitConfigNullEntry
+	for _, rec := range bytes.Split(raw, []byte{0}) {
+		if len(rec) == 0 {
+			continue
+		}
+		if nl := bytes.IndexByte(rec, '\n'); nl >= 0 {
+			entries = append(entries, gitConfigNullEntry{
+				key:      string(rec[:nl]),
+				value:    string(rec[nl+1:]),
+				hasValue: true,
+			})
+		} else {
+			entries = append(entries, gitConfigNullEntry{
+				key:      string(rec),
+				hasValue: false,
+			})
+		}
+	}
+	return entries, nil
+}
+
+func isGitConfigTruthy(val string, hasValue bool) bool {
+	if !hasValue {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(val)) {
+	case "true", "yes", "on", "1":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateGitRemoteName(name string) error {
+	if name == "" {
+		return fmt.Errorf("materialize head tree: promisor remote name is empty")
+	}
+	if strings.HasPrefix(name, "-") {
+		return fmt.Errorf("materialize head tree: promisor remote name %q must not start with '-'", name)
+	}
+	for _, r := range name {
+		if r <= 0x20 || r == 0x7f {
+			return fmt.Errorf("materialize head tree: promisor remote name %q contains whitespace or control character", name)
+		}
+	}
+	return nil
+}
+
+// resolvePromisorRemote resolves and validates the partial-clone promisor
+// remote configured in gitDir (or via commondir for a linked worktree).
+func resolvePromisorRemote(ctx context.Context, gitDir string, missingCount int) (string, error) {
+	entries, err := gitConfigRegexpNoLazy(ctx, gitDir, `^(extensions\.partialclone|remote\..*)$`)
+	if err != nil {
+		return "", err
+	}
+	var partialCloneRemote string
+	var promisorRemotes []string
+	enabled := make(map[string]bool)
+	remoteURLs := make(map[string][]string)
+	unsafeRemoteKey := make(map[string]string)
+
+	for _, e := range entries {
+		if strings.EqualFold(e.key, "extensions.partialclone") {
+			if !e.hasValue || strings.TrimSpace(e.value) == "" {
+				return "", fmt.Errorf("materialize head tree: extensions.partialClone is empty")
+			}
+			if err := validateGitRemoteName(e.value); err != nil {
+				return "", err
+			}
+			partialCloneRemote = e.value
+			continue
+		}
+		if !strings.HasPrefix(e.key, "remote.") {
+			continue
+		}
+		rest := e.key[len("remote."):]
+		dot := strings.LastIndexByte(rest, '.')
+		if dot <= 0 {
+			continue
+		}
+		remoteName := rest[:dot]
+		subKey := strings.ToLower(rest[dot+1:])
+		switch {
+		case subKey == "promisor":
+			if err := validateGitRemoteName(remoteName); err != nil {
+				return "", err
+			}
+			if _, seen := enabled[remoteName]; !seen {
+				promisorRemotes = append(promisorRemotes, remoteName)
+			}
+			enabled[remoteName] = isGitConfigTruthy(e.value, e.hasValue)
+		case gitCheckpointUnsafeRemoteKeys[subKey]:
+			if _, exists := unsafeRemoteKey[remoteName]; !exists {
+				unsafeRemoteKey[remoteName] = subKey
+			}
+		case subKey == "url":
+			if !e.hasValue {
+				remoteURLs[remoteName] = append(remoteURLs[remoteName], "")
+			} else {
+				remoteURLs[remoteName] = append(remoteURLs[remoteName], e.value)
+			}
+		}
+	}
+
+	chosen := partialCloneRemote
+	if chosen == "" {
+		for _, name := range promisorRemotes {
+			if enabled[name] {
+				chosen = name
+				break
+			}
+		}
+	}
+	if chosen == "" {
+		return "", fmt.Errorf("materialize head tree: %d missing blob(s) but no promisor remote is configured", missingCount)
+	}
+	if err := validateGitRemoteName(chosen); err != nil {
+		return "", err
+	}
+	if badKey, bad := unsafeRemoteKey[chosen]; bad {
+		return "", fmt.Errorf("materialize head tree: promisor remote %q sets unsafe config key %q", chosen, badKey)
+	}
+	urls := remoteURLs[chosen]
+	if len(urls) == 0 {
+		return "", fmt.Errorf("materialize head tree: promisor remote %q has no url", chosen)
+	}
+	for _, u := range urls {
+		if err := gitcache.ValidateRepoURL(u); err != nil {
+			return "", fmt.Errorf("materialize head tree: promisor remote %q url rejected: %w", chosen, err)
+		}
+	}
+	return chosen, nil
 }
 
 // gitCheckpointSafeConfigKeys are the only config keys a restored checkpoint
