@@ -406,6 +406,13 @@ func (s *Store) migrate() (err error) {
 	if err := dropObsoleteMetaIndexes(ctx, s.db); err != nil {
 		return err
 	}
+	// Before the diff: an old installation has the subject columns indexed, and
+	// TiDB refuses a collation change on an indexed column, so the conversion has
+	// to run (and rebuild the indexes) before the repair planner would issue a
+	// bare MODIFY for the mismatch it is about to observe.
+	if err := ensureBinarySubjectKeyCollation(ctx, s.db); err != nil {
+		return err
+	}
 	diffs, err := diffMetaSchema(ctx, s.db, spec)
 	if err != nil {
 		return fmt.Errorf("diff meta schema: %w", err)
@@ -434,6 +441,83 @@ func (s *Store) migrate() (err error) {
 	}
 	if len(diffs) > 0 {
 		return &metaSchemaDiffError{diffs: diffs}
+	}
+	return nil
+}
+
+// binarySubjectKeyColumns are the OAuth subject columns whose comparison must be
+// byte-exact. The index is part of the entry because TiDB refuses
+// "MODIFY COLUMN ... COLLATE" while an index covers the column (error 8200), so
+// the index around the column is dropped and recreated around the change.
+var binarySubjectKeyColumns = []struct {
+	table      string
+	column     string
+	definition string
+	indexName  string
+	indexSQL   string
+}{
+	{
+		table:      "tenant_external_bindings",
+		column:     "subject_key",
+		definition: "VARCHAR(512) COLLATE utf8mb4_bin NOT NULL",
+		indexName:  "uk_external_binding_subject",
+		indexSQL:   "ALTER TABLE tenant_external_bindings ADD UNIQUE INDEX uk_external_binding_subject (provider, subject_key)",
+	},
+	{
+		table:      "tenant_api_keys",
+		column:     "issued_by_subject_key",
+		definition: "VARCHAR(512) COLLATE utf8mb4_bin NOT NULL DEFAULT ''",
+		indexName:  "idx_api_keys_issuer",
+		indexSQL:   "ALTER TABLE tenant_api_keys ADD INDEX idx_api_keys_issuer (tenant_id, issued_by_provider, issued_by_subject_key, status, created_at)",
+	},
+}
+
+// ensureBinarySubjectKeyCollation converts an existing control plane to the
+// byte-exact subject comparison the schema contract declares. A case-insensitive
+// collation makes the OAuth subject lookup treat "SUBJ" and "subj" as the same
+// identity, which hands the caller another tenant's owner key; fresh installs get
+// the collation from CREATE TABLE, and this is the migration for the rest.
+//
+// The change itself is data-preserving: the old collation was case-insensitive, so
+// two rows differing only by case could not coexist and the binary comparison can
+// only distinguish values that were previously folded together.
+func ensureBinarySubjectKeyCollation(ctx context.Context, db *sql.DB) error {
+	for _, target := range binarySubjectKeyColumns {
+		var collation sql.NullString
+		err := db.QueryRowContext(ctx, `SELECT collation_name FROM information_schema.columns
+			WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`,
+			target.table, target.column).Scan(&collation)
+		if errors.Is(err, sql.ErrNoRows) {
+			// The table or column does not exist yet; applying the schema
+			// statements creates it with the pinned collation.
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("read %s.%s collation: %w", target.table, target.column, err)
+		}
+		if !collation.Valid || strings.EqualFold(collation.String, "utf8mb4_bin") {
+			continue
+		}
+		var indexed bool
+		if err := db.QueryRowContext(ctx, `SELECT EXISTS (
+				SELECT 1 FROM information_schema.statistics
+				WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?)`,
+			target.table, target.indexName).Scan(&indexed); err != nil {
+			return fmt.Errorf("read %s.%s index: %w", target.table, target.indexName, err)
+		}
+		if indexed {
+			if _, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s DROP INDEX %s", target.table, target.indexName)); err != nil {
+				return fmt.Errorf("drop %s.%s before collation change: %w", target.table, target.indexName, err)
+			}
+		}
+		if _, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s %s", target.table, target.column, target.definition)); err != nil {
+			return fmt.Errorf("pin %s.%s collation: %w", target.table, target.column, err)
+		}
+		if indexed {
+			if _, err := db.ExecContext(ctx, target.indexSQL); err != nil {
+				return fmt.Errorf("restore %s.%s after collation change: %w", target.table, target.indexName, err)
+			}
+		}
 	}
 	return nil
 }
@@ -484,6 +568,7 @@ func acquireMetaSchemaMigrationLock(ctx context.Context, db *sql.DB) (func() err
 
 type metaColumnMeta struct {
 	columnType string
+	collation  string
 }
 
 type metaTableMeta struct {
@@ -537,8 +622,11 @@ type metaTableSpec struct {
 
 type metaColumnSpec struct {
 	columnType string
-	addSQL     string
-	modifySQL  string
+	// collation is the COLLATE clause the definition pins, empty when it pins
+	// none. Pinning it is what makes a case-sensitive identity byte-compared.
+	collation string
+	addSQL    string
+	modifySQL string
 }
 
 type metaIndexSpec struct {
@@ -663,7 +751,7 @@ func metaInitSchemaStatements() []string {
 			status         VARCHAR(20) NOT NULL DEFAULT 'active',
 			scope_kind     VARCHAR(32) NOT NULL DEFAULT 'owner',
 			issued_by_provider VARCHAR(64) NOT NULL DEFAULT '',
-			issued_by_subject_key VARCHAR(512) NOT NULL DEFAULT '',
+			issued_by_subject_key VARCHAR(512) COLLATE utf8mb4_bin NOT NULL DEFAULT '',
 			issued_by_metadata_json JSON NULL,
 			issued_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			revoked_at     DATETIME(3) NULL,
@@ -673,9 +761,16 @@ func metaInitSchemaStatements() []string {
 			INDEX idx_api_keys_tenant (tenant_id, status),
 			INDEX idx_api_keys_issuer (tenant_id, issued_by_provider, issued_by_subject_key, status, created_at)
 		)`,
+		// subject_key and tenant_api_keys.issued_by_subject_key are opaque,
+		// case-sensitive identities from the OAuth provider, so both columns pin
+		// utf8mb4_bin: under a case-insensitive collation "SUBJ" resolves to the
+		// binding stored for "subj" and the caller is handed another tenant's key.
+		// ensureBinarySubjectKeyCollation converts existing installations (TiDB
+		// refuses a collation change on an indexed column, so the indexes around
+		// the two columns are rebuilt).
 		`CREATE TABLE IF NOT EXISTS tenant_external_bindings (
 			provider      VARCHAR(64) NOT NULL,
-			subject_key   VARCHAR(512) NOT NULL,
+			subject_key   VARCHAR(512) COLLATE utf8mb4_bin NOT NULL,
 			tenant_id     VARCHAR(64) NOT NULL,
 			metadata_json JSON NULL,
 			created_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
@@ -1082,6 +1177,16 @@ func diffMetaTableMetaWithObservedIndexes(table metaTableSpec, meta metaTableMet
 			})
 			continue
 		}
+		if spec.collation != "" && !strings.EqualFold(col.collation, spec.collation) {
+			diffs = append(diffs, metaSchemaDiff{
+				kind:       metaSchemaDiffColumnType,
+				tableName:  table.name,
+				columnName: name,
+				detail:     fmt.Sprintf("%s schema contract: %s column collation = %q, want %s", table.name, name, col.collation, spec.collation),
+				repairSQL:  spec.modifySQL,
+			})
+			continue
+		}
 		observedType := normalizeMetaSQLFragment(col.columnType)
 		desiredType := normalizeMetaSQLFragment(spec.columnType)
 		if observedType != desiredType {
@@ -1472,6 +1577,7 @@ func parseMetaColumnDefinition(tableName, def string) (string, metaColumnSpec, b
 	}
 	return strings.ToLower(name), metaColumnSpec{
 		columnType: strings.ToLower(strings.TrimSpace(colType)),
+		collation:  parseMetaColumnCollation(rest),
 		addSQL:     fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", tableName, name, strings.TrimSpace(rest)),
 		modifySQL:  fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s %s", tableName, name, strings.TrimSpace(rest)),
 	}, true
@@ -1479,6 +1585,19 @@ func parseMetaColumnDefinition(tableName, def string) (string, metaColumnSpec, b
 
 func parseMetaColumnType(rest string) string {
 	return schemaspec.ParseColumnType(rest)
+}
+
+// parseMetaColumnCollation returns the collation a column definition pins
+// ("VARCHAR(512) COLLATE utf8mb4_bin NOT NULL" -> "utf8mb4_bin"), or "" when the
+// definition defers to the table default.
+func parseMetaColumnCollation(rest string) string {
+	fields := strings.Fields(strings.ToLower(rest))
+	for i := 0; i+1 < len(fields); i++ {
+		if fields[i] == "collate" {
+			return strings.Trim(fields[i+1], "`")
+		}
+	}
+	return ""
 }
 
 func splitMetaIdentifierAndRest(s string) (identifier string, rest string) {
@@ -1529,6 +1648,16 @@ func isSafeModifyColumnRepairSQL(diff metaSchemaDiff) bool {
 	if diff.tableName == "org_object_backends" && diff.columnName == "secret_cipher" {
 		return n == "alter table org_object_backends modify column secret_cipher varbinary(8192) null"
 	}
+	// Pinning the collation of an OAuth subject column is data-preserving in the
+	// direction that matters: the old collation was case-insensitive, so two rows
+	// that differ only by case could not both exist and the binary comparison can
+	// only distinguish more values, never fewer.
+	if diff.tableName == "tenant_external_bindings" && diff.columnName == "subject_key" {
+		return n == "alter table tenant_external_bindings modify column subject_key varchar(512) collate utf8mb4_bin not null"
+	}
+	if diff.tableName == "tenant_api_keys" && diff.columnName == "issued_by_subject_key" {
+		return n == "alter table tenant_api_keys modify column issued_by_subject_key varchar(512) collate utf8mb4_bin not null default ''"
+	}
 	return false
 }
 
@@ -1537,7 +1666,7 @@ func isIgnorableMetaSchemaError(err error) bool {
 }
 
 func loadMetaTableMeta(ctx context.Context, db *sql.DB, tableName string) (metaTableMeta, error) {
-	rows, err := db.QueryContext(ctx, `SELECT column_name, column_type
+	rows, err := db.QueryContext(ctx, `SELECT column_name, column_type, collation_name
 		FROM information_schema.columns
 		WHERE table_schema = DATABASE() AND table_name = ?`, tableName)
 	if err != nil {
@@ -1548,10 +1677,11 @@ func loadMetaTableMeta(ctx context.Context, db *sql.DB, tableName string) (metaT
 	columns := make(map[string]metaColumnMeta)
 	for rows.Next() {
 		var name, columnType string
-		if err := rows.Scan(&name, &columnType); err != nil {
+		var collation sql.NullString
+		if err := rows.Scan(&name, &columnType, &collation); err != nil {
 			return metaTableMeta{}, err
 		}
-		columns[strings.ToLower(name)] = metaColumnMeta{columnType: columnType}
+		columns[strings.ToLower(name)] = metaColumnMeta{columnType: columnType, collation: collation.String}
 	}
 	if err := rows.Err(); err != nil {
 		return metaTableMeta{}, err
