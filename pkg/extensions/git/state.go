@@ -589,6 +589,13 @@ func archiveLocalGitStateDir(gitDir string) ([]byte, error) {
 // HEAD (the remote's default branch) instead of the branch the workspace was on, or
 // failed the whole restore for a linked worktree whose checkpoint had no other HEAD.
 // It is recorded as the regular-file form git reads as the same symbolic ref.
+//
+// No entry is ever written THROUGH a link that was already at its path. os.Root
+// refuses a link that leaves the root but follows one that stays inside it, and the
+// standalone restore clones into the same directory before extracting: on a host with
+// core.preferSymlinkRefs the clone's HEAD is a link to the default branch, so
+// "HEAD" would rewrite refs/heads/main instead of becoming the file itself. A link
+// at the entry's path is removed first.
 func extractGitArchive(content []byte, dst string) error {
 	if err := os.MkdirAll(dst, 0o755); err != nil {
 		return err
@@ -632,6 +639,9 @@ func extractGitArchive(content []byte, dst string) error {
 		}
 		switch hdr.Typeflag {
 		case tar.TypeDir:
+			if err := removeArchiveLink(root, name); err != nil {
+				return fmt.Errorf("git archive: replace link at %q: %w", hdr.Name, err)
+			}
 			if err := root.MkdirAll(name, 0o755); err != nil {
 				return fmt.Errorf("git archive: create directory %q: %w", hdr.Name, err)
 			}
@@ -655,7 +665,7 @@ func extractGitArchive(content []byte, dst string) error {
 				if err != nil {
 					return fmt.Errorf("git archive: %w", err)
 				}
-				if err := root.WriteFile(name, body, 0o644); err != nil {
+				if err := writeArchiveFile(root, name, body, 0o644); err != nil {
 					return fmt.Errorf("git archive: write %q: %w", name, err)
 				}
 				continue
@@ -671,11 +681,33 @@ func extractGitArchive(content []byte, dst string) error {
 			if err != nil {
 				return err
 			}
-			if err := root.WriteFile(name, data, fs.FileMode(hdr.Mode)&0o777|0o600); err != nil {
+			if err := writeArchiveFile(root, name, data, fs.FileMode(hdr.Mode)&0o777|0o600); err != nil {
 				return fmt.Errorf("git archive: write %q: %w", hdr.Name, err)
 			}
 		}
 	}
+}
+
+// removeArchiveLink removes a link that already sits at an entry's path, so the
+// entry is written as itself instead of through the link's target. os.Root refuses a
+// link that escapes the root but follows one that stays inside it, and the standalone
+// restore extracts over a clone: with core.preferSymlinkRefs the clone's HEAD is a
+// link into refs/heads, and writing "HEAD" through it rewrites the default branch.
+func removeArchiveLink(root *os.Root, name string) error {
+	info, err := root.Lstat(name)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		return nil
+	}
+	return root.Remove(name)
+}
+
+// writeArchiveFile writes one regular file from a checkpoint archive, replacing a
+// link at the same path first.
+func writeArchiveFile(root *os.Root, name string, body []byte, mode fs.FileMode) error {
+	if err := removeArchiveLink(root, name); err != nil {
+		return err
+	}
+	return root.WriteFile(name, body, mode)
 }
 
 func gitDirLooksUsable(ctx context.Context, gitDir string) bool {
@@ -862,10 +894,15 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 		// Validate the worktree gitdir before restoring any state, so a workspace
 		// whose gitdir_rel is not a worktree admin directory is refused before the
 		// common repository is materialized at all. The same resolution supplies the
-		// path below; it is not repeated here, because the common repository is
-		// materialized from a checkpoint whose links the extractor drops, so a second
-		// look could only repeat the first answer. The swap resolves the path once
-		// more, immediately before it deletes anything.
+		// path below.
+		//
+		// It is not repeated after the common repository is materialized: a common
+		// repository that this restore just created was checked here when it did not
+		// exist yet, and the swap resolves the path once more immediately before it
+		// deletes anything, which is what refuses a path that appeared in between. The
+		// cost of dropping the second look is that such a refusal happens after the
+		// linked checkpoint was fetched and its packs unpacked into the common object
+		// store.
 		target, err := linkedWorktreeGitDir(linkedCommonGitDir, w.gitDirRelPath(), w.worktreeAdminName())
 		if err != nil {
 			return err
@@ -2006,6 +2043,8 @@ func gitSafeEnv(base []string) []string {
 	for _, kv := range base {
 		switch {
 		case strings.HasPrefix(kv, "GIT_CONFIG_COUNT="),
+			strings.HasPrefix(kv, "GIT_CONFIG_KEY_"),
+			strings.HasPrefix(kv, "GIT_CONFIG_VALUE_"),
 			strings.HasPrefix(kv, "GIT_ALLOW_PROTOCOL="),
 			strings.HasPrefix(kv, "GIT_TERMINAL_PROMPT="),
 			strings.HasPrefix(kv, "GIT_ASKPASS="),
@@ -2015,13 +2054,18 @@ func gitSafeEnv(base []string) []string {
 		out = append(out, kv)
 	}
 	// core.hooksPath=/dev/null still leaves no hook to run, and disabling the
-	// fsmonitor/askpass hooks keeps a crafted repo config inert.
+	// fsmonitor/askpass hooks keeps a crafted repo config inert. The third entry
+	// keeps the restore's clone from recording HEAD as a link (a host with
+	// core.preferSymlinkRefs set would otherwise hand back a HEAD the extractor has
+	// to write through; see extractGitArchive).
 	return append(out,
 		"GIT_CONFIG_NOSYSTEM=1",
-		"GIT_CONFIG_COUNT=2",
+		"GIT_CONFIG_COUNT=3",
 		"GIT_CONFIG_KEY_0=core.hooksPath",
 		"GIT_CONFIG_VALUE_0=/dev/null",
 		"GIT_CONFIG_KEY_1=core.fsmonitor",
 		"GIT_CONFIG_VALUE_1=false",
+		"GIT_CONFIG_KEY_2=core.preferSymlinkRefs",
+		"GIT_CONFIG_VALUE_2=false",
 	)
 }

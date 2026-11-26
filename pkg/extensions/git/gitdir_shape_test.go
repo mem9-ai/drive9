@@ -155,8 +155,8 @@ func TestLinkedWorktreeGitDirRefusesSymlinkedComponents(t *testing.T) {
 	}
 }
 
-// A restore with a checkpoint available, on a mount whose overlay already carries the
-// planted link: the refusal has to be the symlink one, not "checkpoint not available".
+// A mount whose overlay already carries the planted link: the restore has to refuse
+// it by name, not shape or "checkpoint not available".
 func TestRestoreRefusesSymlinkedWorktreesWithACheckpoint(t *testing.T) {
 	localRoot := t.TempDir()
 	commonGitDir := filepath.Join(localRoot, "overlay", "repo", ".git")
@@ -176,10 +176,9 @@ func TestRestoreRefusesSymlinkedWorktreesWithACheckpoint(t *testing.T) {
 	b.SeedGitWorktree("linked", "/repo/wt", "https://example.test/repo.git", strings.Repeat("a", 40), "main", "worktrees/heads")
 	ts := httptest.NewServer(b)
 	t.Cleanup(ts.Close)
-	// A checkpoint exists, so the restore cannot stop at "not available".
-	seedGitState(t, ts.URL, "linked")
-	seedGitState(t, ts.URL, "main")
 
+	// No checkpoint: the refusal comes from the early resolution, before either
+	// workspace's state is fetched, so "not available" cannot mask it.
 	g, err := New(Options{Client: client.New(ts.URL, ""), LocalRoot: localRoot})
 	if err != nil {
 		t.Fatal(err)
@@ -762,6 +761,13 @@ func TestRestoreKeepsASymbolicHeadFromAnOlderCheckpoint(t *testing.T) {
 		t.Fatalf("restore: %v", err)
 	}
 	repo := filepath.Join(localRoot, "overlay", "repo")
+	headInfo, err := os.Lstat(filepath.Join(repo, ".git", "HEAD"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if headInfo.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("restored HEAD is a link, not the checkpoint's regular HEAD")
+	}
 	body, err := os.ReadFile(filepath.Join(repo, ".git", "HEAD"))
 	if err != nil {
 		t.Fatal(err)
@@ -952,8 +958,10 @@ func TestSwapLinkedGitDirReportsATargetThatMovedAfterTheSection(t *testing.T) {
 		g.mu.Unlock()
 		close(writerDone)
 	}()
+	// A slow first poll must not shorten the second one.
+	queueDeadline := time.Now().Add(10 * time.Second)
 	queued := false
-	for time.Now().Before(waitDeadline) {
+	for time.Now().Before(queueDeadline) {
 		if g.mu.TryRLock() {
 			g.mu.RUnlock()
 			time.Sleep(time.Millisecond)
@@ -966,7 +974,12 @@ func TestSwapLinkedGitDirReportsATargetThatMovedAfterTheSection(t *testing.T) {
 		t.Fatal("the queued reload never reached the registry lock")
 	}
 	releaseMain()
-	err := <-swapErr
+	var err error
+	select {
+	case err = <-swapErr:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the swap never returned; the verification may have been moved inside the section")
+	}
 	if err == nil {
 		t.Fatal("the swap reported success while the row moved under it")
 	}
@@ -1045,6 +1058,141 @@ func TestRestoreRefusesAPlantedWorktreeAdminPath(t *testing.T) {
 	// The linked root was never pointed at the planted shape.
 	if _, statErr := os.Stat(filepath.Join(localRoot, "overlay", "repo", "wt", ".git")); !os.IsNotExist(statErr) {
 		t.Fatalf("the linked root was written despite the refusal (stat err = %v)", statErr)
+	}
+}
+
+// The extractor writes over a clone, and on a host with core.preferSymlinkRefs the
+// clone's HEAD is a link into the branch store. Writing the checkpoint's HEAD must
+// not follow it: os.Root follows a link that stays inside the root, so without the
+// guard the write would rewrite refs/heads/<default> instead of HEAD itself.
+func TestExtractGitArchiveDoesNotWriteThroughAnExistingLink(t *testing.T) {
+	const defaultRef = "1111111111111111111111111111111111111111\n"
+	cases := []struct {
+		name    string
+		entries []tarEntry
+	}{
+		{
+			name:    "HEAD recorded as a link",
+			entries: []tarEntry{{symlink: "HEAD", target: "refs/heads/feature"}},
+		},
+		{
+			name:    "HEAD recorded as a regular file",
+			entries: []tarEntry{{name: "HEAD", body: "ref: refs/heads/feature\n"}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dst := filepath.Join(t.TempDir(), ".git")
+			if err := os.MkdirAll(filepath.Join(dst, "refs", "heads"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			defaultRefPath := filepath.Join(dst, "refs", "heads", "main")
+			if err := os.WriteFile(defaultRefPath, []byte(defaultRef), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("refs/heads/main", filepath.Join(dst, "HEAD")); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := extractGitArchive(tarArchive(t, tc.entries...), dst); err != nil {
+				t.Fatalf("extractGitArchive: %v", err)
+			}
+			info, err := os.Lstat(filepath.Join(dst, "HEAD"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				t.Fatal("HEAD is still the clone's link; the entry was written through it")
+			}
+			body, err := os.ReadFile(filepath.Join(dst, "HEAD"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(body) != "ref: refs/heads/feature\n" {
+				t.Fatalf("HEAD = %q, want the checkpoint's branch", body)
+			}
+			if got, err := os.ReadFile(defaultRefPath); err != nil || string(got) != defaultRef {
+				t.Fatalf("refs/heads/main = %q (%v), want the branch file untouched", got, err)
+			}
+		})
+	}
+}
+
+// The host configuration that produces a link HEAD in the first place: clone under
+// core.preferSymlinkRefs and the restore still has to end with a regular HEAD on the
+// checkpoint's branch, not the default branch's ref file replaced by a symref line.
+func TestRestoreKeepsTheBranchOnAHostWithSymlinkRefs(t *testing.T) {
+	gitBin(t)
+	// The host's own configuration, which is what makes git write a link HEAD: it has
+	// to reach the restore's clone, so it is a config FILE (the restore replaces the
+	// GIT_CONFIG_* environment for the clone it runs).
+	globalConfig := filepath.Join(t.TempDir(), "gitconfig")
+	if err := os.WriteFile(globalConfig, []byte("[core]\n\tpreferSymlinkRefs = true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", globalConfig)
+
+	src := t.TempDir()
+	run(t, src, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(src, "f.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, src, "add", "f.txt")
+	run(t, src, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "one")
+	head := run(t, src, "rev-parse", "HEAD")
+	run(t, src, "branch", "feature")
+
+	localRoot := t.TempDir()
+	b := testbackend.NewBackend()
+	b.SeedGitWorkspaceFull("main", "/repo", "file://"+src, head)
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	// An older build's checkpoint on such a host: HEAD is a link, and the archive
+	// carries the default branch's ref file too.
+	seedGitStateArchive(t, ts.URL, "main", tarArchive(t,
+		tarEntry{symlink: "HEAD", target: "refs/heads/feature"},
+		tarEntry{name: "refs/heads/main", body: head + "\n"},
+		tarEntry{name: "refs/heads/feature", body: head + "\n"},
+	))
+
+	g, err := New(Options{Client: client.New(ts.URL, ""), LocalRoot: localRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws := &workspace{id: "main", root: "/repo", headCommit: head, repoURL: "file://" + src}
+	g.workspaces = []*workspace{ws}
+	if err := g.restoreWorkspaceState(context.Background(), ws); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	repo := filepath.Join(localRoot, "overlay", "repo")
+	headPath := filepath.Join(repo, ".git", "HEAD")
+	info, err := os.Lstat(headPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("restored HEAD is the clone's link, so the checkpoint was written through it")
+	}
+	body, err := os.ReadFile(headPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "ref: refs/heads/feature\n" {
+		t.Fatalf("restored HEAD = %q, want the checkpoint's branch", body)
+	}
+	// The default branch's ref file still names the commit, not a symref line.
+	mainRef, err := os.ReadFile(filepath.Join(repo, ".git", "refs", "heads", "main"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(mainRef) != head+"\n" {
+		t.Fatalf("refs/heads/main = %q, want the commit", mainRef)
+	}
+	if out := run(t, repo, "rev-parse", "HEAD"); out != head {
+		t.Fatalf("restored HEAD commit = %q, want %q", out, head)
+	}
+	if out := run(t, repo, "symbolic-ref", "--short", "HEAD"); out != "feature" {
+		t.Fatalf("restored branch = %q, want feature", out)
 	}
 }
 
