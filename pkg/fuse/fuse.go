@@ -2088,50 +2088,84 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 		survivor, _ := f.inodes.SurvivorOfInode(ino, child)
 		// Preparation may block on an upload or a clean reader. Keep the
 		// name, open index and replayable staged writes intact meanwhile.
-		var finish func(bool) error
+		var (
+			cancelQueue     func(func() bool) error
+			publishUnlink   func()
+			finishCommitted func() error
+			discardUnlink   func()
+			finishLegacy    func(bool) error
+		)
 		for _, h := range f.chain.Handlers() {
+			if prep, ok := h.(interface {
+				PreparePathUnlinkPhased(string, bool) (func(func() bool) error, func(), func() error, func())
+			}); ok {
+				cancelQueue, publishUnlink, finishCommitted, discardUnlink = prep.PreparePathUnlinkPhased(child, survivor != "")
+				break
+			}
 			if prep, ok := h.(interface {
 				PreparePathUnlink(string, bool) func(bool) error
 			}); ok {
-				finish = prep.PreparePathUnlink(child, survivor != "")
+				finishLegacy = prep.PreparePathUnlink(child, survivor != "")
 				break
 			}
 		}
 		binding := f.layerFence
+		isFenced := func() bool {
+			return binding != nil && binding.fenced.Load()
+		}
 		if binding != nil {
 			binding.fenceMu.Lock()
 			fenced := binding.fenced.Load()
 			binding.fenceMu.Unlock()
 			if fenced {
-				if finish != nil {
-					_ = finish(false)
+				if discardUnlink != nil {
+					discardUnlink()
+				} else if finishLegacy != nil {
+					_ = finishLegacy(false)
 				}
 				return gofuse.EIO
 			}
 		}
-		// Commit local unlink WAL/queue state without holding binding.fenceMu so
-		// a slow fsync or commit-queue wait never blocks triggerSelfFence from
-		// immediately fencing writes across other paths.
-		if finish != nil {
-			if err := finish(true); err != nil {
-				if binding != nil && binding.fenced.Load() {
+		// Run queue cancellation and unlink WAL journaling WITHOUT holding
+		// binding.fenceMu so a slow fsync or commit-queue wait never blocks
+		// triggerSelfFence from immediately fencing sibling writes. Neither
+		// Shadow/Pending/wbCache/landed nor handle flags are mutated here.
+		if cancelQueue != nil {
+			if err := cancelQueue(isFenced); err != nil {
+				if discardUnlink != nil {
+					discardUnlink()
+				}
+				if isFenced() {
+					return gofuse.EIO
+				}
+				return fs.StatusOf(err)
+			}
+		} else if finishLegacy != nil {
+			if err := finishLegacy(true); err != nil {
+				if isFenced() {
 					return gofuse.EIO
 				}
 				return fs.StatusOf(err)
 			}
 		}
-		// Re-check lease state under binding.fenceMu across the fast in-memory
-		// namespace publication boundary. If self-fence fired while finish(true)
-		// ran, roll back local unlink marks and return EIO without removing the path.
+		// Re-check lease state under binding.fenceMu across the fast, pure
+		// in-memory unlink publication boundary. If self-fence won the race,
+		// discard local prepared state and return EIO with zero side effects
+		// on handles, Shadow, Pending, wbCache, landed, or namespace tables.
 		if binding != nil {
 			binding.fenceMu.Lock()
 			if binding.fenced.Load() {
 				binding.fenceMu.Unlock()
-				if finish != nil {
-					_ = finish(false)
+				if discardUnlink != nil {
+					discardUnlink()
+				} else if finishLegacy != nil {
+					_ = finishLegacy(false)
 				}
 				return gofuse.EIO
 			}
+		}
+		if publishUnlink != nil {
+			publishUnlink()
 		}
 		f.openIdx.UnlinkPath(child)
 		for _, h := range f.chain.Handlers() {
@@ -2155,6 +2189,11 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 		f.markNameNegative(child)
 		if binding != nil {
 			binding.fenceMu.Unlock()
+		}
+		// Finalize cache removal and clean-reader shadow persistence after
+		// releasing binding.fenceMu (still serialized on child by gate).
+		if finishCommitted != nil {
+			_ = finishCommitted()
 		}
 		f.touchParentMtime(header.NodeId)
 		f.mutated(fs.EventDelete, child)
