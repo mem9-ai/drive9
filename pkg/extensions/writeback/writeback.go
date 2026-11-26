@@ -1296,6 +1296,9 @@ func (w *Writeback) PreparePathUnlinkPhased(p string, hasSurvivor bool) (
 				w.unlinkedMu.Unlock()
 				if !pinned {
 					pin = st.Shadow.Pin(snap.h.path)
+					if addedPin == 0 && snap.h.path == p {
+						addedPin = pin
+					}
 				}
 				w.recordUnlinkedSnapshot(snap.h.path, contentGen, pin)
 			}
