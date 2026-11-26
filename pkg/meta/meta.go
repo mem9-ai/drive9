@@ -1848,6 +1848,18 @@ func (s *Store) InsertExternalBinding(ctx context.Context, b *ExternalBinding) (
 	// the pool for a second one. It is a short statement; the caller's per-subject
 	// lock still covers the read-modify-write around it.
 	return s.WithExternalBindingSchemaLock(ctx, func(lockCtx context.Context, conn *sql.Conn) error {
+		// Fail closed if the migration that holds this gate ever leaves the unique
+		// index missing: a store that was already serving would otherwise write into
+		// the gap, and the recreate would then refuse to run (or a duplicate subject
+		// would survive on an engine that does not enforce it). The gate is released
+		// when the migration fails, so the check has to be repeated per insert.
+		indexed, err := metaIndexExists(lockCtx, conn, "tenant_external_bindings", "uk_external_binding_subject")
+		if err != nil {
+			return err
+		}
+		if !indexed {
+			return fmt.Errorf("insert external binding: the unique subject index %s is missing, so the schema migration has to complete first", externalBindingSubjectIndexName)
+		}
 		_, err = conn.ExecContext(lockCtx, `INSERT INTO tenant_external_bindings
 			(provider, subject_key, tenant_id, metadata_json, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?)`,
@@ -2761,6 +2773,12 @@ func compactTiDBCloudOrgClusterBindings(bindings []TenantTiDBCloudOrgBinding) []
 	})
 	return out
 }
+
+// externalBindingSubjectIndexName is the unique index over (provider, subject_key)
+// that makes a subject's binding unique. The collation migration has to remove it
+// for a moment (TiDB refuses a collation change while an index covers the column),
+// and writes fail closed while it is missing.
+const externalBindingSubjectIndexName = "uk_external_binding_subject"
 
 // externalBindingSchemaLockName is the advisory lock that serializes binding
 // writers against a schema change that has to remove the unique subject index for

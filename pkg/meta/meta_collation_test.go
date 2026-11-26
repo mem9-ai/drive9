@@ -204,9 +204,12 @@ func TestInsertExternalBindingWaitsForSchemaLock(t *testing.T) {
 	// Registered before the holder starts: a failed assertion below must not leave
 	// the holder (and its advisory lock) behind, or a repeated run of this test in
 	// the same process would block on the lock it still holds.
-	t.Cleanup(closeRelease)
 	holderDone := make(chan struct{})
 	acquireErr := make(chan error, 1)
+	t.Cleanup(func() {
+		closeRelease()
+		<-holderDone
+	})
 	go func() {
 		defer close(holderDone)
 		acquireErr <- s.WithExternalBindingSchemaLock(ctx, func(lockCtx context.Context, _ *sql.Conn) error {
@@ -311,20 +314,25 @@ func TestPinnedCollationRecoveryIsSerializedWithWriters(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
 	db := s.DB()
-	// The state a crash between DROP INDEX and ADD INDEX leaves behind.
-	dropIndex(t, db, "tenant_external_bindings", "uk_external_binding_subject")
 	now := time.Now().UTC()
 	if err := s.InsertExternalBinding(ctx, &ExternalBinding{
 		Provider: "slock", SubjectKey: "before-the-crash", TenantID: "t", CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
-		t.Fatalf("insert before the recovery: %v", err)
+		t.Fatalf("insert before the crash: %v", err)
+	}
+	// The state a crash between DROP INDEX and ADD INDEX leaves behind.
+	dropIndex(t, db, "tenant_external_bindings", "uk_external_binding_subject")
+	// A write into that gap fails closed rather than trusting the missing index.
+	if err := s.InsertExternalBinding(ctx, &ExternalBinding{
+		Provider: "slock", SubjectKey: "into-the-gap", TenantID: "t", CreatedAt: now, UpdatedAt: now,
+	}); err == nil {
+		t.Fatal("insert succeeded while the unique subject index was missing")
 	}
 
 	holding := make(chan struct{})
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
-	t.Cleanup(closeRelease)
 	holderDone := make(chan struct{})
 	go func() {
 		defer close(holderDone)
@@ -334,6 +342,10 @@ func TestPinnedCollationRecoveryIsSerializedWithWriters(t *testing.T) {
 			return nil
 		})
 	}()
+	t.Cleanup(func() {
+		closeRelease()
+		<-holderDone
+	})
 	select {
 	case <-holding:
 	case <-time.After(10 * time.Second):
@@ -368,14 +380,28 @@ func TestPinnedCollationRecoveryIsSerializedWithWriters(t *testing.T) {
 	if err := <-recovered; err != nil {
 		t.Fatalf("recover the index after a crash: %v", err)
 	}
-	if err := <-writeErr; err != nil {
+	// The writer that queued behind the gate either saw the recovered index and
+	// stored the row, or observed the index missing and failed closed. Neither may
+	// land a write in the gap.
+	switch err := <-writeErr; {
+	case err == nil:
+		if got, getErr := s.GetExternalBinding(ctx, "slock", "during-recovery"); getErr != nil || got == nil {
+			t.Fatalf("binding written after the recovery is not readable: %v, %v", got, getErr)
+		}
+	case strings.Contains(err.Error(), "is missing"):
+		// Fail-closed: the recovery had not run yet when the write was admitted.
+	default:
 		t.Fatalf("writer after the recovery: %v", err)
 	}
 	assertPinnedCollationAndIndex(t, db, "tenant_external_bindings", "subject_key", "uk_external_binding_subject")
-	for _, subject := range []string{"before-the-crash", "during-recovery"} {
-		if got, err := s.GetExternalBinding(ctx, "slock", subject); err != nil || got == nil {
-			t.Fatalf("binding %q: %v, %v", subject, got, err)
-		}
+	if got, err := s.GetExternalBinding(ctx, "slock", "before-the-crash"); err != nil || got == nil {
+		t.Fatalf("pre-crash binding: %v, %v", got, err)
+	}
+	// With the index back, a write is admitted again.
+	if err := s.InsertExternalBinding(ctx, &ExternalBinding{
+		Provider: "slock", SubjectKey: "after-recovery", TenantID: "t", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("insert after the recovery: %v", err)
 	}
 }
 

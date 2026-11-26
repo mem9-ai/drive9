@@ -77,7 +77,16 @@ func metaPinnedCollationTargets(spec metaSchemaSpec) []metaCollationTarget {
 // It is also resumable: TiDB commits each DDL statement on its own, so a run
 // interrupted between the drop, the modify and the recreate leaves a column that is
 // already binary with a missing index. The index restore therefore does not depend
-// on the collation branch.
+// on the collation branch, and it runs under the same gate as the conversion.
+//
+// Rollout: the gate is what makes this build's writers safe, and an insert also
+// refuses to run while the index is missing, so a failed recovery cannot be written
+// into. A pod running a build from before the gate cannot be held back by it, so the
+// conversion must not run while such pods serve traffic — either they are drained
+// first, or the migration runs after the last of them is gone. What an old pod can
+// do meanwhile is the behaviour this migration is replacing (a case-insensitive
+// lookup on the column it has not converted yet); it cannot lower a converted
+// column, and its writes can only make the recreate fail, which is fail-closed.
 func ensurePinnedCollations(ctx context.Context, db *sql.DB, spec metaSchemaSpec) error {
 	for _, target := range metaPinnedCollationTargets(spec) {
 		needsSync, err := metaPinnedCollationNeedsSync(ctx, db, target)

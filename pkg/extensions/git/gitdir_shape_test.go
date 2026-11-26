@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mem9-ai/drive9/internal/testbackend"
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -338,15 +339,14 @@ func TestCheckLinkedRestoreTargetRejectsCommonChange(t *testing.T) {
 
 	commonGitDir := g.gitDirFor("/repo")
 	gitDir := filepath.Join(commonGitDir, "worktrees", "wt")
-	if err := g.checkLinkedRestoreTarget(linkedWS, commonGitDir, gitDir); err != nil {
+	if err := g.checkLinkedRestoreTarget("linked", "main", "worktrees/wt", "wt", commonGitDir, gitDir); err != nil {
 		t.Fatalf("unchanged workspace was refused: %v", err)
 	}
 
 	// A reload moves the workspace onto another common repository.
-	linkedWS.setLinkedMeta("linked", "main-2", "worktrees/wt", "wt")
 	mainWS2 := &workspace{id: "main-2", root: "/repo-2", workspaceKind: "main"}
 	g.workspaces = append(g.workspaces, mainWS2)
-	err := g.checkLinkedRestoreTarget(linkedWS, commonGitDir, gitDir)
+	err := g.checkLinkedRestoreTarget("linked", "main-2", "worktrees/wt", "wt", commonGitDir, gitDir)
 	if err == nil {
 		t.Fatal("common repository change during restore was accepted")
 	}
@@ -355,10 +355,97 @@ func TestCheckLinkedRestoreTargetRejectsCommonChange(t *testing.T) {
 	}
 
 	// The common workspace disappearing is refused the same way.
-	g.workspaces = []*workspace{mainWS, linkedWS}
-	linkedWS.setLinkedMeta("linked", "gone", "worktrees/wt", "wt")
-	if err := g.checkLinkedRestoreTarget(linkedWS, commonGitDir, gitDir); err == nil {
+	if err := g.checkLinkedRestoreTarget("linked", "gone", "worktrees/wt", "wt", commonGitDir, gitDir); err == nil {
 		t.Fatal("missing common workspace was accepted")
+	}
+}
+
+// The check and the swap have to be one frozen step: a reload that lands between
+// them would change what the swap deletes. The mechanism is asserted directly —
+// while the linked identity is frozen, a reload waits.
+func TestWorkspaceIdentityIsFrozenForTheSwap(t *testing.T) {
+	linkedWS := &workspace{
+		id: "linked", root: "/repo/wt",
+		workspaceKind: "linked", commonID: "main", gitDirRel: "worktrees/wt", worktreeName: "wt",
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	frozen := make(chan struct{})
+	go func() {
+		defer close(frozen)
+		_ = linkedWS.withFrozenLinkedTarget(func(_, _, _ string) error {
+			close(started)
+			<-release
+			return nil
+		})
+	}()
+	<-started
+
+	reloaded := make(chan struct{})
+	go func() {
+		linkedWS.setLinkedMeta("linked", "main", "worktrees/other", "other")
+		close(reloaded)
+	}()
+	select {
+	case <-reloaded:
+		t.Fatal("a reload applied its linked identity while the swap section was frozen")
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(release)
+	<-frozen
+	select {
+	case <-reloaded:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the reload never applied after the frozen section ended")
+	}
+	if got := linkedWS.gitDirRelPath(); got != "worktrees/other" {
+		t.Fatalf("reload did not apply after the swap section: %q", got)
+	}
+}
+
+// An unchanged workspace swaps the prepared directory in.
+func TestSwapLinkedGitDirReplacesTheAdminDir(t *testing.T) {
+	localRoot := t.TempDir()
+	g := &Git{localRoot: localRoot}
+	mainWS := &workspace{id: "main", root: "/repo", workspaceKind: "main"}
+	linkedWS := &workspace{
+		id: "linked", root: "/repo/wt",
+		workspaceKind: "linked", commonID: "main", gitDirRel: "worktrees/wt", worktreeName: "wt",
+	}
+	g.workspaces = []*workspace{mainWS, linkedWS}
+	commonGitDir := g.gitDirFor("/repo")
+	gitDir := filepath.Join(commonGitDir, "worktrees", "wt")
+	if err := os.MkdirAll(gitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "stale"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prepared := filepath.Join(t.TempDir(), "prepared")
+	if err := os.MkdirAll(prepared, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(prepared, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := g.swapLinkedGitDir(linkedWS, commonGitDir, gitDir, prepared); err != nil {
+		t.Fatalf("swap: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(gitDir, "HEAD")); err != nil {
+		t.Fatalf("prepared directory was not swapped in: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(gitDir, "stale")); !os.IsNotExist(err) {
+		t.Fatalf("the previous admin directory survived the swap (stat err = %v)", err)
+	}
+	// The linked root's .git pointer now names the admin directory.
+	pointer, err := os.ReadFile(filepath.Join(localRoot, "overlay", "repo", "wt", ".git"))
+	if err != nil {
+		t.Fatalf("read worktree pointer: %v", err)
+	}
+	if !strings.Contains(string(pointer), gitDir) {
+		t.Fatalf("worktree pointer = %q, want it to name %q", pointer, gitDir)
 	}
 }
 

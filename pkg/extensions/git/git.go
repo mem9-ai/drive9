@@ -185,6 +185,16 @@ func (w *workspace) worktreeAdminName() string {
 	return w.worktreeName
 }
 
+// withFrozenLinkedTarget runs fn while holding the write lock, so a reload cannot
+// change the linked identity in the middle of it. The restore validates the target
+// and swaps it in inside one frozen section: a reload between the two would
+// otherwise let the check approve a target the swap does not write.
+func (w *workspace) withFrozenLinkedTarget(fn func(commonID, gitDirRel, worktreeName string) error) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return fn(w.commonID, w.gitDirRel, w.worktreeName)
+}
+
 func (w *workspace) commonWorkspaceID() string {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
