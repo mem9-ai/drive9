@@ -2170,16 +2170,6 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 		}
 		savedOpen = f.openIdx.SnapshotPath(child)
 		f.openIdx.UnlinkPath(child)
-		for _, h := range f.chain.Handlers() {
-			if survivor != "" {
-				if rt, ok := h.(interface{ RetargetPath(string, string) }); ok {
-					rt.RetargetPath(child, survivor)
-				}
-			}
-			if mark, ok := h.(interface{ MarkPathUnlinked(string) }); ok {
-				mark.MarkPathUnlinked(child)
-			}
-		}
 		pending.mu.Lock()
 		f.inodes.RemoveLinkPreserve(child)
 		if iok {
@@ -2210,6 +2200,16 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 				}
 				pending.mu.Unlock()
 				return fs.StatusOf(err)
+			}
+		}
+		for _, h := range f.chain.Handlers() {
+			if survivor != "" {
+				if rt, ok := h.(interface{ RetargetPath(string, string) }); ok {
+					rt.RetargetPath(child, survivor)
+				}
+			}
+			if mark, ok := h.(interface{ MarkPathUnlinked(string) }); ok {
+				mark.MarkPathUnlinked(child)
 			}
 		}
 		f.markNameNegative(child)

@@ -2,8 +2,13 @@ package fuse
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -665,5 +670,199 @@ func TestRestoreUnlinkedPathSkipsConcurrentlyRemovedHandle(t *testing.T) {
 	idx.Remove(h2)
 	if idx.HasOpenPath("/held") || idx.HasOpenInode(42) {
 		t.Fatal("leaked closed handle in OpenHandleIndex after rollback")
+	}
+}
+
+type spyRetargetHandler struct {
+	fs.HandlerFunc
+	retargets int
+	marks     int
+}
+
+func (s *spyRetargetHandler) RetargetPath(string, string) { s.retargets++ }
+func (s *spyRetargetHandler) MarkPathUnlinked(string)     { s.marks++ }
+
+// TestOpenUnlinkPersistFailureRollsBackAndAllowsContinuedWrite exercises a
+// real FUSE Phase 3 failure where both WAL JournalUnlink and fallback shadow
+// removal fail: FS.Unlink must fail, roll back all Phase 2 in-memory state
+// (inodes, openIdx, deferredUnlinks, handle unlinked flag) without invoking
+// RetargetPath/MarkPathUnlinked, preserve Pending + staged bytes for reads,
+// and allow continued writes + remote landing after the fault is repaired.
+func TestOpenUnlinkPersistFailureRollsBackAndAllowsContinuedWrite(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("chmod read-only shadow dir does not block root")
+	}
+	for _, withHardlink := range []bool{false, true} {
+		name := "single_link"
+		if withHardlink {
+			name = "hardlink_survivor"
+		}
+		t.Run(name, func(t *testing.T) {
+			b := testbackend.NewBackend()
+			b.Seed("/held", []byte("orig"))
+			var holdPut atomic.Bool
+			holdPut.Store(true)
+			putStarted := make(chan struct{}, 4)
+			release := make(chan struct{})
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/held") && holdPut.Load() && (r.Method == http.MethodPut || r.Method == http.MethodPost) {
+					select {
+					case putStarted <- struct{}{}:
+					default:
+					}
+					select {
+					case <-r.Context().Done():
+						http.Error(w, "canceled", http.StatusRequestTimeout)
+						return
+					case <-release:
+					}
+				}
+				b.ServeHTTP(w, r)
+			}))
+			t.Cleanup(func() {
+				holdPut.Store(false)
+				close(release)
+				srv.Close()
+			})
+
+			cl := client.New(srv.URL, "")
+			cl.SetSmallFileThresholdForTests(1 << 20)
+			dir := t.TempDir()
+			ledger, err := staging.NewStaging(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wb, err := writeback.New(writeback.Options{
+				Policy:                  writeback.PolicyWriteBack,
+				SyncMode:                "interactive",
+				Client:                  cl,
+				Staging:                 ledger,
+				RemoteCommitWaitTimeout: 200 * time.Millisecond,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+			terminal, err := core.New(cl, core.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			spy := &spyRetargetHandler{
+				HandlerFunc: func(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
+					return next(ctx, op)
+				},
+			}
+			f, err := New(Options{Extensions: []fs.Handler{wb, spy, terminal}, DefaultPermissions: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			heldIno := lookupFacade(t, f, "held")
+			header := gofuse.InHeader{NodeId: heldIno}
+			var openOut gofuse.OpenOut
+			if st := f.Open(nil, &gofuse.OpenIn{InHeader: header, Flags: syscall.O_RDWR}, &openOut); st != gofuse.OK {
+				t.Fatalf("open: %v", st)
+			}
+			if withHardlink {
+				if !f.inodes.AddAlias(heldIno, "/survivor", "", 2, false, 0, time.Now()) {
+					t.Fatal("failed adding /survivor alias")
+				}
+			}
+			v1 := []byte("persisted-v1")
+			if n, st := f.Write(nil, &gofuse.WriteIn{InHeader: header, Fh: openOut.Fh}, v1); n != uint32(len(v1)) || st != gofuse.OK {
+				t.Fatalf("write v1: %d %v", n, st)
+			}
+			if st := f.Fsync(nil, &gofuse.FsyncIn{InHeader: header, Fh: openOut.Fh}); st != gofuse.OK {
+				t.Fatalf("fsync v1: %v", st)
+			}
+			select {
+			case <-putStarted:
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for background commit upload to start")
+			}
+
+			// Break WAL + make shadow directory read-only so Phase 3 fails.
+			if err := ledger.Journal.Close(); err != nil {
+				t.Fatalf("close journal: %v", err)
+			}
+			shadowDir := filepath.Join(dir, "shadow")
+			if err := os.Chmod(shadowDir, 0o500); err != nil {
+				t.Fatalf("chmod shadow dir: %v", err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(shadowDir, 0o700) })
+
+			if st := f.Unlink(nil, rootHeader(), "held"); st == gofuse.OK {
+				t.Fatal("expected FS.Unlink to fail when WAL and shadow removal both fail")
+			}
+
+			// Verify full Phase 2 rollback and zero stray RetargetPath/MarkPathUnlinked calls.
+			if spy.retargets != 0 || spy.marks != 0 {
+				t.Fatalf("failed Phase 3 unlink invoked retarget=%d mark=%d, want 0/0", spy.retargets, spy.marks)
+			}
+			if !f.openIdx.HasOpenPath("/held") || f.isDeferredUnlink("/held") {
+				t.Fatal("failed Phase 3 unlink left openIdx or deferredUnlinks corrupted")
+			}
+			if id, ok := f.inodes.GetInode("/held"); !ok || id != heldIno {
+				t.Fatalf("inode mapping for /held lost after rollback: ok=%v id=%d", ok, id)
+			}
+			if withHardlink {
+				if id, ok := f.inodes.GetInode("/survivor"); !ok || id != heldIno {
+					t.Fatalf("survivor mapping lost after rollback: ok=%v id=%d", ok, id)
+				}
+			}
+			if !ledger.Pending.HasPending("/held") {
+				t.Fatal("failed Phase 3 unlink dropped Pending entry")
+			}
+			buf := make([]byte, len(v1))
+			res, st := f.Read(nil, &gofuse.ReadIn{InHeader: header, Fh: openOut.Fh, Size: uint32(len(v1))}, buf)
+			if st != gofuse.OK {
+				t.Fatalf("read after failed unlink: %v", st)
+			}
+			got, _ := res.Bytes(buf)
+			if string(got) != string(v1) {
+				t.Fatalf("read after failed unlink = %q, want %q", string(got), string(v1))
+			}
+
+			// Repair shadow permissions and lift PUT hold: the re-driven upload
+			// of v1 must land remotely (failed unlink did not strand it), and
+			// continued writes/reads on the same open handle must still work.
+			if err := os.Chmod(shadowDir, 0o700); err != nil {
+				t.Fatalf("restore shadow dir: %v", err)
+			}
+			holdPut.Store(false)
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				if node, ok := b.Node("/held"); ok && string(node.Data) == string(v1) {
+					break
+				}
+				if time.Now().After(deadline) {
+					node, _ := b.Node("/held")
+					t.Fatalf("timed out waiting for re-driven v1 upload on /held; last backend bytes=%q", string(node.Data))
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			v2 := []byte("persisted-v2!")
+			if n, st := f.Write(nil, &gofuse.WriteIn{InHeader: header, Fh: openOut.Fh}, v2); n != uint32(len(v2)) || st != gofuse.OK {
+				t.Fatalf("write v2 after rollback: %d %v", n, st)
+			}
+			buf2 := make([]byte, len(v2))
+			res2, st := f.Read(nil, &gofuse.ReadIn{InHeader: header, Fh: openOut.Fh, Size: uint32(len(v2))}, buf2)
+			if st != gofuse.OK {
+				t.Fatalf("read v2 after rollback: %v", st)
+			}
+			got2, _ := res2.Bytes(buf2)
+			if string(got2) != string(v2) {
+				t.Fatalf("read v2 after rollback = %q, want %q", string(got2), string(v2))
+			}
+			f.Release(nil, &gofuse.ReleaseIn{InHeader: header, Fh: openOut.Fh})
+			// Release of the handle must not trigger a stray deferred unlink on remote.
+			if node, ok := b.Node("/held"); !ok || string(node.Data) != string(v1) {
+				t.Fatalf("after release, remote /held missing or corrupted: ok=%v data=%q", ok, string(node.Data))
+			}
+			var lookupOut gofuse.EntryOut
+			if st := f.Lookup(nil, rootHeader(), "held", &lookupOut); st != gofuse.OK {
+				t.Fatalf("lookup /held after release: %v", st)
+			}
+		})
 	}
 }
