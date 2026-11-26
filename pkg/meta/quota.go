@@ -477,7 +477,9 @@ func (s *Store) AcquireTiDBCloudFreeQuotaLock(ctx context.Context, organizationI
 	})
 	if err != nil {
 		// A lock this call cannot get is busy, not broken: the caller retries later.
-		if strings.Contains(err.Error(), "timed out waiting") {
+		// The helper reports the timeout through a sentinel, so a rewording of its
+		// message cannot turn "busy" into a hard failure.
+		if errors.Is(err, errMetaNamedLockBusy) {
 			return nil, ErrTiDBCloudFreeQuotaBusy
 		}
 		return nil, err

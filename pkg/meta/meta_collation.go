@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	mysql "github.com/go-sql-driver/mysql"
 )
 
 // metaCollationTarget is one column whose comparison the schema contract pins to
@@ -31,7 +33,7 @@ type metaCollationIndex struct {
 
 // metaPinnedCollationTargets derives the pinned columns and their indexes from the
 // parsed schema contract. Deriving instead of listing them by hand is what keeps
-// the DDL, the migration and the repair allow-list from disagreeing: a stale
+// the DDL, the migration and the insert's index check from disagreeing: a stale
 // hand-written definition would rewrite the column on every boot.
 func metaPinnedCollationTargets(spec metaSchemaSpec) []metaCollationTarget {
 	var targets []metaCollationTarget
@@ -67,6 +69,24 @@ func metaPinnedCollationTargets(spec metaSchemaSpec) []metaCollationTarget {
 	return targets
 }
 
+// metaPinnedIndex returns the contract's declaration of one index on a table that has
+// a pinned column. Callers that have to check an index — the insert's fail-closed
+// check — take it from here instead of restating the columns by hand, so the check and
+// the CREATE TABLE cannot disagree.
+func metaPinnedIndex(spec metaSchemaSpec, table, indexName string) (metaCollationIndex, bool) {
+	for _, target := range metaPinnedCollationTargets(spec) {
+		if target.table != table {
+			continue
+		}
+		for _, index := range target.indexes {
+			if index.name == indexName {
+				return index, true
+			}
+		}
+	}
+	return metaCollationIndex{}, false
+}
+
 // ensurePinnedCollations converts an existing control plane to the collations the
 // contract declares. A case-insensitive collation on an OAuth subject column makes
 // the lookup treat "SUBJ" and "subj" as one identity, which hands the caller
@@ -74,8 +94,8 @@ func metaPinnedCollationTargets(spec metaSchemaSpec) []metaCollationTarget {
 // TABLE and this is the migration for the rest.
 //
 // It runs before diffMetaSchema, because TiDB refuses MODIFY COLUMN … COLLATE while
-// an index covers the column (error 8200) and would fail the repair the planner
-// would otherwise issue for the mismatch it is about to observe.
+// an index covers the column (error 8200) and the diff reports that mismatch without
+// a repair statement, so nothing else would convert it.
 //
 // It is also resumable: TiDB commits each DDL statement on its own, so a run
 // interrupted between the drop, the modify and the recreate leaves a column that is
@@ -218,6 +238,8 @@ func syncPinnedCollation(ctx context.Context, q metaQueryer, target metaCollatio
 // covers the column, and only then does the migration look at what covers it. An index
 // the contract does not declare is reported instead of dropped — dropping the contract's
 // own indexes first and then failing the retry would leave the table worse than it was.
+// That refusal is a TiDB behaviour: MySQL 8.4 converts the column with the undeclared
+// index still in place, so there is nothing to report there.
 func pinColumnCollation(ctx context.Context, q metaQueryer, target metaCollationTarget, present, wrongShape map[string]bool) error {
 	_, err := q.ExecContext(ctx, target.modifySQL)
 	if err == nil {
@@ -275,8 +297,10 @@ func pinColumnCollation(ctx context.Context, q metaQueryer, target metaCollation
 		}
 	}
 	// The indexes are restored whatever happened: leaving the table without them would be
-	// a worse state than the one this migration found. The restore runs on a context a
-	// cancelled caller cannot shorten, or an expired attempt would abandon a dropped index.
+	// a worse state than the one this migration found. The restore runs on a context
+	// nothing cancels: the migration runs on its own context now, but the restore must
+	// still finish the repair it started if a caller ever passes a cancellable one, or an
+	// expired attempt would abandon a dropped index.
 	restoreCtx := context.WithoutCancel(ctx)
 	var restoreErr error
 	for _, index := range dropped {
@@ -288,13 +312,9 @@ func pinColumnCollation(ctx context.Context, q metaQueryer, target metaCollation
 		}
 		present[index.name] = true
 	}
-	if dropErr != nil {
-		return dropErr
-	}
-	if modifyErr != nil {
-		return modifyErr
-	}
-	return restoreErr
+	// A failed restore is part of the outcome: the next start recovers the index, but the
+	// error this run returns has to say that the table is missing one.
+	return errors.Join(dropErr, modifyErr, restoreErr)
 }
 
 // restoreMetaCollationIndex recreates one index the contract requires. A unique
@@ -323,9 +343,18 @@ func restoreMetaCollationIndex(ctx context.Context, q metaQueryer, target metaCo
 
 // metaCollationRefusedOverIndex reports the TiDB refusal to change a column's
 // collation while an index covers it (error 8200). MySQL accepts the same
-// statement, so the drop is only a TiDB requirement.
+// statement, so the drop is only a TiDB requirement. The error number is checked
+// first; the message match covers a driver that wraps the server error without
+// keeping the number.
 func metaCollationRefusedOverIndex(err error) bool {
-	return err != nil && strings.Contains(strings.ToLower(err.Error()), "unsupported modifying collation")
+	if err == nil {
+		return false
+	}
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) {
+		return mysqlErr.Number == 8200
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "unsupported modifying collation")
 }
 
 // metaColumnCollation reports whether the column exists and, when it does, the

@@ -384,6 +384,233 @@ func TestGatedCallbackEndsWhenItsContextIsCanceled(t *testing.T) {
 	}
 }
 
+// Every callback lock has to free its advisory lock when the callback panics. The
+// panic propagates out of the helper, but a lock left on a session would make every
+// later writer and migration wait for it. Each case probes the lock through its own
+// API with a short deadline: a still-held lock is a timeout, not silence.
+func TestCallbackLocksReleaseOnPanic(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	probeCtx, cancelProbe := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelProbe()
+	noop := func(context.Context) error { return nil }
+
+	// panicsRecovered runs fn, which must panic, and reports the recovered value.
+	panicsRecovered := func(t *testing.T, fn func()) any {
+		t.Helper()
+		var recovered any
+		func() {
+			defer func() { recovered = recover() }()
+			fn()
+		}()
+		if recovered == nil {
+			t.Fatal("the panicking callback did not propagate")
+		}
+		return recovered
+	}
+
+	cases := []struct {
+		name   string
+		panics func()
+		probe  func(context.Context) error
+	}{
+		{
+			name: "external binding schema gate",
+			panics: func() {
+				_ = withExternalBindingSchemaLock(ctx, s.DB(), func(context.Context, *sql.Conn) error {
+					panic("schema gate panic")
+				})
+			},
+			probe: func(ctx context.Context) error {
+				return withExternalBindingSchemaLock(ctx, s.DB(), func(context.Context, *sql.Conn) error {
+					return nil
+				})
+			},
+		},
+		{
+			name: "external binding subject",
+			panics: func() {
+				_ = s.WithExternalBindingLock(ctx, "slock", "panic-subject", func(context.Context) error {
+					panic("subject lock panic")
+				})
+			},
+			probe: func(ctx context.Context) error {
+				return s.WithExternalBindingLock(ctx, "slock", "panic-subject", noop)
+			},
+		},
+		{
+			name: "tidbcloud org binding",
+			panics: func() {
+				_ = s.withTiDBCloudOrgBindingLock(ctx, "org", "cluster", "branch", func(context.Context, metaQueryExecer) error {
+					panic("org binding lock panic")
+				})
+			},
+			probe: func(ctx context.Context) error {
+				return s.withTiDBCloudOrgBindingLock(ctx, "org", "cluster", "branch", func(context.Context, metaQueryExecer) error {
+					return nil
+				})
+			},
+		},
+		{
+			name: "tenant pool",
+			panics: func() {
+				_ = s.WithTenantPoolLock(ctx, "panic-pool", func(context.Context) error {
+					panic("tenant pool lock panic")
+				})
+			},
+			probe: func(ctx context.Context) error {
+				return s.WithTenantPoolLock(ctx, "panic-pool", noop)
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			panicsRecovered(t, tc.panics)
+			if err := tc.probe(probeCtx); err != nil {
+				t.Fatalf("the lock was not released after a panicking callback: %v", err)
+			}
+		})
+	}
+}
+
+// A release that cannot be confirmed must not put the session back in the pool with
+// the advisory lock still held: the session is discarded, which is what frees the
+// lock. The failure here leaves the session alive on purpose — a killed session
+// proves nothing, because closing it is what released the lock.
+func TestNamedLockReleaseDiscardsAnUnconfirmedSession(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spec := metaNamedLockSpec{
+		name:           "d9_test_unconfirmed_release",
+		databaseScoped: true,
+		timeoutSeconds: 5,
+		releaseTimeout: 2 * time.Second,
+	}
+	lock, err := acquireMetaNamedLock(ctx, s.DB(), spec)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	mid := s.DB().Stats()
+	if mid.InUse != 1 {
+		t.Fatalf("in-use connections while the lock is held = %d, want 1", mid.InUse)
+	}
+	// RELEASE_LOCK reports nothing usable while the session stays alive: that is an
+	// unconfirmed release, and the helper must not trust it.
+	lock.releaseSQL = "SELECT NULL"
+	lock.releaseArgs = nil
+	if err := lock.release(); err == nil {
+		t.Fatal("an unconfirmed release reported success")
+	}
+	// The session must be discarded, not pooled: a pooled session still holds the
+	// advisory lock, and every later acquisition would wait for it. The accounting is
+	// what distinguishes the two, because a discarded session is closed and a pooled
+	// one becomes idle. A re-acquisition cannot tell them apart — the pool hands the
+	// same session back, and GET_LOCK succeeds there.
+	after := s.DB().Stats()
+	if after.InUse != 0 {
+		t.Fatalf("in-use connections after the release = %d, want 0", after.InUse)
+	}
+	if after.OpenConnections != mid.OpenConnections-1 || after.Idle != mid.Idle {
+		t.Fatalf("connection accounting after an unconfirmed release: open %d -> %d, idle %d -> %d; want the session discarded",
+			mid.OpenConnections, after.OpenConnections, mid.Idle, after.Idle)
+	}
+}
+
+// The conversion runs under the same gate binding writers take. The test pins the
+// gate call itself: while this test holds the gate, the conversion's connection is
+// visible in the process list waiting for the lock, and the conversion finishes only
+// after the gate is released. Without the gate there is no waiting statement to find
+// and the conversion is already done, so the poll below fails instead of passing on
+// a silence measurement.
+func TestMigrationConvertsUnderTheSchemaGate(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	db := s.DB()
+	dropIndex(t, db, "tenant_external_bindings", "uk_external_binding_subject")
+	if _, err := db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings MODIFY COLUMN subject_key VARCHAR(512) COLLATE utf8mb4_general_ci NOT NULL"); err != nil {
+		t.Fatalf("downgrade the column: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings ADD UNIQUE INDEX uk_external_binding_subject (provider, subject_key)"); err != nil {
+		t.Fatalf("restore the unique index: %v", err)
+	}
+
+	holding := make(chan int64, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	holderDone := make(chan struct{})
+	go func() {
+		defer close(holderDone)
+		_ = s.WithExternalBindingSchemaLock(ctx, func(lockCtx context.Context, conn *sql.Conn) error {
+			var id int64
+			if err := conn.QueryRowContext(lockCtx, "SELECT CONNECTION_ID()").Scan(&id); err != nil {
+				return err
+			}
+			holding <- id
+			<-release
+			return nil
+		})
+	}()
+	t.Cleanup(func() {
+		closeRelease()
+		select {
+		case <-holderDone:
+		case <-time.After(30 * time.Second):
+			t.Errorf("the gate holder did not exit")
+		}
+	})
+	var holderID int64
+	select {
+	case holderID = <-holding:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the gate was never acquired")
+	}
+
+	workerCtx, cancelWorker := context.WithTimeout(ctx, 60*time.Second)
+	spec := mustMetaSpec(t)
+	converted := make(chan error, 1)
+	go func() { converted <- ensurePinnedCollations(workerCtx, db, spec) }()
+	t.Cleanup(cancelWorker)
+
+	// Positive evidence that the conversion is waiting for the gate: a statement in
+	// the process list on a connection that is not the holder's, waiting on GET_LOCK.
+	// Nothing else in this test takes a named lock.
+	pollCtx, stopPoll := context.WithTimeout(ctx, 20*time.Second)
+	defer stopPoll()
+	waited := false
+	for {
+		var n int
+		err := db.QueryRowContext(pollCtx, `SELECT COUNT(*) FROM information_schema.processlist
+			WHERE id <> ? AND info LIKE ?`, holderID, "SELECT GET_LOCK%").Scan(&n)
+		if err != nil && pollCtx.Err() != nil {
+			t.Fatalf("no connection waited for the gate, so the conversion did not take it: %v", err)
+		}
+		if err == nil && n > 0 {
+			waited = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !waited {
+		t.Fatal("the conversion never waited for the schema gate")
+	}
+	select {
+	case err := <-converted:
+		t.Fatalf("the conversion finished while the gate was held (err = %v)", err)
+	default:
+	}
+	closeRelease()
+	select {
+	case err := <-converted:
+		if err != nil {
+			t.Fatalf("convert under the gate: %v", err)
+		}
+	case <-time.After(45 * time.Second):
+		t.Fatal("the conversion never finished after the gate was released")
+	}
+	assertPinnedCollationAndIndex(t, db, "tenant_external_bindings", "subject_key", "uk_external_binding_subject")
+}
+
 // A run that crashed after dropping the index leaves it missing; the recovery runs
 // under the same gate binding writers take, so a writer that arrives while the
 // index is absent waits for the repair instead of inserting into the gap.
@@ -598,8 +825,10 @@ func TestPinnedCollationLeavesADriftedColumnTypeAlone(t *testing.T) {
 	}
 }
 
-// An index the contract does not declare also blocks TiDB's collation change, so it
-// has to be reported before the contract's own indexes are dropped.
+// TiDB refuses the collation change while an index the contract does not declare
+// covers the column, so the migration reports that index before dropping the
+// contract's own. MySQL 8.4 accepts the change with the extra index in place; there
+// the conversion is expected to go through and the index to be left alone.
 func TestPinnedCollationReportsAnExtraCoveringIndex(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
@@ -623,17 +852,29 @@ func TestPinnedCollationReportsAnExtraCoveringIndex(t *testing.T) {
 		}
 	}
 
-	_, err := Open(testDSN)
-	if err == nil {
-		t.Fatal("the migration converted a column covered by an undeclared index")
+	reopened, err := Open(testDSN)
+	if err != nil {
+		// TiDB: the change was refused and the undeclared index is what the
+		// migration reports. Nothing may have been touched on the way there.
+		if !strings.Contains(err.Error(), "idx_extra_subject") {
+			t.Fatalf("migration error = %v, want it to name the extra index", err)
+		}
+		if got := collationAndIndexState(t, db, "tenant_external_bindings", "subject_key", "uk_external_binding_subject"); got != "collation=utf8mb4_general_ci indexed=true" {
+			t.Fatalf("state = %q, want the column untouched and the contract index still present", got)
+		}
+		return
 	}
-	if !strings.Contains(err.Error(), "idx_extra_subject") {
-		t.Fatalf("migration error = %v, want it to name the extra index", err)
+	// MySQL: the change was accepted with the extra index covering the column, so
+	// the conversion is expected and the extra index stays.
+	t.Cleanup(func() { _ = reopened.Close() })
+	assertPinnedCollationAndIndex(t, reopened.DB(), "tenant_external_bindings", "subject_key", "uk_external_binding_subject")
+	var extra int
+	if err := reopened.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.statistics
+		WHERE table_schema = DATABASE() AND table_name = 'tenant_external_bindings' AND index_name = 'idx_extra_subject'`).Scan(&extra); err != nil {
+		t.Fatal(err)
 	}
-	// The contract's own index was not dropped on the way to that error, and the
-	// column was not converted either.
-	if got := collationAndIndexState(t, db, "tenant_external_bindings", "subject_key", "uk_external_binding_subject"); got != "collation=utf8mb4_general_ci indexed=true" {
-		t.Fatalf("state = %q, want the column untouched and the contract index still present", got)
+	if extra == 0 {
+		t.Fatal("the undeclared index was dropped on an engine that did not have to drop it")
 	}
 }
 
