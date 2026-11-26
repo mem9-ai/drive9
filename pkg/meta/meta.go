@@ -2791,9 +2791,10 @@ func withExternalBindingSchemaLock(ctx context.Context, db *sql.DB, fn func(cont
 
 // withMetaNamedLock takes one advisory lock, runs fn on the connection that holds
 // it, and always gives the lock back. The release is deferred inside this one
-// function, so a callback that panics still releases the lock and no caller can
-// forget it: an outer recover used to leave the advisory lock on a pooled
-// connection, and every later writer and migration waited for it.
+// function, so a callback that panics still releases the lock and no call site can
+// forget it. Every lock that used to spell the acquire/release pair out itself did
+// this by hand; one of them ran the release after the callback instead, which left
+// the lock on a pooled session for the rest of the process's life.
 //
 // A release that cannot be confirmed is reported the way every caller wants it: a
 // successful callback is not turned into a failure (the caller would roll back work

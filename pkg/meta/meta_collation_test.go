@@ -391,9 +391,6 @@ func TestGatedCallbackEndsWhenItsContextIsCanceled(t *testing.T) {
 func TestCallbackLocksReleaseOnPanic(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
-	probeCtx, cancelProbe := context.WithTimeout(ctx, 5*time.Second)
-	defer cancelProbe()
-	noop := func(context.Context) error { return nil }
 
 	// panicsRecovered runs fn, which must panic, and reports the recovered value.
 	panicsRecovered := func(t *testing.T, fn func()) any {
@@ -408,23 +405,36 @@ func TestCallbackLocksReleaseOnPanic(t *testing.T) {
 		}
 		return recovered
 	}
-
+	databaseName := func(t *testing.T, db *sql.DB) string {
+		t.Helper()
+		var name sql.NullString
+		if err := db.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		return name.String
+	}
+	// Every lock is probed on a pool of its own: the store's pool may hand back the
+	// session that took the lock, and GET_LOCK on that session succeeds whether or not
+	// the lock was released.
 	cases := []struct {
 		name   string
 		panics func()
-		probe  func(context.Context) error
+		spec   func(t *testing.T, db *sql.DB) metaNamedLockSpec
 	}{
 		{
 			name: "external binding schema gate",
 			panics: func() {
-				_ = withExternalBindingSchemaLock(ctx, s.DB(), func(context.Context, *sql.Conn) error {
+				_ = s.WithExternalBindingSchemaLock(ctx, func(context.Context, *sql.Conn) error {
 					panic("schema gate panic")
 				})
 			},
-			probe: func(ctx context.Context) error {
-				return withExternalBindingSchemaLock(ctx, s.DB(), func(context.Context, *sql.Conn) error {
-					return nil
-				})
+			spec: func(*testing.T, *sql.DB) metaNamedLockSpec {
+				return metaNamedLockSpec{
+					name:           externalBindingSchemaLockName,
+					databaseScoped: true,
+					timeoutSeconds: 5,
+					releaseTimeout: 2 * time.Second,
+				}
 			},
 		},
 		{
@@ -434,8 +444,13 @@ func TestCallbackLocksReleaseOnPanic(t *testing.T) {
 					panic("subject lock panic")
 				})
 			},
-			probe: func(ctx context.Context) error {
-				return s.WithExternalBindingLock(ctx, "slock", "panic-subject", noop)
+			spec: func(*testing.T, *sql.DB) metaNamedLockSpec {
+				return metaNamedLockSpec{
+					name:           externalBindingLockName("slock", "panic-subject"),
+					databaseScoped: true,
+					timeoutSeconds: 5,
+					releaseTimeout: 2 * time.Second,
+				}
 			},
 		},
 		{
@@ -445,10 +460,14 @@ func TestCallbackLocksReleaseOnPanic(t *testing.T) {
 					panic("org binding lock panic")
 				})
 			},
-			probe: func(ctx context.Context) error {
-				return s.withTiDBCloudOrgBindingLock(ctx, "org", "cluster", "branch", func(context.Context, metaQueryExecer) error {
-					return nil
-				})
+			spec: func(t *testing.T, db *sql.DB) metaNamedLockSpec {
+				return metaNamedLockSpec{
+					name: tenantPoolDatabaseLockName(
+						tidbCloudOrgBindingLockName("org", "cluster", "branch"), databaseName(t, db)),
+					ignorePlanCache: true,
+					timeoutSeconds:  5,
+					releaseTimeout:  2 * time.Second,
+				}
 			},
 		},
 		{
@@ -458,16 +477,32 @@ func TestCallbackLocksReleaseOnPanic(t *testing.T) {
 					panic("tenant pool lock panic")
 				})
 			},
-			probe: func(ctx context.Context) error {
-				return s.WithTenantPoolLock(ctx, "panic-pool", noop)
+			spec: func(t *testing.T, db *sql.DB) metaNamedLockSpec {
+				return metaNamedLockSpec{
+					name:            tenantPoolDatabaseLockName(tenantPoolLockName("panic-pool"), databaseName(t, db)),
+					ignorePlanCache: true,
+					timeoutSeconds:  5,
+					releaseTimeout:  2 * time.Second,
+				}
 			},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			panicsRecovered(t, tc.panics)
-			if err := tc.probe(probeCtx); err != nil {
+			probeDB, err := sql.Open("mysql", testDSN)
+			if err != nil {
+				t.Fatalf("open the probe pool: %v", err)
+			}
+			t.Cleanup(func() { _ = probeDB.Close() })
+			probeCtx, cancelProbe := context.WithTimeout(ctx, 5*time.Second)
+			defer cancelProbe()
+			lock, err := acquireMetaNamedLock(probeCtx, probeDB, tc.spec(t, probeDB))
+			if err != nil {
 				t.Fatalf("the lock was not released after a panicking callback: %v", err)
+			}
+			if err := lock.release(); err != nil {
+				t.Fatalf("release the probe acquisition: %v", err)
 			}
 		})
 	}
@@ -581,7 +616,7 @@ func TestMigrationConvertsUnderTheSchemaGate(t *testing.T) {
 	for {
 		var n int
 		err := db.QueryRowContext(pollCtx, `SELECT COUNT(*) FROM information_schema.processlist
-			WHERE id <> ? AND info LIKE ?`, holderID, "SELECT GET_LOCK%").Scan(&n)
+			WHERE db = DATABASE() AND id <> ? AND info LIKE ?`, holderID, "SELECT GET_LOCK%").Scan(&n)
 		if err != nil && pollCtx.Err() != nil {
 			t.Fatalf("no connection waited for the gate, so the conversion did not take it: %v", err)
 		}
