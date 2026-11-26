@@ -3,6 +3,7 @@ package meta
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -189,41 +190,7 @@ func syncPinnedCollation(ctx context.Context, q metaQueryer, target metaCollatio
 	}
 	typeMatches := strings.EqualFold(normalizeMetaSQLFragment(columnType), normalizeMetaSQLFragment(target.columnType))
 	if typeMatches && !strings.EqualFold(collation, target.collation) {
-		// An index this migration does not know about also blocks TiDB's change, and
-		// dropping only the contract's indexes would leave a retry that cannot
-		// succeed. Report it instead of acting on it.
-		covering, err := metaIndexesCoveringColumn(ctx, q, target.table, target.column)
-		if err != nil {
-			return err
-		}
-		known := make(map[string]bool, len(target.indexes))
-		for _, index := range target.indexes {
-			known[strings.ToLower(index.name)] = true
-		}
-		var extra []string
-		for _, name := range covering {
-			if !known[strings.ToLower(name)] {
-				extra = append(extra, name)
-			}
-		}
-		if len(extra) > 0 {
-			return fmt.Errorf("%s.%s collation is not pinned and the column is covered by index(es) %s that the schema contract does not declare; drop them (renaming keeps them covering the column) so the migration can convert it",
-				target.table, target.column, strings.Join(extra, ", "))
-		}
-		// A covering index the contract does not recognise has to go before the change
-		// as well, or TiDB refuses the MODIFY: a same-named but wrong-shaped index is
-		// in the contract by name, not by shape, so it is neither present nor in the
-		// extra list. It is recreated below as the contract declares it.
-		for _, index := range target.indexes {
-			if !wrongShape[index.name] {
-				continue
-			}
-			if _, err := q.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s DROP INDEX %s", target.table, index.name)); err != nil && !isIgnorableMetaSchemaError(err) {
-				return fmt.Errorf("drop %s.%s before the collation change: %w", target.table, index.name, err)
-			}
-			wrongShape[index.name] = false
-		}
-		if err := pinColumnCollation(ctx, q, target, present); err != nil {
+		if err := pinColumnCollation(ctx, q, target, present, wrongShape); err != nil {
 			return err
 		}
 	}
@@ -246,12 +213,12 @@ func syncPinnedCollation(ctx context.Context, q metaQueryer, target metaCollatio
 	return nil
 }
 
-// pinColumnCollation changes one column's collation. MySQL accepts the MODIFY with
-// the indexes in place, so that is tried first; TiDB refuses it while an index
-// covers the column, so on that error the covering indexes are dropped, the change
-// retried, and the indexes recreated. present is updated with what was dropped, so
-// the caller restores whatever this left out.
-func pinColumnCollation(ctx context.Context, q metaQueryer, target metaCollationTarget, present map[string]bool) error {
+// pinColumnCollation changes one column's collation. The change is tried first, because
+// MySQL accepts it with the covering indexes in place; TiDB refuses it while any index
+// covers the column, and only then does the migration look at what covers it. An index
+// the contract does not declare is reported instead of dropped — dropping the contract's
+// own indexes first and then failing the retry would leave the table worse than it was.
+func pinColumnCollation(ctx context.Context, q metaQueryer, target metaCollationTarget, present, wrongShape map[string]bool) error {
 	_, err := q.ExecContext(ctx, target.modifySQL)
 	if err == nil {
 		return nil
@@ -259,7 +226,36 @@ func pinColumnCollation(ctx context.Context, q metaQueryer, target metaCollation
 	if !metaCollationRefusedOverIndex(err) {
 		return fmt.Errorf("pin %s.%s collation: %w", target.table, target.column, err)
 	}
-	// Drop the covering indexes, retry the change, then put them back.
+	covering, err := metaIndexesCoveringColumn(ctx, q, target.table, target.column)
+	if err != nil {
+		return err
+	}
+	known := make(map[string]bool, len(target.indexes))
+	for _, index := range target.indexes {
+		known[strings.ToLower(index.name)] = true
+	}
+	var extra []string
+	for _, name := range covering {
+		if !known[strings.ToLower(name)] {
+			extra = append(extra, name)
+		}
+	}
+	if len(extra) > 0 {
+		return fmt.Errorf("%s.%s collation is not pinned and the column is covered by index(es) %s that the schema contract does not declare; drop them (renaming keeps them covering the column) so the migration can convert it",
+			target.table, target.column, strings.Join(extra, ", "))
+	}
+	// A same-named but wrong-shaped index is in the contract by name, not by shape, so
+	// it is neither present nor "extra"; it still blocks the change. It is dropped here
+	// and recreated below as the contract declares it.
+	for name := range wrongShape {
+		if !wrongShape[name] {
+			continue
+		}
+		if _, err := q.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s DROP INDEX %s", target.table, name)); err != nil && !isIgnorableMetaSchemaError(err) {
+			return fmt.Errorf("drop %s.%s before the collation change: %w", target.table, name, err)
+		}
+		wrongShape[name] = false
+	}
 	var dropped []metaCollationIndex
 	var dropErr error
 	for _, index := range target.indexes {
@@ -278,10 +274,9 @@ func pinColumnCollation(ctx context.Context, q metaQueryer, target metaCollation
 			modifyErr = fmt.Errorf("pin %s.%s collation: %w", target.table, target.column, modifyErr)
 		}
 	}
-	// The indexes are restored whatever happened: leaving the table without them would
-	// be a worse state than the one this migration found. The restore runs on a context
-	// a cancelled caller cannot shorten, or an expired attempt would abandon a dropped
-	// index.
+	// The indexes are restored whatever happened: leaving the table without them would be
+	// a worse state than the one this migration found. The restore runs on a context a
+	// cancelled caller cannot shorten, or an expired attempt would abandon a dropped index.
 	restoreCtx := context.WithoutCancel(ctx)
 	var restoreErr error
 	for _, index := range dropped {
@@ -341,7 +336,7 @@ func metaColumnCollation(ctx context.Context, q metaQueryer, table, column strin
 	err := q.QueryRowContext(ctx, `SELECT collation_name, column_type FROM information_schema.columns
 		WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`,
 		table, column).Scan(&collation, &columnType)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return false, "", "", nil
 	}
 	if err != nil {

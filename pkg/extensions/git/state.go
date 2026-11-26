@@ -576,13 +576,13 @@ func archiveLocalGitStateDir(gitDir string) ([]byte, error) {
 
 // extractGitArchive unpacks a checkpoint archive into dst.
 //
-// The archive is tenant-supplied, and a lexical containment check is not
-// containment: an entry can create a symlink ("..self" -> ".") through which a
-// later entry writes, so filepath.Join plus os.WriteFile lands bytes outside dst
-// — a hook in the common repository's hooks directory, for instance. Every
-// operation therefore goes through an os.Root opened on dst, which resolves
-// symlinks and refuses any that leave the tree, and the lexical checks stay as
-// the cheap early rejection.
+// The archive is tenant-supplied, so every entry is checked twice: a lexical name
+// check rejects the entries no admin directory needs, and every operation goes
+// through an os.Root opened on dst so a path that only resolves outside the tree
+// (through a link planted by an earlier entry) is refused as well. Link entries are
+// not created at all — a link's target is resolved long after the sanitizer has
+// walked the tree — and are dropped with a log line so a checkpoint written by an
+// older build still restores.
 func extractGitArchive(content []byte, dst string) error {
 	if err := os.MkdirAll(dst, 0o755); err != nil {
 		return err
@@ -1072,7 +1072,7 @@ func (g *Git) wasFreshRestored(dir string) bool {
 
 // linkedWorktreeGitDir resolves a linked worktree's gitdir from the common
 // repository's .git and the registered relative gitdir (".git/worktrees/w1").
-//
+
 // The shape rule is shared with the API that stores gitdir_rel (pkg/gitworktree):
 // only <git>/worktrees/<worktree_name> is a worktree admin directory, so any other
 // target — ".git/hooks" above all — would let a tenant replace a directory git
@@ -1094,12 +1094,12 @@ func linkedWorktreeGitDir(commonGitDir, gitDirRel, worktreeName string) (string,
 	return target, nil
 }
 
-// ensureWorktreeAdminPathIsReal refuses a worktree admin path whose components
-// exist as symlinks (or as non-directories). The restore deletes and replaces
-// whatever this path names, so a link planted by the tenant-controlled common
-// checkpoint would redirect the replacement — "worktrees -> refs" makes
+// ensureWorktreeAdminPathIsReal refuses a worktree admin path whose components exist
+// as symlinks (or as non-directories). The restore deletes and replaces whatever this
+// path names, so a link would redirect the replacement — "worktrees -> refs" makes
 // worktrees/<name> land in the branch store, "worktrees -> ." reaches the hooks
-// directory one level down.
+// directory one level down. Checkpoints no longer carry links, so this now guards a
+// local overlay written by an older build (or by anything else that can write it).
 func ensureWorktreeAdminPathIsReal(commonGitDir, adminRel string) error {
 	baseReal, err := filepath.EvalSymlinks(commonGitDir)
 	if err != nil {

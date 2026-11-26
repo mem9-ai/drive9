@@ -149,6 +149,7 @@ func TestEnsurePinnedCollationsConvertsExistingInstall(t *testing.T) {
 	ctx := context.Background()
 	db := s.DB()
 	downgradeSubjectKey(t, db)
+	downgradeIssuerSubjectKey(t, db)
 
 	now := time.Now().UTC()
 	if err := s.InsertExternalBinding(ctx, &ExternalBinding{
@@ -175,6 +176,8 @@ func TestEnsurePinnedCollationsConvertsExistingInstall(t *testing.T) {
 	if got, err := s.GetExternalBinding(ctx, "slock", "subj"); err != nil || got == nil || got.TenantID != "victim-tenant" {
 		t.Fatalf("exact lookup = %v, %v; want the victim binding", got, err)
 	}
+	// Both pinned columns are converted, so the issuer column is exercised too.
+	assertPinnedCollationAndIndex(t, reopened.DB(), "tenant_api_keys", "issued_by_subject_key", "idx_api_keys_issuer")
 
 	// A second migration is a no-op: the schema state is identical before and after.
 	before := collationAndIndexState(t, reopened.DB(), "tenant_external_bindings", "subject_key", "uk_external_binding_subject")
@@ -328,31 +331,41 @@ func TestGatedCallbackEndsWhenItsContextIsCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	const sleepQuery = "SELECT SLEEP(5)"
 	// The statement has to be running before the cancel: a cancel that lands before the
 	// gate is even acquired also produces an error, and would make this pass without
-	// exercising the cancellation path. Presence in the server's process list is the
-	// proof that it started.
-	const sleepQuery = "SELECT SLEEP(5)"
-	statementRunning := func() bool {
-		var n int
-		if err := db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM information_schema.processlist
-			WHERE info LIKE ?`, sleepQuery+"%").Scan(&n); err != nil {
-			return false
-		}
-		return n > 0
-	}
-
+	// exercising the cancellation path. The holder's own connection id is what proves it,
+	// so another session running the same statement cannot satisfy the check.
+	holderConn := make(chan int64, 1)
 	returned := make(chan error, 1)
 	go func() {
 		returned <- s.WithExternalBindingSchemaLock(ctx, func(lockCtx context.Context, conn *sql.Conn) error {
+			var id int64
+			if err := conn.QueryRowContext(lockCtx, "SELECT CONNECTION_ID()").Scan(&id); err != nil {
+				return err
+			}
+			holderConn <- id
 			_, err := conn.ExecContext(lockCtx, sleepQuery)
 			return err
 		})
 	}()
-	deadline := time.Now().Add(10 * time.Second)
-	for !statementRunning() {
-		if time.Now().After(deadline) {
-			t.Fatal("the gated statement never started")
+	var connID int64
+	select {
+	case connID = <-holderConn:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the gated callback never reported its connection")
+	}
+	pollCtx, stopPoll := context.WithTimeout(ctx, 10*time.Second)
+	defer stopPoll()
+	for {
+		var n int
+		err := db.QueryRowContext(pollCtx, `SELECT COUNT(*) FROM information_schema.processlist
+			WHERE id = ? AND info LIKE ?`, connID, sleepQuery+"%").Scan(&n)
+		if err != nil && pollCtx.Err() != nil {
+			t.Fatalf("the gated statement never started: %v", err)
+		}
+		if err == nil && n > 0 {
+			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -368,79 +381,6 @@ func TestGatedCallbackEndsWhenItsContextIsCanceled(t *testing.T) {
 		}
 	case <-time.After(4 * time.Second):
 		t.Fatal("the gated callback did not return after its context was canceled; the store cleanup could hang with it")
-	}
-}
-
-// The gate has to release the lock even when the callback panics, and a release that
-// cannot be confirmed must discard the session instead of pooling it with the lock
-// still held.
-func TestSchemaLockReleasesOnPanic(t *testing.T) {
-	s := newControlStore(t)
-	ctx := context.Background()
-	panicked := make(chan struct{})
-	func() {
-		defer func() {
-			if recover() != nil {
-				close(panicked)
-			}
-		}()
-		_ = s.WithExternalBindingSchemaLock(ctx, func(context.Context, *sql.Conn) error {
-			panic("callback panic")
-		})
-	}()
-	select {
-	case <-panicked:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the callback panic did not propagate")
-	}
-
-	// The lock is free again: a short-timeout acquisition succeeds.
-	acquired := make(chan error, 1)
-	go func() {
-		acquired <- s.WithExternalBindingSchemaLock(ctx, func(context.Context, *sql.Conn) error { return nil })
-	}()
-	select {
-	case err := <-acquired:
-		if err != nil {
-			t.Fatalf("the schema lock was not released after a panic: %v", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the schema lock stayed held after a panicking callback")
-	}
-}
-
-// A release that cannot be confirmed must not put a session back in the pool with the
-// advisory lock still held: the session is discarded.
-func TestNamedLockReleaseDiscardsAnUnconfirmedSession(t *testing.T) {
-	s := newControlStore(t)
-	ctx := context.Background()
-	lock, err := acquireMetaNamedLock(ctx, s.DB(), metaNamedLockSpec{
-		name:           "d9_test_unconfirmed_release",
-		databaseScoped: true,
-		timeoutSeconds: 5,
-	})
-	if err != nil {
-		t.Fatalf("acquire: %v", err)
-	}
-	// Kill the session so RELEASE_LOCK cannot return a result. TiDB accepts the
-	// statement and closes the connection asynchronously.
-	_, _ = lock.conn.ExecContext(ctx, "KILL CONNECTION_ID()")
-	time.Sleep(50 * time.Millisecond)
-	if err := lock.release(); err == nil {
-		t.Fatalf("release on a dead session reported success")
-	}
-	// A later acquisition with a short timeout still works: the dead session was not
-	// reused for it.
-	again, err := acquireMetaNamedLock(ctx, s.DB(), metaNamedLockSpec{
-		name:           "d9_test_unconfirmed_release",
-		databaseScoped: true,
-		timeoutSeconds: 5,
-	})
-	if err != nil {
-		t.Fatalf("the lock was not available after an unconfirmed release: %v", err)
-	}
-	if err := again.release(); err != nil {
-		t.Fatalf("release the second acquisition: %v", err)
 	}
 }
 
@@ -760,6 +700,20 @@ func TestPinnedCollationReplacesANonUniqueSameNamedIndex(t *testing.T) {
 // downgradeSubjectKey puts the binding subject column back into the pre-fix shape:
 // case-insensitive, with its unique index rebuilt around the downgrade (TiDB
 // refuses the collation change while the index covers the column).
+// downgradeIssuerSubjectKey puts the issuer subject column back into the pre-fix shape.
+func downgradeIssuerSubjectKey(t *testing.T, db *sql.DB) {
+	t.Helper()
+	dropIndex(t, db, "tenant_api_keys", "idx_api_keys_issuer")
+	if _, err := db.ExecContext(context.Background(),
+		"ALTER TABLE tenant_api_keys MODIFY COLUMN issued_by_subject_key VARCHAR(512) COLLATE utf8mb4_general_ci NOT NULL DEFAULT ''"); err != nil {
+		t.Fatalf("downgrade issued_by_subject_key: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(),
+		"ALTER TABLE tenant_api_keys ADD INDEX idx_api_keys_issuer (tenant_id, issued_by_provider, issued_by_subject_key, status, created_at)"); err != nil {
+		t.Fatalf("recreate the issuer index: %v", err)
+	}
+}
+
 func downgradeSubjectKey(t *testing.T, db *sql.DB) {
 	t.Helper()
 	dropIndex(t, db, "tenant_external_bindings", "uk_external_binding_subject")

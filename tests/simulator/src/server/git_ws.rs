@@ -167,7 +167,16 @@ pub async fn upsert(
     if kind == "linked" {
         let gitdir_rel = g("gitdir_rel");
         let worktree_name = g("worktree_name");
-        if worktree_name.trim().is_empty() || gitdir_rel.trim().is_empty() {
+        if worktree_name.trim().is_empty() {
+            return err_resp(400, "invalid worktree_name: name is required");
+        }
+        if worktree_name.trim().len() > 255 {
+            return err_resp(400, "invalid worktree_name: name exceeds 255 bytes");
+        }
+        if worktree_name.trim().contains('/') || worktree_name.trim().contains('\\') {
+            return err_resp(400, "invalid worktree_name: name must be a single safe path segment");
+        }
+        if gitdir_rel.trim().is_empty() {
             return err_resp(400, "invalid gitdir_rel: gitdir_rel is required for a linked workspace");
         }
         if !gitdir_rel_is_valid(&gitdir_rel, &worktree_name) {

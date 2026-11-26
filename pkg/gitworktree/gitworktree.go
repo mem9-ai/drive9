@@ -56,14 +56,15 @@ func AdminRel(gitdirRel, worktreeName string) (string, error) {
 	if len(rel) > MaxGitDirRelBytes {
 		return "", fmt.Errorf("gitdir_rel exceeds %d bytes", MaxGitDirRelBytes)
 	}
+	// Reject the raw value's separators before normalizing: a backslash is a path
+	// separator to tar and to git on Windows, and checking after ToSlash would let it
+	// through on the platform where it matters.
+	if strings.ContainsAny(rel, "\\\x00") {
+		return "", fmt.Errorf("gitdir_rel contains an invalid character")
+	}
 	slashed := filepath.ToSlash(rel)
 	if strings.HasPrefix(slashed, "/") {
 		return "", fmt.Errorf("gitdir_rel must be relative")
-	}
-	// A backslash is a separator to tar and to git on Windows, and NUL truncates
-	// the path in the C strings git builds, so neither may appear.
-	if strings.ContainsAny(slashed, "\\\x00") {
-		return "", fmt.Errorf("gitdir_rel contains an invalid character")
 	}
 	slashed = strings.TrimPrefix(slashed, ".git/")
 	parts := strings.Split(slashed, "/")
