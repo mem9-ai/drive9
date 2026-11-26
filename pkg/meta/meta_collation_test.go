@@ -386,8 +386,9 @@ func TestGatedCallbackEndsWhenItsContextIsCanceled(t *testing.T) {
 
 // Every callback lock has to free its advisory lock when the callback panics. The
 // panic propagates out of the helper, but a lock left on a session would make every
-// later writer and migration wait for it. Each case probes the lock through its own
-// API with a short deadline: a still-held lock is a timeout, not silence.
+// later writer and migration wait for it. Each case re-acquires the lock it just
+// leaked, by name, on a pool of its own with a short deadline: a still-held lock is a
+// timeout, not silence.
 func TestCallbackLocksReleaseOnPanic(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
@@ -607,16 +608,25 @@ func TestMigrationConvertsUnderTheSchemaGate(t *testing.T) {
 	go func() { converted <- ensurePinnedCollations(workerCtx, db, spec) }()
 	t.Cleanup(cancelWorker)
 
-	// Positive evidence that the conversion is waiting for the gate: a statement in
-	// the process list on a connection that is not the holder's, waiting on GET_LOCK.
-	// Nothing else in this test takes a named lock.
+	// Positive evidence that the conversion is waiting for the gate: the gate's own
+	// statement, on a connection in this database that is not the holder's. Nothing
+	// else in this test takes a named lock, and the statement pins it to the gate.
+	//
+	// INFORMATION_SCHEMA.PROCESSLIST is deprecated on MySQL 8.4, but it is the one
+	// that can be read while another thread waits for a named lock:
+	// performance_schema.processlist does not answer in that state (it times out
+	// instead), and TiDB only has the INFORMATION_SCHEMA one.
+	// The statement as each engine reports it: TiDB keeps the parameter markers,
+	// MySQL substitutes them, so only the gate's shape is compared.
+	const gateWaitShape = "%GET_LOCK(CONCAT(%"
 	pollCtx, stopPoll := context.WithTimeout(ctx, 20*time.Second)
 	defer stopPoll()
 	waited := false
 	for {
 		var n int
 		err := db.QueryRowContext(pollCtx, `SELECT COUNT(*) FROM information_schema.processlist
-			WHERE db = DATABASE() AND id <> ? AND info LIKE ?`, holderID, "SELECT GET_LOCK%").Scan(&n)
+			WHERE db = DATABASE() AND id <> ? AND info LIKE ?`,
+			holderID, gateWaitShape).Scan(&n)
 		if err != nil && pollCtx.Err() != nil {
 			t.Fatalf("no connection waited for the gate, so the conversion did not take it: %v", err)
 		}

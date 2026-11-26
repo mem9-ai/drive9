@@ -155,9 +155,12 @@ func TestLinkedWorktreeGitDirRefusesSymlinkedComponents(t *testing.T) {
 	}
 }
 
-// A mount whose overlay already carries the planted link: the restore has to refuse
-// it by name, not shape or "checkpoint not available".
-func TestRestoreRefusesSymlinkedWorktreesWithACheckpoint(t *testing.T) {
+// The worktree admin path must be a real directory. An overlay written by an older
+// build can carry "worktrees -> refs", and a restore would then delete and replace the
+// branch store instead of an admin directory. The refusal has to be the symlink one,
+// by name, and it comes from the early resolution — before either workspace's
+// checkpoint is fetched — so no checkpoint is seeded here.
+func TestRestoreRefusesSymlinkedWorktreesFromTheOverlay(t *testing.T) {
 	localRoot := t.TempDir()
 	commonGitDir := filepath.Join(localRoot, "overlay", "repo", ".git")
 	if err := os.MkdirAll(filepath.Join(commonGitDir, "refs", "heads"), 0o755); err != nil {
@@ -177,8 +180,6 @@ func TestRestoreRefusesSymlinkedWorktreesWithACheckpoint(t *testing.T) {
 	ts := httptest.NewServer(b)
 	t.Cleanup(ts.Close)
 
-	// No checkpoint: the refusal comes from the early resolution, before either
-	// workspace's state is fetched, so "not available" cannot mask it.
 	g, err := New(Options{Client: client.New(ts.URL, ""), LocalRoot: localRoot})
 	if err != nil {
 		t.Fatal(err)
@@ -199,53 +200,6 @@ func TestRestoreRefusesSymlinkedWorktreesWithACheckpoint(t *testing.T) {
 	if !strings.Contains(err.Error(), "is not a worktrees directory") {
 		t.Fatalf("restore error = %v, want the symlinked worktrees refusal", err)
 	}
-	got, readErr := os.ReadFile(headPath)
-	if readErr != nil {
-		t.Fatalf("refs/heads/heads was removed by the refused restore: %v", readErr)
-	}
-	if string(got) != "ref: refs/heads/main\n" {
-		t.Fatalf("refs/heads/heads = %q, want the original content", got)
-	}
-}
-
-// The worktree admin path must be a real directory. An overlay written by an older
-// build can carry "worktrees -> refs", and a restore would then delete and replace the
-// branch store instead of an admin directory.
-func TestRestoreRefusesSymlinkedWorktreesBeforeSwap(t *testing.T) {
-	localRoot := t.TempDir()
-	commonGitDir := filepath.Join(localRoot, "overlay", "repo", ".git")
-	if err := os.MkdirAll(filepath.Join(commonGitDir, "refs", "heads"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("refs", filepath.Join(commonGitDir, "worktrees")); err != nil {
-		t.Fatal(err)
-	}
-	headPath := filepath.Join(commonGitDir, "refs", "heads", "heads")
-	if err := os.WriteFile(headPath, []byte("ref: refs/heads/main\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	b := testbackend.NewBackend()
-	b.SeedGitWorkspaceFull("main", "/repo", "https://example.test/repo.git", strings.Repeat("a", 40))
-	b.SeedGitWorktree("linked", "/repo/wt", "https://example.test/repo.git", strings.Repeat("a", 40), "main", "worktrees/heads")
-	ts := httptest.NewServer(b)
-	t.Cleanup(ts.Close)
-
-	g, err := New(Options{Client: client.New(ts.URL, ""), LocalRoot: localRoot})
-	if err != nil {
-		t.Fatal(err)
-	}
-	mainWS := &workspace{id: "main", root: "/repo", headCommit: strings.Repeat("a", 40), repoURL: "https://example.test/repo.git"}
-	linkedWS := &workspace{
-		id: "linked", root: "/repo/wt", headCommit: strings.Repeat("a", 40), repoURL: "https://example.test/repo.git",
-		workspaceKind: "linked", commonID: "main", gitDirRel: "worktrees/heads", worktreeName: "heads",
-	}
-	g.workspaces = []*workspace{mainWS, linkedWS}
-
-	if err := g.restoreWorkspaceState(context.Background(), linkedWS); err == nil {
-		t.Fatal("restore accepted a symlinked worktrees directory")
-	}
-	// The branch store the link pointed at is untouched.
 	got, readErr := os.ReadFile(headPath)
 	if readErr != nil {
 		t.Fatalf("refs/heads/heads was removed by the refused restore: %v", readErr)
@@ -1118,6 +1072,36 @@ func TestExtractGitArchiveDoesNotWriteThroughAnExistingLink(t *testing.T) {
 	}
 }
 
+// An archive directory entry that lands on an existing link replaces the link with a
+// real directory, for the same reason: a later entry below it must not be written into
+// the link's target.
+func TestExtractGitArchiveReplacesALinkWithADirectory(t *testing.T) {
+	dst := filepath.Join(t.TempDir(), ".git")
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dst, "refs")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("refs", filepath.Join(dst, "linkdir")); err != nil {
+		t.Fatal(err)
+	}
+	if err := extractGitArchive(tarArchive(t, tarEntry{name: "linkdir", dir: true}), dst); err != nil {
+		t.Fatalf("extractGitArchive: %v", err)
+	}
+	info, err := os.Lstat(filepath.Join(dst, "linkdir"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		t.Fatal("the directory entry did not replace the link with a real directory")
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("the link target was removed: %v", err)
+	}
+}
+
 // The host configuration that produces a link HEAD in the first place: clone under
 // core.preferSymlinkRefs and the restore still has to end with a regular HEAD on the
 // checkpoint's branch, not the default branch's ref file replaced by a symref line.
@@ -1134,6 +1118,11 @@ func TestRestoreKeepsTheBranchOnAHostWithSymlinkRefs(t *testing.T) {
 
 	src := t.TempDir()
 	run(t, src, "init", "-q", "-b", "main")
+	// The test is only meaningful where git honours the setting: init writes HEAD as
+	// a link there, and this one would otherwise pass without exercising anything.
+	if info, err := os.Lstat(filepath.Join(src, ".git", "HEAD")); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Skip("this git does not write HEAD as a link for core.preferSymlinkRefs")
+	}
 	if err := os.WriteFile(filepath.Join(src, "f.txt"), []byte("hello"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1204,6 +1193,7 @@ type tarEntry struct {
 	mode    int64
 	symlink string
 	target  string
+	dir     bool
 }
 
 func tarArchive(t *testing.T, entries ...tarEntry) []byte {
@@ -1218,6 +1208,10 @@ func tarArchive(t *testing.T, entries ...tarEntry) []byte {
 			hdr.Typeflag = tar.TypeSymlink
 			hdr.Size = 0
 			hdr.Linkname = entry.target
+		}
+		if entry.dir {
+			hdr.Typeflag = tar.TypeDir
+			hdr.Size = 0
 		}
 		if err := tw.WriteHeader(hdr); err != nil {
 			t.Fatalf("write header %q: %v", hdr.Name, err)
