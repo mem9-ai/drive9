@@ -23,17 +23,17 @@ import (
 
 func TestPortLinkedWorktreeGitDirResolution(t *testing.T) {
 	common := filepath.Join(t.TempDir(), "repo", ".git")
-	got, err := linkedWorktreeGitDir(common, ".git/worktrees/w1")
+	got, err := linkedWorktreeGitDir(common, ".git/worktrees/w1", "w1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if want := filepath.Join(common, "worktrees", "w1"); got != want {
 		t.Fatalf("gitdir = %q, want %q", got, want)
 	}
-	if _, err := linkedWorktreeGitDir(common, "../escape"); err == nil {
+	if _, err := linkedWorktreeGitDir(common, "../escape", "escape"); err == nil {
 		t.Fatal("escaping gitdir accepted")
 	}
-	if _, err := linkedWorktreeGitDir(common, ""); err == nil {
+	if _, err := linkedWorktreeGitDir(common, "", "w1"); err == nil {
 		t.Fatal("empty gitdir accepted")
 	}
 }
@@ -97,7 +97,7 @@ func TestPortLinkedWorktreeRestore(t *testing.T) {
 	restored := &workspace{id: "main", root: "/repo", headCommit: head, repoURL: "file://" + src}
 	linked := &workspace{
 		id: "linked", root: "/repo/wt", headCommit: head, repoURL: "file://" + src,
-		workspaceKind: "linked", commonID: "main", gitDirRel: ".git/worktrees/wt",
+		workspaceKind: "linked", commonID: "main", gitDirRel: ".git/worktrees/wt", worktreeName: "wt",
 	}
 	g.workspaces = []*workspace{restored, linked}
 	if err := g.restoreWorkspaceState(ctx, restored); err != nil {
@@ -335,7 +335,7 @@ func TestPortLinkedWorktreeCheckpointAndStagedRestore(t *testing.T) {
 	mainWS := &workspace{id: "main", root: "/repo", headCommit: head, repoURL: "file://" + src}
 	linkedWS := &workspace{
 		id: "linked", root: "/repo/wt", headCommit: head, repoURL: "file://" + src,
-		workspaceKind: "linked", commonID: "main", gitDirRel: ".git/worktrees/wt",
+		workspaceKind: "linked", commonID: "main", gitDirRel: ".git/worktrees/wt", worktreeName: "wt",
 	}
 	g.workspaces = []*workspace{mainWS, linkedWS}
 	ctx := context.Background()
@@ -370,7 +370,7 @@ func TestPortLinkedWorktreeCheckpointAndStagedRestore(t *testing.T) {
 	restoredMain := &workspace{id: "main", root: "/repo", headCommit: head, repoURL: "file://" + src}
 	restoredLinked := &workspace{
 		id: "linked", root: "/repo/wt", headCommit: head, repoURL: "file://" + src,
-		workspaceKind: "linked", commonID: "main", gitDirRel: ".git/worktrees/wt",
+		workspaceKind: "linked", commonID: "main", gitDirRel: ".git/worktrees/wt", worktreeName: "wt",
 	}
 	g2.workspaces = []*workspace{restoredMain, restoredLinked}
 	if err := g2.restoreWorkspaceState(ctx, restoredMain); err != nil {

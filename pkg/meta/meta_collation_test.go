@@ -1,0 +1,1129 @@
+package meta
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	mysql "github.com/go-sql-driver/mysql"
+)
+
+// The OAuth subject columns are case-sensitive identities. Declaring them without
+// a collation lets the database default decide, and a case-insensitive default
+// maps "SUBJ" onto the binding stored for "subj" — another tenant's owner key.
+func TestMetaSubjectKeyColumnsPinBinaryCollation(t *testing.T) {
+	spec := mustMetaSpec(t)
+	targets := metaPinnedCollationTargets(spec)
+	want := map[string]string{
+		"tenant_external_bindings.subject_key":  "utf8mb4_bin",
+		"tenant_api_keys.issued_by_subject_key": "utf8mb4_bin",
+	}
+	got := map[string]string{}
+	for _, target := range targets {
+		got[target.table+"."+target.column] = target.collation
+	}
+	for key, collation := range want {
+		if got[key] != collation {
+			t.Fatalf("%s pinned collation = %q, want %q (targets: %v)", key, got[key], collation, got)
+		}
+	}
+
+	// Deriving the targets from the contract is what keeps the DDL and the
+	// migration in step: the definition and the index the migration recreates come
+	// from the same parsed statements.
+	byKey := map[string]metaCollationTarget{}
+	for _, target := range targets {
+		byKey[target.table+"."+target.column] = target
+	}
+	binding := byKey["tenant_external_bindings.subject_key"]
+	if !strings.Contains(strings.ToUpper(binding.modifySQL), "COLLATE UTF8MB4_BIN") {
+		t.Fatalf("subject_key modifySQL = %q, want the pinned collation", binding.modifySQL)
+	}
+	if len(binding.indexes) != 1 || binding.indexes[0].name != "uk_external_binding_subject" || !binding.indexes[0].unique {
+		t.Fatalf("subject_key indexes = %#v, want the unique binding subject index", binding.indexes)
+	}
+	issuer := byKey["tenant_api_keys.issued_by_subject_key"]
+	if len(issuer.indexes) != 1 || issuer.indexes[0].name != "idx_api_keys_issuer" || issuer.indexes[0].unique {
+		t.Fatalf("issued_by_subject_key indexes = %#v, want the non-unique issuer index", issuer.indexes)
+	}
+}
+
+// A fresh control plane gets the pinned collation from CREATE TABLE. It is checked
+// on a database whose default is case-insensitive: on the shared test database the
+// TiDB default is already utf8mb4_bin, so the same assertion would pass without the
+// contract pinning anything.
+func TestMigrateCreatesBinarySubjectKeyCollationOnCaseInsensitiveDatabase(t *testing.T) {
+	s := freshControlStoreInDatabase(t, "utf8mb4_general_ci")
+	ctx := context.Background()
+	for _, target := range metaPinnedCollationTargets(mustMetaSpec(t)) {
+		var collation sql.NullString
+		if err := s.DB().QueryRowContext(ctx, `SELECT collation_name FROM information_schema.columns
+			WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`,
+			target.table, target.column).Scan(&collation); err != nil {
+			t.Fatalf("read %s.%s collation: %v", target.table, target.column, err)
+		}
+		if collation.String != target.collation {
+			t.Fatalf("%s.%s collation = %q, want %q", target.table, target.column, collation.String, target.collation)
+		}
+	}
+}
+
+// An installation whose subject column was created with a case-insensitive
+// collation is a contract mismatch that must be reported, not silently accepted.
+func TestDiffMetaTableMetaReportsCollationMismatch(t *testing.T) {
+	spec := mustMetaSpec(t)
+	table := mustMetaTableSpec(t, spec, "tenant_external_bindings")
+	observed := metaTableMeta{
+		tableName: "tenant_external_bindings",
+		columns: map[string]metaColumnMeta{
+			"provider":    {columnType: "varchar(64)", collation: "utf8mb4_general_ci"},
+			"subject_key": {columnType: "varchar(512)", collation: "utf8mb4_general_ci"},
+			"tenant_id":   {columnType: "varchar(64)", collation: "utf8mb4_general_ci"},
+		},
+	}
+	diffs := diffMetaTableMeta(table, observed, table.createStatement)
+	var found *metaSchemaDiff
+	for i := range diffs {
+		if diffs[i].columnName == "subject_key" && diffs[i].kind == metaSchemaDiffColumnType {
+			found = &diffs[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("diff did not report the subject_key collation, got %#v", diffs)
+	}
+	if !strings.Contains(found.detail, "collation") || !strings.Contains(found.detail, "utf8mb4_bin") {
+		t.Fatalf("diff detail = %q, want the collation mismatch", found.detail)
+	}
+	// The repair is owned by the migration pre-step: a bare MODIFY cannot run while
+	// an index covers the column on TiDB, so the planner must not claim one.
+	if found.repairSQL != "" {
+		t.Fatalf("collation mismatch carries a repair (%q)", found.repairSQL)
+	}
+	if isSafeMetaRepairDiff(*found, nil) {
+		t.Fatal("a bare MODIFY cannot run while an index covers the column")
+	}
+}
+
+// The premise the migration rests on: with an index in place the bare collation
+// change is refused by TiDB (error 8200) and only succeeds once the index is
+// dropped. That is why the migration drops and recreates instead of leaving the
+// change to the repair planner.
+func TestBareCollationModifyIsRefusedWhileIndexed(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	db := s.DB()
+	downgradeSubjectKey(t, db)
+
+	_, err := db.ExecContext(ctx,
+		"ALTER TABLE tenant_external_bindings MODIFY COLUMN subject_key VARCHAR(512) COLLATE utf8mb4_bin NOT NULL")
+	if err == nil {
+		t.Skip("this engine allows a collation change on an indexed column, so no drop is needed")
+	}
+	if !metaCollationRefusedOverIndex(err) {
+		t.Fatalf("bare MODIFY failed with an unexpected error: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings DROP INDEX uk_external_binding_subject"); err != nil {
+		t.Fatalf("drop index: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		"ALTER TABLE tenant_external_bindings MODIFY COLUMN subject_key VARCHAR(512) COLLATE utf8mb4_bin NOT NULL"); err != nil {
+		t.Fatalf("MODIFY after dropping the index: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		"ALTER TABLE tenant_external_bindings ADD UNIQUE INDEX uk_external_binding_subject (provider, subject_key)"); err != nil {
+		t.Fatalf("recreate the index: %v", err)
+	}
+}
+
+// The migration converts an installation whose subject columns predate the pinned
+// collation, and the case-folded lookup stops resolving afterwards.
+func TestEnsurePinnedCollationsConvertsExistingInstall(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	db := s.DB()
+	downgradeSubjectKey(t, db)
+	downgradeIssuerSubjectKey(t, db)
+
+	now := time.Now().UTC()
+	if err := s.InsertExternalBinding(ctx, &ExternalBinding{
+		Provider: "slock", SubjectKey: "subj", TenantID: "victim-tenant", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("insert binding: %v", err)
+	}
+
+	// The vulnerability: a case-variant subject resolves to the victim's binding.
+	if got, err := s.GetExternalBinding(ctx, "slock", "SUBJ"); err != nil || got == nil || got.TenantID != "victim-tenant" {
+		t.Fatalf("case-insensitive lookup = %v, %v; want the victim binding (pre-fix shape)", got, err)
+	}
+
+	reopened, err := Open(testDSN)
+	if err != nil {
+		t.Fatalf("migrate a case-insensitive install: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	assertPinnedCollationAndIndex(t, reopened.DB(), "tenant_external_bindings", "subject_key", "uk_external_binding_subject")
+
+	if _, err := s.GetExternalBinding(ctx, "slock", "SUBJ"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("case-variant lookup error = %v, want ErrNotFound", err)
+	}
+	if got, err := s.GetExternalBinding(ctx, "slock", "subj"); err != nil || got == nil || got.TenantID != "victim-tenant" {
+		t.Fatalf("exact lookup = %v, %v; want the victim binding", got, err)
+	}
+	// Both pinned columns are converted, so the issuer column is exercised too.
+	assertPinnedCollationAndIndex(t, reopened.DB(), "tenant_api_keys", "issued_by_subject_key", "idx_api_keys_issuer")
+
+	// A second migration is a no-op: the schema state is identical before and after.
+	before := collationAndIndexState(t, reopened.DB(), "tenant_external_bindings", "subject_key", "uk_external_binding_subject")
+	again, err := Open(testDSN)
+	if err != nil {
+		t.Fatalf("second migration: %v", err)
+	}
+	t.Cleanup(func() { _ = again.Close() })
+	if after := collationAndIndexState(t, again.DB(), "tenant_external_bindings", "subject_key", "uk_external_binding_subject"); after != before {
+		t.Fatalf("second migration changed the schema: %q -> %q", before, after)
+	}
+}
+
+// Binding writes take the schema gate, so a migration that has to remove the
+// unique subject index cannot overlap one: the write waits for the migration and
+// then runs with the index back in place.
+func TestInsertExternalBindingWaitsForSchemaLock(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	binding := &ExternalBinding{Provider: "slock", SubjectKey: "gated", TenantID: "t", CreatedAt: now, UpdatedAt: now}
+
+	holding := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	// Registered before the holder starts: a failed assertion below must not leave
+	// the holder (and its advisory lock) behind, or a repeated run of this test in
+	// the same process would block on the lock it still holds.
+	holderDone := make(chan struct{})
+	acquireErr := make(chan error, 1)
+	// The holder gets its own cancelable context, and the cleanup cancels it as well as
+	// releasing the callback: a stalled database call must not outlive the test, and a
+	// wait that expires is reported rather than silently dropped.
+	holderCtx, cancelHolder := context.WithCancel(ctx)
+	t.Cleanup(func() {
+		closeRelease()
+		cancelHolder()
+		select {
+		case <-holderDone:
+		case <-time.After(30 * time.Second):
+			t.Errorf("the schema-lock holder did not exit; its database call may still be running")
+		}
+	})
+	go func() {
+		defer close(holderDone)
+		acquireErr <- s.WithExternalBindingSchemaLock(holderCtx, func(lockCtx context.Context, _ *sql.Conn) error {
+			close(holding)
+			<-release
+			return nil
+		})
+	}()
+	select {
+	case err := <-acquireErr:
+		// The callback ran to completion, so the gate was never held open.
+		if err != nil {
+			t.Fatalf("hold the schema lock: %v", err)
+		}
+		t.Fatal("schema lock callback returned before the test released it")
+	case <-holding:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the schema lock was never acquired")
+	}
+
+	inserted := make(chan error, 1)
+	go func() { inserted <- s.InsertExternalBinding(ctx, binding) }()
+	select {
+	case err := <-inserted:
+		t.Fatalf("binding insert did not wait for the schema lock (err = %v)", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	closeRelease()
+	select {
+	case err := <-inserted:
+		if err != nil {
+			t.Fatalf("binding insert after the lock was released: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("binding insert never completed after the schema lock was released")
+	}
+	if err := <-acquireErr; err != nil {
+		t.Fatalf("release the schema lock: %v", err)
+	}
+	<-holderDone
+	if got, err := s.GetExternalBinding(ctx, "slock", "gated"); err != nil || got == nil {
+		t.Fatalf("binding was not stored: %v, %v", got, err)
+	}
+}
+
+// TiDB commits each DDL statement on its own, so a migration interrupted between
+// the index drop and its recreation leaves the column binary with no index. The
+// retry must restore the index instead of skipping the column as "already binary"
+// — otherwise the schema planner refuses to recreate a unique index on an existing
+// table and every later startup fails.
+func TestPinnedCollationsRestoreIndexAfterInterruptedRun(t *testing.T) {
+	cases := []struct {
+		name    string
+		prepare func(t *testing.T, db *sql.DB)
+	}{
+		{
+			name: "crashed after MODIFY COLUMN",
+			prepare: func(t *testing.T, db *sql.DB) {
+				t.Helper()
+				// Column already binary, both indexes missing.
+				dropIndex(t, db, "tenant_external_bindings", "uk_external_binding_subject")
+				dropIndex(t, db, "tenant_api_keys", "idx_api_keys_issuer")
+			},
+		},
+		{
+			name: "crashed after DROP INDEX",
+			prepare: func(t *testing.T, db *sql.DB) {
+				t.Helper()
+				// Indexes missing and the subject column still case-insensitive.
+				dropIndex(t, db, "tenant_external_bindings", "uk_external_binding_subject")
+				if _, err := db.ExecContext(context.Background(),
+					"ALTER TABLE tenant_external_bindings MODIFY COLUMN subject_key VARCHAR(512) COLLATE utf8mb4_general_ci NOT NULL"); err != nil {
+					t.Fatalf("downgrade column: %v", err)
+				}
+				dropIndex(t, db, "tenant_api_keys", "idx_api_keys_issuer")
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newControlStore(t)
+			tc.prepare(t, s.DB())
+
+			reopened, err := Open(testDSN)
+			if err != nil {
+				t.Fatalf("migration did not recover from an interrupted run: %v", err)
+			}
+			t.Cleanup(func() { _ = reopened.Close() })
+
+			assertPinnedCollationAndIndex(t, reopened.DB(), "tenant_external_bindings", "subject_key", "uk_external_binding_subject")
+			// The non-unique issuer index is restored through the same pre-step, not
+			// only the unique one.
+			assertPinnedCollationAndIndex(t, reopened.DB(), "tenant_api_keys", "issued_by_subject_key", "idx_api_keys_issuer")
+		})
+	}
+}
+
+// A stalled statement inside the gate must end when the caller cancels its context:
+// that is what keeps the holder — and the store cleanup that waits for its goroutine —
+// bounded when the database stops answering. The statement here is a real long-running
+// query on the gated connection, canceled from outside.
+func TestGatedCallbackEndsWhenItsContextIsCanceled(t *testing.T) {
+	// A scratch database: the canceled session can keep its advisory lock until the
+	// server notices the query is gone, and that must not stall the other tests.
+	s := freshControlStoreInDatabase(t, "utf8mb4_bin")
+	db := s.DB()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const sleepQuery = "SELECT SLEEP(5)"
+	// The statement has to be running before the cancel: a cancel that lands before the
+	// gate is even acquired also produces an error, and would make this pass without
+	// exercising the cancellation path. The holder's own connection id is what proves it,
+	// so another session running the same statement cannot satisfy the check.
+	holderConn := make(chan int64, 1)
+	returned := make(chan error, 1)
+	go func() {
+		returned <- s.WithExternalBindingSchemaLock(ctx, func(lockCtx context.Context, conn *sql.Conn) error {
+			var id int64
+			if err := conn.QueryRowContext(lockCtx, "SELECT CONNECTION_ID()").Scan(&id); err != nil {
+				return err
+			}
+			holderConn <- id
+			_, err := conn.ExecContext(lockCtx, sleepQuery)
+			return err
+		})
+	}()
+	var connID int64
+	select {
+	case connID = <-holderConn:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the gated callback never reported its connection")
+	}
+	pollCtx, stopPoll := context.WithTimeout(ctx, 10*time.Second)
+	defer stopPoll()
+	for {
+		var n int
+		err := db.QueryRowContext(pollCtx, `SELECT COUNT(*) FROM information_schema.processlist
+			WHERE id = ? AND info LIKE ?`, connID, sleepQuery+"%").Scan(&n)
+		if err != nil && pollCtx.Err() != nil {
+			t.Fatalf("the gated statement never started: %v", err)
+		}
+		if err == nil && n > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("the context was canceled before the statement started: %v", err)
+	}
+	cancel()
+
+	select {
+	case err := <-returned:
+		if err == nil {
+			t.Fatal("the gated callback reported success after its context was canceled")
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("the gated callback did not return after its context was canceled; the store cleanup could hang with it")
+	}
+}
+
+// Every callback lock has to free its advisory lock when the callback panics. The
+// panic propagates out of the helper, but a lock left on a session would make every
+// later writer and migration wait for it. Each case re-acquires the lock it just
+// leaked, by name, on a pool of its own with a short deadline: a still-held lock is a
+// timeout, not silence.
+func TestCallbackLocksReleaseOnPanic(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+
+	// panicsRecovered runs fn, which must panic, and reports the recovered value.
+	panicsRecovered := func(t *testing.T, fn func()) any {
+		t.Helper()
+		var recovered any
+		func() {
+			defer func() { recovered = recover() }()
+			fn()
+		}()
+		if recovered == nil {
+			t.Fatal("the panicking callback did not propagate")
+		}
+		return recovered
+	}
+	databaseName := func(t *testing.T, db *sql.DB) string {
+		t.Helper()
+		var name sql.NullString
+		if err := db.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		return name.String
+	}
+	// Every lock is probed on a pool of its own: the store's pool may hand back the
+	// session that took the lock, and GET_LOCK on that session succeeds whether or not
+	// the lock was released.
+	cases := []struct {
+		name   string
+		panics func()
+		spec   func(t *testing.T, db *sql.DB) metaNamedLockSpec
+	}{
+		{
+			name: "external binding schema gate",
+			panics: func() {
+				_ = s.WithExternalBindingSchemaLock(ctx, func(context.Context, *sql.Conn) error {
+					panic("schema gate panic")
+				})
+			},
+			spec: func(*testing.T, *sql.DB) metaNamedLockSpec {
+				return metaNamedLockSpec{
+					name:           externalBindingSchemaLockName,
+					databaseScoped: true,
+					timeoutSeconds: 5,
+					releaseTimeout: 2 * time.Second,
+				}
+			},
+		},
+		{
+			name: "external binding subject",
+			panics: func() {
+				_ = s.WithExternalBindingLock(ctx, "slock", "panic-subject", func(context.Context) error {
+					panic("subject lock panic")
+				})
+			},
+			spec: func(*testing.T, *sql.DB) metaNamedLockSpec {
+				return metaNamedLockSpec{
+					name:           externalBindingLockName("slock", "panic-subject"),
+					databaseScoped: true,
+					timeoutSeconds: 5,
+					releaseTimeout: 2 * time.Second,
+				}
+			},
+		},
+		{
+			name: "tidbcloud org binding",
+			panics: func() {
+				_ = s.withTiDBCloudOrgBindingLock(ctx, "org", "cluster", "branch", func(context.Context, metaQueryExecer) error {
+					panic("org binding lock panic")
+				})
+			},
+			spec: func(t *testing.T, db *sql.DB) metaNamedLockSpec {
+				return metaNamedLockSpec{
+					name: tenantPoolDatabaseLockName(
+						tidbCloudOrgBindingLockName("org", "cluster", "branch"), databaseName(t, db)),
+					ignorePlanCache: true,
+					timeoutSeconds:  5,
+					releaseTimeout:  2 * time.Second,
+				}
+			},
+		},
+		{
+			name: "tenant pool",
+			panics: func() {
+				_ = s.WithTenantPoolLock(ctx, "panic-pool", func(context.Context) error {
+					panic("tenant pool lock panic")
+				})
+			},
+			spec: func(t *testing.T, db *sql.DB) metaNamedLockSpec {
+				return metaNamedLockSpec{
+					name:            tenantPoolDatabaseLockName(tenantPoolLockName("panic-pool"), databaseName(t, db)),
+					ignorePlanCache: true,
+					timeoutSeconds:  5,
+					releaseTimeout:  2 * time.Second,
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			panicsRecovered(t, tc.panics)
+			probeDB, err := sql.Open("mysql", testDSN)
+			if err != nil {
+				t.Fatalf("open the probe pool: %v", err)
+			}
+			t.Cleanup(func() { _ = probeDB.Close() })
+			probeCtx, cancelProbe := context.WithTimeout(ctx, 5*time.Second)
+			defer cancelProbe()
+			lock, err := acquireMetaNamedLock(probeCtx, probeDB, tc.spec(t, probeDB))
+			if err != nil {
+				t.Fatalf("the lock was not released after a panicking callback: %v", err)
+			}
+			if err := lock.release(); err != nil {
+				t.Fatalf("release the probe acquisition: %v", err)
+			}
+		})
+	}
+}
+
+// A release that cannot be confirmed must not put the session back in the pool with
+// the advisory lock still held: the session is discarded, which is what frees the
+// lock. The failure here leaves the session alive on purpose — a killed session
+// proves nothing, because closing it is what released the lock.
+func TestNamedLockReleaseDiscardsAnUnconfirmedSession(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	spec := metaNamedLockSpec{
+		name:           "d9_test_unconfirmed_release",
+		databaseScoped: true,
+		timeoutSeconds: 5,
+		releaseTimeout: 2 * time.Second,
+	}
+	lock, err := acquireMetaNamedLock(ctx, s.DB(), spec)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	mid := s.DB().Stats()
+	if mid.InUse != 1 {
+		t.Fatalf("in-use connections while the lock is held = %d, want 1", mid.InUse)
+	}
+	// RELEASE_LOCK reports nothing usable while the session stays alive: that is an
+	// unconfirmed release, and the helper must not trust it.
+	lock.releaseSQL = "SELECT NULL"
+	lock.releaseArgs = nil
+	if err := lock.release(); err == nil {
+		t.Fatal("an unconfirmed release reported success")
+	}
+	// The session must be discarded, not pooled: a pooled session still holds the
+	// advisory lock, and every later acquisition would wait for it. The accounting is
+	// what distinguishes the two, because a discarded session is closed and a pooled
+	// one becomes idle. A re-acquisition cannot tell them apart — the pool hands the
+	// same session back, and GET_LOCK succeeds there.
+	after := s.DB().Stats()
+	if after.InUse != 0 {
+		t.Fatalf("in-use connections after the release = %d, want 0", after.InUse)
+	}
+	if after.OpenConnections != mid.OpenConnections-1 || after.Idle != mid.Idle {
+		t.Fatalf("connection accounting after an unconfirmed release: open %d -> %d, idle %d -> %d; want the session discarded",
+			mid.OpenConnections, after.OpenConnections, mid.Idle, after.Idle)
+	}
+}
+
+// The conversion runs under the same gate binding writers take. The test pins the
+// gate call itself: while this test holds the gate, the conversion's connection is
+// visible in the process list waiting for the lock, and the conversion finishes only
+// after the gate is released. Without the gate there is no waiting statement to find
+// and the conversion is already done, so the poll below fails instead of passing on
+// a silence measurement.
+func TestMigrationConvertsUnderTheSchemaGate(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	db := s.DB()
+	dropIndex(t, db, "tenant_external_bindings", "uk_external_binding_subject")
+	if _, err := db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings MODIFY COLUMN subject_key VARCHAR(512) COLLATE utf8mb4_general_ci NOT NULL"); err != nil {
+		t.Fatalf("downgrade the column: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings ADD UNIQUE INDEX uk_external_binding_subject (provider, subject_key)"); err != nil {
+		t.Fatalf("restore the unique index: %v", err)
+	}
+
+	holding := make(chan int64, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	holderDone := make(chan struct{})
+	go func() {
+		defer close(holderDone)
+		_ = s.WithExternalBindingSchemaLock(ctx, func(lockCtx context.Context, conn *sql.Conn) error {
+			var id int64
+			if err := conn.QueryRowContext(lockCtx, "SELECT CONNECTION_ID()").Scan(&id); err != nil {
+				return err
+			}
+			holding <- id
+			<-release
+			return nil
+		})
+	}()
+	t.Cleanup(func() {
+		closeRelease()
+		select {
+		case <-holderDone:
+		case <-time.After(30 * time.Second):
+			t.Errorf("the gate holder did not exit")
+		}
+	})
+	var holderID int64
+	select {
+	case holderID = <-holding:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the gate was never acquired")
+	}
+
+	workerCtx, cancelWorker := context.WithTimeout(ctx, 60*time.Second)
+	spec := mustMetaSpec(t)
+	converted := make(chan error, 1)
+	go func() { converted <- ensurePinnedCollations(workerCtx, db, spec) }()
+	t.Cleanup(cancelWorker)
+
+	// Positive evidence that the conversion is waiting for the gate: a statement on
+	// another connection in this database that starts with the gate's GET_LOCK. The
+	// pattern is anchored and the polling session is excluded, or the poll's own
+	// statement would match on MySQL, which substitutes the pattern into the text.
+	// It identifies a database-scoped named lock, which the migration lock and the
+	// per-subject lock are as well; nothing else in this test takes one.
+	//
+	// INFORMATION_SCHEMA.PROCESSLIST is deprecated on MySQL 8.4, but it is the one
+	// this test can use: on 8.4.13 performance_schema.processlist did not answer while
+	// a thread waited for a named lock (the poll timed out), and TiDB only has the
+	// INFORMATION_SCHEMA one.
+	// The statement as each engine reports it: TiDB keeps the parameter markers,
+	// MySQL substitutes them, so the anchored prefix is what both match.
+	const gateWaitPrefix = "SELECT GET_LOCK(CONCAT(%"
+	pollCtx, stopPoll := context.WithTimeout(ctx, 20*time.Second)
+	defer stopPoll()
+	waited := false
+	for {
+		var n int
+		err := db.QueryRowContext(pollCtx, `SELECT COUNT(*) FROM information_schema.processlist
+			WHERE db = DATABASE() AND id <> CONNECTION_ID() AND id <> ? AND info LIKE ?`,
+			holderID, gateWaitPrefix).Scan(&n)
+		if err != nil && pollCtx.Err() != nil {
+			t.Fatalf("no connection waited for the gate, so the conversion did not take it: %v", err)
+		}
+		if err == nil && n > 0 {
+			waited = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !waited {
+		t.Fatal("the conversion never waited for the schema gate")
+	}
+	select {
+	case err := <-converted:
+		t.Fatalf("the conversion finished while the gate was held (err = %v)", err)
+	default:
+	}
+	closeRelease()
+	select {
+	case err := <-converted:
+		if err != nil {
+			t.Fatalf("convert under the gate: %v", err)
+		}
+	case <-time.After(45 * time.Second):
+		t.Fatal("the conversion never finished after the gate was released")
+	}
+	assertPinnedCollationAndIndex(t, db, "tenant_external_bindings", "subject_key", "uk_external_binding_subject")
+}
+
+// A run that crashed after dropping the index leaves it missing; the recovery runs
+// under the same gate binding writers take, so a writer that arrives while the
+// index is absent waits for the repair instead of inserting into the gap.
+func TestPinnedCollationRecoveryIsSerializedWithWriters(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	db := s.DB()
+	now := time.Now().UTC()
+	if err := s.InsertExternalBinding(ctx, &ExternalBinding{
+		Provider: "slock", SubjectKey: "before-the-crash", TenantID: "t", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("insert before the crash: %v", err)
+	}
+	// The state a crash between DROP INDEX and MODIFY COLUMN leaves behind: the
+	// column is still case-insensitive and the unique index is gone.
+	dropIndex(t, db, "tenant_external_bindings", "uk_external_binding_subject")
+	if _, err := db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings MODIFY COLUMN subject_key VARCHAR(512) COLLATE utf8mb4_general_ci NOT NULL"); err != nil {
+		t.Fatalf("downgrade the column: %v", err)
+	}
+	if got := collationAndIndexState(t, db, "tenant_external_bindings", "subject_key", "uk_external_binding_subject"); got != "collation=utf8mb4_general_ci indexed=false" {
+		t.Fatalf("crash state = %q, want the case-insensitive column without its index", got)
+	}
+	// A write into that gap fails closed rather than trusting the missing index.
+	if err := s.InsertExternalBinding(context.Background(), &ExternalBinding{
+		Provider: "slock", SubjectKey: "into-the-gap", TenantID: "t", CreatedAt: now, UpdatedAt: now,
+	}); err == nil {
+		t.Fatal("insert succeeded while the unique subject index was missing")
+	}
+
+	holding := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	holderDone := make(chan struct{})
+	holderCtx, cancelHolder := context.WithCancel(ctx)
+	go func() {
+		defer close(holderDone)
+		_ = s.WithExternalBindingSchemaLock(holderCtx, func(lockCtx context.Context, _ *sql.Conn) error {
+			close(holding)
+			<-release
+			return nil
+		})
+	}()
+	t.Cleanup(func() {
+		closeRelease()
+		cancelHolder()
+		select {
+		case <-holderDone:
+		case <-time.After(30 * time.Second):
+			t.Errorf("the schema-lock holder did not exit; its database call may still be running")
+		}
+	})
+	select {
+	case <-holding:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the schema lock was never acquired")
+	}
+
+	// Both the migration and the writer have to wait for the gate this test holds.
+	// Their contexts are cancelable and every wait is bounded, so a stalled database
+	// fails this test with a message instead of hanging the package.
+	workersCtx, cancelWorkers := context.WithTimeout(ctx, 60*time.Second)
+	workerDone := make(chan struct{}, 2)
+	t.Cleanup(func() {
+		cancelWorkers()
+		for i := 0; i < 2; i++ {
+			select {
+			case <-workerDone:
+			case <-time.After(30 * time.Second):
+				t.Errorf("a recovery worker did not exit after its context was canceled")
+			}
+		}
+	})
+	recovered := make(chan error, 1)
+	go func() {
+		defer func() { workerDone <- struct{}{} }()
+		reopened, err := OpenContext(workersCtx, testDSN)
+		if err == nil {
+			_ = reopened.Close()
+		}
+		recovered <- err
+	}()
+	writeErr := make(chan error, 1)
+	go func() {
+		defer func() { workerDone <- struct{}{} }()
+		writeErr <- s.InsertExternalBinding(workersCtx, &ExternalBinding{
+			Provider: "slock", SubjectKey: "during-recovery", TenantID: "t", CreatedAt: now, UpdatedAt: now,
+		})
+	}()
+	for _, ch := range []chan error{recovered, writeErr} {
+		select {
+		case err := <-ch:
+			t.Fatalf("work proceeded while the schema gate was held (err = %v)", err)
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+	closeRelease()
+	select {
+	case <-holderDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the schema-lock holder never exited after the gate was released")
+	}
+
+	select {
+	case err := <-recovered:
+		if err != nil {
+			t.Fatalf("recover the index after a crash: %v", err)
+		}
+	case <-time.After(45 * time.Second):
+		t.Fatal("the recovery never finished after the schema gate was released")
+	}
+	// The writer that queued behind the gate either saw the recovered index and
+	// stored the row, or observed the index missing and failed closed. Neither may
+	// land a write in the gap.
+	var queuedErr error
+	select {
+	case queuedErr = <-writeErr:
+	case <-time.After(45 * time.Second):
+		t.Fatal("the queued writer never finished after the schema gate was released")
+	}
+	switch err := queuedErr; {
+	case err == nil:
+		if got, getErr := s.GetExternalBinding(ctx, "slock", "during-recovery"); getErr != nil || got == nil {
+			t.Fatalf("binding written after the recovery is not readable: %v, %v", got, getErr)
+		}
+	case strings.Contains(err.Error(), "is missing"):
+		// Fail-closed: the recovery had not run yet when the write was admitted.
+	default:
+		t.Fatalf("writer after the recovery: %v", err)
+	}
+	assertPinnedCollationAndIndex(t, db, "tenant_external_bindings", "subject_key", "uk_external_binding_subject")
+	if got, err := s.GetExternalBinding(ctx, "slock", "before-the-crash"); err != nil || got == nil {
+		t.Fatalf("pre-crash binding: %v, %v", got, err)
+	}
+	// With the index back, a write is admitted again.
+	if err := s.InsertExternalBinding(ctx, &ExternalBinding{
+		Provider: "slock", SubjectKey: "after-recovery", TenantID: "t", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("insert after the recovery: %v", err)
+	}
+}
+
+// Recreating the unique index must report duplicate rows instead of failing with a
+// raw duplicate-key error, so an operator sees what to clean up.
+func TestPinnedCollationsRefuseToRecreateUniqueIndexOverDuplicates(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	db := s.DB()
+	dropIndex(t, db, "tenant_external_bindings", "uk_external_binding_subject")
+	// The shared test database is reused by every test in the package, and the
+	// migration runs before the per-test reset, so the leftovers have to go.
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(ctx, `DELETE FROM tenant_external_bindings WHERE subject_key = 'dup'`)
+		_, _ = db.ExecContext(ctx, `ALTER TABLE tenant_external_bindings
+			ADD UNIQUE INDEX uk_external_binding_subject (provider, subject_key)`)
+	})
+	for i := 0; i < 2; i++ {
+		if _, err := db.ExecContext(ctx, `INSERT INTO tenant_external_bindings
+			(provider, subject_key, tenant_id, created_at, updated_at)
+			VALUES ('slock', 'dup', 'tenant', UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))`); err != nil {
+			t.Fatalf("insert duplicate %d: %v", i, err)
+		}
+	}
+
+	_, err := Open(testDSN)
+	if err == nil {
+		t.Fatal("migration recreated a unique index over duplicate rows")
+	}
+	if !strings.Contains(err.Error(), "duplicate rows") {
+		t.Fatalf("migration error = %v, want the duplicate preflight message", err)
+	}
+}
+
+// A pinned column whose type drifted must be left alone: rewriting the definition to
+// the contract's VARCHAR(512) would shrink a wider column before the schema check
+// could report the mismatch.
+func TestPinnedCollationLeavesADriftedColumnTypeAlone(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	db := s.DB()
+	restore := func() {
+		_, _ = db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings DROP INDEX uk_external_binding_subject")
+		_, _ = db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings MODIFY COLUMN subject_key VARCHAR(512) COLLATE utf8mb4_bin NOT NULL")
+		_, _ = db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings ADD UNIQUE INDEX uk_external_binding_subject (provider, subject_key)")
+	}
+	t.Cleanup(restore)
+	dropIndex(t, db, "tenant_external_bindings", "uk_external_binding_subject")
+	if _, err := db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings MODIFY COLUMN subject_key VARCHAR(600) COLLATE utf8mb4_general_ci NOT NULL"); err != nil {
+		t.Fatalf("drift the column type: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings ADD UNIQUE INDEX uk_external_binding_subject (provider, subject_key)"); err != nil {
+		t.Fatalf("recreate the index: %v", err)
+	}
+
+	_, err := Open(testDSN)
+	if err == nil {
+		t.Fatal("the migration rewrote a column whose type does not match the contract")
+	}
+	if !strings.Contains(err.Error(), "column type") {
+		t.Fatalf("migration error = %v, want the schema check to report the type", err)
+	}
+	var columnType, collation string
+	if err := db.QueryRowContext(ctx, `SELECT column_type, collation_name FROM information_schema.columns
+		WHERE table_schema = DATABASE() AND table_name = 'tenant_external_bindings' AND column_name = 'subject_key'`).Scan(&columnType, &collation); err != nil {
+		t.Fatal(err)
+	}
+	if strings.ToLower(columnType) != "varchar(600)" {
+		t.Fatalf("column type = %q, want it untouched at varchar(600)", columnType)
+	}
+	if collation != "utf8mb4_general_ci" {
+		t.Fatalf("collation = %q, want it untouched while the type is drifted", collation)
+	}
+}
+
+// TiDB refuses the collation change while an index the contract does not declare
+// covers the column, so the migration reports that index before dropping the
+// contract's own. MySQL 8.4 accepts the change with the extra index in place; there
+// the conversion is expected to go through and the index to be left alone.
+func TestPinnedCollationReportsAnExtraCoveringIndex(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	db := s.DB()
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings DROP INDEX idx_extra_subject")
+		_, _ = db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings DROP INDEX uk_external_binding_subject")
+		_, _ = db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings MODIFY COLUMN subject_key VARCHAR(512) COLLATE utf8mb4_bin NOT NULL")
+		_, _ = db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings ADD UNIQUE INDEX uk_external_binding_subject (provider, subject_key)")
+	})
+	dropIndex(t, db, "tenant_external_bindings", "uk_external_binding_subject")
+	if _, err := db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings MODIFY COLUMN subject_key VARCHAR(512) COLLATE utf8mb4_general_ci NOT NULL"); err != nil {
+		t.Fatalf("downgrade the column: %v", err)
+	}
+	for _, stmt := range []string{
+		"ALTER TABLE tenant_external_bindings ADD UNIQUE INDEX uk_external_binding_subject (provider, subject_key)",
+		"ALTER TABLE tenant_external_bindings ADD INDEX idx_extra_subject (subject_key)",
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+
+	reopened, err := Open(testDSN)
+	if err != nil {
+		// TiDB: the change was refused and the undeclared index is what the
+		// migration reports. Nothing may have been touched on the way there.
+		if !strings.Contains(err.Error(), "idx_extra_subject") {
+			t.Fatalf("migration error = %v, want it to name the extra index", err)
+		}
+		if got := collationAndIndexState(t, db, "tenant_external_bindings", "subject_key", "uk_external_binding_subject"); got != "collation=utf8mb4_general_ci indexed=true" {
+			t.Fatalf("state = %q, want the column untouched and the contract index still present", got)
+		}
+		return
+	}
+	// MySQL: the change was accepted with the extra index covering the column, so
+	// the conversion is expected and the extra index stays.
+	t.Cleanup(func() { _ = reopened.Close() })
+	assertPinnedCollationAndIndex(t, reopened.DB(), "tenant_external_bindings", "subject_key", "uk_external_binding_subject")
+	var extra int
+	if err := reopened.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.statistics
+		WHERE table_schema = DATABASE() AND table_name = 'tenant_external_bindings' AND index_name = 'idx_extra_subject'`).Scan(&extra); err != nil {
+		t.Fatal(err)
+	}
+	if extra == 0 {
+		t.Fatal("the undeclared index was dropped on an engine that did not have to drop it")
+	}
+}
+
+// A same-named but wrong-shaped index is neither the contract's index nor an
+// undeclared one, and TiDB refuses the collation change while it covers the column,
+// so it has to be dropped before the change and recreated as the contract declares.
+func TestPinnedCollationConvertsUnderAWrongShapedIndex(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	db := s.DB()
+	dropIndex(t, db, "tenant_external_bindings", "uk_external_binding_subject")
+	if _, err := db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings MODIFY COLUMN subject_key VARCHAR(512) COLLATE utf8mb4_general_ci NOT NULL"); err != nil {
+		t.Fatalf("downgrade the column: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings ADD INDEX uk_external_binding_subject (provider, subject_key)"); err != nil {
+		t.Fatalf("add the non-unique same-named index: %v", err)
+	}
+	if got := collationAndIndexState(t, db, "tenant_external_bindings", "subject_key", "uk_external_binding_subject"); got != "collation=utf8mb4_general_ci indexed=true" {
+		t.Fatalf("setup state = %q, want the case-insensitive column with a non-unique index", got)
+	}
+
+	reopened, err := Open(testDSN)
+	if err != nil {
+		t.Fatalf("migration did not convert under a wrong-shaped index: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	assertPinnedCollationAndIndex(t, reopened.DB(), "tenant_external_bindings", "subject_key", "uk_external_binding_subject")
+	// The replacement has to be the contract's unique index, not just the same name.
+	assertPinnedCollationIndexShape(t, reopened.DB(), "tenant_external_bindings", "subject_key", "uk_external_binding_subject",
+		&metaCollationIndex{name: "uk_external_binding_subject", columns: []string{"provider", "subject_key"}, unique: true})
+}
+
+// A same-named index that is not unique is not proof that uniqueness is enforced:
+// the migration replaces it and inserts enforce the key again.
+func TestPinnedCollationReplacesANonUniqueSameNamedIndex(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	db := s.DB()
+	dropIndex(t, db, "tenant_external_bindings", "uk_external_binding_subject")
+	if _, err := db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings ADD INDEX uk_external_binding_subject (provider, subject_key)"); err != nil {
+		t.Fatalf("add the non-unique index: %v", err)
+	}
+
+	reopened, err := Open(testDSN)
+	if err != nil {
+		t.Fatalf("migration did not replace the non-unique index: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	assertPinnedCollationAndIndex(t, reopened.DB(), "tenant_external_bindings", "subject_key", "uk_external_binding_subject")
+
+	now := time.Now().UTC()
+	if err := s.InsertExternalBinding(ctx, &ExternalBinding{
+		Provider: "slock", SubjectKey: "unique-check", TenantID: "t", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("first insert: %v", err)
+	}
+	if err := s.InsertExternalBinding(ctx, &ExternalBinding{
+		Provider: "slock", SubjectKey: "unique-check", TenantID: "t2", CreatedAt: now, UpdatedAt: now,
+	}); !errors.Is(err, ErrDuplicate) {
+		t.Fatalf("duplicate insert error = %v, want ErrDuplicate", err)
+	}
+}
+
+// downgradeSubjectKey puts the binding subject column back into the pre-fix shape:
+// case-insensitive, with its unique index rebuilt around the downgrade (TiDB
+// refuses the collation change while the index covers the column).
+// downgradeIssuerSubjectKey puts the issuer subject column back into the pre-fix shape.
+func downgradeIssuerSubjectKey(t *testing.T, db *sql.DB) {
+	t.Helper()
+	dropIndex(t, db, "tenant_api_keys", "idx_api_keys_issuer")
+	if _, err := db.ExecContext(context.Background(),
+		"ALTER TABLE tenant_api_keys MODIFY COLUMN issued_by_subject_key VARCHAR(512) COLLATE utf8mb4_general_ci NOT NULL DEFAULT ''"); err != nil {
+		t.Fatalf("downgrade issued_by_subject_key: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(),
+		"ALTER TABLE tenant_api_keys ADD INDEX idx_api_keys_issuer (tenant_id, issued_by_provider, issued_by_subject_key, status, created_at)"); err != nil {
+		t.Fatalf("recreate the issuer index: %v", err)
+	}
+}
+
+func downgradeSubjectKey(t *testing.T, db *sql.DB) {
+	t.Helper()
+	dropIndex(t, db, "tenant_external_bindings", "uk_external_binding_subject")
+	if _, err := db.ExecContext(context.Background(),
+		"ALTER TABLE tenant_external_bindings MODIFY COLUMN subject_key VARCHAR(512) COLLATE utf8mb4_general_ci NOT NULL"); err != nil {
+		t.Fatalf("downgrade subject_key: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(),
+		"ALTER TABLE tenant_external_bindings ADD UNIQUE INDEX uk_external_binding_subject (provider, subject_key)"); err != nil {
+		t.Fatalf("recreate subject index: %v", err)
+	}
+}
+
+func dropIndex(t *testing.T, db *sql.DB, table, index string) {
+	t.Helper()
+	if _, err := db.ExecContext(context.Background(), fmt.Sprintf("ALTER TABLE %s DROP INDEX %s", table, index)); err != nil {
+		t.Fatalf("drop %s.%s: %v", table, index, err)
+	}
+}
+
+func collationAndIndexState(t *testing.T, db *sql.DB, table, column, index string) string {
+	t.Helper()
+	var collation sql.NullString
+	if err := db.QueryRowContext(context.Background(), `SELECT collation_name FROM information_schema.columns
+		WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`, table, column).Scan(&collation); err != nil {
+		t.Fatalf("read %s.%s collation: %v", table, column, err)
+	}
+	var indexed bool
+	if err := db.QueryRowContext(context.Background(), `SELECT EXISTS (
+			SELECT 1 FROM information_schema.statistics
+			WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?)`, table, index).Scan(&indexed); err != nil {
+		t.Fatalf("read %s.%s index: %v", table, index, err)
+	}
+	return fmt.Sprintf("collation=%s indexed=%t", collation.String, indexed)
+}
+
+func assertPinnedCollationAndIndex(t *testing.T, db *sql.DB, table, column, index string) {
+	t.Helper()
+	assertPinnedCollationIndexShape(t, db, table, column, index, nil)
+}
+
+// assertPinnedCollationIndexShape also checks the index is the contract's: same
+// uniqueness and columns. A name-only check would accept the wrong-shaped index this
+// migration is supposed to replace.
+func assertPinnedCollationIndexShape(t *testing.T, db *sql.DB, table, column, index string, shape *metaCollationIndex) {
+	t.Helper()
+	if got := collationAndIndexState(t, db, table, column, index); got != "collation=utf8mb4_bin indexed=true" {
+		t.Fatalf("%s.%s state = %q, want collation=utf8mb4_bin indexed=true", table, column, got)
+	}
+	want := shape
+	if want == nil {
+		for _, target := range metaPinnedCollationTargets(mustMetaSpec(t)) {
+			if target.table != table || target.column != column {
+				continue
+			}
+			for _, candidate := range target.indexes {
+				if candidate.name == index {
+					shapeCopy := candidate
+					want = &shapeCopy
+				}
+			}
+		}
+	}
+	if want == nil {
+		t.Fatalf("no contract index %s.%s to compare with", table, index)
+	}
+	present, healthy, err := metaIndexMatches(context.Background(), db, table, *want)
+	if err != nil {
+		t.Fatalf("read %s.%s shape: %v", table, index, err)
+	}
+	if !present || !healthy {
+		t.Fatalf("%s.%s is not the contract index shape (present=%v healthy=%v)", table, index, present, healthy)
+	}
+}
+
+// freshControlStoreInDatabase migrates a brand-new database whose default
+// collation is the given one, so a fresh-install assertion is meaningful on an
+// engine whose own default already matches.
+func freshControlStoreInDatabase(t *testing.T, collation string) *Store {
+	t.Helper()
+	// The name has to stay short: the migration lock is named after the database and
+	// MySQL caps a lock name at 64 characters.
+	sum := sha256.Sum256([]byte(t.Name()))
+	name := fmt.Sprintf("meta_fresh_%x", sum[:6])
+	admin, err := sql.Open("mysql", metaTestDSNWithDatabase(t, ""))
+	if err != nil {
+		t.Fatalf("open admin connection: %v", err)
+	}
+	defer func() { _ = admin.Close() }()
+	ctx := context.Background()
+	if _, err := admin.ExecContext(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", name)); err != nil {
+		t.Fatalf("drop scratch database: %v", err)
+	}
+	if _, err := admin.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE `%s` COLLATE %s", name, collation)); err != nil {
+		t.Fatalf("create scratch database: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanup, err := sql.Open("mysql", metaTestDSNWithDatabase(t, ""))
+		if err != nil {
+			return
+		}
+		defer func() { _ = cleanup.Close() }()
+		_, _ = cleanup.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", name))
+	})
+	store, err := Open(metaTestDSNWithDatabase(t, name))
+	if err != nil {
+		t.Fatalf("open scratch store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}
+
+// metaTestDSNWithDatabase rewrites the test DSN onto another database (empty means
+// no database selected). The DSN is parsed rather than sliced: a password may
+// contain any character the driver accepts, including "?" and "/".
+func metaTestDSNWithDatabase(t *testing.T, name string) string {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(testDSN)
+	if err != nil {
+		t.Fatalf("parse test DSN: %v", err)
+	}
+	cfg.DBName = name
+	return cfg.FormatDSN()
+}

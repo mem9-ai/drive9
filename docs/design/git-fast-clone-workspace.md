@@ -42,7 +42,7 @@ This is therefore not a pure generic filesystem optimization. It is a Git-aware 
 - `workspace_kind=main` is a primary fast clone. `workspace_kind=linked` is a Git linked worktree with its own clean tree manifest and dirty overlay.
 - `common_workspace_id` points from a linked worktree to the main/common workspace that owns the shared Git common dir.
 - `worktree_name` is the stable name under the common Git dir's `worktrees/` directory.
-- `gitdir_rel` stores the linked gitdir path relative to the common `.git` directory, normally `worktrees/<worktree_name>`.
+- `gitdir_rel` stores the linked gitdir path relative to the common `.git` directory and must be `worktrees/<worktree_name>` (a leading `.git/` is accepted); the API rejects any other shape and the mount refuses to restore one, because a checkpoint is published at that path and anything else (`hooks`, `config`, `refs/...`) is a directory git executes from or reads configuration from.
 
 `git_workspace_tree_nodes`
 

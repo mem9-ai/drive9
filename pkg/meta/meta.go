@@ -5,11 +5,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mem9-ai/drive9/internal/schemaspec"
@@ -375,6 +377,7 @@ func (s *Store) DB() *sql.DB  { return s.db }
 
 const metaSchemaMigrateLockNamePrefix = "dat9_meta_schema_migrate:"
 const metaSchemaMigrateLockTimeoutSeconds = 30
+const metaSchemaMigrateReleaseLockTimeout = 5 * time.Second
 const externalBindingLockTimeoutSeconds = 90
 const externalBindingReleaseLockTimeout = 5 * time.Second
 const tidbCloudOrgBindingLockTimeoutSeconds = 90
@@ -386,6 +389,15 @@ var tidbCloudFreeQuotaLockTimeoutSeconds = 5
 
 const tidbCloudFreeQuotaReleaseLockTimeout = 5 * time.Second
 
+// migrate brings the control-plane schema up to the contract.
+//
+// It runs on its own context, not the caller's: OpenContext is called from the
+// startup retry with a short per-attempt deadline, and a migration that inherits it
+// fails mid-ALTER on a large table, leaves the statement running on the server, and
+// makes every later attempt wait behind it. Nothing bounds the migration's own
+// statements now: the migration lock bounds only the wait for another instance's
+// migration, and a stalled statement blocks startup until the database answers or
+// the process is stopped from outside.
 func (s *Store) migrate() (err error) {
 	ctx := context.Background()
 	releaseLock, err := acquireMetaSchemaMigrationLock(ctx, s.db)
@@ -398,12 +410,19 @@ func (s *Store) migrate() (err error) {
 		}
 	}()
 
-	stmts := metaInitSchemaStatements()
-	spec, err := metaSchemaSpecFromStatements(stmts)
+	spec, err := metaInitSchemaSpec()
 	if err != nil {
 		return fmt.Errorf("parse meta schema statements: %w", err)
 	}
 	if err := dropObsoleteMetaIndexes(ctx, s.db); err != nil {
+		return err
+	}
+	// Before the diff: an old installation has the pinned columns indexed, and
+	// TiDB refuses a collation change on an indexed column, so the conversion has
+	// to run (and rebuild the indexes) before the diff would report the collation
+	// mismatch it is about to observe. There is no repair for that mismatch: the
+	// diff reports it without SQL, and this pre-step is what fixes it.
+	if err := ensurePinnedCollations(ctx, s.db, spec); err != nil {
 		return err
 	}
 	diffs, err := diffMetaSchema(ctx, s.db, spec)
@@ -439,51 +458,21 @@ func (s *Store) migrate() (err error) {
 }
 
 func acquireMetaSchemaMigrationLock(ctx context.Context, db *sql.DB) (func() error, error) {
-	conn, err := db.Conn(ctx)
+	lock, err := acquireMetaNamedLock(ctx, db, metaNamedLockSpec{
+		name:           metaSchemaMigrateLockNamePrefix,
+		databaseScoped: true,
+		timeoutSeconds: metaSchemaMigrateLockTimeoutSeconds,
+		releaseTimeout: metaSchemaMigrateReleaseLockTimeout,
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	var got sql.NullInt64
-	if err := conn.QueryRowContext(ctx,
-		"SELECT GET_LOCK(CONCAT(?, DATABASE()), ?)",
-		metaSchemaMigrateLockNamePrefix,
-		metaSchemaMigrateLockTimeoutSeconds,
-	).Scan(&got); err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	if !got.Valid {
-		_ = conn.Close()
-		return nil, fmt.Errorf("named lock returned NULL")
-	}
-	if got.Int64 != 1 {
-		_ = conn.Close()
-		return nil, fmt.Errorf("timed out waiting for named lock")
-	}
-
-	return func() error {
-		defer func() { _ = conn.Close() }()
-
-		var released sql.NullInt64
-		if err := conn.QueryRowContext(ctx,
-			"SELECT RELEASE_LOCK(CONCAT(?, DATABASE()))",
-			metaSchemaMigrateLockNamePrefix,
-		).Scan(&released); err != nil {
-			return err
-		}
-		if !released.Valid {
-			return fmt.Errorf("named lock release returned NULL")
-		}
-		if released.Int64 != 1 {
-			return fmt.Errorf("named lock was not held by current connection")
-		}
-		return nil
-	}, nil
+	return lock.release, nil
 }
 
 type metaColumnMeta struct {
 	columnType string
+	collation  string
 }
 
 type metaTableMeta struct {
@@ -537,8 +526,11 @@ type metaTableSpec struct {
 
 type metaColumnSpec struct {
 	columnType string
-	addSQL     string
-	modifySQL  string
+	// collation is the COLLATE clause the definition pins, empty when it pins
+	// none. Pinning it is what makes a case-sensitive identity byte-compared.
+	collation string
+	addSQL    string
+	modifySQL string
 }
 
 type metaIndexSpec struct {
@@ -663,7 +655,7 @@ func metaInitSchemaStatements() []string {
 			status         VARCHAR(20) NOT NULL DEFAULT 'active',
 			scope_kind     VARCHAR(32) NOT NULL DEFAULT 'owner',
 			issued_by_provider VARCHAR(64) NOT NULL DEFAULT '',
-			issued_by_subject_key VARCHAR(512) NOT NULL DEFAULT '',
+			issued_by_subject_key VARCHAR(512) COLLATE utf8mb4_bin NOT NULL DEFAULT '',
 			issued_by_metadata_json JSON NULL,
 			issued_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			revoked_at     DATETIME(3) NULL,
@@ -673,9 +665,16 @@ func metaInitSchemaStatements() []string {
 			INDEX idx_api_keys_tenant (tenant_id, status),
 			INDEX idx_api_keys_issuer (tenant_id, issued_by_provider, issued_by_subject_key, status, created_at)
 		)`,
+		// subject_key and tenant_api_keys.issued_by_subject_key are opaque,
+		// case-sensitive identities from the OAuth provider, so both columns pin
+		// utf8mb4_bin: under a case-insensitive collation "SUBJ" resolves to the
+		// binding stored for "subj" and the caller is handed another tenant's key.
+		// ensurePinnedCollations converts existing installations (TiDB
+		// refuses a collation change on an indexed column, so the indexes around
+		// the two columns are rebuilt).
 		`CREATE TABLE IF NOT EXISTS tenant_external_bindings (
 			provider      VARCHAR(64) NOT NULL,
-			subject_key   VARCHAR(512) NOT NULL,
+			subject_key   VARCHAR(512) COLLATE utf8mb4_bin NOT NULL,
 			tenant_id     VARCHAR(64) NOT NULL,
 			metadata_json JSON NULL,
 			created_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
@@ -974,6 +973,13 @@ func sameStringSlice(a, b []string) bool {
 	return true
 }
 
+// metaInitSchemaSpec parses the init schema once. Everything that needs the
+// contract — the migration, the insert's index check — derives it from the same
+// statements, so a hand-written copy cannot drift from the DDL.
+var metaInitSchemaSpec = sync.OnceValues(func() (metaSchemaSpec, error) {
+	return metaSchemaSpecFromStatements(metaInitSchemaStatements())
+})
+
 func metaSchemaSpecFromStatements(stmts []string) (metaSchemaSpec, error) {
 	tables := make([]metaTableSpec, 0)
 	for _, stmt := range stmts {
@@ -1081,6 +1087,17 @@ func diffMetaTableMetaWithObservedIndexes(table metaTableSpec, meta metaTableMet
 				repairSQL:  spec.addSQL,
 			})
 			continue
+		}
+		if spec.collation != "" && !strings.EqualFold(col.collation, spec.collation) {
+			// Reported, not repaired: ensurePinnedCollations owns the conversion,
+			// because TiDB refuses a bare MODIFY while an index covers the column.
+			// A drifted type is still compared below, so both are reported.
+			diffs = append(diffs, metaSchemaDiff{
+				kind:       metaSchemaDiffColumnType,
+				tableName:  table.name,
+				columnName: name,
+				detail:     fmt.Sprintf("%s schema contract: %s column collation = %q, want %s", table.name, name, col.collation, spec.collation),
+			})
 		}
 		observedType := normalizeMetaSQLFragment(col.columnType)
 		desiredType := normalizeMetaSQLFragment(spec.columnType)
@@ -1334,9 +1351,9 @@ func metaTableExists(ctx context.Context, db *sql.DB, tableName string) (bool, e
 	return count > 0, nil
 }
 
-func metaIndexExists(ctx context.Context, db *sql.DB, tableName, indexName string) (bool, error) {
+func metaIndexExists(ctx context.Context, q metaQueryer, tableName, indexName string) (bool, error) {
 	var count int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*)
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*)
 		FROM information_schema.statistics
 		WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?`,
 		tableName, indexName).Scan(&count); err != nil {
@@ -1472,6 +1489,7 @@ func parseMetaColumnDefinition(tableName, def string) (string, metaColumnSpec, b
 	}
 	return strings.ToLower(name), metaColumnSpec{
 		columnType: strings.ToLower(strings.TrimSpace(colType)),
+		collation:  parseMetaColumnCollation(rest),
 		addSQL:     fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", tableName, name, strings.TrimSpace(rest)),
 		modifySQL:  fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s %s", tableName, name, strings.TrimSpace(rest)),
 	}, true
@@ -1479,6 +1497,19 @@ func parseMetaColumnDefinition(tableName, def string) (string, metaColumnSpec, b
 
 func parseMetaColumnType(rest string) string {
 	return schemaspec.ParseColumnType(rest)
+}
+
+// parseMetaColumnCollation returns the collation a column definition pins
+// ("VARCHAR(512) COLLATE utf8mb4_bin NOT NULL" -> "utf8mb4_bin"), or "" when the
+// definition defers to the table default.
+func parseMetaColumnCollation(rest string) string {
+	fields := strings.Fields(strings.ToLower(rest))
+	for i := 0; i+1 < len(fields); i++ {
+		if fields[i] == "collate" {
+			return strings.Trim(fields[i+1], "`")
+		}
+	}
+	return ""
 }
 
 func splitMetaIdentifierAndRest(s string) (identifier string, rest string) {
@@ -1537,7 +1568,7 @@ func isIgnorableMetaSchemaError(err error) bool {
 }
 
 func loadMetaTableMeta(ctx context.Context, db *sql.DB, tableName string) (metaTableMeta, error) {
-	rows, err := db.QueryContext(ctx, `SELECT column_name, column_type
+	rows, err := db.QueryContext(ctx, `SELECT column_name, column_type, collation_name
 		FROM information_schema.columns
 		WHERE table_schema = DATABASE() AND table_name = ?`, tableName)
 	if err != nil {
@@ -1548,10 +1579,11 @@ func loadMetaTableMeta(ctx context.Context, db *sql.DB, tableName string) (metaT
 	columns := make(map[string]metaColumnMeta)
 	for rows.Next() {
 		var name, columnType string
-		if err := rows.Scan(&name, &columnType); err != nil {
+		var collation sql.NullString
+		if err := rows.Scan(&name, &columnType, &collation); err != nil {
 			return metaTableMeta{}, err
 		}
-		columns[strings.ToLower(name)] = metaColumnMeta{columnType: columnType}
+		columns[strings.ToLower(name)] = metaColumnMeta{columnType: columnType, collation: collation.String}
 	}
 	if err := rows.Err(); err != nil {
 		return metaTableMeta{}, err
@@ -1798,14 +1830,44 @@ func (s *Store) InsertExternalBinding(ctx context.Context, b *ExternalBinding) (
 	if b == nil {
 		return fmt.Errorf("external binding is required")
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO tenant_external_bindings
-		(provider, subject_key, tenant_id, metadata_json, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?)`,
-		b.Provider, b.SubjectKey, b.TenantID, nullableBytes(b.MetadataJSON), b.CreatedAt.UTC(), b.UpdatedAt.UTC())
-	if isDuplicateEntry(err) {
-		return ErrDuplicate
+	// The unique subject index can be absent for a moment while the schema
+	// migration converts its collation, so the insert runs under the schema gate
+	// the migration holds — on the gated connection, which is why this does not ask
+	// the pool for a second one. It is a short statement; the caller's per-subject
+	// lock still covers the read-modify-write around it.
+	//
+	// The index is taken from the parsed contract rather than restated here: the
+	// check and the DDL cannot disagree about which columns are unique.
+	spec, err := metaInitSchemaSpec()
+	if err != nil {
+		return err
 	}
-	return err
+	contractIndex, ok := metaPinnedIndex(spec, "tenant_external_bindings", externalBindingSubjectIndexName)
+	if !ok {
+		return fmt.Errorf("insert external binding: the schema contract does not declare index %s", externalBindingSubjectIndexName)
+	}
+	return s.WithExternalBindingSchemaLock(ctx, func(lockCtx context.Context, conn *sql.Conn) error {
+		// Fail closed unless the unique index the contract declares is really there:
+		// a store that was already serving would otherwise write into the gap the
+		// migration leaves, and a same-named non-unique index would not enforce the
+		// uniqueness this check is for. The gate is released when the migration
+		// fails, so the check has to be repeated per insert.
+		_, healthy, err := metaIndexMatches(lockCtx, conn, "tenant_external_bindings", contractIndex)
+		if err != nil {
+			return err
+		}
+		if !healthy {
+			return fmt.Errorf("insert external binding: the unique subject index %s is missing or not unique, so the schema migration has to complete first", externalBindingSubjectIndexName)
+		}
+		_, err = conn.ExecContext(lockCtx, `INSERT INTO tenant_external_bindings
+			(provider, subject_key, tenant_id, metadata_json, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			b.Provider, b.SubjectKey, b.TenantID, nullableBytes(b.MetadataJSON), b.CreatedAt.UTC(), b.UpdatedAt.UTC())
+		if isDuplicateEntry(err) {
+			return ErrDuplicate
+		}
+		return err
+	})
 }
 
 func (s *Store) DeleteExternalBinding(ctx context.Context, provider, subjectKey string) (err error) {
@@ -1915,49 +1977,23 @@ func (s *Store) withTiDBCloudOrgBindingLock(ctx context.Context, organizationID,
 		return fmt.Errorf("tidbcloud org binding lock callback is required")
 	}
 	lockName := tidbCloudOrgBindingLockName(organizationID, clusterID, branchID)
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = conn.Close() }()
-
+	// The database suffix is resolved here rather than by CONCAT(?, DATABASE()) so the
+	// lock name stays exactly what earlier builds took: a lock name that differs by
+	// build would not exclude the other pod during a rolling deploy.
 	var databaseName sql.NullString
-	if err := conn.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&databaseName); err != nil {
+	if err := s.db.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&databaseName); err != nil {
 		return err
 	}
 	lockName = tenantPoolDatabaseLockName(lockName, databaseName.String)
 
-	// These parameterized operations own connection-local locks; TiDB must
-	// execute them each time instead of reusing a folded prepared plan.
-	var got sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT /*+ IGNORE_PLAN_CACHE() */ GET_LOCK(?, ?)", lockName, tidbCloudOrgBindingLockTimeoutSeconds).Scan(&got); err != nil {
-		return err
-	}
-	if !got.Valid {
-		return fmt.Errorf("tidbcloud org binding named lock returned NULL")
-	}
-	if got.Int64 != 1 {
-		return fmt.Errorf("timed out waiting for tidbcloud org binding named lock")
-	}
-	defer func() {
-		releaseCtx, cancel := context.WithTimeout(context.Background(), tidbCloudOrgBindingReleaseLockTimeout)
-		defer cancel()
-		var released sql.NullInt64
-		releaseErr := conn.QueryRowContext(releaseCtx, "SELECT /*+ IGNORE_PLAN_CACHE() */ RELEASE_LOCK(?)", lockName).Scan(&released)
-		if releaseErr != nil {
-			err = errors.Join(err, releaseErr)
-			return
-		}
-		if !released.Valid {
-			err = errors.Join(err, fmt.Errorf("tidbcloud org binding named lock release returned NULL"))
-			return
-		}
-		if released.Int64 != 1 {
-			err = errors.Join(err, fmt.Errorf("tidbcloud org binding named lock was not held by current connection"))
-		}
-	}()
-
-	return fn(ctx, conn)
+	return withMetaNamedLock(ctx, s.db, metaNamedLockSpec{
+		name:            lockName,
+		ignorePlanCache: true,
+		timeoutSeconds:  tidbCloudOrgBindingLockTimeoutSeconds,
+		releaseTimeout:  tidbCloudOrgBindingReleaseLockTimeout,
+	}, func(ctx context.Context, conn *sql.Conn) error {
+		return fn(ctx, conn)
+	})
 }
 
 func ensureTiDBCloudOrgBindingAvailable(ctx context.Context, q metaQueryExecer, tenantID, organizationID, clusterID, branchID string) error {
@@ -2711,48 +2747,203 @@ func compactTiDBCloudOrgClusterBindings(bindings []TenantTiDBCloudOrgBinding) []
 	return out
 }
 
+// externalBindingSubjectIndexName is the unique index over (provider, subject_key)
+// that makes a subject's binding unique. The collation migration has to remove it
+// for a moment (TiDB refuses a collation change while an index covers the column),
+// and writes fail closed while it is missing.
+const externalBindingSubjectIndexName = "uk_external_binding_subject"
+
+// externalBindingSchemaLockName is the advisory lock that serializes binding
+// writers against a schema change that has to remove the unique subject index for
+// a moment. The per-subject lock cannot do that: the migration does not know which
+// subjects will be written.
+const externalBindingSchemaLockName = "d9_extbind_schema"
+
+// WithExternalBindingSchemaLock runs fn while holding the schema-level binding
+// lock. Binding writers take it too (InsertExternalBinding), so a migration that
+// has to drop the unique subject index — TiDB refuses a collation change while an
+// index covers the column (error 8200) — cannot overlap a write that would then
+// violate uniqueness once the index is recreated.
+func (s *Store) WithExternalBindingSchemaLock(ctx context.Context, fn func(context.Context, *sql.Conn) error) error {
+	return withExternalBindingSchemaLock(ctx, s.db, fn)
+}
+
+// withExternalBindingSchemaLock is the same gate for callers that hold the
+// database handle rather than a Store (the schema migration does).
+//
+// The callback runs on the connection that holds the advisory lock, and it has to
+// run its own statements there: the lock is connection-local and the connection is
+// already reserved, so asking the pool for another one inside the callback can
+// deadlock a busy pool (every waiter holds a gated connection of its own).
+func withExternalBindingSchemaLock(ctx context.Context, db *sql.DB, fn func(context.Context, *sql.Conn) error) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "external_binding_schema_lock", start, &err)
+	if fn == nil {
+		return fmt.Errorf("external binding schema lock callback is required")
+	}
+	return withMetaNamedLock(ctx, db, metaNamedLockSpec{
+		name:           externalBindingSchemaLockName,
+		databaseScoped: true,
+		timeoutSeconds: externalBindingLockTimeoutSeconds,
+		releaseTimeout: externalBindingReleaseLockTimeout,
+	}, fn)
+}
+
+// withMetaNamedLock takes one advisory lock, runs fn on the connection that holds
+// it, and always gives the lock back. The release is deferred inside this one
+// function, so a callback that panics still releases the lock and no call site can
+// forget it. A release written after the callback instead leaks the lock whenever the
+// callback panics: the session keeps it, and every later acquisition waits until the
+// process ends.
+//
+// A release that cannot be confirmed is reported the way every caller wants it: a
+// successful callback is not turned into a failure (the caller would roll back work
+// that already committed), and a failed callback carries the release error as well.
+func withMetaNamedLock(ctx context.Context, db *sql.DB, spec metaNamedLockSpec, fn func(context.Context, *sql.Conn) error) (err error) {
+	lock, err := acquireMetaNamedLock(ctx, db, spec)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		releaseErr := lock.release()
+		if releaseErr == nil {
+			return
+		}
+		if err != nil {
+			err = errors.Join(err, releaseErr)
+			return
+		}
+		logger.Warn(ctx, "meta_named_lock_release_failed", zap.String("lock", lock.name), zap.Error(releaseErr))
+	}()
+	return fn(ctx, lock.conn)
+}
+
+// metaNamedLockSpec describes one advisory lock. Scoping the name to the database is
+// the default for this package; the TiDB Cloud locks are cluster-wide and use the
+// plan-cache hint because they are parameterized operations TiDB must not fold.
+type metaNamedLockSpec struct {
+	name            string
+	databaseScoped  bool
+	ignorePlanCache bool
+	timeoutSeconds  int
+	// releaseTimeout bounds the RELEASE_LOCK call. Each lock keeps its own value so a
+	// slow shutdown path cannot hold a caller longer than it used to.
+	releaseTimeout time.Duration
+}
+
+// metaNamedLock is an advisory lock held on one session. The session is part of the
+// lock: MySQL advisory locks are connection-local, so the work the lock protects has
+// to run on lock.conn.
+type metaNamedLock struct {
+	conn           *sql.Conn
+	name           string
+	releaseSQL     string
+	releaseArgs    []any
+	releaseTimeout time.Duration
+}
+
+func (s metaNamedLockSpec) getSQL() string {
+	hint := ""
+	if s.ignorePlanCache {
+		hint = "/*+ IGNORE_PLAN_CACHE() */ "
+	}
+	if s.databaseScoped {
+		return "SELECT " + hint + "GET_LOCK(CONCAT(?, DATABASE()), ?)"
+	}
+	return "SELECT " + hint + "GET_LOCK(?, ?)"
+}
+
+func (s metaNamedLockSpec) releaseSQLStmt() string {
+	hint := ""
+	if s.ignorePlanCache {
+		hint = "/*+ IGNORE_PLAN_CACHE() */ "
+	}
+	if s.databaseScoped {
+		return "SELECT " + hint + "RELEASE_LOCK(CONCAT(?, DATABASE()))"
+	}
+	return "SELECT " + hint + "RELEASE_LOCK(?)"
+}
+
+// errMetaNamedLockBusy reports that the lock stayed held by another session for the
+// whole acquisition timeout. Callers that answer "busy" test it with errors.Is
+// instead of matching the message text, which survives a rewording.
+var errMetaNamedLockBusy = errors.New("named lock is busy")
+
+// acquireMetaNamedLock takes one advisory lock and returns the session that holds it.
+func acquireMetaNamedLock(ctx context.Context, db *sql.DB, spec metaNamedLockSpec) (*metaNamedLock, error) {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var got sql.NullInt64
+	if err := conn.QueryRowContext(ctx, spec.getSQL(), spec.name, spec.timeoutSeconds).Scan(&got); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if !got.Valid {
+		_ = conn.Close()
+		return nil, fmt.Errorf("%s named lock returned NULL", spec.name)
+	}
+	if got.Int64 != 1 {
+		_ = conn.Close()
+		return nil, fmt.Errorf("%w: timed out waiting for %s", errMetaNamedLockBusy, spec.name)
+	}
+	releaseTimeout := spec.releaseTimeout
+	if releaseTimeout <= 0 {
+		releaseTimeout = externalBindingReleaseLockTimeout
+	}
+	return &metaNamedLock{
+		conn:           conn,
+		name:           spec.name,
+		releaseSQL:     spec.releaseSQLStmt(),
+		releaseArgs:    []any{spec.name},
+		releaseTimeout: releaseTimeout,
+	}, nil
+}
+
+// release gives the lock back and closes the session. A release that cannot be
+// confirmed keeps the lock on the server, so the session is discarded instead of
+// being returned to the pool where another caller could inherit it.
+func (l *metaNamedLock) release() error {
+	var releaseErr error
+	defer func() {
+		if releaseErr != nil {
+			_ = l.conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+		_ = l.conn.Close()
+	}()
+	releaseCtx, cancel := context.WithTimeout(context.Background(), l.releaseTimeout)
+	defer cancel()
+	var released sql.NullInt64
+	if err := l.conn.QueryRowContext(releaseCtx, l.releaseSQL, l.releaseArgs...).Scan(&released); err != nil {
+		releaseErr = err
+		return err
+	}
+	if !released.Valid {
+		releaseErr = fmt.Errorf("%s named lock release returned NULL", l.name)
+		return releaseErr
+	}
+	if released.Int64 != 1 {
+		releaseErr = fmt.Errorf("%s named lock was not held by current connection", l.name)
+		return releaseErr
+	}
+	return nil
+}
+
 func (s *Store) WithExternalBindingLock(ctx context.Context, provider, subjectKey string, fn func(context.Context) error) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "external_binding_lock", start, &err)
 	if fn == nil {
 		return fmt.Errorf("external binding lock callback is required")
 	}
-	lockName := externalBindingLockName(provider, subjectKey)
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = conn.Close() }()
-
-	var got sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(CONCAT(?, DATABASE()), ?)", lockName, externalBindingLockTimeoutSeconds).Scan(&got); err != nil {
-		return err
-	}
-	if !got.Valid {
-		return fmt.Errorf("external binding named lock returned NULL")
-	}
-	if got.Int64 != 1 {
-		return fmt.Errorf("timed out waiting for external binding named lock")
-	}
-	defer func() {
-		releaseCtx, cancel := context.WithTimeout(context.Background(), externalBindingReleaseLockTimeout)
-		defer cancel()
-		var released sql.NullInt64
-		releaseErr := conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(CONCAT(?, DATABASE()))", lockName).Scan(&released)
-		if releaseErr != nil {
-			err = errors.Join(err, releaseErr)
-			return
-		}
-		if !released.Valid {
-			err = errors.Join(err, fmt.Errorf("external binding named lock release returned NULL"))
-			return
-		}
-		if released.Int64 != 1 {
-			err = errors.Join(err, fmt.Errorf("external binding named lock was not held by current connection"))
-		}
-	}()
-
-	return fn(ctx)
+	return withMetaNamedLock(ctx, s.db, metaNamedLockSpec{
+		name:           externalBindingLockName(provider, subjectKey),
+		databaseScoped: true,
+		timeoutSeconds: externalBindingLockTimeoutSeconds,
+		releaseTimeout: externalBindingReleaseLockTimeout,
+	}, func(ctx context.Context, _ *sql.Conn) error {
+		return fn(ctx)
+	})
 }
 
 func (s *Store) WithTenantPoolLock(ctx context.Context, poolID string, fn func(context.Context) error) (err error) {
@@ -2765,49 +2956,22 @@ func (s *Store) WithTenantPoolLock(ctx context.Context, poolID string, fn func(c
 	if lockName == "" {
 		return fmt.Errorf("pool_id is required")
 	}
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = conn.Close() }()
-
+	// The database suffix is resolved here rather than by CONCAT(?, DATABASE()) so the
+	// lock name stays exactly what earlier builds took.
 	var databaseName sql.NullString
-	if err := conn.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&databaseName); err != nil {
+	if err := s.db.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&databaseName); err != nil {
 		return err
 	}
 	lockName = tenantPoolDatabaseLockName(lockName, databaseName.String)
 
-	// These parameterized operations own connection-local locks; TiDB must
-	// execute them each time instead of reusing a folded prepared plan.
-	var got sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT /*+ IGNORE_PLAN_CACHE() */ GET_LOCK(?, ?)", lockName, tenantPoolLockTimeoutSeconds).Scan(&got); err != nil {
-		return err
-	}
-	if !got.Valid {
-		return fmt.Errorf("tenant pool named lock returned NULL")
-	}
-	if got.Int64 != 1 {
-		return fmt.Errorf("timed out waiting for tenant pool named lock")
-	}
-	defer func() {
-		releaseCtx, cancel := context.WithTimeout(context.Background(), tenantPoolReleaseLockTimeout)
-		defer cancel()
-		var released sql.NullInt64
-		releaseErr := conn.QueryRowContext(releaseCtx, "SELECT /*+ IGNORE_PLAN_CACHE() */ RELEASE_LOCK(?)", lockName).Scan(&released)
-		if releaseErr != nil {
-			err = errors.Join(err, releaseErr)
-			return
-		}
-		if !released.Valid {
-			err = errors.Join(err, fmt.Errorf("tenant pool named lock release returned NULL"))
-			return
-		}
-		if released.Int64 != 1 {
-			err = errors.Join(err, fmt.Errorf("tenant pool named lock was not held by current connection"))
-		}
-	}()
-
-	return fn(ctx)
+	return withMetaNamedLock(ctx, s.db, metaNamedLockSpec{
+		name:            lockName,
+		ignorePlanCache: true,
+		timeoutSeconds:  tenantPoolLockTimeoutSeconds,
+		releaseTimeout:  tenantPoolReleaseLockTimeout,
+	}, func(ctx context.Context, _ *sql.Conn) error {
+		return fn(ctx)
+	})
 }
 
 func externalBindingLockName(provider, subjectKey string) string {

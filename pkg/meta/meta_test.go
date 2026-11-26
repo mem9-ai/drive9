@@ -1456,7 +1456,7 @@ func TestMetaSchemaSpecIncludesAPIKeyScopeTables(t *testing.T) {
 	}
 	for column, wantAddSQL := range map[string]string{
 		"issued_by_provider":      "ALTER TABLE tenant_api_keys ADD COLUMN issued_by_provider VARCHAR(64) NOT NULL DEFAULT ''",
-		"issued_by_subject_key":   "ALTER TABLE tenant_api_keys ADD COLUMN issued_by_subject_key VARCHAR(512) NOT NULL DEFAULT ''",
+		"issued_by_subject_key":   "ALTER TABLE tenant_api_keys ADD COLUMN issued_by_subject_key VARCHAR(512) COLLATE utf8mb4_bin NOT NULL DEFAULT ''",
 		"issued_by_metadata_json": "ALTER TABLE tenant_api_keys ADD COLUMN issued_by_metadata_json JSON NULL",
 	} {
 		spec, ok := apiKeys.columns[column]
