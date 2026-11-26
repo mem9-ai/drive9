@@ -316,6 +316,38 @@ func TestPinnedCollationsRestoreIndexAfterInterruptedRun(t *testing.T) {
 	}
 }
 
+// A stalled statement inside the gate must end when the caller cancels its context:
+// that is what keeps the holder — and the store cleanup that waits for its goroutine —
+// bounded when the database stops answering. The statement here is a real long-running
+// query on the gated connection, canceled from outside.
+func TestGatedCallbackEndsWhenItsContextIsCanceled(t *testing.T) {
+	// A scratch database: the canceled session can keep its advisory lock until the
+	// server notices the query is gone, and that must not stall the other tests.
+	s := freshControlStoreInDatabase(t, "utf8mb4_bin")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	returned := make(chan error, 1)
+	go func() {
+		returned <- s.WithExternalBindingSchemaLock(ctx, func(lockCtx context.Context, conn *sql.Conn) error {
+			_, err := conn.ExecContext(lockCtx, "SELECT SLEEP(5)")
+			return err
+		})
+	}()
+	// Let the statement start, then cancel it.
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-returned:
+		if err == nil {
+			t.Fatal("the gated callback reported success after its context was canceled")
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("the gated callback did not return after its context was canceled; the store cleanup could hang with it")
+	}
+}
+
 // A run that crashed after dropping the index leaves it missing; the recovery runs
 // under the same gate binding writers take, so a writer that arrives while the
 // index is absent waits for the repair instead of inserting into the gap.

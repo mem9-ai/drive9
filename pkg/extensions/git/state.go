@@ -816,6 +816,12 @@ func (g *Git) checkpointAllGitWorkspaces() {
 // errGitStateNotReady reports that no server-side checkpoint exists yet —
 // the discovery-time restore racing the CLI's upload. Callers retry later
 // instead of consuming their restore attempt.
+// testHookSwapRegistrySection runs inside the swap's registry section, after the
+// section is entered and before anything is written. A test uses it to hold the
+// section open while it queues a registry writer, so the interaction the section is
+// supposed to prevent can be scheduled deterministically instead of by timing.
+var testHookSwapRegistrySection func()
+
 var errGitStateNotReady = errors.New("git state checkpoint not available yet")
 
 func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
@@ -978,6 +984,9 @@ func (g *Git) swapLinkedGitDir(w *workspace, expectedCommonGitDir, expectedGitDi
 
 // swapLinkedGitDirLocked is swapLinkedGitDir with the workspace registry held.
 func (g *Git) swapLinkedGitDirLocked(w *workspace, commonID, expectedCommonGitDir, expectedGitDir, preparedGitDir string) error {
+	if testHookSwapRegistrySection != nil {
+		testHookSwapRegistrySection()
+	}
 	common := g.workspaceByIDLocked(commonID)
 	if common == nil || common.id == w.id {
 		return fmt.Errorf("git: linked workspace common repository went away during restore")

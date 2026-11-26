@@ -498,11 +498,10 @@ func TestRegistryReadLockBlocksAReload(t *testing.T) {
 	}
 }
 
-// The post-swap verification must run after the registry section ends. This drives
-// the real swap, waits until it holds the registry read lock, queues a writer, and
-// requires both to finish: if the verification moves back inside the section its own
-// read lock queues behind that writer, which is waiting for the section — the swap
-// never returns and this test times out.
+// The post-swap verification must run after the registry section ends, and the section
+// must not wait on anything that a registry writer could be queued behind. The hook
+// holds the section open, so the writer is queued while the section is provably
+// running; the swap then has to finish with the writer.
 func TestSwapLinkedGitDirCompletesWithAQueuedRegistryWriter(t *testing.T) {
 	localRoot := t.TempDir()
 	g := &Git{localRoot: localRoot}
@@ -514,56 +513,55 @@ func TestSwapLinkedGitDirCompletesWithAQueuedRegistryWriter(t *testing.T) {
 	g.workspaces = []*workspace{mainWS, linkedWS}
 	commonGitDir := g.gitDirFor("/repo")
 	gitDir := filepath.Join(commonGitDir, "worktrees", "wt")
-	// Enough entries that the swap is still inside its section when the writer is
-	// queued; the section's own work (RemoveAll + Rename) is the window this needs.
 	if err := os.MkdirAll(gitDir, 0o755); err != nil {
 		t.Fatal(err)
-	}
-	for i := 0; i < 2000; i++ {
-		if err := os.WriteFile(filepath.Join(gitDir, fmt.Sprintf("f-%04d", i)), []byte("x"), 0o644); err != nil {
-			t.Fatal(err)
-		}
 	}
 	prepared := t.TempDir()
 	if err := os.WriteFile(filepath.Join(prepared, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
+	sectionEntered := make(chan struct{})
+	leaveSection := make(chan struct{})
+	testHookSwapRegistrySection = func() {
+		close(sectionEntered)
+		<-leaveSection
+	}
+	t.Cleanup(func() { testHookSwapRegistrySection = nil })
+
 	swapErr := make(chan error, 1)
 	go func() { swapErr <- g.swapLinkedGitDir(linkedWS, commonGitDir, gitDir, prepared) }()
+	<-sectionEntered
 
-	// A failed TryLock means readers hold the registry, i.e. the swap is inside its
-	// section.
-	sectionEntered := false
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if !g.mu.TryLock() {
-			sectionEntered = true
-			break
-		}
-		g.mu.Unlock()
-		time.Sleep(time.Millisecond)
-	}
-	if !sectionEntered {
-		t.Fatal("the swap never entered its registry section")
-	}
-
+	// Queued while the section is provably held: it can only proceed once the section
+	// releases the registry.
+	writerQueued := make(chan struct{})
 	writerDone := make(chan struct{})
 	writerSawRegistry := make(chan int, 1)
 	go func() {
+		close(writerQueued)
 		g.mu.Lock()
 		writerSawRegistry <- len(g.workspaces)
 		g.mu.Unlock()
 		close(writerDone)
 	}()
+	<-writerQueued
+	select {
+	case <-writerDone:
+		t.Fatal("the registry writer acquired g.mu while the swap section held it")
+	case <-time.After(100 * time.Millisecond):
+	}
 
+	// The swap must not need anything the queued writer holds; it finishes with the
+	// section, which lets the writer in, and only then verifies.
+	close(leaveSection)
 	select {
 	case err := <-swapErr:
 		if err != nil {
 			t.Fatalf("swap: %v", err)
 		}
 	case <-time.After(15 * time.Second):
-		t.Fatal("the swap never completed with a writer queued; the post-swap verification must run outside the registry section")
+		t.Fatal("the swap never completed with a registry writer queued; the verification must run outside the section")
 	}
 	select {
 	case <-writerDone:
