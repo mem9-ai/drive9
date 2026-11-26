@@ -800,15 +800,36 @@ func (cq *CommitQueue) CancelPathPreserveLocal(path string) error {
 	return cq.cancelPath(path, true)
 }
 
-// CancelPathPreserveLocalLocked cancels queued or in-flight uploads for path
-// and journals the unlink fence without removing local shadow/index state,
-// returning the held path-lock release function on success so callers can
-// complete fast in-memory unlink publication before another staging can race.
-// If aborted reports true before cancellation or after acquiring the path lock
-// (prior to journaling), it releases the lock and returns errLayerRolledBack
-// with zero WAL writes and zero mutations to local staged state.
-func (cq *CommitQueue) CancelPathPreserveLocalLocked(path string, aborted func() bool) (func(), error) {
-	return cq.cancelPathLocked(path, true, aborted)
+// AcquireCancelPathLock cancels queued or in-flight uploads for path and
+// acquires the per-path lock WITHOUT writing any WAL marker or mutating local
+// shadow/index state. Callers then decide (e.g. under a fast lease fence)
+// whether to proceed to FinishCancelPathLocked or release the lock and abort
+// with zero WAL/local side effects.
+func (cq *CommitQueue) AcquireCancelPathLock(path string, aborted func() bool) (func(), error) {
+	if aborted != nil && aborted() {
+		return nil, errLayerRolledBack
+	}
+	// First pass without the path lock: an in-flight upload holds that lock
+	// for its whole transfer, and aborting it here is what releases it.
+	for _, cancel := range cq.cancelPathEntries(path) {
+		cancel()
+	}
+	unlock := cq.lockPath(path)
+	if aborted != nil && aborted() {
+		unlock()
+		return nil, errLayerRolledBack
+	}
+	for _, cancel := range cq.cancelPathEntries(path) {
+		cancel()
+	}
+	return unlock, nil
+}
+
+// FinishCancelPathLocked journals the unlink fence (and removes local state
+// when !preserveLocal) while the caller holds the per-path lock returned by
+// AcquireCancelPathLock.
+func (cq *CommitQueue) FinishCancelPathLocked(path string, preserveLocal bool) error {
+	return cq.finishCancelPathLocked(path, preserveLocal)
 }
 
 // CancelEntryInFlight cancels EXACTLY the given entry — the targeted
@@ -1507,41 +1528,15 @@ func (cq *CommitQueue) cancelPathEntries(path string) []context.CancelFunc {
 // for data the recreator never wrote. The failure-free error return keeps the
 // record — the name survived, and so did its unlanded data.
 func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
-	unlock, err := cq.cancelPathLocked(path, preserveLocal, nil)
-	if unlock != nil {
-		unlock()
+	unlock, err := cq.AcquireCancelPathLock(path, nil)
+	if err != nil {
+		return err
 	}
-	return err
+	defer unlock()
+	return cq.finishCancelPathLocked(path, preserveLocal)
 }
 
-func (cq *CommitQueue) cancelPathLocked(path string, preserveLocal bool, aborted func() bool) (func(), error) {
-	if aborted != nil && aborted() {
-		return nil, errLayerRolledBack
-	}
-	// First pass without the path lock: an in-flight upload holds that lock
-	// for its whole transfer, and aborting it here is what releases it.
-	for _, cancel := range cq.cancelPathEntries(path) {
-		cancel()
-	}
-	// Second pass under the same-path lock the staging path holds across
-	// its shadow/pending publication and Enqueue: an entry that slipped in
-	// between the two passes is canceled too, and the marker below lands at
-	// a higher Seq than every frame published before it. Keeping the path lock
-	// held across fast unlink publication ensures no staging slips in before
-	// handles are marked unlinked.
-	unlock := cq.lockPath(path)
-	keepLocked := false
-	defer func() {
-		if !keepLocked {
-			unlock()
-		}
-	}()
-	if aborted != nil && aborted() {
-		return nil, errLayerRolledBack
-	}
-	for _, cancel := range cq.cancelPathEntries(path) {
-		cancel()
-	}
+func (cq *CommitQueue) finishCancelPathLocked(path string, preserveLocal bool) error {
 	hadLocal := false
 	var removalErr error
 	hadShadow := cq.shadows != nil && cq.shadows.Has(path)
@@ -1590,8 +1585,7 @@ func (cq *CommitQueue) cancelPathLocked(path string, preserveLocal bool, aborted
 		}
 		dropPending()
 		cq.clearTerminalFailure(path)
-		keepLocked = true
-		return unlock, nil
+		return nil
 	}
 	// AppendSync, not Append: the marker is what fences the frames of this
 	// name after a power loss, so it has to be on disk before the local state
@@ -1609,8 +1603,7 @@ func (cq *CommitQueue) cancelPathLocked(path string, preserveLocal bool, aborted
 		}
 		dropPending()
 		cq.clearTerminalFailure(path)
-		keepLocked = true
-		return unlock, nil
+		return nil
 	}
 	safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", path, appendErr)
 	// A marker that could not be fsynced fences nothing, so BOTH policies must
@@ -1639,8 +1632,7 @@ func (cq *CommitQueue) cancelPathLocked(path string, preserveLocal bool, aborted
 			cq.index.Remove(path)
 		}
 		cq.clearTerminalFailure(path)
-		keepLocked = true
-		return unlock, nil
+		return nil
 	}
 	// The recovery source survived or its absence cannot be proven. Keep the
 	// pending entry (the overlay stays discoverable), re-drive the upload
@@ -1654,7 +1646,7 @@ func (cq *CommitQueue) cancelPathLocked(path string, preserveLocal bool, aborted
 			}
 		}
 	}
-	return nil, fmt.Errorf("commit queue: unlink of %s is not crash-durable: WAL marker failed (%v) and the staged image could not be confirmed removed", path, appendErr)
+	return fmt.Errorf("commit queue: unlink of %s is not crash-durable: WAL marker failed (%v) and the staged image could not be confirmed removed", path, appendErr)
 }
 
 // isEntryCanceled checks whether this specific entry was canceled by

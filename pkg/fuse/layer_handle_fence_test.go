@@ -196,10 +196,10 @@ func (b *unlinkUploadBarrier) PreparePathUnlink(path string, survivor bool) func
 	return finish
 }
 
-func (b *unlinkUploadBarrier) PreparePathUnlinkPhased(path string, survivor bool) (func(func() bool) error, func(), func() error, func()) {
-	cancelQueue, publish, finishCommitted, discard := b.Writeback.PreparePathUnlinkPhased(path, survivor)
+func (b *unlinkUploadBarrier) PreparePathUnlinkPhased(path string, survivor bool) (func(func() bool) error, func(), func() error, func(), func()) {
+	acquireLock, publish, persistAndUnlock, rollbackPublish, discard := b.Writeback.PreparePathUnlinkPhased(path, survivor)
 	b.wait()
-	return cancelQueue, publish, finishCommitted, discard
+	return acquireLock, publish, persistAndUnlock, rollbackPublish, discard
 }
 
 func TestSecondOpenDuringUnlinkKeepsAnonymousImage(t *testing.T) {
@@ -456,19 +456,19 @@ func (b *phasedUnlinkPauseBarrier) wait() {
 	b.once.Do(func() { close(b.entered); <-b.proceed })
 }
 
-func (b *phasedUnlinkPauseBarrier) PreparePathUnlinkPhased(path string, survivor bool) (func(func() bool) error, func(), func() error, func()) {
-	cancelQueue, publish, finishCommitted, discard := b.Writeback.PreparePathUnlinkPhased(path, survivor)
-	wrappedCancel := func(aborted func() bool) error {
+func (b *phasedUnlinkPauseBarrier) PreparePathUnlinkPhased(path string, survivor bool) (func(func() bool) error, func(), func() error, func(), func()) {
+	acquireLock, publish, persistAndUnlock, rollbackPublish, discard := b.Writeback.PreparePathUnlinkPhased(path, survivor)
+	wrappedAcquire := func(aborted func() bool) error {
 		if b.pauseBeforeCancel {
 			b.wait()
 		}
-		err := cancelQueue(aborted)
+		err := acquireLock(aborted)
 		if err == nil && b.pauseAfterCancel {
 			b.wait()
 		}
 		return err
 	}
-	return wrappedCancel, publish, finishCommitted, discard
+	return wrappedAcquire, publish, persistAndUnlock, rollbackPublish, discard
 }
 
 // TestSelfFenceDuringRealWritebackUnlinkPreservesStagedState exercises a real
@@ -517,13 +517,21 @@ func TestSelfFenceDuringRealWritebackUnlinkPreservesStagedState(t *testing.T) {
 			t.Cleanup(func() { _ = wb.Stop(context.Background()) })
 
 			// Stage local recovery bytes for /held directly into Shadow + Pending
-			// (representing an fsync'd write awaiting remote commit).
+			// + WAL Journal (representing an fsync'd write awaiting remote commit).
 			stagedPayload := []byte("staged-recovery-bytes")
 			if err := ledger.Shadow.WriteFull("/held", stagedPayload, 1); err != nil {
 				t.Fatalf("seed shadow: %v", err)
 			}
 			if _, err := ledger.Pending.PutWithBaseRev("/held", int64(len(stagedPayload)), staging.PendingNew, 1); err != nil {
 				t.Fatalf("seed pending: %v", err)
+			}
+			if err := ledger.Journal.AppendSync(staging.JournalEntry{
+				Op:      staging.JournalFsync,
+				Path:    "/held",
+				Length:  int64(len(stagedPayload)),
+				BaseRev: 1,
+			}); err != nil {
+				t.Fatalf("seed journal: %v", err)
 			}
 
 			pause := &phasedUnlinkPauseBarrier{
@@ -599,6 +607,23 @@ func TestSelfFenceDuringRealWritebackUnlinkPreservesStagedState(t *testing.T) {
 			shadowBytes, err := ledger.Shadow.ReadAll("/held")
 			if err != nil || string(shadowBytes) != string(stagedPayload) {
 				t.Fatalf("staged shadow corrupted after rejected unlink: %q err=%v", string(shadowBytes), err)
+			}
+			var fsyncFrames, unlinkFrames int
+			if err := ledger.Journal.Replay(func(e staging.JournalEntry) {
+				if e.Path != "/held" {
+					return
+				}
+				switch e.Op {
+				case staging.JournalFsync:
+					fsyncFrames++
+				case staging.JournalUnlink:
+					unlinkFrames++
+				}
+			}); err != nil {
+				t.Fatalf("replay journal: %v", err)
+			}
+			if fsyncFrames != 1 || unlinkFrames != 0 {
+				t.Fatalf("WAL frames for /held after rejected unlink: fsync=%d unlink=%d, want fsync=1 unlink=0", fsyncFrames, unlinkFrames)
 			}
 			buf := make([]byte, len(stagedPayload))
 			res, st := f.Read(nil, &gofuse.ReadIn{InHeader: gofuse.InHeader{NodeId: heldIno}, Fh: heldOpen.Fh, Size: uint32(len(stagedPayload))}, buf)

@@ -1115,6 +1115,28 @@ func (m *InodeToPath) RemoveLinkPreserve(path string) {
 	m.removePathLocked(path, true, true)
 }
 
+// RestoreLinkPreserve reverses RemoveLinkPreserve for an open-file unlink
+// whose WAL fence failed before returning to the caller.
+func (m *InodeToPath) RestoreLinkPreserve(path string, ino uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, ok := m.byInode[ino]
+	if !ok {
+		return
+	}
+	m.byPath[path] = ino
+	if entry.Paths == nil {
+		entry.Paths = make(map[string]struct{}, 1)
+	}
+	entry.Paths[path] = struct{}{}
+	if entry.Path == "" {
+		entry.Path = path
+	}
+	entry.Unlinked = false
+	entry.Nlink++
+}
+
 // RemoveDirLink removes one directory name after a successful rmdir. Unlike
 // RemoveLink it keeps the inode as a tombstone while any kernel or descriptor
 // reference can still reach it (an open descriptor, a process cwd) — the entry
