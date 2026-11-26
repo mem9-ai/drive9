@@ -533,23 +533,38 @@ func TestSwapLinkedGitDirCompletesWithAQueuedRegistryWriter(t *testing.T) {
 	go func() { swapErr <- g.swapLinkedGitDir(linkedWS, commonGitDir, gitDir, prepared) }()
 	<-sectionEntered
 
-	// Queued while the section is provably held: it can only proceed once the section
-	// releases the registry.
-	writerQueued := make(chan struct{})
+	// Queue a writer and wait until it is really waiting: while the hook holds the read
+	// lock, a failed TryRLock means a writer is pending (a successful one would hand out
+	// another reader). Signalling before the Lock call would leave a scheduling gap.
+	writerSeen := make(chan struct{}, 1)
 	writerDone := make(chan struct{})
 	writerSawRegistry := make(chan int, 1)
 	go func() {
-		close(writerQueued)
+		writerSeen <- struct{}{}
 		g.mu.Lock()
 		writerSawRegistry <- len(g.workspaces)
 		g.mu.Unlock()
 		close(writerDone)
 	}()
-	<-writerQueued
+	<-writerSeen
+	queued := false
+	queueDeadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(queueDeadline) {
+		if g.mu.TryRLock() {
+			g.mu.RUnlock()
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		queued = true
+		break
+	}
+	if !queued {
+		t.Fatal("the queued writer never reached the registry lock")
+	}
 	select {
 	case <-writerDone:
 		t.Fatal("the registry writer acquired g.mu while the swap section held it")
-	case <-time.After(100 * time.Millisecond):
+	default:
 	}
 
 	// The swap must not need anything the queued writer holds; it finishes with the

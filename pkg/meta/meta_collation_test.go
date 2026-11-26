@@ -324,18 +324,41 @@ func TestGatedCallbackEndsWhenItsContextIsCanceled(t *testing.T) {
 	// A scratch database: the canceled session can keep its advisory lock until the
 	// server notices the query is gone, and that must not stall the other tests.
 	s := freshControlStoreInDatabase(t, "utf8mb4_bin")
+	db := s.DB()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// The statement has to be running before the cancel: a cancel that lands before the
+	// gate is even acquired also produces an error, and would make this pass without
+	// exercising the cancellation path. Presence in the server's process list is the
+	// proof that it started.
+	const sleepQuery = "SELECT SLEEP(5)"
+	statementRunning := func() bool {
+		var n int
+		if err := db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM information_schema.processlist
+			WHERE info LIKE ?`, sleepQuery+"%").Scan(&n); err != nil {
+			return false
+		}
+		return n > 0
+	}
 
 	returned := make(chan error, 1)
 	go func() {
 		returned <- s.WithExternalBindingSchemaLock(ctx, func(lockCtx context.Context, conn *sql.Conn) error {
-			_, err := conn.ExecContext(lockCtx, "SELECT SLEEP(5)")
+			_, err := conn.ExecContext(lockCtx, sleepQuery)
 			return err
 		})
 	}()
-	// Let the statement start, then cancel it.
-	time.Sleep(200 * time.Millisecond)
+	deadline := time.Now().Add(10 * time.Second)
+	for !statementRunning() {
+		if time.Now().After(deadline) {
+			t.Fatal("the gated statement never started")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("the context was canceled before the statement started: %v", err)
+	}
 	cancel()
 
 	select {
