@@ -209,9 +209,9 @@ func TestRestoreRefusesSymlinkedWorktreesWithACheckpoint(t *testing.T) {
 	}
 }
 
-// The worktree admin path must be a real directory. The common repository's own
-// checkpoint is tenant-controlled, so it can plant "worktrees -> refs"; a restore
-// would then delete and replace the branch store instead of an admin directory.
+// The worktree admin path must be a real directory. An overlay written by an older
+// build can carry "worktrees -> refs", and a restore would then delete and replace the
+// branch store instead of an admin directory.
 func TestRestoreRefusesSymlinkedWorktreesBeforeSwap(t *testing.T) {
 	localRoot := t.TempDir()
 	commonGitDir := filepath.Join(localRoot, "overlay", "repo", ".git")
