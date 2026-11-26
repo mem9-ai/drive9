@@ -25,10 +25,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mem9-ai/drive9/pkg/gitworktree"
-
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/gitcache"
+	"github.com/mem9-ai/drive9/pkg/gitworktree"
 )
 
 const (
@@ -465,11 +464,12 @@ func collectStagedObjectSet(ctx context.Context, gitDir string) (map[string]stru
 
 // symbolicHeadBody renders a symbolic HEAD's link target in the regular-file form
 // git reads as the same symbolic ref ("ref: <target>"). A target that would not
-// survive as a single ref line fails the checkpoint instead of publishing a HEAD
-// that points somewhere else or nowhere: the previous checkpoint stays live.
+// survive as a single ref line is refused instead of publishing a HEAD that points
+// somewhere else or nowhere. The checkpoint writer and the restore extractor both
+// use it, so the link and the regular file cannot disagree about what is recorded.
 func symbolicHeadBody(target string) ([]byte, error) {
 	if target == "" || strings.ContainsAny(target, "\n\r\x00") {
-		return nil, fmt.Errorf("git checkpoint: symbolic HEAD target %q cannot be recorded", target)
+		return nil, fmt.Errorf("symbolic HEAD target %q cannot be recorded", target)
 	}
 	return []byte("ref: " + target + "\n"), nil
 }
@@ -515,7 +515,7 @@ func archiveLocalGitStateDir(gitDir string) ([]byte, error) {
 		if err != nil {
 			return err
 		}
-		// A .git tree has no legitimate symlink, and the restore refuses one (a
+		// A .git tree has no legitimate symlink, and the restore drops one (a
 		// link's target is followed long after the checkpoint sanitizer has walked
 		// the tree). The single exception is a symbolic HEAD — git writes one when
 		// core.preferSymlinkRefs is set — which is recorded in the regular-file
@@ -524,7 +524,7 @@ func archiveLocalGitStateDir(gitDir string) ([]byte, error) {
 		// its upload.
 		if info.Mode()&os.ModeSymlink != 0 {
 			if name != "HEAD" {
-				fmt.Fprintf(os.Stderr, "drive9: git checkpoint link dropped: %s (the restore refuses links)\n", name)
+				fmt.Fprintf(os.Stderr, "drive9: git checkpoint link dropped: %s (the restore drops links)\n", name)
 				return nil
 			}
 			target, err := os.Readlink(p)
@@ -583,6 +583,12 @@ func archiveLocalGitStateDir(gitDir string) ([]byte, error) {
 // not created at all — a link's target is resolved long after the sanitizer has
 // walked the tree — and are dropped with a log line so a checkpoint written by an
 // older build still restores.
+//
+// The one link that is not merely dropped is a symbolic HEAD. git itself writes one
+// when core.preferSymlinkRefs is set, and dropping it silently restored the clone's
+// HEAD (the remote's default branch) instead of the branch the workspace was on, or
+// failed the whole restore for a linked worktree whose checkpoint had no other HEAD.
+// It is recorded as the regular-file form git reads as the same symbolic ref.
 func extractGitArchive(content []byte, dst string) error {
 	if err := os.MkdirAll(dst, 0o755); err != nil {
 		return err
@@ -638,6 +644,22 @@ func extractGitArchive(content []byte, dst string) error {
 			// not created, and not treated as a reason to fail — so a checkpoint
 			// written by an older build still restores. The writer drops links for the
 			// same reason and says so.
+			//
+			// A symbolic HEAD is the exception: it is git's own representation of the
+			// checked-out branch (core.preferSymlinkRefs), and it is written back as the
+			// regular-file form of the same symbolic ref. Dropping it used to leave the
+			// clone's HEAD in place — the remote's default branch — and for a linked
+			// worktree it left no HEAD at all.
+			if filepath.ToSlash(name) == "HEAD" {
+				body, err := symbolicHeadBody(hdr.Linkname)
+				if err != nil {
+					return fmt.Errorf("git archive: %w", err)
+				}
+				if err := root.WriteFile(name, body, 0o644); err != nil {
+					return fmt.Errorf("git archive: write %q: %w", name, err)
+				}
+				continue
+			}
 			fmt.Fprintf(os.Stderr, "drive9: git checkpoint link dropped: %s (a link from a checkpoint would be followed after sanitization)\n", hdr.Name)
 		case tar.TypeReg:
 			if dir := filepath.Dir(name); dir != "." {
@@ -817,12 +839,6 @@ func (g *Git) checkpointAllGitWorkspaces() {
 // errGitStateNotReady reports that no server-side checkpoint exists yet —
 // the discovery-time restore racing the CLI's upload. Callers retry later
 // instead of consuming their restore attempt.
-// testHookSwapRegistrySection runs inside the swap's registry section, after the
-// section is entered and before anything is written. A test uses it to hold the
-// section open while it queues a registry writer, so the interaction the section is
-// supposed to prevent can be scheduled deterministically instead of by timing.
-var testHookSwapRegistrySection func()
-
 var errGitStateNotReady = errors.New("git state checkpoint not available yet")
 
 func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
@@ -845,18 +861,16 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 		linkedCommonGitDir = g.gitDirFor(common.rootPath())
 		// Validate the worktree gitdir before restoring any state, so a workspace
 		// whose gitdir_rel is not a worktree admin directory is refused before the
-		// common repository is materialized at all.
-		if _, err := linkedWorktreeGitDir(linkedCommonGitDir, w.gitDirRelPath(), w.worktreeAdminName()); err != nil {
+		// common repository is materialized at all. The same resolution supplies the
+		// path below; it is not repeated here, because the common repository is
+		// materialized from a checkpoint whose links the extractor drops, so a second
+		// look could only repeat the first answer. The swap resolves the path once
+		// more, immediately before it deletes anything.
+		target, err := linkedWorktreeGitDir(linkedCommonGitDir, w.gitDirRelPath(), w.worktreeAdminName())
+		if err != nil {
 			return err
 		}
 		if err := g.ensureWorkspaceState(ctx, common); err != nil {
-			return err
-		}
-		// Resolve it again now that the common repository exists: it was just
-		// materialized from tenant-supplied state, so its worktrees/ directory may
-		// be a link.
-		target, err := linkedWorktreeGitDir(linkedCommonGitDir, w.gitDirRelPath(), w.worktreeAdminName())
-		if err != nil {
 			return err
 		}
 		gitDir = target
@@ -970,8 +984,13 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 func (g *Git) swapLinkedGitDir(w *workspace, expectedCommonGitDir, expectedGitDir, preparedGitDir string) error {
 	// Hold the registry across the lookup, the check and the swap: the common
 	// workspace must not leave g.workspaces while the swap runs, or the check would
-	// approve a repository the swap then writes under. The order is g.mu -> w.mu,
-	// which is the order the reload path uses, so it cannot deadlock.
+	// approve a repository the swap then writes under.
+	//
+	// Nothing inside the section may take the registry again — not even a read lock,
+	// and the post-swap verification is outside for exactly that reason: a reload
+	// that queued for the write lock while the section ran would wait for the
+	// section, and a nested read lock would wait for that reload. The order the
+	// section does use is g.mu -> w.mu, the same one the reload path takes.
 	commonID := w.commonWorkspaceID()
 	if err := g.withRegistryReadLock(func() error {
 		return g.swapLinkedGitDirLocked(w, commonID, expectedCommonGitDir, expectedGitDir, preparedGitDir)
@@ -985,9 +1004,6 @@ func (g *Git) swapLinkedGitDir(w *workspace, expectedCommonGitDir, expectedGitDi
 
 // swapLinkedGitDirLocked is swapLinkedGitDir with the workspace registry held.
 func (g *Git) swapLinkedGitDirLocked(w *workspace, commonID, expectedCommonGitDir, expectedGitDir, preparedGitDir string) error {
-	if testHookSwapRegistrySection != nil {
-		testHookSwapRegistrySection()
-	}
 	common := g.workspaceByIDLocked(commonID)
 	if common == nil || common.id == w.id {
 		return fmt.Errorf("git: linked workspace common repository went away during restore")
@@ -1072,7 +1088,7 @@ func (g *Git) wasFreshRestored(dir string) bool {
 
 // linkedWorktreeGitDir resolves a linked worktree's gitdir from the common
 // repository's .git and the registered relative gitdir (".git/worktrees/w1").
-
+//
 // The shape rule is shared with the API that stores gitdir_rel (pkg/gitworktree):
 // only <git>/worktrees/<worktree_name> is a worktree admin directory, so any other
 // target — ".git/hooks" above all — would let a tenant replace a directory git
@@ -1084,10 +1100,12 @@ func linkedWorktreeGitDir(commonGitDir, gitDirRel, worktreeName string) (string,
 		return "", fmt.Errorf("git: %w", err)
 	}
 	target := filepath.Join(commonGitDir, filepath.FromSlash(adminRel))
-	// No component of the target may be a symlink: the common repository's own
-	// checkpoint is tenant-controlled, so it can plant "worktrees -> ." or
-	// "worktrees -> refs" and have this restore replace a directory git reads
-	// refs or hooks from. The shape rule above cannot see that.
+	// No component of the target may be a symlink or a non-directory: the overlay
+	// this reads can be written by an older build (whose checkpoints still carried
+	// links) or by anything else that writes the local directory, and the restore
+	// replaces whatever the path names. "worktrees -> refs" would make
+	// worktrees/<name> land in the branch store instead. The shape rule above
+	// cannot see that.
 	if err := ensureWorktreeAdminPathIsReal(commonGitDir, adminRel); err != nil {
 		return "", err
 	}

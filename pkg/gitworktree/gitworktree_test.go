@@ -2,8 +2,9 @@ package gitworktree
 
 import "testing"
 
-// The spelling table lives here; the API and the mount tests use it through the
-// package instead of keeping their own copy.
+// The accepted/refused spelling table for AdminRel and ValidateName. The API and the
+// mount layers keep their own cases too: they assert what their endpoint answers, and
+// this package's table is what they all resolve through.
 func TestAdminRelSpellings(t *testing.T) {
 	accepted := []struct{ rel, name, want string }{
 		{".git/worktrees/w1", "w1", "worktrees/w1"},

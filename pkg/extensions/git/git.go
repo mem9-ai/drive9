@@ -240,6 +240,10 @@ func (g *Git) workspaceByID(id string) *workspace {
 // keeps it across the target check and the swap so a reload cannot remove or replace
 // the workspaces the check resolved; the order is g.mu -> w.mu, the same one the
 // reload path uses.
+//
+// fn must not take the registry again, not even for a read: a reload queued for the
+// write lock waits for fn to return, and a nested read lock would wait for that
+// reload. Verification that needs a lookup runs after the section ends.
 func (g *Git) withRegistryReadLock(fn func() error) error {
 	g.mu.RLock()
 	defer g.mu.RUnlock()

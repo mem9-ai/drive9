@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -194,7 +195,9 @@ func TestRestoreRefusesSymlinkedWorktreesWithACheckpoint(t *testing.T) {
 	if err == nil {
 		t.Fatal("restore accepted a symlinked worktrees directory")
 	}
-	if !strings.Contains(err.Error(), "worktrees") {
+	// The specific refusal, not any message that happens to mention "worktrees":
+	// the shape rule alone would produce a different one.
+	if !strings.Contains(err.Error(), "is not a worktrees directory") {
 		t.Fatalf("restore error = %v, want the symlinked worktrees refusal", err)
 	}
 	got, readErr := os.ReadFile(headPath)
@@ -426,12 +429,31 @@ func TestCheckpointArchiveRecordsSymbolicHead(t *testing.T) {
 	if string(body) != "ref: refs/heads/main\n" {
 		t.Fatalf("HEAD = %q, want the symbolic ref", body)
 	}
-	// The recorded form is what git reads as the same symbolic ref. (The extracted
-	// tree has no object store of its own — the restore supplies it — so this
-	// asserts the ref file rather than running git against a half-built repo.)
-	if out := run(t, src, "symbolic-ref", "HEAD"); out != "refs/heads/main" {
-		t.Fatalf("source symbolic-ref = %q", out)
+	// git itself reads the extracted form as the same symbolic ref. Run it against the
+	// EXTRACTED directory: on the source repository this could never fail for the
+	// archive. git only accepts the directory as a git dir with its object and ref
+	// stores present, and symbolic-ref needs nothing in them.
+	for _, dir := range []string{"objects", "refs/heads"} {
+		if err := os.MkdirAll(filepath.Join(dst, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
+	if out := gitOut(t, "--git-dir", dst, "symbolic-ref", "HEAD"); out != "refs/heads/main" {
+		t.Fatalf("extracted symbolic-ref = %q, want refs/heads/main", out)
+	}
+}
+
+// gitOut runs git and returns its trimmed stdout.
+func gitOut(t *testing.T, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, stderr.String())
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // The final check has to revalidate the common repository too: a reload can point
@@ -568,46 +590,6 @@ func TestSwapLinkedGitDirReplacesTheAdminDir(t *testing.T) {
 	}
 }
 
-// The registry is held across the check and the swap, so a reload cannot remove or
-// replace the workspaces the check resolved.
-func TestRegistryReadLockBlocksAReload(t *testing.T) {
-	g := &Git{localRoot: t.TempDir()}
-	g.workspaces = []*workspace{{id: "main", root: "/repo", workspaceKind: "main"}}
-
-	inside := make(chan struct{})
-	leave := make(chan struct{})
-	sectionDone := make(chan struct{})
-	go func() {
-		defer close(sectionDone)
-		_ = g.withRegistryReadLock(func() error {
-			close(inside)
-			<-leave
-			return nil
-		})
-	}()
-	<-inside
-
-	reloadDone := make(chan struct{})
-	go func() {
-		g.mu.Lock()
-		g.workspaces = nil
-		g.mu.Unlock()
-		close(reloadDone)
-	}()
-	select {
-	case <-reloadDone:
-		t.Fatal("a registry rewrite applied while the restore section held the registry")
-	case <-time.After(150 * time.Millisecond):
-	}
-	close(leave)
-	<-sectionDone
-	select {
-	case <-reloadDone:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the registry rewrite never applied after the section ended")
-	}
-}
-
 // The registry section must not take the registry again, and the swap must be inside
 // it. This stalls the section on the common workspace's write lock — i.e. after the
 // registry read lock is held — queues a registry writer there, releases, and requires
@@ -676,6 +658,10 @@ func TestSwapLinkedGitDirCompletesWithAQueuedRegistryWriter(t *testing.T) {
 	}()
 	<-writerSeen
 	queued := false
+	if time.Now().After(deadline) {
+		// A slow first poll must not shorten the second one.
+		deadline = time.Now().Add(10 * time.Second)
+	}
 	for time.Now().Before(deadline) {
 		if g.mu.TryRLock() {
 			g.mu.RUnlock()
@@ -708,6 +694,357 @@ func TestSwapLinkedGitDirCompletesWithAQueuedRegistryWriter(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(gitDir, "HEAD")); err != nil {
 		t.Fatalf("prepared directory was not swapped in: %v", err)
+	}
+}
+
+// An older checkpoint records a symbolic HEAD as a link (core.preferSymlinkRefs).
+// The extractor drops links, but HEAD has to become the regular-file form: dropping
+// it left the clone's HEAD in place, which is the remote's default branch and not the
+// branch the workspace was on.
+func TestExtractGitArchiveRecordsAHeadLink(t *testing.T) {
+	dst := t.TempDir()
+	if err := extractGitArchive(tarArchive(t, tarEntry{symlink: "HEAD", target: "refs/heads/feature"}), dst); err != nil {
+		t.Fatalf("extractGitArchive: %v", err)
+	}
+	info, err := os.Lstat(filepath.Join(dst, "HEAD"))
+	if err != nil {
+		t.Fatalf("HEAD missing from the extraction: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("HEAD was extracted as a link")
+	}
+	body, err := os.ReadFile(filepath.Join(dst, "HEAD"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "ref: refs/heads/feature\n" {
+		t.Fatalf("HEAD = %q, want the symbolic ref in regular-file form", body)
+	}
+	// A target that cannot be a single ref line is refused, not written.
+	if err := extractGitArchive(tarArchive(t, tarEntry{symlink: "HEAD", target: "refs/heads/a\nb"}), t.TempDir()); err == nil {
+		t.Fatal("extractGitArchive recorded a HEAD target that cannot be a ref line")
+	}
+}
+
+// The restore-level case for a standalone workspace: the checkpoint's branch wins over
+// the branch the remote clone happens to default to.
+func TestRestoreKeepsASymbolicHeadFromAnOlderCheckpoint(t *testing.T) {
+	gitBin(t)
+	src := t.TempDir()
+	run(t, src, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(src, "f.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, src, "add", "f.txt")
+	run(t, src, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "one")
+	head := run(t, src, "rev-parse", "HEAD")
+	run(t, src, "branch", "feature")
+
+	localRoot := t.TempDir()
+	b := testbackend.NewBackend()
+	b.SeedGitWorkspaceFull("main", "/repo", "file://"+src, head)
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	// The shape the previous writer produced for core.preferSymlinkRefs = true: the
+	// branch a clone does not create locally travels in the archive with its ref.
+	seedGitStateArchive(t, ts.URL, "main", tarArchive(t,
+		tarEntry{symlink: "HEAD", target: "refs/heads/feature"},
+		tarEntry{name: "refs/heads/feature", body: head + "\n"},
+	))
+
+	g, err := New(Options{Client: client.New(ts.URL, ""), LocalRoot: localRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws := &workspace{id: "main", root: "/repo", headCommit: head, repoURL: "file://" + src}
+	g.workspaces = []*workspace{ws}
+	if err := g.restoreWorkspaceState(context.Background(), ws); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	repo := filepath.Join(localRoot, "overlay", "repo")
+	body, err := os.ReadFile(filepath.Join(repo, ".git", "HEAD"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "ref: refs/heads/feature\n" {
+		t.Fatalf("restored HEAD = %q, want the checkpoint's branch", body)
+	}
+	if out := run(t, repo, "symbolic-ref", "--short", "HEAD"); out != "feature" {
+		t.Fatalf("restored branch = %q, want feature", out)
+	}
+}
+
+// The same case for a linked workspace, where the dropped HEAD was fatal: the admin
+// directory has no other HEAD, so the restore failed with "missing a usable HEAD".
+func TestRestoreKeepsALinkedSymbolicHeadFromAnOlderCheckpoint(t *testing.T) {
+	gitBin(t)
+	src := t.TempDir()
+	run(t, src, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(src, "f.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, src, "add", "f.txt")
+	run(t, src, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "one")
+	head := run(t, src, "rev-parse", "HEAD")
+
+	localRoot := t.TempDir()
+	repo := filepath.Join(localRoot, "overlay", "repo")
+	if err := os.MkdirAll(filepath.Dir(repo), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run(t, filepath.Dir(repo), "clone", "-q", "file://"+src, repo)
+	run(t, repo, "worktree", "add", "-q", "wt", "-b", "b1")
+
+	b := testbackend.NewBackend()
+	b.SeedGitWorkspaceFull("main", "/repo", "file://"+src, head)
+	b.SeedGitWorktree("linked", "/repo/wt", "file://"+src, head, "main", ".git/worktrees/wt")
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	g, err := New(Options{Client: cl, LocalRoot: localRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := g.checkpointWorkspace(ctx, &workspace{id: "main", root: "/repo", headCommit: head, repoURL: "file://" + src}, filepath.Join(repo, ".git")); err != nil {
+		t.Fatalf("main checkpoint: %v", err)
+	}
+	// The linked checkpoint an older build wrote: HEAD as a link, commondir relative.
+	seedGitStateArchive(t, ts.URL, "linked", tarArchive(t,
+		tarEntry{symlink: "HEAD", target: "refs/heads/b1"},
+		tarEntry{name: "commondir", body: "../..\n"},
+	))
+	if err := os.RemoveAll(filepath.Join(localRoot, "overlay")); err != nil {
+		t.Fatal(err)
+	}
+
+	restored := &workspace{id: "main", root: "/repo", headCommit: head, repoURL: "file://" + src}
+	linked := &workspace{
+		id: "linked", root: "/repo/wt", headCommit: head, repoURL: "file://" + src,
+		workspaceKind: "linked", commonID: "main", gitDirRel: ".git/worktrees/wt", worktreeName: "wt",
+	}
+	g.workspaces = []*workspace{restored, linked}
+	if err := g.restoreWorkspaceState(ctx, restored); err != nil {
+		t.Fatalf("main restore: %v", err)
+	}
+	if err := g.restoreWorkspaceState(ctx, linked); err != nil {
+		t.Fatalf("linked restore of a checkpoint whose HEAD is a link: %v", err)
+	}
+	adminDir := filepath.Join(localRoot, "overlay", "repo", ".git", "worktrees", "wt")
+	body, err := os.ReadFile(filepath.Join(adminDir, "HEAD"))
+	if err != nil {
+		t.Fatalf("admin HEAD: %v", err)
+	}
+	if string(body) != "ref: refs/heads/b1\n" {
+		t.Fatalf("admin HEAD = %q, want the checkpoint's branch", body)
+	}
+	if out := run(t, filepath.Join(localRoot, "overlay", "repo", "wt"), "symbolic-ref", "--short", "HEAD"); out != "b1" {
+		t.Fatalf("linked branch = %q, want b1", out)
+	}
+}
+
+// The swap resolves the admin target itself, after the earlier check ran and before it
+// deletes anything. This pins that resolution: with the path a link into the branch
+// store the swap has to refuse, and the store must be untouched.
+func TestSwapLinkedGitDirRefusesASymlinkedWorktreesDir(t *testing.T) {
+	localRoot := t.TempDir()
+	g := &Git{localRoot: localRoot}
+	mainWS := &workspace{id: "main", root: "/repo", workspaceKind: "main"}
+	linkedWS := &workspace{
+		id: "linked", root: "/repo/wt",
+		workspaceKind: "linked", commonID: "main", gitDirRel: "worktrees/wt", worktreeName: "wt",
+	}
+	g.workspaces = []*workspace{mainWS, linkedWS}
+	commonGitDir := g.gitDirFor("/repo")
+	if err := os.MkdirAll(filepath.Join(commonGitDir, "refs", "heads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(commonGitDir, "refs", "heads", "keep")
+	if err := os.WriteFile(marker, []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("refs", filepath.Join(commonGitDir, "worktrees")); err != nil {
+		t.Fatal(err)
+	}
+	prepared := t.TempDir()
+	if err := os.WriteFile(filepath.Join(prepared, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := g.swapLinkedGitDir(linkedWS, commonGitDir, filepath.Join(commonGitDir, "worktrees", "wt"), prepared)
+	if err == nil {
+		t.Fatal("the swap accepted a symlinked worktrees directory")
+	}
+	if !strings.Contains(err.Error(), "is not a worktrees directory") {
+		t.Fatalf("swap error = %v, want the symlinked worktrees refusal", err)
+	}
+	if _, readErr := os.ReadFile(marker); readErr != nil {
+		t.Fatalf("the branch store the link pointed at was modified: %v", readErr)
+	}
+	// The refusal has to come BEFORE the swap deletes or renames anything: through the
+	// link, the prepared directory would land in the branch store as refs/wt.
+	if _, statErr := os.Stat(filepath.Join(commonGitDir, "refs", "wt")); !os.IsNotExist(statErr) {
+		t.Fatalf("the prepared directory was swapped through the link (stat err = %v)", statErr)
+	}
+	if _, statErr := os.Stat(prepared); statErr != nil {
+		t.Fatalf("the prepared directory was consumed by a refused swap: %v", statErr)
+	}
+}
+
+// The post-swap verification has to run outside the registry section and still report a
+// row that moved before it ran. The writer below is queued while the section holds the
+// registry, so it applies the new identity before the verification can read it: the swap
+// therefore finishes (the prepared directory is in place) and the result is an error,
+// not a success for a mount that no longer owns the path.
+func TestSwapLinkedGitDirReportsATargetThatMovedAfterTheSection(t *testing.T) {
+	localRoot := t.TempDir()
+	g := &Git{localRoot: localRoot}
+	mainWS := &workspace{id: "main", root: "/repo", workspaceKind: "main"}
+	linkedWS := &workspace{
+		id: "linked", root: "/repo/wt",
+		workspaceKind: "linked", commonID: "main", gitDirRel: "worktrees/wt", worktreeName: "wt",
+	}
+	g.workspaces = []*workspace{mainWS, linkedWS}
+	commonGitDir := g.gitDirFor("/repo")
+	gitDir := filepath.Join(commonGitDir, "worktrees", "wt")
+	if err := os.MkdirAll(gitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prepared := t.TempDir()
+	if err := os.WriteFile(filepath.Join(prepared, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stalling the common's root read holds the swap inside the registry section.
+	mainWS.mu.Lock() //nolint:staticcheck // the test holds the workspace lock deliberately
+	mainStalled := true
+	releaseMain := func() {
+		if mainStalled {
+			mainStalled = false
+			mainWS.mu.Unlock()
+		}
+	}
+	t.Cleanup(releaseMain)
+
+	swapErr := make(chan error, 1)
+	go func() {
+		swapErr <- g.swapLinkedGitDir(linkedWS, commonGitDir, gitDir, prepared)
+	}()
+	registryHeld := false
+	waitDeadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(waitDeadline) {
+		if !g.mu.TryLock() {
+			registryHeld = true
+			break
+		}
+		g.mu.Unlock()
+		time.Sleep(time.Millisecond)
+	}
+	if !registryHeld {
+		t.Fatal("the swap never entered its registry section")
+	}
+
+	// Queue a reload that moves the workspace to another admin directory.
+	writerDone := make(chan struct{})
+	go func() {
+		g.mu.Lock()
+		linkedWS.setLinkedMeta("linked", "main", "worktrees/other", "other")
+		g.mu.Unlock()
+		close(writerDone)
+	}()
+	queued := false
+	for time.Now().Before(waitDeadline) {
+		if g.mu.TryRLock() {
+			g.mu.RUnlock()
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		queued = true
+		break
+	}
+	if !queued {
+		t.Fatal("the queued reload never reached the registry lock")
+	}
+	releaseMain()
+	err := <-swapErr
+	if err == nil {
+		t.Fatal("the swap reported success while the row moved under it")
+	}
+	if !strings.Contains(err.Error(), "target changed while it was restored") {
+		t.Fatalf("swap error = %v, want the moved-target refusal", err)
+	}
+	select {
+	case <-writerDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the queued reload never completed")
+	}
+	// The swap itself did complete: the prepared directory is at the path it approved.
+	if _, statErr := os.Stat(filepath.Join(gitDir, "HEAD")); statErr != nil {
+		t.Fatalf("the prepared directory was not swapped in: %v", statErr)
+	}
+	if got := linkedWS.gitDirRelPath(); got != "worktrees/other" {
+		t.Fatalf("the reload did not apply: %q", got)
+	}
+}
+
+// The common repository's checkpoint is tenant-supplied, so it can carry a regular
+// file where a worktree admin directory belongs. The restore materializes the common
+// repository first and then resolves the admin path again inside the swap, right before
+// it deletes anything: that resolution is what refuses the planted path, and the file
+// it planted is left where it is.
+func TestRestoreRefusesAPlantedWorktreeAdminPath(t *testing.T) {
+	gitBin(t)
+	src := t.TempDir()
+	run(t, src, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(src, "f.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, src, "add", "f.txt")
+	run(t, src, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "one")
+	head := run(t, src, "rev-parse", "HEAD")
+
+	localRoot := t.TempDir()
+	b := testbackend.NewBackend()
+	b.SeedGitWorkspaceFull("main", "/repo", "file://"+src, head)
+	b.SeedGitWorktree("linked", "/repo/wt", "file://"+src, head, "main", ".git/worktrees/wt")
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	// "worktrees/wt" is a file, so the admin path exists but is not a directory.
+	seedGitStateArchive(t, ts.URL, "main", tarArchive(t,
+		tarEntry{name: "HEAD", body: "ref: refs/heads/main\n"},
+		tarEntry{name: "config", body: "[core]\n\trepositoryformatversion = 0\n"},
+		tarEntry{name: "worktrees/wt", body: "planted"},
+	))
+	seedGitState(t, ts.URL, "linked")
+
+	g, err := New(Options{Client: client.New(ts.URL, ""), LocalRoot: localRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainWS := &workspace{id: "main", root: "/repo", headCommit: head, repoURL: "file://" + src}
+	linkedWS := &workspace{
+		id: "linked", root: "/repo/wt", headCommit: head, repoURL: "file://" + src,
+		workspaceKind: "linked", commonID: "main", gitDirRel: ".git/worktrees/wt", worktreeName: "wt",
+	}
+	g.workspaces = []*workspace{mainWS, linkedWS}
+	err = g.restoreWorkspaceState(context.Background(), linkedWS)
+	if err == nil {
+		t.Fatal("restore accepted a common repository whose admin path is a regular file")
+	}
+	if !strings.Contains(err.Error(), "worktree admin path") || !strings.Contains(err.Error(), "is not a directory") {
+		t.Fatalf("restore error = %v, want the planted admin path refusal", err)
+	}
+	planted := filepath.Join(localRoot, "overlay", "repo", ".git", "worktrees", "wt")
+	body, readErr := os.ReadFile(planted)
+	if readErr != nil {
+		t.Fatalf("the planted admin path was replaced instead of refused: %v", readErr)
+	}
+	if string(body) != "planted" {
+		t.Fatalf("planted admin path = %q, want it untouched", body)
+	}
+	// The linked root was never pointed at the planted shape.
+	if _, statErr := os.Stat(filepath.Join(localRoot, "overlay", "repo", "wt", ".git")); !os.IsNotExist(statErr) {
+		t.Fatalf("the linked root was written despite the refusal (stat err = %v)", statErr)
 	}
 }
 
@@ -756,10 +1093,16 @@ func tarArchive(t *testing.T, entries ...tarEntry) []byte {
 // would start writing the overlay before failing on the archive contents.
 func seedGitState(t *testing.T, baseURL, workspaceID string) {
 	t.Helper()
-	archive := tarArchive(t,
+	seedGitStateArchive(t, baseURL, workspaceID, tarArchive(t,
 		tarEntry{name: "HEAD", body: "ref: refs/heads/main\n"},
 		tarEntry{name: "config", body: "[core]\n\trepositoryformatversion = 0\n"},
-	)
+	))
+}
+
+// seedGitStateArchive uploads an exact checkpoint archive, so a test can produce the
+// shapes an older build wrote (a symbolic HEAD recorded as a link, a planted path).
+func seedGitStateArchive(t *testing.T, baseURL, workspaceID string, archive []byte) {
+	t.Helper()
 	sum := sha256.Sum256(archive)
 	_, err := client.New(baseURL, "").UpsertGitState(context.Background(), workspaceID, client.GitStateRequest{
 		CheckpointCommit: strings.Repeat("a", 40),
