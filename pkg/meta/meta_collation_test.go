@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -196,25 +197,44 @@ func TestInsertExternalBindingWaitsForSchemaLock(t *testing.T) {
 	now := time.Now().UTC()
 	binding := &ExternalBinding{Provider: "slock", SubjectKey: "gated", TenantID: "t", CreatedAt: now, UpdatedAt: now}
 
-	inserted := make(chan error, 1)
 	holding := make(chan struct{})
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	// Registered before the holder starts: a failed assertion below must not leave
+	// the holder (and its advisory lock) behind, or a repeated run of this test in
+	// the same process would block on the lock it still holds.
+	t.Cleanup(closeRelease)
+	holderDone := make(chan struct{})
+	acquireErr := make(chan error, 1)
 	go func() {
-		_ = s.WithExternalBindingSchemaLock(ctx, func(lockCtx context.Context) error {
+		defer close(holderDone)
+		acquireErr <- s.WithExternalBindingSchemaLock(ctx, func(lockCtx context.Context, _ *sql.Conn) error {
 			close(holding)
 			<-release
 			return nil
 		})
 	}()
-	<-holding
-	go func() { inserted <- s.InsertExternalBinding(ctx, binding) }()
+	select {
+	case err := <-acquireErr:
+		// The callback ran to completion, so the gate was never held open.
+		if err != nil {
+			t.Fatalf("hold the schema lock: %v", err)
+		}
+		t.Fatal("schema lock callback returned before the test released it")
+	case <-holding:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the schema lock was never acquired")
+	}
 
+	inserted := make(chan error, 1)
+	go func() { inserted <- s.InsertExternalBinding(ctx, binding) }()
 	select {
 	case err := <-inserted:
 		t.Fatalf("binding insert did not wait for the schema lock (err = %v)", err)
 	case <-time.After(150 * time.Millisecond):
 	}
-	close(release)
+	closeRelease()
 	select {
 	case err := <-inserted:
 		if err != nil {
@@ -223,6 +243,10 @@ func TestInsertExternalBindingWaitsForSchemaLock(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("binding insert never completed after the schema lock was released")
 	}
+	if err := <-acquireErr; err != nil {
+		t.Fatalf("release the schema lock: %v", err)
+	}
+	<-holderDone
 	if got, err := s.GetExternalBinding(ctx, "slock", "gated"); err != nil || got == nil {
 		t.Fatalf("binding was not stored: %v, %v", got, err)
 	}
@@ -277,6 +301,81 @@ func TestPinnedCollationsRestoreIndexAfterInterruptedRun(t *testing.T) {
 			// only the unique one.
 			assertPinnedCollationAndIndex(t, reopened.DB(), "tenant_api_keys", "issued_by_subject_key", "idx_api_keys_issuer")
 		})
+	}
+}
+
+// A run that crashed after dropping the index leaves it missing; the recovery runs
+// under the same gate binding writers take, so a writer that arrives while the
+// index is absent waits for the repair instead of inserting into the gap.
+func TestPinnedCollationRecoveryIsSerializedWithWriters(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	db := s.DB()
+	// The state a crash between DROP INDEX and ADD INDEX leaves behind.
+	dropIndex(t, db, "tenant_external_bindings", "uk_external_binding_subject")
+	now := time.Now().UTC()
+	if err := s.InsertExternalBinding(ctx, &ExternalBinding{
+		Provider: "slock", SubjectKey: "before-the-crash", TenantID: "t", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("insert before the recovery: %v", err)
+	}
+
+	holding := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(closeRelease)
+	holderDone := make(chan struct{})
+	go func() {
+		defer close(holderDone)
+		_ = s.WithExternalBindingSchemaLock(ctx, func(lockCtx context.Context, _ *sql.Conn) error {
+			close(holding)
+			<-release
+			return nil
+		})
+	}()
+	select {
+	case <-holding:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the schema lock was never acquired")
+	}
+
+	// Both the migration and the writer have to wait for the gate this test holds.
+	recovered := make(chan error, 1)
+	go func() {
+		reopened, err := Open(testDSN)
+		if err == nil {
+			_ = reopened.Close()
+		}
+		recovered <- err
+	}()
+	writeErr := make(chan error, 1)
+	go func() {
+		writeErr <- s.InsertExternalBinding(ctx, &ExternalBinding{
+			Provider: "slock", SubjectKey: "during-recovery", TenantID: "t", CreatedAt: now, UpdatedAt: now,
+		})
+	}()
+	for _, ch := range []chan error{recovered, writeErr} {
+		select {
+		case err := <-ch:
+			t.Fatalf("work proceeded while the schema gate was held (err = %v)", err)
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+	closeRelease()
+	<-holderDone
+
+	if err := <-recovered; err != nil {
+		t.Fatalf("recover the index after a crash: %v", err)
+	}
+	if err := <-writeErr; err != nil {
+		t.Fatalf("writer after the recovery: %v", err)
+	}
+	assertPinnedCollationAndIndex(t, db, "tenant_external_bindings", "subject_key", "uk_external_binding_subject")
+	for _, subject := range []string{"before-the-crash", "during-recovery"} {
+		if got, err := s.GetExternalBinding(ctx, "slock", subject); err != nil || got == nil {
+			t.Fatalf("binding %q: %v, %v", subject, got, err)
+		}
 	}
 }
 

@@ -1363,9 +1363,9 @@ func metaTableExists(ctx context.Context, db *sql.DB, tableName string) (bool, e
 	return count > 0, nil
 }
 
-func metaIndexExists(ctx context.Context, db *sql.DB, tableName, indexName string) (bool, error) {
+func metaIndexExists(ctx context.Context, q metaQueryer, tableName, indexName string) (bool, error) {
 	var count int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*)
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*)
 		FROM information_schema.statistics
 		WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?`,
 		tableName, indexName).Scan(&count); err != nil {
@@ -1844,10 +1844,11 @@ func (s *Store) InsertExternalBinding(ctx context.Context, b *ExternalBinding) (
 	}
 	// The unique subject index can be absent for a moment while the schema
 	// migration converts its collation, so the insert runs under the schema gate
-	// the migration holds. It is a short statement; the caller's per-subject lock
-	// still covers the read-modify-write around it.
-	return s.WithExternalBindingSchemaLock(ctx, func(lockCtx context.Context) error {
-		_, err = s.db.ExecContext(lockCtx, `INSERT INTO tenant_external_bindings
+	// the migration holds — on the gated connection, which is why this does not ask
+	// the pool for a second one. It is a short statement; the caller's per-subject
+	// lock still covers the read-modify-write around it.
+	return s.WithExternalBindingSchemaLock(ctx, func(lockCtx context.Context, conn *sql.Conn) error {
+		_, err = conn.ExecContext(lockCtx, `INSERT INTO tenant_external_bindings
 			(provider, subject_key, tenant_id, metadata_json, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?)`,
 			b.Provider, b.SubjectKey, b.TenantID, nullableBytes(b.MetadataJSON), b.CreatedAt.UTC(), b.UpdatedAt.UTC())
@@ -2772,13 +2773,18 @@ const externalBindingSchemaLockName = "d9_extbind_schema"
 // has to drop the unique subject index — TiDB refuses a collation change while an
 // index covers the column (error 8200) — cannot overlap a write that would then
 // violate uniqueness once the index is recreated.
-func (s *Store) WithExternalBindingSchemaLock(ctx context.Context, fn func(context.Context) error) error {
+func (s *Store) WithExternalBindingSchemaLock(ctx context.Context, fn func(context.Context, *sql.Conn) error) error {
 	return withExternalBindingSchemaLock(ctx, s.db, fn)
 }
 
 // withExternalBindingSchemaLock is the same gate for callers that hold the
 // database handle rather than a Store (the schema migration does).
-func withExternalBindingSchemaLock(ctx context.Context, db *sql.DB, fn func(context.Context) error) (err error) {
+//
+// The callback runs on the connection that holds the advisory lock, and it has to
+// run its own statements there: the lock is connection-local and the connection is
+// already reserved, so asking the pool for another one inside the callback can
+// deadlock a busy pool (every waiter holds a gated connection of its own).
+func withExternalBindingSchemaLock(ctx context.Context, db *sql.DB, fn func(context.Context, *sql.Conn) error) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "external_binding_schema_lock", start, &err)
 	if fn == nil {
@@ -2788,14 +2794,32 @@ func withExternalBindingSchemaLock(ctx context.Context, db *sql.DB, fn func(cont
 	if err != nil {
 		return err
 	}
-	defer func() { err = errors.Join(err, release()) }()
-	return fn(ctx)
+	fnErr := fn(ctx, release.conn)
+	// A committed write must not be reported as a failure because the lock could
+	// not be released: the caller would roll back provisioning that already
+	// happened. The release error is surfaced through the operation's metric.
+	if releaseErr := release.release(); releaseErr != nil {
+		if fnErr == nil {
+			logger.Warn(ctx, "meta_named_lock_release_failed", zap.String("lock", externalBindingSchemaLockName), zap.Error(releaseErr))
+			return nil
+		}
+		return errors.Join(fnErr, releaseErr)
+	}
+	return fnErr
 }
 
 // acquireMetaNamedLock takes a database-scoped MySQL advisory lock and returns its
 // release. Both statements run on one connection, because the lock is
 // connection-local.
-func acquireMetaNamedLock(ctx context.Context, db *sql.DB, name string) (func() error, error) {
+type metaNamedLock struct {
+	conn *sql.Conn
+	name string
+}
+
+// acquireMetaNamedLock takes a database-scoped MySQL advisory lock. The lock is
+// connection-local, so the connection is returned with it and must be used for the
+// work the lock protects.
+func acquireMetaNamedLock(ctx context.Context, db *sql.DB, name string) (*metaNamedLock, error) {
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return nil, err
@@ -2809,19 +2833,21 @@ func acquireMetaNamedLock(ctx context.Context, db *sql.DB, name string) (func() 
 		_ = conn.Close()
 		return nil, fmt.Errorf("timed out waiting for %s named lock", name)
 	}
-	return func() error {
-		defer func() { _ = conn.Close() }()
-		releaseCtx, cancel := context.WithTimeout(context.Background(), externalBindingReleaseLockTimeout)
-		defer cancel()
-		var released sql.NullInt64
-		if err := conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(CONCAT(?, DATABASE()))", name).Scan(&released); err != nil {
-			return err
-		}
-		if !released.Valid || released.Int64 != 1 {
-			return fmt.Errorf("%s named lock was not held by current connection", name)
-		}
-		return nil
-	}, nil
+	return &metaNamedLock{conn: conn, name: name}, nil
+}
+
+func (l *metaNamedLock) release() error {
+	defer func() { _ = l.conn.Close() }()
+	releaseCtx, cancel := context.WithTimeout(context.Background(), externalBindingReleaseLockTimeout)
+	defer cancel()
+	var released sql.NullInt64
+	if err := l.conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(CONCAT(?, DATABASE()))", l.name).Scan(&released); err != nil {
+		return err
+	}
+	if !released.Valid || released.Int64 != 1 {
+		return fmt.Errorf("%s named lock was not held by current connection", l.name)
+	}
+	return nil
 }
 
 func (s *Store) WithExternalBindingLock(ctx context.Context, provider, subjectKey string, fn func(context.Context) error) (err error) {

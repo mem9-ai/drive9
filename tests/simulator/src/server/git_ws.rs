@@ -586,11 +586,13 @@ fn gitdir_rel_is_valid(gitdir_rel: &str, worktree_name: &str) -> bool {
     }
     let rel = gitdir_rel.trim().strip_prefix(".git/").unwrap_or(gitdir_rel.trim());
     let parts: Vec<&str> = rel.split('/').collect();
+    // The path component itself is what git resolves, so the dot checks apply to it
+    // (a padded " .. " compares equal to parts[1] after trimming).
+    let name = parts.get(1).copied().unwrap_or("");
     parts.len() == 2
         && parts[0] == "worktrees"
-        && parts[1] == worktree_name.trim()
-        && worktree_name != "."
-        && worktree_name != ".."
-        && !worktree_name.contains('/')
-        && !worktree_name.contains('\\')
+        && name == worktree_name.trim()
+        && name != "."
+        && name != ".."
+        && !name.contains('\\')
 }

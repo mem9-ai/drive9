@@ -80,43 +80,100 @@ func metaPinnedCollationTargets(spec metaSchemaSpec) []metaCollationTarget {
 // on the collation branch.
 func ensurePinnedCollations(ctx context.Context, db *sql.DB, spec metaSchemaSpec) error {
 	for _, target := range metaPinnedCollationTargets(spec) {
-		exists, collation, err := metaColumnCollation(ctx, db, target.table, target.column)
+		needsSync, err := metaPinnedCollationNeedsSync(ctx, db, target)
 		if err != nil {
 			return err
 		}
-		if !exists {
-			// The table or column does not exist yet; applying the schema
-			// statements creates it with the pinned collation and its indexes.
+		if !needsSync {
 			continue
 		}
-		present := make(map[string]bool, len(target.indexes))
-		for _, index := range target.indexes {
-			indexed, err := metaIndexExists(ctx, db, target.table, index.name)
-			if err != nil {
+		// Everything that touches the index runs under the binding-writer gate — the
+		// conversion AND the recovery of an index an earlier run left missing. A
+		// writer that slipped in while the unique index was absent would make the
+		// recreate fail, and a run that failed after the drop must not leave the
+		// index missing for the next writer either.
+		//
+		// The state is re-read on the gated connection: the run that failed may have
+		// been this process's predecessor, and the gate is what makes the second
+		// look authoritative.
+		if err := withExternalBindingSchemaLock(ctx, db, func(lockCtx context.Context, conn *sql.Conn) error {
+			needsSync, err := metaPinnedCollationNeedsSync(lockCtx, conn, target)
+			if err != nil || !needsSync {
 				return err
 			}
-			present[index.name] = indexed
+			return syncPinnedCollation(lockCtx, conn, target)
+		}); err != nil {
+			return err
 		}
-		if !strings.EqualFold(collation, target.collation) {
-			// Hold the binding-writer gate across the whole conversion: the unique
-			// subject index is absent between the drop and the recreate, and a write
-			// that slipped in there would make the recreate fail (or, worse, leave a
-			// duplicate subject binding behind on another engine).
-			if err := withExternalBindingSchemaLock(ctx, db, func(lockCtx context.Context) error {
-				return pinColumnCollation(lockCtx, db, target, present)
-			}); err != nil {
-				return err
-			}
+	}
+	return nil
+}
+
+// metaQueryer is the subset of *sql.DB and *sql.Conn the migration needs, so the
+// gated path can run every statement on the connection that holds the lock.
+type metaQueryer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// metaPinnedCollationNeedsSync reports whether the column is missing the pinned
+// collation or any index the contract requires around it.
+func metaPinnedCollationNeedsSync(ctx context.Context, q metaQueryer, target metaCollationTarget) (bool, error) {
+	exists, collation, err := metaColumnCollation(ctx, q, target.table, target.column)
+	if err != nil {
+		return false, err
+	}
+	if !exists {
+		// The table or column does not exist yet; applying the schema statements
+		// creates it with the pinned collation and its indexes.
+		return false, nil
+	}
+	if !strings.EqualFold(collation, target.collation) {
+		return true, nil
+	}
+	for _, index := range target.indexes {
+		indexed, err := metaIndexExists(ctx, q, target.table, index.name)
+		if err != nil {
+			return false, err
 		}
-		for _, index := range target.indexes {
-			if present[index.name] {
-				continue
-			}
-			if err := restoreMetaCollationIndex(ctx, db, target, index); err != nil {
-				return err
-			}
-			present[index.name] = true
+		if !indexed {
+			return true, nil
 		}
+	}
+	return false, nil
+}
+
+// syncPinnedCollation brings one column's collation and its indexes in line with
+// the contract. It runs on the gated connection, so TiDB's refusal to change an
+// indexed column (error 8200) and the recovery of a missing index are both inside
+// the window the gate protects.
+func syncPinnedCollation(ctx context.Context, q metaQueryer, target metaCollationTarget) error {
+	present := make(map[string]bool, len(target.indexes))
+	for _, index := range target.indexes {
+		indexed, err := metaIndexExists(ctx, q, target.table, index.name)
+		if err != nil {
+			return err
+		}
+		present[index.name] = indexed
+	}
+	_, collation, err := metaColumnCollation(ctx, q, target.table, target.column)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(collation, target.collation) {
+		if err := pinColumnCollation(ctx, q, target, present); err != nil {
+			return err
+		}
+	}
+	for _, index := range target.indexes {
+		if present[index.name] {
+			continue
+		}
+		if err := restoreMetaCollationIndex(ctx, q, target, index); err != nil {
+			return err
+		}
+		present[index.name] = true
 	}
 	return nil
 }
@@ -126,8 +183,8 @@ func ensurePinnedCollations(ctx context.Context, db *sql.DB, spec metaSchemaSpec
 // covers the column, so on that error the covering indexes are dropped, the change
 // retried, and the indexes recreated. present is updated with what was dropped, so
 // the caller restores whatever this left out.
-func pinColumnCollation(ctx context.Context, db *sql.DB, target metaCollationTarget, present map[string]bool) error {
-	_, err := db.ExecContext(ctx, target.modifySQL)
+func pinColumnCollation(ctx context.Context, q metaQueryer, target metaCollationTarget, present map[string]bool) error {
+	_, err := q.ExecContext(ctx, target.modifySQL)
 	if err == nil {
 		return nil
 	}
@@ -139,16 +196,16 @@ func pinColumnCollation(ctx context.Context, db *sql.DB, target metaCollationTar
 		if !present[index.name] {
 			continue
 		}
-		if _, dropErr := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s DROP INDEX %s", target.table, index.name)); dropErr != nil {
+		if _, dropErr := q.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s DROP INDEX %s", target.table, index.name)); dropErr != nil {
 			return fmt.Errorf("drop %s.%s before collation change: %w", target.table, index.name, dropErr)
 		}
 		dropped = append(dropped, index)
 	}
-	_, modifyErr := db.ExecContext(ctx, target.modifySQL)
+	_, modifyErr := q.ExecContext(ctx, target.modifySQL)
 	// The indexes are restored whether or not the retry worked: leaving the table
 	// without them would be a worse state than the one this migration found.
 	for _, index := range dropped {
-		if restoreErr := restoreMetaCollationIndex(ctx, db, target, index); restoreErr != nil {
+		if restoreErr := restoreMetaCollationIndex(ctx, q, target, index); restoreErr != nil {
 			return restoreErr
 		}
 		present[index.name] = true
@@ -162,19 +219,19 @@ func pinColumnCollation(ctx context.Context, db *sql.DB, target metaCollationTar
 // restoreMetaCollationIndex recreates one index the contract requires. A unique
 // index is preflighted so a resumed migration reports the duplicate rows instead of
 // a raw duplicate-key error.
-func restoreMetaCollationIndex(ctx context.Context, db *sql.DB, target metaCollationTarget, index metaCollationIndex) error {
+func restoreMetaCollationIndex(ctx context.Context, q metaQueryer, target metaCollationTarget, index metaCollationIndex) error {
 	if index.unique {
 		var duplicates int64
 		checkSQL := fmt.Sprintf("SELECT COUNT(*) FROM (SELECT 1 FROM %s GROUP BY %s HAVING COUNT(*) > 1) AS dup",
 			target.table, strings.Join(index.columns, ", "))
-		if err := db.QueryRowContext(ctx, checkSQL).Scan(&duplicates); err != nil {
+		if err := q.QueryRowContext(ctx, checkSQL).Scan(&duplicates); err != nil {
 			return fmt.Errorf("check %s.%s duplicates: %w", target.table, index.name, err)
 		}
 		if duplicates > 0 {
 			return fmt.Errorf("refusing to recreate unique index %s.%s: %d duplicate rows", target.table, index.name, duplicates)
 		}
 	}
-	if _, err := db.ExecContext(ctx, index.createSQL); err != nil {
+	if _, err := q.ExecContext(ctx, index.createSQL); err != nil {
 		if isIgnorableMetaSchemaError(err) {
 			return nil
 		}
@@ -192,9 +249,9 @@ func metaCollationRefusedOverIndex(err error) bool {
 
 // metaColumnCollation reports whether the column exists and, when it does, the
 // collation the database reports for it.
-func metaColumnCollation(ctx context.Context, db *sql.DB, table, column string) (bool, string, error) {
+func metaColumnCollation(ctx context.Context, q metaQueryer, table, column string) (bool, string, error) {
 	var collation sql.NullString
-	err := db.QueryRowContext(ctx, `SELECT collation_name FROM information_schema.columns
+	err := q.QueryRowContext(ctx, `SELECT collation_name FROM information_schema.columns
 		WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`,
 		table, column).Scan(&collation)
 	if err == sql.ErrNoRows {

@@ -323,6 +323,45 @@ func TestCheckpointArchiveRecordsSymbolicHead(t *testing.T) {
 	}
 }
 
+// The final check has to revalidate the common repository too: a reload can point
+// the workspace at another common workspace while the restore runs, and the earlier
+// resolution captured the old one.
+func TestCheckLinkedRestoreTargetRejectsCommonChange(t *testing.T) {
+	localRoot := t.TempDir()
+	g := &Git{localRoot: localRoot, workspaces: []*workspace{}}
+	mainWS := &workspace{id: "main", root: "/repo", workspaceKind: "main"}
+	linkedWS := &workspace{
+		id: "linked", root: "/repo/wt",
+		workspaceKind: "linked", commonID: "main", gitDirRel: "worktrees/wt", worktreeName: "wt",
+	}
+	g.workspaces = []*workspace{mainWS, linkedWS}
+
+	commonGitDir := g.gitDirFor("/repo")
+	gitDir := filepath.Join(commonGitDir, "worktrees", "wt")
+	if err := g.checkLinkedRestoreTarget(linkedWS, commonGitDir, gitDir); err != nil {
+		t.Fatalf("unchanged workspace was refused: %v", err)
+	}
+
+	// A reload moves the workspace onto another common repository.
+	linkedWS.setLinkedMeta("linked", "main-2", "worktrees/wt", "wt")
+	mainWS2 := &workspace{id: "main-2", root: "/repo-2", workspaceKind: "main"}
+	g.workspaces = append(g.workspaces, mainWS2)
+	err := g.checkLinkedRestoreTarget(linkedWS, commonGitDir, gitDir)
+	if err == nil {
+		t.Fatal("common repository change during restore was accepted")
+	}
+	if !strings.Contains(err.Error(), "common repository changed") {
+		t.Fatalf("error = %v, want the common repository refusal", err)
+	}
+
+	// The common workspace disappearing is refused the same way.
+	g.workspaces = []*workspace{mainWS, linkedWS}
+	linkedWS.setLinkedMeta("linked", "gone", "worktrees/wt", "wt")
+	if err := g.checkLinkedRestoreTarget(linkedWS, commonGitDir, gitDir); err == nil {
+		t.Fatal("missing common workspace was accepted")
+	}
+}
+
 // tarEntry is one member of a test checkpoint archive: a regular file, or a
 // symlink when symlink is set.
 type tarEntry struct {
