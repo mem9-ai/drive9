@@ -206,16 +206,22 @@ func TestInsertExternalBindingWaitsForSchemaLock(t *testing.T) {
 	// the same process would block on the lock it still holds.
 	holderDone := make(chan struct{})
 	acquireErr := make(chan error, 1)
+	// The holder gets its own cancelable context, and the cleanup cancels it as well as
+	// releasing the callback: a stalled database call must not outlive the test, and a
+	// wait that expires is reported rather than silently dropped.
+	holderCtx, cancelHolder := context.WithCancel(ctx)
 	t.Cleanup(func() {
 		closeRelease()
+		cancelHolder()
 		select {
 		case <-holderDone:
 		case <-time.After(30 * time.Second):
+			t.Errorf("the schema-lock holder did not exit; its database call may still be running")
 		}
 	})
 	go func() {
 		defer close(holderDone)
-		acquireErr <- s.WithExternalBindingSchemaLock(ctx, func(lockCtx context.Context, _ *sql.Conn) error {
+		acquireErr <- s.WithExternalBindingSchemaLock(holderCtx, func(lockCtx context.Context, _ *sql.Conn) error {
 			close(holding)
 			<-release
 			return nil
@@ -344,9 +350,10 @@ func TestPinnedCollationRecoveryIsSerializedWithWriters(t *testing.T) {
 	var releaseOnce sync.Once
 	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
 	holderDone := make(chan struct{})
+	holderCtx, cancelHolder := context.WithCancel(ctx)
 	go func() {
 		defer close(holderDone)
-		_ = s.WithExternalBindingSchemaLock(ctx, func(lockCtx context.Context, _ *sql.Conn) error {
+		_ = s.WithExternalBindingSchemaLock(holderCtx, func(lockCtx context.Context, _ *sql.Conn) error {
 			close(holding)
 			<-release
 			return nil
@@ -354,9 +361,11 @@ func TestPinnedCollationRecoveryIsSerializedWithWriters(t *testing.T) {
 	}()
 	t.Cleanup(func() {
 		closeRelease()
+		cancelHolder()
 		select {
 		case <-holderDone:
 		case <-time.After(30 * time.Second):
+			t.Errorf("the schema-lock holder did not exit; its database call may still be running")
 		}
 	})
 	select {

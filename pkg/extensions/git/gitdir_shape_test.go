@@ -498,10 +498,12 @@ func TestRegistryReadLockBlocksAReload(t *testing.T) {
 	}
 }
 
-// The post-swap verification must not run under the registry read lock: with a writer
-// queued for g.mu, a nested read lock inside the section would block behind it while
-// the writer waits for the section to end.
-func TestVerifyLinkedRestoreTargetRunsOutsideTheRegistrySection(t *testing.T) {
+// The post-swap verification must run after the registry section ends. This drives
+// the real swap, waits until it holds the registry read lock, queues a writer, and
+// requires both to finish: if the verification moves back inside the section its own
+// read lock queues behind that writer, which is waiting for the section — the swap
+// never returns and this test times out.
+func TestSwapLinkedGitDirCompletesWithAQueuedRegistryWriter(t *testing.T) {
 	localRoot := t.TempDir()
 	g := &Git{localRoot: localRoot}
 	mainWS := &workspace{id: "main", root: "/repo", workspaceKind: "main"}
@@ -510,31 +512,70 @@ func TestVerifyLinkedRestoreTargetRunsOutsideTheRegistrySection(t *testing.T) {
 		workspaceKind: "linked", commonID: "main", gitDirRel: "worktrees/wt", worktreeName: "wt",
 	}
 	g.workspaces = []*workspace{mainWS, linkedWS}
-	gitDir := filepath.Join(g.gitDirFor("/repo"), "worktrees", "wt")
+	commonGitDir := g.gitDirFor("/repo")
+	gitDir := filepath.Join(commonGitDir, "worktrees", "wt")
+	// Enough entries that the swap is still inside its section when the writer is
+	// queued; the section's own work (RemoveAll + Rename) is the window this needs.
+	if err := os.MkdirAll(gitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2000; i++ {
+		if err := os.WriteFile(filepath.Join(gitDir, fmt.Sprintf("f-%04d", i)), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prepared := t.TempDir()
+	if err := os.WriteFile(filepath.Join(prepared, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
-	// A writer queued for g.mu, then the verification: both have to complete.
-	writerQueued := make(chan struct{})
+	swapErr := make(chan error, 1)
+	go func() { swapErr <- g.swapLinkedGitDir(linkedWS, commonGitDir, gitDir, prepared) }()
+
+	// A failed TryLock means readers hold the registry, i.e. the swap is inside its
+	// section.
+	sectionEntered := false
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if !g.mu.TryLock() {
+			sectionEntered = true
+			break
+		}
+		g.mu.Unlock()
+		time.Sleep(time.Millisecond)
+	}
+	if !sectionEntered {
+		t.Fatal("the swap never entered its registry section")
+	}
+
 	writerDone := make(chan struct{})
+	writerSawRegistry := make(chan int, 1)
 	go func() {
 		g.mu.Lock()
-		// The writer is queued; a nested RLock would block behind it.
-		close(writerQueued)
+		writerSawRegistry <- len(g.workspaces)
 		g.mu.Unlock()
 		close(writerDone)
 	}()
-	<-writerQueued
 
-	verified := make(chan error, 1)
-	go func() { verified <- g.verifyLinkedRestoreTarget(linkedWS, gitDir) }()
 	select {
-	case err := <-verified:
+	case err := <-swapErr:
 		if err != nil {
-			t.Fatalf("verify: %v", err)
+			t.Fatalf("swap: %v", err)
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the post-swap verification blocked behind a queued registry writer")
+	case <-time.After(15 * time.Second):
+		t.Fatal("the swap never completed with a writer queued; the post-swap verification must run outside the registry section")
 	}
-	<-writerDone
+	select {
+	case <-writerDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the queued registry writer never completed")
+	}
+	if got := <-writerSawRegistry; got != 2 {
+		t.Fatalf("the queued writer saw %d workspaces, want 2", got)
+	}
+	if _, err := os.Stat(filepath.Join(gitDir, "HEAD")); err != nil {
+		t.Fatalf("prepared directory was not swapped in: %v", err)
+	}
 }
 
 // tarEntry is one member of a test checkpoint archive: a regular file, or a
