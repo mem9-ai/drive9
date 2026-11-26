@@ -80,6 +80,15 @@ func (idx *OpenHandleIndex) RestoreUnlinkedPath(p string, handles []*fileHandle)
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	for _, fh := range handles {
+		if fh == nil {
+			continue
+		}
+		if _, stillUnlinked := idx.unlinked[fh]; !stillUnlinked {
+			continue
+		}
+		if _, stillOpen := idx.byInode[fh.ino][fh]; !stillOpen {
+			continue
+		}
 		delete(idx.unlinked, fh)
 		if idx.byPath[p] == nil {
 			idx.byPath[p] = make(map[*fileHandle]struct{})

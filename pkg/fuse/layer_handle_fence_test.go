@@ -640,3 +640,30 @@ func TestSelfFenceDuringRealWritebackUnlinkPreservesStagedState(t *testing.T) {
 		})
 	}
 }
+
+func TestRestoreUnlinkedPathSkipsConcurrentlyRemovedHandle(t *testing.T) {
+	idx := NewOpenHandleIndex()
+	h1 := &fileHandle{ino: 42, path: "/held"}
+	h2 := &fileHandle{ino: 42, path: "/held"}
+	idx.Add(h1)
+	idx.Add(h2)
+
+	saved := idx.SnapshotPath("/held")
+	idx.UnlinkPath("/held")
+	// Simulate h1 closing during Phase 3 WAL persistence before rollback runs.
+	idx.Remove(h1)
+
+	idx.RestoreUnlinkedPath("/held", saved)
+	if !idx.HasOpenPath("/held") {
+		t.Fatal("expected surviving handle h2 to remain open on /held")
+	}
+	got := idx.SnapshotPath("/held")
+	if len(got) != 1 || got[0] != h2 {
+		t.Fatalf("restored handles = %v, want only surviving handle h2", got)
+	}
+	// Closing h2 must leave zero leaked entries for /held.
+	idx.Remove(h2)
+	if idx.HasOpenPath("/held") || idx.HasOpenInode(42) {
+		t.Fatal("leaked closed handle in OpenHandleIndex after rollback")
+	}
+}
