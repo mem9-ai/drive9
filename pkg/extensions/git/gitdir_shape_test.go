@@ -5,63 +5,72 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"fmt"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"net/http/httptest"
 
 	"github.com/mem9-ai/drive9/internal/testbackend"
 	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 // A linked worktree's registered gitdir_rel must name the worktree admin
-// directory git itself uses. Every other shape addresses a directory git reads
-// configuration or executables from, so resolution has to refuse it — including
-// for rows that were registered before the shape was validated.
+// directory git itself uses, and it must name THIS worktree. Every other shape
+// addresses a directory git reads configuration or executables from, so
+// resolution has to refuse it — including for rows that were registered while the
+// value was free-form.
 func TestLinkedWorktreeGitDirRejectsNonAdminShape(t *testing.T) {
 	common := filepath.Join(t.TempDir(), "repo", ".git")
 
-	// A trailing separator is normalized away by the path clean, so it names the
-	// same admin directory.
-	accepted := []string{".git/worktrees/w1", "worktrees/w1", "worktrees/wt.1", "worktrees/w1/"}
-	for _, rel := range accepted {
-		got, err := linkedWorktreeGitDir(common, rel)
+	accepted := []struct{ rel, name string }{
+		{".git/worktrees/w1", "w1"},
+		{"worktrees/w1", "w1"},
+		{"worktrees/wt.1", "wt.1"},
+	}
+	for _, tc := range accepted {
+		got, err := linkedWorktreeGitDir(common, tc.rel, tc.name)
 		if err != nil {
-			t.Fatalf("linkedWorktreeGitDir(%q) = %v, want success", rel, err)
+			t.Fatalf("linkedWorktreeGitDir(%q, %q) = %v, want success", tc.rel, tc.name, err)
 		}
-		if want := filepath.Join(common, "worktrees", filepath.Base(got)); got != want {
-			t.Fatalf("linkedWorktreeGitDir(%q) = %q, want %q", rel, got, want)
+		if want := filepath.Join(common, "worktrees", tc.name); got != want {
+			t.Fatalf("linkedWorktreeGitDir(%q, %q) = %q, want %q", tc.rel, tc.name, got, want)
 		}
 	}
 
-	refused := []string{
-		".git/hooks",  // the restore would publish a checkpoint over the hooks git runs
-		"hooks",       // same directory, written without the .git prefix
-		".git/config", // git reads configuration from here
-		".git/objects",
-		"worktrees",                // not an admin directory itself
-		"worktrees/w1/extra",       // deeper than the admin directory
-		"worktrees/../../hooks",    // climbs out and back in
-		"../hooks",                 // escapes the common .git
-		"/etc/hooks",               // absolute
-		".git/worktrees/../hooks",  // ".." segment
-		"worktrees/",               // no name
-		"worktrees/w1\x00",         // NUL
-		"worktrees/w1\\pre-commit", // backslash separator
-		".git/worktrees",           // no name
+	refused := []struct{ rel, name string }{
+		{".git/hooks", "hooks"},   // the restore would publish a checkpoint over the hooks git runs
+		{"hooks", "hooks"},        // same directory, written without the .git prefix
+		{".git/config", "config"}, // git reads configuration from here
+		{".git/objects", "objects"},
+		{"worktrees", "w1"},                  // not an admin directory itself
+		{"worktrees/w1/extra", "w1"},         // deeper than the admin directory
+		{"worktrees/../../hooks", "hooks"},   // climbs out and back in
+		{"../hooks", "hooks"},                // escapes the common .git
+		{"/etc/hooks", "hooks"},              // absolute
+		{".git/worktrees/../hooks", "hooks"}, // ".." segment
+		{"worktrees/", ""},                   // no name
+		{"worktrees/w1\x00", "w1"},           // NUL
+		{"worktrees/w1\\pre-commit", "w1"},   // backslash separator
+		{".git/worktrees", ""},               // no name
+		{"worktrees//w1", "w1"},              // empty segment, which the API also rejects
+		{"worktrees/w1/", "w1"},              // trailing separator: the same rule on both sides
+		{"worktrees/w1", "w2"},               // a sibling worktree's admin directory
+		{"worktrees/w1", ""},                 // the stored name is what makes it this worktree's
 	}
-	for _, rel := range refused {
-		if got, err := linkedWorktreeGitDir(common, rel); err == nil {
-			t.Fatalf("linkedWorktreeGitDir(%q) = %q, want a refusal", rel, got)
+	for _, tc := range refused {
+		if got, err := linkedWorktreeGitDir(common, tc.rel, tc.name); err == nil {
+			t.Fatalf("linkedWorktreeGitDir(%q, %q) = %q, want a refusal", tc.rel, tc.name, got)
 		}
 	}
 }
 
 // restoreWorkspaceState must refuse a workspace whose gitdir_rel is not a
-// worktree admin directory before it restores the common repository, so nothing
-// is published into the targeted directory.
+// worktree admin directory before it materializes the common repository. The
+// common's checkpoint is seeded here and a restore of it creates the overlay
+// directory, so an ordering regression that restored it first turns this red.
 func TestRestoreRefusesNonWorktreeGitDirBeforeTouchingCommon(t *testing.T) {
 	b := testbackend.NewBackend()
 	b.SeedGitWorkspaceFull("main", "/repo", "https://example.test/repo.git", strings.Repeat("a", 40))
@@ -70,6 +79,7 @@ func TestRestoreRefusesNonWorktreeGitDirBeforeTouchingCommon(t *testing.T) {
 	b.SeedGitWorktree("linked", "/repo/wt", "https://example.test/repo.git", strings.Repeat("a", 40), "main", ".git/hooks")
 	ts := httptest.NewServer(b)
 	t.Cleanup(ts.Close)
+	seedGitState(t, ts.URL, "main")
 
 	localRoot := t.TempDir()
 	g, err := New(Options{Client: client.New(ts.URL, ""), LocalRoot: localRoot})
@@ -87,13 +97,60 @@ func TestRestoreRefusesNonWorktreeGitDirBeforeTouchingCommon(t *testing.T) {
 	if err == nil {
 		t.Fatal("restore accepted a gitdir_rel outside worktrees/<name>")
 	}
-	if !strings.Contains(err.Error(), "worktrees/<name>") {
+	if !strings.Contains(err.Error(), "worktrees/") {
 		t.Fatalf("restore error = %v, want the gitdir shape refusal", err)
 	}
-	// The common repository was never materialized, so nothing could have been
-	// written into the targeted directory.
-	if _, statErr := os.Stat(filepath.Join(localRoot, "overlay", "repo", ".git")); !os.IsNotExist(statErr) {
-		t.Fatalf("common git dir exists after a refused restore (stat err = %v)", statErr)
+	// The common repository was never materialized: its overlay directory is the
+	// first thing a restore creates, and the staging directory lands inside it.
+	if _, statErr := os.Stat(filepath.Join(localRoot, "overlay", "repo")); !os.IsNotExist(statErr) {
+		t.Fatalf("common repository was materialized by a refused restore (stat err = %v)", statErr)
+	}
+}
+
+// The worktree admin path must be a real directory. The common repository's own
+// checkpoint is tenant-controlled, so it can plant "worktrees -> refs"; a restore
+// would then delete and replace the branch store instead of an admin directory.
+func TestRestoreRefusesSymlinkedWorktreesBeforeSwap(t *testing.T) {
+	localRoot := t.TempDir()
+	commonGitDir := filepath.Join(localRoot, "overlay", "repo", ".git")
+	if err := os.MkdirAll(filepath.Join(commonGitDir, "refs", "heads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("refs", filepath.Join(commonGitDir, "worktrees")); err != nil {
+		t.Fatal(err)
+	}
+	headPath := filepath.Join(commonGitDir, "refs", "heads", "heads")
+	if err := os.WriteFile(headPath, []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testbackend.NewBackend()
+	b.SeedGitWorkspaceFull("main", "/repo", "https://example.test/repo.git", strings.Repeat("a", 40))
+	b.SeedGitWorktree("linked", "/repo/wt", "https://example.test/repo.git", strings.Repeat("a", 40), "main", "worktrees/heads")
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+
+	g, err := New(Options{Client: client.New(ts.URL, ""), LocalRoot: localRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainWS := &workspace{id: "main", root: "/repo", headCommit: strings.Repeat("a", 40), repoURL: "https://example.test/repo.git"}
+	linkedWS := &workspace{
+		id: "linked", root: "/repo/wt", headCommit: strings.Repeat("a", 40), repoURL: "https://example.test/repo.git",
+		workspaceKind: "linked", commonID: "main", gitDirRel: "worktrees/heads", worktreeName: "heads",
+	}
+	g.workspaces = []*workspace{mainWS, linkedWS}
+
+	if err := g.restoreWorkspaceState(context.Background(), linkedWS); err == nil {
+		t.Fatal("restore accepted a symlinked worktrees directory")
+	}
+	// The branch store the link pointed at is untouched.
+	got, readErr := os.ReadFile(headPath)
+	if readErr != nil {
+		t.Fatalf("refs/heads/heads was removed by the refused restore: %v", readErr)
+	}
+	if string(got) != "ref: refs/heads/main\n" {
+		t.Fatalf("refs/heads/heads = %q, want the original content", got)
 	}
 }
 
@@ -101,31 +158,9 @@ func TestRestoreRefusesNonWorktreeGitDirBeforeTouchingCommon(t *testing.T) {
 // the extraction root is refused instead of silently skipped, because a
 // partially extracted admin directory would still be adopted by the restore.
 func TestExtractGitArchiveRefusesEntriesOutsideExtractionRoot(t *testing.T) {
-	build := func(entries ...string) []byte {
-		var buf bytes.Buffer
-		gz := gzip.NewWriter(&buf)
-		tw := tar.NewWriter(gz)
-		for _, name := range entries {
-			body := []byte("#!/bin/sh\nexit 0\n")
-			if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o755, Size: int64(len(body)), Typeflag: tar.TypeReg}); err != nil {
-				t.Fatalf("write header %q: %v", name, err)
-			}
-			if _, err := tw.Write(body); err != nil {
-				t.Fatalf("write body %q: %v", name, err)
-			}
-		}
-		if err := tw.Close(); err != nil {
-			t.Fatal(err)
-		}
-		if err := gz.Close(); err != nil {
-			t.Fatal(err)
-		}
-		return buf.Bytes()
-	}
-
-	for _, name := range []string{"../pre-commit", "a/../../pre-commit", ".git/config", ".git/hooks/pre-commit"} {
+	for _, name := range []string{"../pre-commit", "a/../../pre-commit", "/abs/pre-commit", ".git/config", ".git/hooks/pre-commit"} {
 		dst := t.TempDir()
-		if err := extractGitArchive(build(name), dst); err == nil {
+		if err := extractGitArchive(tarArchive(t, tarEntry{name: name, body: "#!/bin/sh\nexit 0\n", mode: 0o755}), dst); err == nil {
 			t.Fatalf("extractGitArchive accepted entry %q", name)
 		}
 		if entries, readErr := os.ReadDir(dst); readErr != nil {
@@ -137,7 +172,11 @@ func TestExtractGitArchiveRefusesEntriesOutsideExtractionRoot(t *testing.T) {
 
 	// An ordinary admin-directory archive still extracts.
 	dst := t.TempDir()
-	if err := extractGitArchive(build("HEAD", "hooks/pre-commit"), dst); err != nil {
+	archive := tarArchive(t,
+		tarEntry{name: "HEAD", body: "ref: refs/heads/main\n"},
+		tarEntry{name: "hooks/pre-commit", body: "#!/bin/sh\n", mode: 0o755},
+	)
+	if err := extractGitArchive(archive, dst); err != nil {
 		t.Fatalf("extractGitArchive refused a normal archive: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dst, "HEAD")); err != nil {
@@ -145,132 +184,153 @@ func TestExtractGitArchiveRefusesEntriesOutsideExtractionRoot(t *testing.T) {
 	}
 }
 
-// The archive can create symlinks of its own, and a later entry can be written
-// through them: lexical cleaning cannot see that, so extraction must refuse to
-// follow any link out of the tree. This is the reported sequence — links that
-// fold to "." and then a write that resolves outside the extraction root.
-func TestExtractGitArchiveRefusesSymlinkChainEscape(t *testing.T) {
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	tw := tar.NewWriter(gz)
-	writeLink := func(name, target string) {
-		t.Helper()
-		if err := tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeSymlink, Linkname: target}); err != nil {
-			t.Fatalf("write symlink header %q: %v", name, err)
-		}
+// A link of its own is what makes a lexical path check meaningless: the reported
+// chain built from ".."-named components, and the same chain built from ordinary
+// names, both resolve the final write outside the extraction root. Neither may
+// land anything, and a plain link is refused too — the restore and every later git
+// command follow it long after the sanitizer ran.
+func TestExtractGitArchiveRefusesSymlinks(t *testing.T) {
+	chains := []struct {
+		name   string
+		links  []tarEntry
+		finals []tarEntry
+	}{
+		{
+			name: "..-named links",
+			links: []tarEntry{
+				{symlink: "..self", target: "."},
+				{symlink: "..up", target: "..self/.."},
+				{symlink: "..up/..self", target: "."},
+				{symlink: "..common", target: "..up/..self/.."},
+			},
+			finals: []tarEntry{{name: "..common/hooks/pre-commit", body: "#!/bin/sh\necho pwned\n", mode: 0o755}},
+		},
+		{
+			name: "ordinary names",
+			links: []tarEntry{
+				{symlink: "self", target: "."},
+				{symlink: "up", target: "self/.."},
+				{symlink: "up/self", target: "."},
+				{symlink: "common", target: "up/self/.."},
+			},
+			finals: []tarEntry{{name: "common/hooks/pre-commit", body: "#!/bin/sh\necho pwned\n", mode: 0o755}},
+		},
+		{
+			name:   "in-root link to the config",
+			links:  []tarEntry{{symlink: "config", target: "../config"}},
+			finals: []tarEntry{{name: "HEAD", body: "ref: refs/heads/main\n"}},
+		},
 	}
-	writeLink("..self", ".")
-	writeLink("..up", "..self/..")
-	writeLink("..up/..self", ".")
-	writeLink("..common", "..up/..self/..")
-	body := []byte("#!/bin/sh\necho pwned\n")
-	if err := tw.WriteHeader(&tar.Header{Name: "..common/hooks/pre-commit", Mode: 0o755, Size: int64(len(body)), Typeflag: tar.TypeReg}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tw.Write(body); err != nil {
-		t.Fatal(err)
-	}
-	if err := tw.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := gz.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	parent := t.TempDir()
-	dst := filepath.Join(parent, "worktrees", "tmp")
-	if err := extractGitArchive(buf.Bytes(), dst); err == nil {
-		t.Fatal("extractGitArchive accepted a symlink chain that writes outside the extraction root")
-	}
-	// Nothing may have landed outside the extraction root.
-	for _, outside := range []string{
-		filepath.Join(parent, "hooks", "pre-commit"),
-		filepath.Join(parent, "worktrees", "hooks", "pre-commit"),
-	} {
-		if _, err := os.Stat(outside); err == nil {
-			t.Fatalf("archive wrote outside the extraction root: %s", outside)
-		}
+	for _, tc := range chains {
+		t.Run(tc.name, func(t *testing.T) {
+			parent := t.TempDir()
+			dst := filepath.Join(parent, "worktrees", "tmp")
+			entries := append(append([]tarEntry{}, tc.links...), tc.finals...)
+			if err := extractGitArchive(tarArchive(t, entries...), dst); err == nil {
+				t.Fatal("extractGitArchive accepted a symlink entry")
+			}
+			for _, outside := range []string{
+				filepath.Join(parent, "hooks", "pre-commit"),
+				filepath.Join(parent, "worktrees", "hooks", "pre-commit"),
+				filepath.Join(parent, "config"),
+			} {
+				if _, err := os.Stat(outside); err == nil {
+					t.Fatalf("archive wrote outside the extraction root: %s", outside)
+				}
+			}
+		})
 	}
 }
 
-// In-tree symlinks are legitimate (a checkpoint may carry "HEAD" aliases), so a
-// link whose target stays inside the root must still extract.
-func TestExtractGitArchiveAllowsInRootSymlink(t *testing.T) {
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	tw := tar.NewWriter(gz)
-	body := []byte("ref: refs/heads/main\n")
-	if err := tw.WriteHeader(&tar.Header{Name: "HEAD", Mode: 0o644, Size: int64(len(body)), Typeflag: tar.TypeReg}); err != nil {
+// A repository that carries a symlink still checkpoints and restores: the writer
+// drops the link instead of failing the upload, so no released client is stranded.
+func TestCheckpointArchiveDropsLinks(t *testing.T) {
+	gitBin(t)
+	src := t.TempDir()
+	run(t, src, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(src, "f.txt"), []byte("hello"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tw.Write(body); err != nil {
+	run(t, src, "add", "f.txt")
+	run(t, src, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "one")
+	if err := os.Symlink("HEAD", filepath.Join(src, ".git", "link-to-head")); err != nil {
 		t.Fatal(err)
 	}
-	if err := tw.WriteHeader(&tar.Header{Name: "HEAD-alias", Typeflag: tar.TypeSymlink, Linkname: "HEAD"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := tw.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := gz.Close(); err != nil {
-		t.Fatal(err)
+
+	archive, err := archiveLocalGitStateDir(filepath.Join(src, ".git"))
+	if err != nil {
+		t.Fatalf("archiveLocalGitStateDir: %v", err)
 	}
 	dst := t.TempDir()
-	if err := extractGitArchive(buf.Bytes(), dst); err != nil {
-		t.Fatalf("extractGitArchive refused an in-root symlink: %v", err)
+	if err := extractGitArchive(archive, dst); err != nil {
+		t.Fatalf("a checkpoint that dropped its link must still restore: %v", err)
 	}
-	got, err := os.ReadFile(filepath.Join(dst, "HEAD-alias"))
-	if err != nil {
-		t.Fatalf("read through in-root symlink: %v", err)
+	if _, err := os.Lstat(filepath.Join(dst, "link-to-head")); !os.IsNotExist(err) {
+		t.Fatalf("link-to-head was archived (lstat err = %v), want it dropped", err)
 	}
-	if string(got) != string(body) {
-		t.Fatalf("HEAD-alias = %q, want %q", got, body)
+	if _, err := os.Stat(filepath.Join(dst, "HEAD")); err != nil {
+		t.Fatalf("HEAD missing from the restored archive: %v", err)
 	}
 }
 
-// The worktree admin path must be a real directory: the tenant-controlled common
-// checkpoint can plant "worktrees -> refs" (or "-> ."), which a restore would then
-// replace instead of an admin directory.
-func TestLinkedWorktreeGitDirRefusesSymlinkedComponents(t *testing.T) {
-	root := t.TempDir()
-	common := filepath.Join(root, "repo", ".git")
-	if err := os.MkdirAll(filepath.Join(common, "refs", "heads"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+// tarEntry is one member of a test checkpoint archive: a regular file, or a
+// symlink when symlink is set.
+type tarEntry struct {
+	name    string
+	body    string
+	mode    int64
+	symlink string
+	target  string
+}
 
-	// "worktrees" as a link into the branch store.
-	if err := os.Symlink("refs", filepath.Join(common, "worktrees")); err != nil {
+func tarArchive(t *testing.T, entries ...tarEntry) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	for _, entry := range entries {
+		hdr := &tar.Header{Name: entry.name, Mode: entry.mode, Typeflag: tar.TypeReg, Size: int64(len(entry.body))}
+		if entry.symlink != "" {
+			hdr.Name = entry.symlink
+			hdr.Typeflag = tar.TypeSymlink
+			hdr.Size = 0
+			hdr.Linkname = entry.target
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("write header %q: %v", hdr.Name, err)
+		}
+		if hdr.Typeflag == tar.TypeReg {
+			if _, err := tw.Write([]byte(entry.body)); err != nil {
+				t.Fatalf("write body %q: %v", hdr.Name, err)
+			}
+		}
+	}
+	if err := tw.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := linkedWorktreeGitDir(common, "worktrees/heads"); err == nil {
-		t.Fatalf("linkedWorktreeGitDir = %q, want a refusal for a symlinked worktrees dir", got)
-	}
-	if err := os.Remove(filepath.Join(common, "worktrees")); err != nil {
+	if err := gz.Close(); err != nil {
 		t.Fatal(err)
 	}
+	return buf.Bytes()
+}
 
-	// "worktrees" real, the admin dir itself a link to the hooks directory.
-	if err := os.MkdirAll(filepath.Join(common, "worktrees"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(common, "hooks"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("../hooks", filepath.Join(common, "worktrees", "wt")); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := linkedWorktreeGitDir(common, "worktrees/wt"); err == nil {
-		t.Fatalf("linkedWorktreeGitDir = %q, want a refusal for a symlinked admin dir", got)
-	}
-
-	// A real admin directory still resolves.
-	if err := os.Remove(filepath.Join(common, "worktrees", "wt")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(common, "worktrees", "wt"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := linkedWorktreeGitDir(common, "worktrees/wt"); err != nil {
-		t.Fatalf("linkedWorktreeGitDir refused a real admin dir: %v", err)
+// seedGitState uploads a minimal checkpoint for a workspace, so a restore of it
+// would start writing the overlay before failing on the archive contents.
+func seedGitState(t *testing.T, baseURL, workspaceID string) {
+	t.Helper()
+	archive := tarArchive(t,
+		tarEntry{name: "HEAD", body: "ref: refs/heads/main\n"},
+		tarEntry{name: "config", body: "[core]\n\trepositoryformatversion = 0\n"},
+	)
+	sum := sha256.Sum256(archive)
+	_, err := client.New(baseURL, "").UpsertGitState(context.Background(), workspaceID, client.GitStateRequest{
+		CheckpointCommit: strings.Repeat("a", 40),
+		StorageType:      gitStateStorageTarGzNoObjects,
+		ChecksumSHA256:   fmt.Sprintf("%x", sum),
+		SizeBytes:        int64(len(archive)),
+		Content:          archive,
+	})
+	if err != nil {
+		t.Fatalf("seed git state for %s: %v", workspaceID, err)
 	}
 }

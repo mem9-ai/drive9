@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -18,6 +17,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/gitcache"
+	"github.com/mem9-ai/drive9/pkg/gitworktree"
 	"github.com/mem9-ai/drive9/pkg/gitwsindex"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/pathutil"
@@ -252,15 +252,15 @@ func (s *Server) handleGitWorkspaceUpsert(w http.ResponseWriter, r *http.Request
 			errJSON(w, http.StatusBadRequest, "worktree_name is required for linked git workspaces")
 			return
 		}
-		if err := validateGitWorktreeName(worktreeName); err != nil {
+		if err := gitworktree.ValidateName(worktreeName); err != nil {
 			errJSON(w, http.StatusBadRequest, "invalid worktree_name: "+err.Error())
 			return
 		}
-		if gitDirRel != "" {
-			if err := validateGitWorktreeGitDirRel(gitDirRel, worktreeName); err != nil {
-				errJSON(w, http.StatusBadRequest, "invalid gitdir_rel: "+err.Error())
-				return
-			}
+		// Required, not optional: a linked workspace without it has no admin
+		// directory to restore into, and the restore error is only logged.
+		if _, err := gitworktree.AdminRel(gitDirRel, worktreeName); err != nil {
+			errJSON(w, http.StatusBadRequest, "invalid gitdir_rel: "+err.Error())
+			return
 		}
 		common, err := store.GetGitWorkspace(r.Context(), commonWorkspaceID)
 		if err != nil {
@@ -1007,77 +1007,6 @@ func validateInlineContentMetadata(content []byte, sizeBytes int64, checksumSHA2
 	sum := sha256.Sum256(content)
 	if !strings.EqualFold(checksumSHA256, hex.EncodeToString(sum[:])) {
 		return fmt.Errorf("checksum_sha256 does not match content")
-	}
-	return nil
-}
-
-func validateGitWorktreeName(name string) error {
-	if name == "" {
-		return fmt.Errorf("name is required")
-	}
-	if len(name) > 255 {
-		return fmt.Errorf("name exceeds 255 bytes")
-	}
-	if strings.ContainsRune(name, '\x00') {
-		return fmt.Errorf("name contains NUL")
-	}
-	if strings.ContainsAny(name, `/\`) || name == "." || name == ".." {
-		return fmt.Errorf("name must be a single safe path segment")
-	}
-	return nil
-}
-
-func validateGitMetadataRelativePath(raw string) error {
-	if raw == "" {
-		return nil
-	}
-	if len(raw) > 1024 {
-		return fmt.Errorf("path exceeds 1024 bytes")
-	}
-	if strings.HasPrefix(raw, "/") {
-		return fmt.Errorf("path must be relative")
-	}
-	if strings.ContainsRune(raw, '\x00') || strings.ContainsRune(raw, '\\') {
-		return fmt.Errorf("path contains invalid character")
-	}
-	for _, part := range strings.Split(raw, "/") {
-		if part == "" || part == "." || part == ".." {
-			return fmt.Errorf("path contains invalid segment %q", part)
-		}
-		if len(part) > 255 {
-			return fmt.Errorf("path segment exceeds 255 bytes")
-		}
-	}
-	return nil
-}
-
-// validateGitWorktreeGitDirRel constrains a linked workspace's gitdir_rel to the
-// shape git itself uses: worktrees/<worktree_name>, optionally written with the
-// leading ".git/".
-//
-// The column is otherwise a free-form relative path below the common repository,
-// and the mount host republishes a tenant-supplied git-state checkpoint at
-// <common>/.git/<gitdir_rel>. A value such as "hooks" therefore turns a restore
-// into a writer for <common>/.git/hooks: the checkpoint sanitizer scrubs
-// <gitdir>/hooks of the directory it is restoring, so content that lands at the
-// top of the hooks directory itself (a restored "pre-commit") survives, and the
-// next git command on the mount host executes it as the mounting user. Pinning
-// the shape, rather than blocklisting the directories git reads, is what keeps
-// the restore target the worktree admin area and nothing else.
-func validateGitWorktreeGitDirRel(raw, worktreeName string) error {
-	if raw == "" {
-		return nil
-	}
-	if err := validateGitMetadataRelativePath(raw); err != nil {
-		return err
-	}
-	rel := strings.TrimPrefix(filepath.ToSlash(raw), ".git/")
-	parts := strings.Split(rel, "/")
-	if len(parts) != 2 || parts[0] != "worktrees" {
-		return fmt.Errorf("path must be worktrees/%s", worktreeName)
-	}
-	if parts[1] != worktreeName {
-		return fmt.Errorf("path must name the registered worktree_name %q", worktreeName)
 	}
 	return nil
 }

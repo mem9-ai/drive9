@@ -157,6 +157,18 @@ pub async fn upsert(
         _ => return err_resp(400, "invalid root_path"),
     };
     let g = |k: &str| v[k].as_str().unwrap_or("").to_string();
+    // A linked worktree's gitdir_rel is an allow-listed shape, not a free path:
+    // the mount republishes a tenant checkpoint at <common>/.git/<gitdir_rel>.
+    if g("workspace_kind") == "linked" || !g("common_workspace_id").is_empty() {
+        let gitdir_rel = g("gitdir_rel");
+        let worktree_name = g("worktree_name");
+        if worktree_name.is_empty() || gitdir_rel.is_empty() {
+            return err_resp(400, "invalid gitdir_rel: gitdir_rel is required for a linked workspace");
+        }
+        if !gitdir_rel_is_valid(&gitdir_rel, &worktree_name) {
+            return err_resp(400, "invalid gitdir_rel: gitdir_rel must be worktrees/<worktree_name>");
+        }
+    }
     let now = now_secs();
     let conn = t.db.lock().unwrap();
     ensure_tables(&conn);
@@ -554,4 +566,20 @@ pub async fn object(
         ([_], _) => err_resp(405, "method not allowed"),
         _ => err_resp(404, "not found"),
     }
+}
+
+// gitdir_rel_is_valid applies the same allow-list as the server: the admin
+// directory of THIS worktree, optionally spelled with the leading ".git/".
+fn gitdir_rel_is_valid(gitdir_rel: &str, worktree_name: &str) -> bool {
+    if gitdir_rel.len() > 1024 || gitdir_rel.contains('\\') || gitdir_rel.contains('\0') {
+        return false;
+    }
+    let rel = gitdir_rel.trim().strip_prefix(".git/").unwrap_or(gitdir_rel.trim());
+    let parts: Vec<&str> = rel.split('/').collect();
+    parts.len() == 2
+        && parts[0] == "worktrees"
+        && parts[1] == worktree_name
+        && !worktree_name.is_empty()
+        && worktree_name != "."
+        && worktree_name != ".."
 }

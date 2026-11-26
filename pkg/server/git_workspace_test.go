@@ -324,10 +324,37 @@ func TestGitWorkspaceUpsertRejectsNonWorktreeGitDirRel(t *testing.T) {
 		}
 	}
 
+	// A linked workspace without a gitdir_rel has no admin directory to restore
+	// into, and the restore error is only logged, so it is refused here.
+	body, err := json.Marshal(client.GitWorkspaceRequest{
+		RootPath:          "/repo/no-gitdir/",
+		RepoURL:           "https://example.test/repo.git",
+		RemoteName:        "origin",
+		HeadCommit:        "1111111111111111111111111111111111111111",
+		WorkspaceKind:     "linked",
+		CommonWorkspaceID: mainWS.WorkspaceID,
+		WorktreeName:      "repo-wt",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(ts.URL+"/v1/git-workspaces", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	missingBody, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("linked workspace without gitdir_rel: status = %d, body=%s, want 400", resp.StatusCode, missingBody)
+	}
+
 	refused := []string{
 		".git/hooks", "hooks", "config", "objects",
 		"worktrees/other", "worktrees/repo-wt/extra", "worktrees",
 		"../hooks", "/etc/hooks", ".git/config",
+		// The same rule the mount applies: one segment, no empty segments, and
+		// the name has to be this workspace's worktree_name.
+		"worktrees/repo-wt/", "worktrees//repo-wt", "worktrees",
 	}
 	for _, gitDirRel := range refused {
 		body, err := json.Marshal(client.GitWorkspaceRequest{

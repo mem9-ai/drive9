@@ -392,6 +392,7 @@ All batch endpoints accept `POST` only; any other HTTP method returns `405 Metho
 
 ### 7.3 Git Workspaces (`/v1/git-workspaces*`)
 - `POST /v1/git-workspaces`: upserts `{root_path, repo_url, remote_name?, branch_name?, base_commit?, head_commit?, mode?, workspace_kind?, common_workspace_id?, worktree_name?, gitdir_rel?}` -> `200` workspace object.
+  - `workspace_kind=linked` requires `common_workspace_id`, `worktree_name` (one path segment) and `gitdir_rel`; `gitdir_rel` must be `worktrees/<worktree_name>` (a leading `.git/` is accepted) -> `400` otherwise. The mount republishes a tenant git-state checkpoint at `<common>/.git/<gitdir_rel>`, so the shape is an allow-list.
 - `GET /v1/git-workspaces`: without `root_path` returns `200 {"workspaces": [...]}`; with `?root_path=<path>` returns a single workspace object (`200`) or `404`.
 - `GET /v1/git-workspaces/{workspace_id}` (`200` / `404`) & `DELETE /v1/git-workspaces/{workspace_id}` (`200 {"status": "ok"}`).
 - Sub-resources under `/v1/git-workspaces/{workspace_id}`: `/tree` (`POST` replace, `GET ?commit_sha=`), `/git-state` (`POST|PUT|GET`), `/object-packs` (`POST|PUT|GET`) & `/object-packs/{pack_id}` (`GET`), `/overlay` (`POST|PUT|GET ?path=&limit=&after=`).

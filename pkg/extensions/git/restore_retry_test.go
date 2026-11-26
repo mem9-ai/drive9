@@ -7,19 +7,19 @@ package git
 
 import (
 	"context"
-	"strings"
-	"syscall"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"net/http/httptest"
 
 	"github.com/mem9-ai/drive9/internal/testbackend"
+	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/extensions/core"
 	"github.com/mem9-ai/drive9/pkg/fs"
-	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 func TestPortGitStateRestoreRetriesAfterNotReady(t *testing.T) {

@@ -70,6 +70,7 @@ type workspace struct {
 	workspaceKind string
 	commonID      string
 	gitDirRel     string
+	worktreeName  string
 	// createdAt anchors the clean-tree mtime (v1 gitCleanTreeMtime): a
 	// stable timestamp per commit lets git's stat comparison trust clean
 	// tree files instead of content-checking every one on every status.
@@ -178,6 +179,12 @@ func (w *workspace) gitDirRelPath() string {
 	return w.gitDirRel
 }
 
+func (w *workspace) worktreeAdminName() string {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.worktreeName
+}
+
 func (w *workspace) commonWorkspaceID() string {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
@@ -200,9 +207,9 @@ func (w *workspace) setMeta(root, head, repo string, blobless bool, createdAt ti
 }
 
 // setLinkedMeta refreshes the linked-worktree identity fields.
-func (w *workspace) setLinkedMeta(kind, commonID, gitDirRel string) {
+func (w *workspace) setLinkedMeta(kind, commonID, gitDirRel, worktreeName string) {
 	w.mu.Lock()
-	w.workspaceKind, w.commonID, w.gitDirRel = kind, commonID, gitDirRel
+	w.workspaceKind, w.commonID, w.gitDirRel, w.worktreeName = kind, commonID, gitDirRel, worktreeName
 	w.mu.Unlock()
 }
 
@@ -741,7 +748,7 @@ func (g *Git) ensure(ctx context.Context) {
 		if existing, ok := prev[gw.WorkspaceID]; ok {
 			w = existing
 			w.setMeta(root, gw.HeadCommit, gw.RepoURL, gw.Mode == "fast-blobless", gw.CreatedAt)
-			w.setLinkedMeta(gw.WorkspaceKind, gw.CommonWorkspaceID, gw.GitDirRel)
+			w.setLinkedMeta(gw.WorkspaceKind, gw.CommonWorkspaceID, gw.GitDirRel, gw.WorktreeName)
 			delete(prev, gw.WorkspaceID)
 		} else {
 			w = &workspace{
@@ -754,6 +761,7 @@ func (g *Git) ensure(ctx context.Context) {
 				workspaceKind: gw.WorkspaceKind,
 				commonID:      gw.CommonWorkspaceID,
 				gitDirRel:     gw.GitDirRel,
+				worktreeName:  gw.WorktreeName,
 			}
 		}
 		ws = append(ws, w)
