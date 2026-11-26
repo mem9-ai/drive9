@@ -2099,17 +2099,18 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 		// Preparation may block on an upload or a clean reader. Keep the
 		// name, open index and replayable staged writes intact meanwhile.
 		var (
-			cancelQueue     func(func() bool) error
-			publishUnlink   func()
-			finishCommitted func() error
-			discardUnlink   func()
-			finishLegacy    func(bool) error
+			acquireLock      func(func() bool) error
+			publishUnlink    func()
+			persistAndUnlock func() error
+			rollbackPublish  func()
+			discardUnlink    func()
+			finishLegacy     func(bool) error
 		)
 		for _, h := range f.chain.Handlers() {
 			if prep, ok := h.(interface {
-				PreparePathUnlinkPhased(string, bool) (func(func() bool) error, func(), func() error, func())
+				PreparePathUnlinkPhased(string, bool) (func(func() bool) error, func(), func() error, func(), func())
 			}); ok {
-				cancelQueue, publishUnlink, finishCommitted, discardUnlink = prep.PreparePathUnlinkPhased(child, survivor != "")
+				acquireLock, publishUnlink, persistAndUnlock, rollbackPublish, discardUnlink = prep.PreparePathUnlinkPhased(child, survivor != "")
 				break
 			}
 			if prep, ok := h.(interface {
@@ -2136,12 +2137,11 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 				return gofuse.EIO
 			}
 		}
-		// Run queue cancellation and unlink WAL journaling WITHOUT holding
-		// binding.fenceMu so a slow fsync or commit-queue wait never blocks
-		// triggerSelfFence from immediately fencing sibling writes. Neither
-		// Shadow/Pending/wbCache/landed nor handle flags are mutated here.
-		if cancelQueue != nil {
-			if err := cancelQueue(isFenced); err != nil {
+		// Phase 1 (off binding.fenceMu): cancel in-flight uploads and acquire
+		// the per-path lock with ZERO WAL writes and ZERO mutations to handles,
+		// Shadow, Pending, wbCache, or landed state.
+		if acquireLock != nil {
+			if err := acquireLock(isFenced); err != nil {
 				if discardUnlink != nil {
 					discardUnlink()
 				}
@@ -2158,10 +2158,11 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 				return fs.StatusOf(err)
 			}
 		}
-		// Re-check lease state under binding.fenceMu across the fast, pure
-		// in-memory unlink publication boundary. If self-fence won the race,
-		// discard local prepared state and return EIO with zero side effects
-		// on handles, Shadow, Pending, wbCache, landed, or namespace tables.
+		// Phase 2 (under binding.fenceMu, pure in-memory): linearize lease
+		// validity with namespace + handle publication. If self-fence won,
+		// discard with zero WAL writes and zero mutations to local state.
+		var savedOpen []*fileHandle
+		pending := &deferredUnlink{path: child, ino: ino}
 		if binding != nil {
 			binding.fenceMu.Lock()
 			if binding.fenced.Load() {
@@ -2177,6 +2178,7 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 		if publishUnlink != nil {
 			publishUnlink()
 		}
+		savedOpen = f.openIdx.SnapshotPath(child)
 		f.openIdx.UnlinkPath(child)
 		for _, h := range f.chain.Handlers() {
 			if survivor != "" {
@@ -2188,7 +2190,6 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 				mark.MarkPathUnlinked(child)
 			}
 		}
-		pending := &deferredUnlink{path: child, ino: ino}
 		pending.mu.Lock()
 		f.inodes.RemoveLinkPreserve(child)
 		if iok {
@@ -2196,15 +2197,32 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 			f.deferredUnlinks[child] = pending
 			f.mu.Unlock()
 		}
-		f.markNameNegative(child)
 		if binding != nil {
 			binding.fenceMu.Unlock()
 		}
-		// Finalize cache removal and clean-reader shadow persistence after
-		// releasing binding.fenceMu (still serialized on child by gate).
-		if finishCommitted != nil {
-			_ = finishCommitted()
+		// Phase 3 (off binding.fenceMu, while still holding gate, per-path
+		// lock, and pending.mu): write WAL JournalUnlink, persist clean-reader
+		// shadows, remove wbCache, and release the per-path lock last so no
+		// recreated same-name file can race Shadow writes.
+		if persistAndUnlock != nil {
+			if err := persistAndUnlock(); err != nil {
+				if rollbackPublish != nil {
+					rollbackPublish()
+				}
+				f.openIdx.RestoreUnlinkedPath(child, savedOpen)
+				if iok {
+					f.inodes.RestoreLinkPreserve(child, ino)
+					f.mu.Lock()
+					if f.deferredUnlinks[child] == pending {
+						delete(f.deferredUnlinks, child)
+					}
+					f.mu.Unlock()
+				}
+				pending.mu.Unlock()
+				return fs.StatusOf(err)
+			}
 		}
+		f.markNameNegative(child)
 		f.touchParentMtime(header.NodeId)
 		f.mutated(fs.EventDelete, child)
 		pending.mu.Unlock()

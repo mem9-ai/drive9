@@ -74,6 +74,20 @@ func (idx *OpenHandleIndex) UnlinkPath(p string) {
 	delete(idx.byPath, p)
 }
 
+// RestoreUnlinkedPath reverses UnlinkPath for handles still open on p when a
+// durable unlink commit fails after in-memory publication.
+func (idx *OpenHandleIndex) RestoreUnlinkedPath(p string, handles []*fileHandle) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	for _, fh := range handles {
+		delete(idx.unlinked, fh)
+		if idx.byPath[p] == nil {
+			idx.byPath[p] = make(map[*fileHandle]struct{})
+		}
+		idx.byPath[p][fh] = struct{}{}
+	}
+}
+
 // RelinkPath rebinds handles onto a fresh incarnation of p.
 func (idx *OpenHandleIndex) RelinkPath(p string, handles []*fileHandle) {
 	idx.mu.Lock()
