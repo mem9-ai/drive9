@@ -327,36 +327,45 @@ func TestCheckpointArchiveRecordsSymbolicHead(t *testing.T) {
 // The final check has to revalidate the common repository too: a reload can point
 // the workspace at another common workspace while the restore runs, and the earlier
 // resolution captured the old one.
-func TestCheckLinkedRestoreTargetRejectsCommonChange(t *testing.T) {
+func TestSwapLinkedGitDirRejectsChangedCommon(t *testing.T) {
 	localRoot := t.TempDir()
-	g := &Git{localRoot: localRoot, workspaces: []*workspace{}}
+	g := &Git{localRoot: localRoot}
 	mainWS := &workspace{id: "main", root: "/repo", workspaceKind: "main"}
+	otherWS := &workspace{id: "main-2", root: "/repo-2", workspaceKind: "main"}
 	linkedWS := &workspace{
 		id: "linked", root: "/repo/wt",
 		workspaceKind: "linked", commonID: "main", gitDirRel: "worktrees/wt", worktreeName: "wt",
 	}
-	g.workspaces = []*workspace{mainWS, linkedWS}
+	g.workspaces = []*workspace{mainWS, otherWS, linkedWS}
 
-	commonGitDir := g.gitDirFor("/repo")
-	gitDir := filepath.Join(commonGitDir, "worktrees", "wt")
-	if err := g.checkLinkedRestoreTarget("linked", "main", "worktrees/wt", "wt", commonGitDir, gitDir); err != nil {
-		t.Fatalf("unchanged workspace was refused: %v", err)
+	expectedCommon := g.gitDirFor("/repo")
+	expectedGitDir := filepath.Join(expectedCommon, "worktrees", "wt")
+	if err := os.MkdirAll(expectedGitDir, 0o755); err != nil {
+		t.Fatal(err)
 	}
+	prepared := t.TempDir()
 
-	// A reload moves the workspace onto another common repository.
-	mainWS2 := &workspace{id: "main-2", root: "/repo-2", workspaceKind: "main"}
-	g.workspaces = append(g.workspaces, mainWS2)
-	err := g.checkLinkedRestoreTarget("linked", "main-2", "worktrees/wt", "wt", commonGitDir, gitDir)
+	// The row moved to another common repository: the prepared path belongs to the
+	// old one, so the swap is refused.
+	linkedWS.setLinkedMeta("linked", "main-2", "worktrees/wt", "wt")
+	err := g.swapLinkedGitDir(linkedWS, expectedCommon, expectedGitDir, prepared)
 	if err == nil {
-		t.Fatal("common repository change during restore was accepted")
+		t.Fatal("a common repository change during restore was accepted")
 	}
 	if !strings.Contains(err.Error(), "common repository changed") {
 		t.Fatalf("error = %v, want the common repository refusal", err)
 	}
 
-	// The common workspace disappearing is refused the same way.
-	if err := g.checkLinkedRestoreTarget("linked", "gone", "worktrees/wt", "wt", commonGitDir, gitDir); err == nil {
-		t.Fatal("missing common workspace was accepted")
+	// A missing common workspace is refused the same way.
+	linkedWS.setLinkedMeta("linked", "gone", "worktrees/wt", "wt")
+	if err := g.swapLinkedGitDir(linkedWS, expectedCommon, expectedGitDir, prepared); err == nil {
+		t.Fatal("a missing common workspace was accepted")
+	}
+
+	// A changed admin path is refused too.
+	linkedWS.setLinkedMeta("linked", "main", "worktrees/other", "other")
+	if err := g.swapLinkedGitDir(linkedWS, expectedCommon, expectedGitDir, prepared); err == nil {
+		t.Fatal("a changed worktree gitdir was accepted")
 	}
 }
 
@@ -374,7 +383,7 @@ func TestWorkspaceIdentityIsFrozenForTheSwap(t *testing.T) {
 	frozen := make(chan struct{})
 	go func() {
 		defer close(frozen)
-		_ = linkedWS.withFrozenLinkedTarget(func(_, _, _ string) error {
+		_ = linkedWS.withFrozenLinkedTarget(func(_, _, _, _ string) error {
 			close(started)
 			<-release
 			return nil

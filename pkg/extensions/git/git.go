@@ -189,10 +189,13 @@ func (w *workspace) worktreeAdminName() string {
 // change the linked identity in the middle of it. The restore validates the target
 // and swaps it in inside one frozen section: a reload between the two would
 // otherwise let the check approve a target the swap does not write.
-func (w *workspace) withFrozenLinkedTarget(fn func(commonID, gitDirRel, worktreeName string) error) error {
+// The root is passed through as well: it is part of what the caller acts on (the
+// worktree pointer is written under it) and reading it through the accessor inside
+// the frozen section would deadlock on the lock the section holds.
+func (w *workspace) withFrozenLinkedTarget(fn func(commonID, gitDirRel, worktreeName, root string) error) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return fn(w.commonID, w.gitDirRel, w.worktreeName)
+	return fn(w.commonID, w.gitDirRel, w.worktreeName, w.root)
 }
 
 func (w *workspace) commonWorkspaceID() string {

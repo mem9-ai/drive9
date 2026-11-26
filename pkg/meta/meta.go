@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -1102,14 +1103,14 @@ func diffMetaTableMetaWithObservedIndexes(table metaTableSpec, meta metaTableMet
 		}
 		if spec.collation != "" && !strings.EqualFold(col.collation, spec.collation) {
 			// Reported, not repaired: ensurePinnedCollations owns the conversion,
-			// because a bare MODIFY cannot run while an index covers the column.
+			// because a bare MODIFY cannot run while an index covers the column. A
+			// drifted type is still compared below, so both are reported.
 			diffs = append(diffs, metaSchemaDiff{
 				kind:       metaSchemaDiffColumnType,
 				tableName:  table.name,
 				columnName: name,
 				detail:     fmt.Sprintf("%s schema contract: %s column collation = %q, want %s", table.name, name, col.collation, spec.collation),
 			})
-			continue
 		}
 		observedType := normalizeMetaSQLFragment(col.columnType)
 		desiredType := normalizeMetaSQLFragment(spec.columnType)
@@ -1848,17 +1849,21 @@ func (s *Store) InsertExternalBinding(ctx context.Context, b *ExternalBinding) (
 	// the pool for a second one. It is a short statement; the caller's per-subject
 	// lock still covers the read-modify-write around it.
 	return s.WithExternalBindingSchemaLock(ctx, func(lockCtx context.Context, conn *sql.Conn) error {
-		// Fail closed if the migration that holds this gate ever leaves the unique
-		// index missing: a store that was already serving would otherwise write into
-		// the gap, and the recreate would then refuse to run (or a duplicate subject
-		// would survive on an engine that does not enforce it). The gate is released
-		// when the migration fails, so the check has to be repeated per insert.
-		indexed, err := metaIndexExists(lockCtx, conn, "tenant_external_bindings", "uk_external_binding_subject")
+		// Fail closed unless the unique index the contract declares is really there:
+		// a store that was already serving would otherwise write into the gap the
+		// migration leaves, and a same-named non-unique index would not enforce the
+		// uniqueness this check is for. The gate is released when the migration
+		// fails, so the check has to be repeated per insert.
+		_, healthy, err := metaIndexMatches(lockCtx, conn, "tenant_external_bindings", metaCollationIndex{
+			name:    externalBindingSubjectIndexName,
+			columns: []string{"provider", "subject_key"},
+			unique:  true,
+		})
 		if err != nil {
 			return err
 		}
-		if !indexed {
-			return fmt.Errorf("insert external binding: the unique subject index %s is missing, so the schema migration has to complete first", externalBindingSubjectIndexName)
+		if !healthy {
+			return fmt.Errorf("insert external binding: the unique subject index %s is missing or not unique, so the schema migration has to complete first", externalBindingSubjectIndexName)
 		}
 		_, err = conn.ExecContext(lockCtx, `INSERT INTO tenant_external_bindings
 			(provider, subject_key, tenant_id, metadata_json, created_at, updated_at)
@@ -2812,11 +2817,26 @@ func withExternalBindingSchemaLock(ctx context.Context, db *sql.DB, fn func(cont
 	if err != nil {
 		return err
 	}
+	released := false
+	releaseNow := func() error {
+		released = true
+		return release.release()
+	}
+	// The gate must not survive a panic: an outer recover would leave the advisory
+	// lock on a pooled connection and every later writer and migration would wait for
+	// it. The panic keeps propagating after the cleanup.
+	defer func() {
+		if !released {
+			if releaseErr := release.release(); releaseErr != nil {
+				logger.Warn(ctx, "meta_named_lock_release_failed", zap.String("lock", externalBindingSchemaLockName), zap.Error(releaseErr))
+			}
+		}
+	}()
 	fnErr := fn(ctx, release.conn)
 	// A committed write must not be reported as a failure because the lock could
 	// not be released: the caller would roll back provisioning that already
 	// happened. The release error is surfaced through the operation's metric.
-	if releaseErr := release.release(); releaseErr != nil {
+	if releaseErr := releaseNow(); releaseErr != nil {
 		if fnErr == nil {
 			logger.Warn(ctx, "meta_named_lock_release_failed", zap.String("lock", externalBindingSchemaLockName), zap.Error(releaseErr))
 			return nil
@@ -2855,11 +2875,20 @@ func acquireMetaNamedLock(ctx context.Context, db *sql.DB, name string) (*metaNa
 }
 
 func (l *metaNamedLock) release() error {
-	defer func() { _ = l.conn.Close() }()
+	// A session that could not confirm the release keeps the lock on the server, so it
+	// must not go back to the pool where another caller could inherit it.
+	var releaseErr error
+	defer func() {
+		if releaseErr != nil {
+			_ = l.conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+		_ = l.conn.Close()
+	}()
 	releaseCtx, cancel := context.WithTimeout(context.Background(), externalBindingReleaseLockTimeout)
 	defer cancel()
 	var released sql.NullInt64
 	if err := l.conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(CONCAT(?, DATABASE()))", l.name).Scan(&released); err != nil {
+		releaseErr = err
 		return err
 	}
 	if !released.Valid || released.Int64 != 1 {

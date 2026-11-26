@@ -961,12 +961,30 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 // landed between the two would otherwise let the check approve a target the swap
 // does not write (and delete the directory the check approved).
 func (g *Git) swapLinkedGitDir(w *workspace, expectedCommonGitDir, expectedGitDir, preparedGitDir string) error {
-	// Read the root before freezing: the pointer write below needs it, and the
-	// workspace accessors take the same lock the frozen section holds.
-	root := w.rootPath()
-	return w.withFrozenLinkedTarget(func(commonID, gitDirRel, worktreeName string) error {
-		if err := g.checkLinkedRestoreTarget(w.id, commonID, gitDirRel, worktreeName, expectedCommonGitDir, expectedGitDir); err != nil {
+	// Resolve the common workspace before taking the workspace's write lock: resolving
+	// another workspace takes g.mu, which the reload path holds while it takes a
+	// workspace's lock, so calling it inside the frozen section would invert the order
+	// into a deadlock. Everything the section acts on is read from the frozen values.
+	commonID := w.commonWorkspaceID()
+	common := g.workspaceByID(commonID)
+	if common == nil || common.id == w.id {
+		return fmt.Errorf("git: linked workspace common repository went away during restore")
+	}
+	err := w.withFrozenLinkedTarget(func(frozenCommonID, frozenGitDirRel, frozenWorktreeName, frozenRoot string) error {
+		// The identity below cannot move while the section runs; the common
+		// workspace's own row is compared through its current root.
+		if frozenCommonID != commonID {
+			return fmt.Errorf("git: linked workspace common repository changed during restore (%q -> %q)", commonID, frozenCommonID)
+		}
+		if current := g.gitDirFor(common.rootPath()); current != expectedCommonGitDir {
+			return fmt.Errorf("git: linked workspace common repository changed during restore (%q -> %q)", expectedCommonGitDir, current)
+		}
+		target, err := linkedWorktreeGitDir(expectedCommonGitDir, frozenGitDirRel, frozenWorktreeName)
+		if err != nil {
 			return err
+		}
+		if target != expectedGitDir {
+			return fmt.Errorf("git: linked workspace gitdir changed during restore (%q -> %q)", expectedGitDir, target)
 		}
 		if err := os.RemoveAll(expectedGitDir); err != nil {
 			return err
@@ -974,29 +992,30 @@ func (g *Git) swapLinkedGitDir(w *workspace, expectedCommonGitDir, expectedGitDi
 		if err := os.Rename(preparedGitDir, expectedGitDir); err != nil {
 			return err
 		}
-		return writeWorktreeGitPointer(g, root, expectedGitDir)
+		return writeWorktreeGitPointer(g, frozenRoot, expectedGitDir)
 	})
+	if err != nil {
+		return err
+	}
+	// A row that moved while the swap ran is reported instead of reported as done:
+	// the next restore targets the new path. This runs outside the frozen section,
+	// because resolving a workspace takes g.mu.
+	return g.verifyLinkedRestoreTarget(w, expectedGitDir)
 }
 
-// checkLinkedRestoreTarget refuses the swap when the linked workspace no longer
-// resolves to the directory this restore prepared. Both halves can move: a reload
-// can update common_workspace_id (a different common repository), worktree_name or
-// gitdir_rel, and swapping the earlier path would then delete a directory — or a
-// common repository — that this restore never validated.
-func (g *Git) checkLinkedRestoreTarget(workspaceID, commonID, gitDirRel, worktreeName, expectedCommonGitDir, expectedGitDir string) error {
-	common := g.workspaceByID(commonID)
-	if common == nil || common.id == workspaceID {
+// verifyLinkedRestoreTarget re-reads the linked identity after the swap and refuses to
+// report success when it no longer names the directory that was just written.
+func (g *Git) verifyLinkedRestoreTarget(w *workspace, expectedGitDir string) error {
+	common := g.workspaceByID(w.commonWorkspaceID())
+	if common == nil || common.id == w.id {
 		return fmt.Errorf("git: linked workspace common repository went away during restore")
 	}
-	if current := g.gitDirFor(common.rootPath()); current != expectedCommonGitDir {
-		return fmt.Errorf("git: linked workspace common repository changed during restore (%q -> %q)", expectedCommonGitDir, current)
-	}
-	target, err := linkedWorktreeGitDir(expectedCommonGitDir, gitDirRel, worktreeName)
+	target, err := linkedWorktreeGitDir(g.gitDirFor(common.rootPath()), w.gitDirRelPath(), w.worktreeAdminName())
 	if err != nil {
 		return err
 	}
 	if target != expectedGitDir {
-		return fmt.Errorf("git: linked workspace gitdir changed during restore (%q -> %q)", expectedGitDir, target)
+		return fmt.Errorf("git: linked workspace target changed while it was restored (%q -> %q)", expectedGitDir, target)
 	}
 	return nil
 }

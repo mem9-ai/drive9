@@ -320,8 +320,15 @@ func TestPinnedCollationRecoveryIsSerializedWithWriters(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("insert before the crash: %v", err)
 	}
-	// The state a crash between DROP INDEX and ADD INDEX leaves behind.
+	// The state a crash between DROP INDEX and MODIFY COLUMN leaves behind: the
+	// column is still case-insensitive and the unique index is gone.
 	dropIndex(t, db, "tenant_external_bindings", "uk_external_binding_subject")
+	if _, err := db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings MODIFY COLUMN subject_key VARCHAR(512) COLLATE utf8mb4_general_ci NOT NULL"); err != nil {
+		t.Fatalf("downgrade the column: %v", err)
+	}
+	if got := collationAndIndexState(t, db, "tenant_external_bindings", "subject_key", "uk_external_binding_subject"); got != "collation=utf8mb4_general_ci indexed=false" {
+		t.Fatalf("crash state = %q, want the case-insensitive column without its index", got)
+	}
 	// A write into that gap fails closed rather than trusting the missing index.
 	if err := s.InsertExternalBinding(ctx, &ExternalBinding{
 		Provider: "slock", SubjectKey: "into-the-gap", TenantID: "t", CreatedAt: now, UpdatedAt: now,
@@ -353,8 +360,22 @@ func TestPinnedCollationRecoveryIsSerializedWithWriters(t *testing.T) {
 	}
 
 	// Both the migration and the writer have to wait for the gate this test holds.
+	// Their contexts are cancelable and every wait is bounded, so a stalled database
+	// fails this test with a message instead of hanging the package.
+	workersCtx, cancelWorkers := context.WithTimeout(ctx, 60*time.Second)
+	workerDone := make(chan struct{}, 2)
+	t.Cleanup(func() {
+		cancelWorkers()
+		for i := 0; i < 2; i++ {
+			select {
+			case <-workerDone:
+			case <-time.After(30 * time.Second):
+			}
+		}
+	})
 	recovered := make(chan error, 1)
 	go func() {
+		defer func() { workerDone <- struct{}{} }()
 		reopened, err := Open(testDSN)
 		if err == nil {
 			_ = reopened.Close()
@@ -363,7 +384,8 @@ func TestPinnedCollationRecoveryIsSerializedWithWriters(t *testing.T) {
 	}()
 	writeErr := make(chan error, 1)
 	go func() {
-		writeErr <- s.InsertExternalBinding(ctx, &ExternalBinding{
+		defer func() { workerDone <- struct{}{} }()
+		writeErr <- s.InsertExternalBinding(workersCtx, &ExternalBinding{
 			Provider: "slock", SubjectKey: "during-recovery", TenantID: "t", CreatedAt: now, UpdatedAt: now,
 		})
 	}()
@@ -377,13 +399,24 @@ func TestPinnedCollationRecoveryIsSerializedWithWriters(t *testing.T) {
 	closeRelease()
 	<-holderDone
 
-	if err := <-recovered; err != nil {
-		t.Fatalf("recover the index after a crash: %v", err)
+	select {
+	case err := <-recovered:
+		if err != nil {
+			t.Fatalf("recover the index after a crash: %v", err)
+		}
+	case <-time.After(45 * time.Second):
+		t.Fatal("the recovery never finished after the schema gate was released")
 	}
 	// The writer that queued behind the gate either saw the recovered index and
 	// stored the row, or observed the index missing and failed closed. Neither may
 	// land a write in the gap.
-	switch err := <-writeErr; {
+	var queuedErr error
+	select {
+	case queuedErr = <-writeErr:
+	case <-time.After(45 * time.Second):
+		t.Fatal("the queued writer never finished after the schema gate was released")
+	}
+	switch err := queuedErr; {
 	case err == nil:
 		if got, getErr := s.GetExternalBinding(ctx, "slock", "during-recovery"); getErr != nil || got == nil {
 			t.Fatalf("binding written after the recovery is not readable: %v, %v", got, getErr)
@@ -433,6 +466,117 @@ func TestPinnedCollationsRefuseToRecreateUniqueIndexOverDuplicates(t *testing.T)
 	}
 	if !strings.Contains(err.Error(), "duplicate rows") {
 		t.Fatalf("migration error = %v, want the duplicate preflight message", err)
+	}
+}
+
+// A pinned column whose type drifted must be left alone: rewriting the definition to
+// the contract's VARCHAR(512) would shrink a wider column before the schema check
+// could report the mismatch.
+func TestPinnedCollationLeavesADriftedColumnTypeAlone(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	db := s.DB()
+	restore := func() {
+		_, _ = db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings DROP INDEX uk_external_binding_subject")
+		_, _ = db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings MODIFY COLUMN subject_key VARCHAR(512) COLLATE utf8mb4_bin NOT NULL")
+		_, _ = db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings ADD UNIQUE INDEX uk_external_binding_subject (provider, subject_key)")
+	}
+	t.Cleanup(restore)
+	dropIndex(t, db, "tenant_external_bindings", "uk_external_binding_subject")
+	if _, err := db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings MODIFY COLUMN subject_key VARCHAR(600) COLLATE utf8mb4_general_ci NOT NULL"); err != nil {
+		t.Fatalf("drift the column type: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings ADD UNIQUE INDEX uk_external_binding_subject (provider, subject_key)"); err != nil {
+		t.Fatalf("recreate the index: %v", err)
+	}
+
+	_, err := Open(testDSN)
+	if err == nil {
+		t.Fatal("the migration rewrote a column whose type does not match the contract")
+	}
+	if !strings.Contains(err.Error(), "column type") {
+		t.Fatalf("migration error = %v, want the schema check to report the type", err)
+	}
+	var columnType, collation string
+	if err := db.QueryRowContext(ctx, `SELECT column_type, collation_name FROM information_schema.columns
+		WHERE table_schema = DATABASE() AND table_name = 'tenant_external_bindings' AND column_name = 'subject_key'`).Scan(&columnType, &collation); err != nil {
+		t.Fatal(err)
+	}
+	if strings.ToLower(columnType) != "varchar(600)" {
+		t.Fatalf("column type = %q, want it untouched at varchar(600)", columnType)
+	}
+	if collation != "utf8mb4_general_ci" {
+		t.Fatalf("collation = %q, want it untouched while the type is drifted", collation)
+	}
+}
+
+// An index the contract does not declare also blocks TiDB's collation change, so it
+// has to be reported before the contract's own indexes are dropped.
+func TestPinnedCollationReportsAnExtraCoveringIndex(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	db := s.DB()
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings DROP INDEX idx_extra_subject")
+		_, _ = db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings DROP INDEX uk_external_binding_subject")
+		_, _ = db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings MODIFY COLUMN subject_key VARCHAR(512) COLLATE utf8mb4_bin NOT NULL")
+		_, _ = db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings ADD UNIQUE INDEX uk_external_binding_subject (provider, subject_key)")
+	})
+	dropIndex(t, db, "tenant_external_bindings", "uk_external_binding_subject")
+	if _, err := db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings MODIFY COLUMN subject_key VARCHAR(512) COLLATE utf8mb4_general_ci NOT NULL"); err != nil {
+		t.Fatalf("downgrade the column: %v", err)
+	}
+	for _, stmt := range []string{
+		"ALTER TABLE tenant_external_bindings ADD UNIQUE INDEX uk_external_binding_subject (provider, subject_key)",
+		"ALTER TABLE tenant_external_bindings ADD INDEX idx_extra_subject (subject_key)",
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+
+	_, err := Open(testDSN)
+	if err == nil {
+		t.Fatal("the migration converted a column covered by an undeclared index")
+	}
+	if !strings.Contains(err.Error(), "idx_extra_subject") {
+		t.Fatalf("migration error = %v, want it to name the extra index", err)
+	}
+	// The contract's own index was not dropped on the way to that error, and the
+	// column was not converted either.
+	if got := collationAndIndexState(t, db, "tenant_external_bindings", "subject_key", "uk_external_binding_subject"); got != "collation=utf8mb4_general_ci indexed=true" {
+		t.Fatalf("state = %q, want the column untouched and the contract index still present", got)
+	}
+}
+
+// A same-named index that is not unique is not proof that uniqueness is enforced:
+// the migration replaces it and inserts enforce the key again.
+func TestPinnedCollationReplacesANonUniqueSameNamedIndex(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	db := s.DB()
+	dropIndex(t, db, "tenant_external_bindings", "uk_external_binding_subject")
+	if _, err := db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings ADD INDEX uk_external_binding_subject (provider, subject_key)"); err != nil {
+		t.Fatalf("add the non-unique index: %v", err)
+	}
+
+	reopened, err := Open(testDSN)
+	if err != nil {
+		t.Fatalf("migration did not replace the non-unique index: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	assertPinnedCollationAndIndex(t, reopened.DB(), "tenant_external_bindings", "subject_key", "uk_external_binding_subject")
+
+	now := time.Now().UTC()
+	if err := s.InsertExternalBinding(ctx, &ExternalBinding{
+		Provider: "slock", SubjectKey: "unique-check", TenantID: "t", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("first insert: %v", err)
+	}
+	if err := s.InsertExternalBinding(ctx, &ExternalBinding{
+		Provider: "slock", SubjectKey: "unique-check", TenantID: "t2", CreatedAt: now, UpdatedAt: now,
+	}); !errors.Is(err, ErrDuplicate) {
+		t.Fatalf("duplicate insert error = %v, want ErrDuplicate", err)
 	}
 }
 

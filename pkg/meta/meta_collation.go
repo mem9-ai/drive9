@@ -10,11 +10,12 @@ import (
 // metaCollationTarget is one column whose comparison the schema contract pins to
 // a collation, together with the indexes the contract requires around it.
 type metaCollationTarget struct {
-	table     string
-	column    string
-	collation string
-	modifySQL string
-	indexes   []metaCollationIndex
+	table      string
+	column     string
+	columnType string
+	collation  string
+	modifySQL  string
+	indexes    []metaCollationIndex
 }
 
 // metaCollationIndex is one index covering a pinned column, as the contract spells
@@ -40,10 +41,11 @@ func metaPinnedCollationTargets(spec metaSchemaSpec) []metaCollationTarget {
 				continue
 			}
 			target := metaCollationTarget{
-				table:     table.name,
-				column:    columnName,
-				collation: column.collation,
-				modifySQL: column.modifySQL,
+				table:      table.name,
+				column:     columnName,
+				columnType: column.columnType,
+				collation:  column.collation,
+				modifySQL:  column.modifySQL,
 			}
 			for _, indexName := range sortedMetaIndexNames(table.indexes) {
 				index := table.indexes[indexName]
@@ -127,9 +129,11 @@ type metaQueryer interface {
 }
 
 // metaPinnedCollationNeedsSync reports whether the column is missing the pinned
-// collation or any index the contract requires around it.
+// collation or any index the contract requires around it. A column whose type has
+// drifted is left alone: the schema check reports it, and this migration must not
+// rewrite a definition it does not own.
 func metaPinnedCollationNeedsSync(ctx context.Context, q metaQueryer, target metaCollationTarget) (bool, error) {
-	exists, collation, err := metaColumnCollation(ctx, q, target.table, target.column)
+	exists, columnType, collation, err := metaColumnCollation(ctx, q, target.table, target.column)
 	if err != nil {
 		return false, err
 	}
@@ -138,15 +142,21 @@ func metaPinnedCollationNeedsSync(ctx context.Context, q metaQueryer, target met
 		// creates it with the pinned collation and its indexes.
 		return false, nil
 	}
-	if !strings.EqualFold(collation, target.collation) {
+	if !strings.EqualFold(normalizeMetaSQLFragment(columnType), normalizeMetaSQLFragment(target.columnType)) {
+		if !strings.EqualFold(collation, target.collation) {
+			// The mismatch the schema check has to report; converting would also
+			// rewrite the column definition.
+			return false, nil
+		}
+	} else if !strings.EqualFold(collation, target.collation) {
 		return true, nil
 	}
 	for _, index := range target.indexes {
-		indexed, err := metaIndexExists(ctx, q, target.table, index.name)
+		present, healthy, err := metaIndexMatches(ctx, q, target.table, index)
 		if err != nil {
 			return false, err
 		}
-		if !indexed {
+		if !present || !healthy {
 			return true, nil
 		}
 	}
@@ -159,18 +169,47 @@ func metaPinnedCollationNeedsSync(ctx context.Context, q metaQueryer, target met
 // the window the gate protects.
 func syncPinnedCollation(ctx context.Context, q metaQueryer, target metaCollationTarget) error {
 	present := make(map[string]bool, len(target.indexes))
+	wrongShape := make(map[string]bool, len(target.indexes))
 	for _, index := range target.indexes {
-		indexed, err := metaIndexExists(ctx, q, target.table, index.name)
+		exists, healthy, err := metaIndexMatches(ctx, q, target.table, index)
 		if err != nil {
 			return err
 		}
-		present[index.name] = indexed
+		if exists && healthy {
+			present[index.name] = true
+			continue
+		}
+		if exists {
+			wrongShape[index.name] = true
+		}
 	}
-	_, collation, err := metaColumnCollation(ctx, q, target.table, target.column)
+	_, columnType, collation, err := metaColumnCollation(ctx, q, target.table, target.column)
 	if err != nil {
 		return err
 	}
-	if !strings.EqualFold(collation, target.collation) {
+	typeMatches := strings.EqualFold(normalizeMetaSQLFragment(columnType), normalizeMetaSQLFragment(target.columnType))
+	if typeMatches && !strings.EqualFold(collation, target.collation) {
+		// An index this migration does not know about also blocks TiDB's change, and
+		// dropping only the contract's indexes would leave a retry that cannot
+		// succeed. Report it instead of acting on it.
+		covering, err := metaIndexesCoveringColumn(ctx, q, target.table, target.column)
+		if err != nil {
+			return err
+		}
+		known := make(map[string]bool, len(target.indexes))
+		for _, index := range target.indexes {
+			known[strings.ToLower(index.name)] = true
+		}
+		var extra []string
+		for _, name := range covering {
+			if !known[strings.ToLower(name)] {
+				extra = append(extra, name)
+			}
+		}
+		if len(extra) > 0 {
+			return fmt.Errorf("%s.%s collation is not pinned and the column is covered by index(es) %s that the schema contract does not declare; drop or rename them so the migration can convert the column",
+				target.table, target.column, strings.Join(extra, ", "))
+		}
 		if err := pinColumnCollation(ctx, q, target, present); err != nil {
 			return err
 		}
@@ -178,6 +217,13 @@ func syncPinnedCollation(ctx context.Context, q metaQueryer, target metaCollatio
 	for _, index := range target.indexes {
 		if present[index.name] {
 			continue
+		}
+		// A same-named index that is not the contract's (non-unique, or covering the
+		// wrong columns) is replaced, not trusted.
+		if wrongShape[index.name] {
+			if _, err := q.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s DROP INDEX %s", target.table, index.name)); err != nil && !isIgnorableMetaSchemaError(err) {
+				return fmt.Errorf("drop %s.%s before recreating it: %w", target.table, index.name, err)
+			}
 		}
 		if err := restoreMetaCollationIndex(ctx, q, target, index); err != nil {
 			return err
@@ -258,18 +304,80 @@ func metaCollationRefusedOverIndex(err error) bool {
 
 // metaColumnCollation reports whether the column exists and, when it does, the
 // collation the database reports for it.
-func metaColumnCollation(ctx context.Context, q metaQueryer, table, column string) (bool, string, error) {
+func metaColumnCollation(ctx context.Context, q metaQueryer, table, column string) (bool, string, string, error) {
 	var collation sql.NullString
-	err := q.QueryRowContext(ctx, `SELECT collation_name FROM information_schema.columns
+	var columnType string
+	err := q.QueryRowContext(ctx, `SELECT collation_name, column_type FROM information_schema.columns
 		WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`,
-		table, column).Scan(&collation)
+		table, column).Scan(&collation, &columnType)
 	if err == sql.ErrNoRows {
-		return false, "", nil
+		return false, "", "", nil
 	}
 	if err != nil {
-		return false, "", fmt.Errorf("read %s.%s collation: %w", table, column, err)
+		return false, "", "", fmt.Errorf("read %s.%s collation: %w", table, column, err)
 	}
-	return true, collation.String, nil
+	return true, columnType, collation.String, nil
+}
+
+// metaIndexMatches reports whether an index with that name is present and whether it
+// is the index the contract declares: same uniqueness and the same columns in the
+// same order. A same-named non-unique index (a manual schema edit) must not count as
+// proof that uniqueness is enforced, and a present-but-wrong index has to be dropped
+// before it can be recreated.
+func metaIndexMatches(ctx context.Context, q metaQueryer, table string, index metaCollationIndex) (present, healthy bool, err error) {
+	rows, err := q.QueryContext(ctx, `SELECT column_name, non_unique
+		FROM information_schema.statistics
+		WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?
+		ORDER BY seq_in_index`, table, index.name)
+	if err != nil {
+		return false, false, fmt.Errorf("read %s.%s index: %w", table, index.name, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var columns []string
+	unique := false
+	for rows.Next() {
+		var column string
+		var nonUnique int
+		if err := rows.Scan(&column, &nonUnique); err != nil {
+			return false, false, err
+		}
+		columns = append(columns, strings.ToLower(column))
+		unique = nonUnique == 0
+	}
+	if err := rows.Err(); err != nil {
+		return false, false, err
+	}
+	if len(columns) == 0 {
+		return false, false, nil
+	}
+	if unique != index.unique {
+		return true, false, nil
+	}
+	return true, strings.Join(columns, ",") == strings.Join(index.columns, ","), nil
+}
+
+// metaIndexesCoveringColumn lists every index that covers the column, contract or
+// not: TiDB refuses a collation change while ANY index covers it, so an index this
+// migration does not know about would make the retry fail after the contract's own
+// indexes were already dropped.
+func metaIndexesCoveringColumn(ctx context.Context, q metaQueryer, table, column string) ([]string, error) {
+	rows, err := q.QueryContext(ctx, `SELECT DISTINCT index_name
+		FROM information_schema.statistics
+		WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?
+		ORDER BY index_name`, table, column)
+	if err != nil {
+		return nil, fmt.Errorf("read %s indexes covering %s: %w", table, column, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
 }
 
 // metaIndexColumns lists the columns an index create statement covers, e.g.
