@@ -559,8 +559,22 @@ func extractGitArchive(content []byte, dst string) error {
 			return err
 		}
 		name := filepath.Clean(filepath.FromSlash(hdr.Name))
-		if name == "." || strings.HasPrefix(name, "..") {
+		if name == "." {
+			// The extraction root itself ("./" from another tar tool).
 			continue
+		}
+		// A checkpoint archive is untrusted input and every entry must land
+		// inside the extraction root: an absolute name or one that climbs out
+		// is refused outright rather than skipped, because a partially
+		// extracted admin directory is still adopted by the restore below.
+		if filepath.IsAbs(name) || name == ".." || strings.HasPrefix(name, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("git archive: entry %q is outside the extraction root", hdr.Name)
+		}
+		// A repository nested in the restored gitdir is not something this
+		// archive ever needs to carry, and git reads configuration and hooks
+		// from one if a later pointer names it.
+		if first := strings.Split(filepath.ToSlash(name), "/")[0]; first == ".git" {
+			return fmt.Errorf("git archive: entry %q nests a repository inside the git directory", hdr.Name)
 		}
 		target := filepath.Join(dst, name)
 		switch hdr.Typeflag {
@@ -786,13 +800,16 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 			// the next load instead of restoring a broken standalone repo.
 			return errGitStateNotReady
 		}
-		if err := g.ensureWorkspaceState(ctx, common); err != nil {
-			return err
-		}
 		linkedCommonGitDir = g.gitDirFor(common.rootPath())
+		// Resolve (and so validate) the worktree gitdir before restoring any
+		// state: a workspace whose gitdir_rel is not a worktree admin directory
+		// must be refused before the common repository is materialized.
 		target, lerr := linkedWorktreeGitDir(linkedCommonGitDir, w.gitDirRelPath())
 		if lerr != nil {
 			return lerr
+		}
+		if err := g.ensureWorkspaceState(ctx, common); err != nil {
+			return err
 		}
 		gitDir = target
 	}
@@ -925,11 +942,21 @@ func (g *Git) wasFreshRestored(dir string) bool {
 
 // linkedWorktreeGitDir resolves a linked worktree's gitdir from the common
 // repository's .git and the registered relative gitdir (".git/worktrees/w1").
+//
+// Only <git>/worktrees/<name> is a linked worktree's admin directory, and the
+// shape is enforced here as well as at registration: the registered value is
+// tenant-supplied, the restore republishes a supplied checkpoint at whatever
+// path this returns, and rows registered before the shape was validated must not
+// be restored either. Any other target — ".git/hooks" above all — would let a
+// tenant replace a directory git executes from on the mount host.
 func linkedWorktreeGitDir(commonGitDir, gitDirRel string) (string, error) {
 	rel := filepath.Clean(strings.TrimSpace(filepath.FromSlash(gitDirRel)))
 	rel = strings.TrimPrefix(rel, ".git"+string(filepath.Separator))
 	if rel == "" || rel == "." || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
 		return "", fmt.Errorf("git: linked workspace has no usable gitdir (%q)", gitDirRel)
+	}
+	if parts := strings.Split(filepath.ToSlash(rel), "/"); len(parts) != 2 || parts[0] != "worktrees" || !safeGitWorktreeAdminName(parts[1]) {
+		return "", fmt.Errorf("git: linked workspace gitdir %q is not worktrees/<name>", gitDirRel)
 	}
 	target := filepath.Join(commonGitDir, rel)
 	// The resolved path must stay inside the common .git.
@@ -937,6 +964,19 @@ func linkedWorktreeGitDir(commonGitDir, gitDirRel string) (string, error) {
 		return "", fmt.Errorf("git: linked workspace gitdir %q escapes the common repository", gitDirRel)
 	}
 	return target, nil
+}
+
+// safeGitWorktreeAdminName reports whether name can be a worktree id below
+// worktrees/: git derives it from the worktree directory's basename, so it is a
+// single non-empty path segment.
+func safeGitWorktreeAdminName(name string) bool {
+	if name == "" || name == "." || name == ".." || len(name) > 255 {
+		return false
+	}
+	if strings.ContainsAny(name, `/\`) || strings.ContainsRune(name, 0) {
+		return false
+	}
+	return true
 }
 
 // ensureWorktreeCommondir writes the canonical relative commondir for a

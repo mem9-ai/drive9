@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -256,7 +257,7 @@ func (s *Server) handleGitWorkspaceUpsert(w http.ResponseWriter, r *http.Request
 			return
 		}
 		if gitDirRel != "" {
-			if err := validateGitMetadataRelativePath(gitDirRel); err != nil {
+			if err := validateGitWorktreeGitDirRel(gitDirRel, worktreeName); err != nil {
 				errJSON(w, http.StatusBadRequest, "invalid gitdir_rel: "+err.Error())
 				return
 			}
@@ -1046,6 +1047,37 @@ func validateGitMetadataRelativePath(raw string) error {
 		if len(part) > 255 {
 			return fmt.Errorf("path segment exceeds 255 bytes")
 		}
+	}
+	return nil
+}
+
+// validateGitWorktreeGitDirRel constrains a linked workspace's gitdir_rel to the
+// shape git itself uses: worktrees/<worktree_name>, optionally written with the
+// leading ".git/".
+//
+// The column is otherwise a free-form relative path below the common repository,
+// and the mount host republishes a tenant-supplied git-state checkpoint at
+// <common>/.git/<gitdir_rel>. A value such as "hooks" therefore turns a restore
+// into a writer for <common>/.git/hooks: the checkpoint sanitizer scrubs
+// <gitdir>/hooks of the directory it is restoring, so content that lands at the
+// top of the hooks directory itself (a restored "pre-commit") survives, and the
+// next git command on the mount host executes it as the mounting user. Pinning
+// the shape, rather than blocklisting the directories git reads, is what keeps
+// the restore target the worktree admin area and nothing else.
+func validateGitWorktreeGitDirRel(raw, worktreeName string) error {
+	if raw == "" {
+		return nil
+	}
+	if err := validateGitMetadataRelativePath(raw); err != nil {
+		return err
+	}
+	rel := strings.TrimPrefix(filepath.ToSlash(raw), ".git/")
+	parts := strings.Split(rel, "/")
+	if len(parts) != 2 || parts[0] != "worktrees" {
+		return fmt.Errorf("path must be worktrees/%s", worktreeName)
+	}
+	if parts[1] != worktreeName {
+		return fmt.Errorf("path must name the registered worktree_name %q", worktreeName)
 	}
 	return nil
 }

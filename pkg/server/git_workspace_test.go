@@ -276,6 +276,88 @@ func TestGitWorkspaceUpsertRejectsSelfLinkedWorkspace(t *testing.T) {
 	}
 }
 
+// gitdir_rel names where a linked workspace's admin directory is restored inside
+// the common repository's .git, and the restore republishes a tenant checkpoint
+// there. Only worktrees/<worktree_name> is a worktree admin directory, so any
+// other shape is refused at registration instead of being stored for the mount
+// host to act on.
+func TestGitWorkspaceUpsertRejectsNonWorktreeGitDirRel(t *testing.T) {
+	s := newTestServer(t)
+	ensureGitWorkspaceSchema(t, s)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	c := client.New(ts.URL, "")
+	mainWS, err := c.UpsertGitWorkspace(context.Background(), client.GitWorkspaceRequest{
+		RootPath:   "/repo/",
+		RepoURL:    "https://example.test/repo.git",
+		RemoteName: "origin",
+		HeadCommit: "1111111111111111111111111111111111111111",
+	})
+	if err != nil {
+		t.Fatalf("UpsertGitWorkspace main: %v", err)
+	}
+
+	accepted := []string{"worktrees/repo-wt", ".git/worktrees/repo-wt"}
+	for _, gitDirRel := range accepted {
+		body, err := json.Marshal(client.GitWorkspaceRequest{
+			RootPath:          "/repo/linked-" + strings.NewReplacer("/", "-", ".", "-").Replace(gitDirRel) + "/",
+			RepoURL:           "https://example.test/repo.git",
+			RemoteName:        "origin",
+			HeadCommit:        "1111111111111111111111111111111111111111",
+			WorkspaceKind:     "linked",
+			CommonWorkspaceID: mainWS.WorkspaceID,
+			WorktreeName:      "repo-wt",
+			GitDirRel:         gitDirRel,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.Post(ts.URL+"/v1/git-workspaces", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotBody, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("gitdir_rel %q: status = %d, body=%s, want 200", gitDirRel, resp.StatusCode, gotBody)
+		}
+	}
+
+	refused := []string{
+		".git/hooks", "hooks", "config", "objects",
+		"worktrees/other", "worktrees/repo-wt/extra", "worktrees",
+		"../hooks", "/etc/hooks", ".git/config",
+	}
+	for _, gitDirRel := range refused {
+		body, err := json.Marshal(client.GitWorkspaceRequest{
+			RootPath:          "/repo/refused-" + strings.NewReplacer("/", "-", ".", "-").Replace(gitDirRel) + "/",
+			RepoURL:           "https://example.test/repo.git",
+			RemoteName:        "origin",
+			HeadCommit:        "1111111111111111111111111111111111111111",
+			WorkspaceKind:     "linked",
+			CommonWorkspaceID: mainWS.WorkspaceID,
+			WorktreeName:      "repo-wt",
+			GitDirRel:         gitDirRel,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.Post(ts.URL+"/v1/git-workspaces", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotBody, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("gitdir_rel %q: status = %d, body=%s, want 400", gitDirRel, resp.StatusCode, gotBody)
+		}
+		if !strings.Contains(string(gotBody), "invalid gitdir_rel") {
+			t.Fatalf("gitdir_rel %q: body = %s, want the gitdir_rel refusal", gitDirRel, gotBody)
+		}
+	}
+}
+
 func TestGitWorkspaceSubresourcesRejectedAfterDelete(t *testing.T) {
 	s := newTestServer(t)
 	ensureGitWorkspaceSchema(t, s)
