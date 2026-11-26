@@ -257,3 +257,181 @@ func TestSecondOpenDuringUnlinkKeepsAnonymousImage(t *testing.T) {
 		t.Fatal("deleted name resurrected")
 	}
 }
+
+type blockingCommitUnlink struct {
+	fs.HandlerFunc
+	commitEntered chan struct{}
+	commitProceed chan struct{}
+	rollbackSeen  chan struct{}
+	onceEnter     sync.Once
+	onceRollback  sync.Once
+}
+
+func (b *blockingCommitUnlink) PreparePathUnlink(string, bool) func(bool) error {
+	return func(commit bool) error {
+		if !commit {
+			b.onceRollback.Do(func() { close(b.rollbackSeen) })
+			return nil
+		}
+		b.onceEnter.Do(func() { close(b.commitEntered) })
+		<-b.commitProceed
+		return nil
+	}
+}
+
+// TestSelfFenceNotBlockedBySlowUnlinkCommit verifies that holding an open-file
+// unlink inside finish(true) (simulating WAL fsync / commit-queue wait) does
+// NOT block triggerSelfFence from acquiring binding.fenceMu, fencing other
+// paths immediately, and causing the in-flight unlink to fail with EIO at the
+// publication boundary without removing the path.
+func TestSelfFenceNotBlockedBySlowUnlinkCommit(t *testing.T) {
+	coreFS := newMemCore()
+	gate := &blockingCommitUnlink{
+		commitEntered: make(chan struct{}),
+		commitProceed: make(chan struct{}),
+		rollbackSeen:  make(chan struct{}),
+	}
+	gate.HandlerFunc = func(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) { return next(ctx, op) }
+	f := newTestFS(t, coreFS, gate)
+
+	var heldOut, otherOut gofuse.CreateOut
+	if st := f.Create(nil, exclusiveCreateInput(), "held", &heldOut); st != gofuse.OK {
+		t.Fatalf("create held: %v", st)
+	}
+	if st := f.Create(nil, exclusiveCreateInput(), "other", &otherOut); st != gofuse.OK {
+		t.Fatalf("create other: %v", st)
+	}
+	otherRaw := &leaseTestHandle{}
+	f.handles.put(otherOut.Fh, &fileHandle{ino: otherOut.NodeId, path: "/other", flags: syscall.O_RDWR, h: otherRaw})
+
+	binding := &layerMountBinding{}
+	f.layerFence = binding
+
+	unlinkStatus := make(chan gofuse.Status, 1)
+	go func() {
+		unlinkStatus <- f.Unlink(nil, rootHeader(), "held")
+	}()
+	// Wait until unlink has entered finish(true) and is blocked in WAL/queue wait.
+	awaitUnlinkTest(t, gate.commitEntered)
+
+	// triggerSelfFence must complete immediately without waiting for finish(true).
+	fenceDone := make(chan struct{})
+	go func() {
+		binding.triggerSelfFence("lease expired while unlink waited in commit queue")
+		close(fenceDone)
+	}()
+	select {
+	case <-fenceDone:
+	case <-time.After(2 * time.Second):
+		close(gate.commitProceed)
+		t.Fatal("triggerSelfFence blocked behind unlink finish(true)")
+	}
+
+	// Other paths must reject writes immediately while unlink is still blocked.
+	if n, st := f.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: otherOut.NodeId}, Fh: otherOut.Fh}, []byte("blocked")); n != 0 || st != gofuse.EIO {
+		close(gate.commitProceed)
+		t.Fatalf("write on sibling path after self-fence = (%d, %v), want (0, EIO)", n, st)
+	}
+	if otherRaw.writes != 0 {
+		close(gate.commitProceed)
+		t.Fatalf("sibling raw handle saw %d writes after self-fence, want 0", otherRaw.writes)
+	}
+
+	// Unblock finish(true): unlink must notice lease loss at the publication boundary,
+	// roll back local unlink state, return EIO, and leave /held intact.
+	close(gate.commitProceed)
+	if st := awaitUnlinkTest(t, unlinkStatus); st != gofuse.EIO {
+		t.Fatalf("unlink status = %v, want EIO", st)
+	}
+	awaitUnlinkTest(t, gate.rollbackSeen)
+	if id, ok := f.inodes.GetInode("/held"); !ok || id != heldOut.NodeId {
+		t.Fatal("rejected unlink removed /held inode mapping")
+	}
+	if !f.openIdx.HasOpenPath("/held") || f.isDeferredUnlink("/held") {
+		t.Fatal("rejected unlink altered open index or queued deferred unlink")
+	}
+	releaseUnlinkFixture(f, heldOut)
+	if _, ok := coreFS.get("/held"); !ok {
+		t.Fatal("rejected unlink deleted remote /held on last close")
+	}
+}
+
+// TestRejectedUnlinkKeepsCleanReaderSeeingLiveWriteBuffer verifies that when a
+// clean reader and a second writer with unflushed buffered writes share a path,
+// a lease-loss-rejected unlink does NOT leave a stale remote snapshot pinned on
+// the clean reader — subsequent reads on the clean reader still observe the
+// writer's acknowledged write-buffer bytes.
+func TestRejectedUnlinkKeepsCleanReaderSeeingLiveWriteBuffer(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/doc", []byte("old-remote!!"))
+	srv := httptest.NewServer(b)
+	t.Cleanup(srv.Close)
+	cl := client.New(srv.URL, "")
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb, err := writeback.New(writeback.Options{Policy: writeback.PolicyCloseSync, Client: cl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pause := &unlinkUploadBarrier{Writeback: wb, entered: make(chan struct{}), proceed: make(chan struct{})}
+	var resume sync.Once
+	unblock := func() { resume.Do(func() { close(pause.proceed) }) }
+	t.Cleanup(unblock)
+
+	f, err := New(Options{Extensions: []fs.Handler{pause, terminal}, DefaultPermissions: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := &layerMountBinding{}
+	binding.OnSelfFence(func() { wb.AbandonLayerForRollback() })
+	f.layerFence = binding
+
+	inode := lookupFacade(t, f, "doc")
+	header := gofuse.InHeader{NodeId: inode}
+	open := func(flags uint32) uint64 {
+		var out gofuse.OpenOut
+		if st := f.Open(nil, &gofuse.OpenIn{InHeader: header, Flags: flags}, &out); st != gofuse.OK {
+			t.Fatalf("open(0x%x): %v", flags, st)
+		}
+		return out.Fh
+	}
+
+	// Open clean reader H1 and writer H2; write unflushed data through H2.
+	readerFh := open(syscall.O_RDONLY)
+	writerFh := open(syscall.O_RDWR)
+	if n, st := f.Write(nil, &gofuse.WriteIn{InHeader: header, Fh: writerFh}, []byte("new-buffered")); n != 12 || st != gofuse.OK {
+		t.Fatalf("write: %d %v", n, st)
+	}
+
+	// Start unlink, let PreparePathUnlink complete and pause before publication,
+	// then trigger self-fence so unlink is rejected.
+	unlinked := make(chan gofuse.Status, 1)
+	go func() { unlinked <- f.Unlink(nil, rootHeader(), "doc") }()
+	awaitUnlinkTest(t, pause.entered)
+	binding.triggerSelfFence("lease expired before unlink publication")
+	unblock()
+
+	if st := awaitUnlinkTest(t, unlinked); st != gofuse.EIO {
+		t.Fatalf("unlink status = %v, want EIO", st)
+	}
+	if !f.openIdx.HasOpenPath("/doc") || f.isDeferredUnlink("/doc") {
+		t.Fatal("rejected unlink altered open path state")
+	}
+
+	// H1 must NOT have a stale "old-remote!!" snapshot pinned; it must read H2's
+	// acknowledged write-buffer bytes ("new-buffered").
+	buf := make([]byte, 12)
+	res, st := f.Read(nil, &gofuse.ReadIn{InHeader: header, Fh: readerFh, Size: 12}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("reader Read: %v", st)
+	}
+	got, _ := res.Bytes(buf)
+	if string(got) != "new-buffered" {
+		t.Fatalf("clean reader saw %q after rejected unlink, want live write-buffer %q", string(got), "new-buffered")
+	}
+
+	f.Release(nil, &gofuse.ReleaseIn{InHeader: header, Fh: writerFh})
+	f.Release(nil, &gofuse.ReleaseIn{InHeader: header, Fh: readerFh})
+}

@@ -2100,22 +2100,37 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 		binding := f.layerFence
 		if binding != nil {
 			binding.fenceMu.Lock()
-			if binding.fenced.Load() {
-				binding.fenceMu.Unlock()
+			fenced := binding.fenced.Load()
+			binding.fenceMu.Unlock()
+			if fenced {
 				if finish != nil {
 					_ = finish(false)
 				}
 				return gofuse.EIO
 			}
 		}
-		// Commit the local unlink and its namespace publication on the same
-		// side of triggerSelfFence. Final close can retry the deferred delete.
+		// Commit local unlink WAL/queue state without holding binding.fenceMu so
+		// a slow fsync or commit-queue wait never blocks triggerSelfFence from
+		// immediately fencing writes across other paths.
 		if finish != nil {
 			if err := finish(true); err != nil {
-				if binding != nil {
-					binding.fenceMu.Unlock()
+				if binding != nil && binding.fenced.Load() {
+					return gofuse.EIO
 				}
 				return fs.StatusOf(err)
+			}
+		}
+		// Re-check lease state under binding.fenceMu across the fast in-memory
+		// namespace publication boundary. If self-fence fired while finish(true)
+		// ran, roll back local unlink marks and return EIO without removing the path.
+		if binding != nil {
+			binding.fenceMu.Lock()
+			if binding.fenced.Load() {
+				binding.fenceMu.Unlock()
+				if finish != nil {
+					_ = finish(false)
+				}
+				return gofuse.EIO
 			}
 		}
 		f.openIdx.UnlinkPath(child)

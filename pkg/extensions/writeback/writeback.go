@@ -1168,23 +1168,67 @@ func (w *Writeback) Stop(ctx context.Context) error {
 func (w *Writeback) WaitPathUnlinkUploads(p string) { w.waitUploaderPath(p) }
 
 // PreparePathUnlink captures live readers and waits for active transfers
-// before the facade decides whether the name may be removed. The caller
-// must invoke finish exactly once, including when lease loss rejects unlink.
+// before the facade decides whether the name may be removed. Clean-handle
+// snapshots are buffered locally until commit so a lease-loss rejection never
+// leaves stale snapshots installed on handles that must continue serving live
+// writes. The caller must invoke finish at least once (and may invoke
+// finish(false) after finish(true) if self-fence wins the publication race).
 func (w *Writeback) PreparePathUnlink(p string, hasSurvivor bool) func(bool) error {
 	var handles []*bufferingHandle
+	var prepared []preparedUnlinkSnapshot
 	var snapshotErr error
 	w.waitUploaderPath(p)
 	if !hasSurvivor {
-		handles, snapshotErr = w.snapshotUnlinkHandles(p, false, false)
+		handles, prepared, snapshotErr = w.prepareUnlinkSnapshots(p)
+	}
+	var marked []*bufferingHandle
+	var installed []installedUnlinkSnapshot
+	committed := false
+	discardPrepared := func() {
+		for i := range prepared {
+			if prepared[i].file != nil {
+				_ = prepared[i].file.Close()
+				prepared[i].file = nil
+			}
+		}
+		prepared = nil
+	}
+	rollbackInstalled := func() {
+		restoreMarked(marked)
+		marked = nil
+		for _, inst := range installed {
+			inst.h.mu.Lock()
+			if inst.setFile && inst.h.pendingFile == inst.file {
+				inst.h.pendingFile = nil
+				inst.h.pendingFileSize = 0
+				if inst.file != nil {
+					_ = inst.file.Close()
+				}
+			}
+			if inst.setImage {
+				inst.h.pendingImage = nil
+			}
+			inst.h.mu.Unlock()
+		}
+		installed = nil
 	}
 	return func(commit bool) error {
-		if !commit || w.rolledBack.Load() {
+		if !commit {
+			discardPrepared()
+			if committed {
+				rollbackInstalled()
+				committed = false
+			}
+			return errLayerRolledBack
+		}
+		if w.rolledBack.Load() {
+			discardPrepared()
 			return errLayerRolledBack
 		}
 		if snapshotErr != nil {
+			discardPrepared()
 			return snapshotErr
 		}
-		var marked []*bufferingHandle
 		for _, h := range handles {
 			h.mu.Lock()
 			if !h.unlinked && !h.closed && h.path == p {
@@ -1194,12 +1238,148 @@ func (w *Writeback) PreparePathUnlink(p string, hasSurvivor bool) func(bool) err
 			}
 			h.mu.Unlock()
 		}
+		var installErr error
+		installed, installErr = w.installPreparedUnlinkSnapshots(prepared)
+		prepared = nil
+		if installErr != nil {
+			rollbackInstalled()
+			return installErr
+		}
 		err := w.commitOpenUnlink(p, marked)
 		if err != nil {
-			w.submitOrphanedCacheForRollback(p, false)
+			rollbackInstalled()
+			if !errors.Is(err, errLayerRolledBack) {
+				w.submitOrphanedCacheForRollback(p, false)
+			}
+			return err
 		}
-		return err
+		committed = true
+		return nil
 	}
+}
+
+type preparedUnlinkSnapshot struct {
+	h      *bufferingHandle
+	seq    uint64
+	buf    []byte
+	file   *os.File
+	size   int64
+	staged bool
+}
+
+type installedUnlinkSnapshot struct {
+	h        *bufferingHandle
+	file     *os.File
+	setFile  bool
+	setImage bool
+}
+
+func (w *Writeback) prepareUnlinkSnapshots(p string) ([]*bufferingHandle, []preparedUnlinkSnapshot, error) {
+	var clean, handles []*bufferingHandle
+	var submitting []chan struct{}
+	w.liveSet.Range(func(key, _ any) bool {
+		h := key.(*bufferingHandle)
+		h.mu.Lock()
+		if h.path == p {
+			if h.submitDone != nil {
+				submitting = append(submitting, h.submitDone)
+			}
+			if !h.unlinked {
+				handles = append(handles, h)
+				if h.buf == nil && !h.isNew && !h.dirty {
+					clean = append(clean, h)
+				}
+			}
+		}
+		h.mu.Unlock()
+		return true
+	})
+	for _, ch := range submitting {
+		<-ch
+	}
+	var prepared []preparedUnlinkSnapshot
+	var firstErr error
+	for _, h := range clean {
+		staged := w.opts.Staging != nil
+		if staged && w.opts.Staging.Pending.HasPending(h.path) {
+			continue
+		}
+		if h.inner == nil {
+			continue
+		}
+		size := w.liveObjectSize(context.Background(), h)
+		if size < 0 {
+			continue
+		}
+		h.mu.Lock()
+		seq, stillClean := h.mutSeq, h.buf == nil && !h.dirty
+		h.mu.Unlock()
+		if !stillClean {
+			continue
+		}
+		buf, file, err := w.captureSnapshot(h, size)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		prepared = append(prepared, preparedUnlinkSnapshot{
+			h: h, seq: seq, buf: buf, file: file, size: size, staged: staged,
+		})
+	}
+	return handles, prepared, firstErr
+}
+
+func (w *Writeback) installPreparedUnlinkSnapshots(prepared []preparedUnlinkSnapshot) ([]installedUnlinkSnapshot, error) {
+	installed := make([]installedUnlinkSnapshot, 0, len(prepared))
+	var firstErr error
+	for i := range prepared {
+		snap := prepared[i]
+		h := snap.h
+		h.mu.Lock()
+		if h.closed || h.buf != nil || h.dirty || h.mutSeq != snap.seq {
+			h.mu.Unlock()
+			if snap.file != nil {
+				_ = snap.file.Close()
+			}
+			continue
+		}
+		var inst installedUnlinkSnapshot
+		inst.h = h
+		if snap.file != nil {
+			h.pendingFile, h.pendingFileSize = snap.file, snap.size
+			inst.file = snap.file
+			inst.setFile = true
+		} else if h.pendingImage == nil {
+			h.pendingImage = snap.buf
+			inst.setImage = true
+		}
+		h.mu.Unlock()
+		if inst.setFile || inst.setImage {
+			installed = append(installed, inst)
+		}
+		if !snap.staged || snap.size == 0 || snap.file != nil {
+			w.recordUnlinkedSnapshot(h.path, 0, 0)
+			continue
+		}
+		st := w.opts.Staging
+		if err := st.Shadow.WriteFull(h.path, snap.buf, h.baseRev); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		contentGen := st.Shadow.ActiveGeneration(h.path)
+		w.unlinkedMu.Lock()
+		pin, pinned := w.unlinkedShadowPin[h.path]
+		w.unlinkedMu.Unlock()
+		if !pinned {
+			pin = st.Shadow.Pin(h.path)
+		}
+		w.recordUnlinkedSnapshot(h.path, contentGen, pin)
+	}
+	return installed, firstErr
 }
 
 func (w *Writeback) commitOpenUnlink(p string, marked []*bufferingHandle) error {
@@ -1229,6 +1409,10 @@ func (w *Writeback) commitOpenUnlink(p string, marked []*bufferingHandle) error 
 			restoreMarked(marked)
 			return err
 		}
+	}
+	if w.rolledBack.Load() {
+		restoreMarked(marked)
+		return errLayerRolledBack
 	}
 	if w.wbCache != nil {
 		unlock := w.pathLocks.lock(p)
