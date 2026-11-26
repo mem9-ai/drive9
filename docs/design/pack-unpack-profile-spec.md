@@ -47,7 +47,20 @@ A pack archive contains:
   paths, and entries;
 - regular files;
 - directories;
-- symlinks, with their original link target preserved.
+- symlinks, with their original link target preserved;
+- a trailing checksums entry (format version 2 and newer) with the size and
+  SHA-256 of every regular file.
+
+The manifest carries a `version`. Version 0 means the archive predates the
+field and is read as version 1. Version 1 archives have no checksum entry and
+still unpack. Version 2 adds the trailing `entries`-external checksum entry:
+unpack verifies file count and per-file content against it and refuses to
+install anything when a file is missing, truncated, or altered. An archive
+claiming a version newer than the binary supports is refused with an
+actionable error instead of being partially installed, and a version 2
+archive without its checksum entry is refused as well. Version 2 archives are
+not readable by binaries that only understand version 1; that direction is
+refused on the writer's side by the version field it cannot read.
 
 The archive is uploaded to Drive9. It is not stored inside the local root.
 

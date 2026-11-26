@@ -28,8 +28,18 @@ import (
 const (
 	packArchiveFormat      = "drive9.pack.v1"
 	packManifestEntryName  = ".drive9-pack-manifest.json"
+	packChecksumEntryName  = ".drive9-pack-checksums.json"
 	packArchiveEntryPrefix = "entries/"
 	defaultPackRoot        = "/.drive9/packs"
+
+	// packFormatVersion is the version this binary writes. Version 2 adds the
+	// trailing checksum entry, which lets an unpack verify file count and
+	// content before it installs anything. Version 1 archives (and archives
+	// written before the version field existed, which decode as 0) still
+	// unpack, they are only not checksum-verified.
+	packFormatVersion = 2
+	// packMinFormatVersion is the oldest version this binary can read.
+	packMinFormatVersion = 1
 )
 
 type packManifest struct {
@@ -51,6 +61,20 @@ type packManifestEntry struct {
 	Size       int64  `json:"size,omitempty"`
 	Linkname   string `json:"linkname,omitempty"`
 	ModTime    int64  `json:"mtime,omitempty"`
+}
+
+// packChecksums is the trailing archive entry written by format version 2 and
+// newer: the size and SHA-256 of every regular file entry, keyed by the
+// manifest path so a reader can verify the staged tree before installing it.
+type packChecksums struct {
+	Format  string                  `json:"format"`
+	Version int                     `json:"version"`
+	Entries map[string]packChecksum `json:"entries"`
+}
+
+type packChecksum struct {
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
 }
 
 type packOptions struct {
@@ -343,6 +367,22 @@ func readExistingPackReplacePaths(ctx context.Context, c *client.Client, archive
 	return manifestReplacePaths(*manifest), nil
 }
 
+// validatePackFormatVersion accepts every version this binary can read and
+// rejects the rest with an actionable message. Version 0 means the archive
+// predates the version field, which is version 1 by definition.
+func validatePackFormatVersion(version int) (int, error) {
+	switch {
+	case version == 0:
+		return packMinFormatVersion, nil
+	case version >= packMinFormatVersion && version <= packFormatVersion:
+		return version, nil
+	default:
+		return 0, fmt.Errorf(
+			"unsupported pack archive version %d: this drive9 reads versions %d through %d, so upgrade drive9 before unpacking this archive",
+			version, packMinFormatVersion, packFormatVersion)
+	}
+}
+
 func readPackArchiveManifest(ctx context.Context, r io.Reader) (*packManifest, error) {
 	gz, err := gzip.NewReader(r)
 	if err != nil {
@@ -370,6 +410,11 @@ func readPackArchiveManifest(ctx context.Context, r io.Reader) (*packManifest, e
 	if manifest.Format != packArchiveFormat {
 		return nil, fmt.Errorf("unsupported pack format %q", manifest.Format)
 	}
+	version, err := validatePackFormatVersion(manifest.Version)
+	if err != nil {
+		return nil, err
+	}
+	manifest.Version = version
 	return &manifest, nil
 }
 
@@ -407,7 +452,7 @@ func writePackArchive(ctx context.Context, w io.Writer, opts packOptions) (*pack
 	paths := packSourcePaths(sources)
 	manifest := packManifest{
 		Format:       packArchiveFormat,
-		Version:      1,
+		Version:      packFormatVersion,
 		CreatedAt:    time.Now().UTC(),
 		Profile:      strings.TrimSpace(opts.Profile),
 		RemoteRoot:   remoteRoot,
@@ -423,17 +468,31 @@ func writePackArchive(ctx context.Context, w io.Writer, opts packOptions) (*pack
 		_ = gz.Close()
 		return nil, err
 	}
+	sums := make(map[string]packChecksum, len(items))
 	for _, item := range items {
 		if err := ctx.Err(); err != nil {
 			_ = tw.Close()
 			_ = gz.Close()
 			return nil, err
 		}
-		if err := writePackItem(tw, item); err != nil {
+		sum, err := writePackItem(tw, item)
+		if err != nil {
 			_ = tw.Close()
 			_ = gz.Close()
 			return nil, err
 		}
+		if sum.SHA256 != "" {
+			sums[item.ArchivePath] = sum
+		}
+	}
+	if err := writePackChecksums(tw, packChecksums{
+		Format:  packArchiveFormat,
+		Version: packFormatVersion,
+		Entries: sums,
+	}); err != nil {
+		_ = tw.Close()
+		_ = gz.Close()
+		return nil, err
 	}
 	if err := tw.Close(); err != nil {
 		_ = gz.Close()
@@ -471,7 +530,8 @@ func extractPackArchive(ctx context.Context, r io.Reader, opts unpackOptions) (*
 	}
 	defer func() { _ = gz.Close() }()
 	tr := tar.NewReader(gz)
-	manifest := packManifest{Format: packArchiveFormat, Version: 1}
+	manifest := packManifest{Format: packArchiveFormat, Version: packMinFormatVersion}
+	var sums *packChecksums
 	sawManifest := false
 	var dirTimes []packDirTime
 	for {
@@ -493,6 +553,22 @@ func extractPackArchive(ctx context.Context, r io.Reader, opts unpackOptions) (*
 			if manifest.Format != packArchiveFormat {
 				return nil, fmt.Errorf("unsupported pack format %q", manifest.Format)
 			}
+			version, err := validatePackFormatVersion(manifest.Version)
+			if err != nil {
+				return nil, err
+			}
+			manifest.Version = version
+			continue
+		}
+		if hdr.Name == packChecksumEntryName {
+			if !sawManifest {
+				return nil, fmt.Errorf("invalid pack archive: %s must follow the manifest", packChecksumEntryName)
+			}
+			decoded := packChecksums{}
+			if err := json.NewDecoder(tr).Decode(&decoded); err != nil {
+				return nil, fmt.Errorf("decode pack checksums: %w", err)
+			}
+			sums = &decoded
 			continue
 		}
 		if !sawManifest {
@@ -504,6 +580,11 @@ func extractPackArchive(ctx context.Context, r io.Reader, opts unpackOptions) (*
 	}
 	if !sawManifest {
 		return nil, fmt.Errorf("invalid pack archive: missing %s", packManifestEntryName)
+	}
+	if manifest.Version >= 2 {
+		if err := verifyPackChecksums(stageRoot, &manifest, sums); err != nil {
+			return nil, err
+		}
 	}
 	for i := len(dirTimes) - 1; i >= 0; i-- {
 		_ = os.Chtimes(dirTimes[i].Path, dirTimes[i].ModTime, dirTimes[i].ModTime)
@@ -552,28 +633,59 @@ func writePackManifest(tw *tar.Writer, manifest packManifest) error {
 	return err
 }
 
-func writePackItem(tw *tar.Writer, item packItem) error {
+// writePackItem appends one entry and returns its content checksum for regular
+// files. Non-file entries return the zero checksum.
+func writePackItem(tw *tar.Writer, item packItem) (packChecksum, error) {
 	hdr, err := tar.FileInfoHeader(item.Info, item.Linkname)
 	if err != nil {
-		return fmt.Errorf("pack header %s: %w", item.ArchivePath, err)
+		return packChecksum{}, fmt.Errorf("pack header %s: %w", item.ArchivePath, err)
 	}
 	hdr.Name = packArchiveEntryPrefix + strings.TrimPrefix(item.ArchivePath, "/")
 	if item.Type == "file" {
 		hdr.Size = item.Info.Size()
 	}
 	if err := tw.WriteHeader(hdr); err != nil {
-		return fmt.Errorf("write pack header %s: %w", item.ArchivePath, err)
+		return packChecksum{}, fmt.Errorf("write pack header %s: %w", item.ArchivePath, err)
 	}
 	if item.Type != "file" {
-		return nil
+		return packChecksum{}, nil
 	}
 	f, err := os.Open(item.LocalPath)
 	if err != nil {
-		return fmt.Errorf("open pack source %s: %w", item.LocalPath, err)
+		return packChecksum{}, fmt.Errorf("open pack source %s: %w", item.LocalPath, err)
 	}
 	defer func() { _ = f.Close() }()
-	if _, err := io.Copy(tw, f); err != nil {
-		return fmt.Errorf("write pack content %s: %w", item.ArchivePath, err)
+	sum := sha256.New()
+	written, err := io.Copy(io.MultiWriter(tw, sum), f)
+	if err != nil {
+		return packChecksum{}, fmt.Errorf("write pack content %s: %w", item.ArchivePath, err)
+	}
+	if written != item.Info.Size() {
+		// The archive header already promised item.Info.Size() bytes; a file that
+		// changed between the walk and the read would otherwise produce a
+		// truncated but checksum-consistent entry.
+		return packChecksum{}, fmt.Errorf("pack content %s changed while packing: read %d bytes, expected %d", item.ArchivePath, written, item.Info.Size())
+	}
+	return packChecksum{SHA256: hex.EncodeToString(sum.Sum(nil)), Size: written}, nil
+}
+
+func writePackChecksums(tw *tar.Writer, sums packChecksums) error {
+	data, err := json.MarshalIndent(sums, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode pack checksums: %w", err)
+	}
+	data = append(data, '\n')
+	hdr := &tar.Header{
+		Name:    packChecksumEntryName,
+		Mode:    0o644,
+		Size:    int64(len(data)),
+		ModTime: time.Now().UTC(),
+	}
+	if err := tw.WriteHeader(hdr); err != nil {
+		return fmt.Errorf("write pack checksum header: %w", err)
+	}
+	if _, err := tw.Write(data); err != nil {
+		return fmt.Errorf("write pack checksums: %w", err)
 	}
 	return nil
 }
@@ -1103,6 +1215,65 @@ func joinArchivePath(base, rel string) (string, error) {
 type packDirTime struct {
 	Path    string
 	ModTime time.Time
+}
+
+// verifyPackChecksums compares the staged tree against the archive's trailing
+// checksum entry before anything is installed. A mismatch means the archive is
+// truncated, corrupted, or was rebuilt by hand; installing it would silently
+// replace local work with the damaged copy.
+func verifyPackChecksums(stageRoot string, manifest *packManifest, sums *packChecksums) error {
+	if sums == nil {
+		return fmt.Errorf("invalid pack archive: version %d archive is missing %s", manifest.Version, packChecksumEntryName)
+	}
+	if sums.Format != packArchiveFormat {
+		return fmt.Errorf("unsupported pack checksum format %q", sums.Format)
+	}
+	if _, err := validatePackFormatVersion(sums.Version); err != nil {
+		return err
+	}
+	files := 0
+	for _, entry := range manifest.Entries {
+		if entry.Type != "file" {
+			continue
+		}
+		files++
+		want, ok := sums.Entries[entry.Path]
+		if !ok {
+			return fmt.Errorf("invalid pack archive: no checksum for %q", entry.Path)
+		}
+		rel := strings.TrimSuffix(strings.TrimPrefix(entry.Path, "/"), "/")
+		target, err := safeOverlayTarget(stageRoot, rel)
+		if err != nil {
+			return err
+		}
+		gotSum, gotSize, err := fileSHA256(target)
+		if err != nil {
+			return fmt.Errorf("checksum staged %q: %w", entry.Path, err)
+		}
+		if gotSize != want.Size || gotSum != want.SHA256 {
+			return fmt.Errorf(
+				"pack content mismatch for %q: archive declares %d bytes sha256 %s, staged copy is %d bytes sha256 %s",
+				entry.Path, want.Size, want.SHA256, gotSize, gotSum)
+		}
+	}
+	if len(sums.Entries) != files {
+		return fmt.Errorf("invalid pack archive: %d checksums for %d file entries", len(sums.Entries), files)
+	}
+	return nil
+}
+
+func fileSHA256(path string) (string, int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer func() { _ = f.Close() }()
+	sum := sha256.New()
+	n, err := io.Copy(sum, f)
+	if err != nil {
+		return "", 0, err
+	}
+	return hex.EncodeToString(sum.Sum(nil)), n, nil
 }
 
 func extractPackEntry(localRoot string, hdr *tar.Header, r io.Reader, dirTimes *[]packDirTime) error {
