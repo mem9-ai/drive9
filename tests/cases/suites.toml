@@ -99,14 +99,19 @@ name = "drive9/fuse/cross-fs-isolation"
 tier = "pr-fuse"
 timeout = "15m"
 
+# The scoped-token and WebDAV variants depend on capabilities the PR tier's
+# server and host do not guarantee (the tokens API is [prod-ext]; a Linux host
+# needs mount.davfs). They run in the daily suites, where a missing capability
+# reports "unsupported" without failing the gate, instead of turning the PR
+# gate into a permanently skipped case.
 [[case]]
 name = "drive9/fuse/cross-fs-scoped-token"
-tier = "pr-fuse"
+tier = "daily-fuse"
 timeout = "15m"
 
 [[case]]
 name = "drive9/fuse/cross-fs-webdav-isolation"
-tier = "pr-fuse"
+tier = "daily-fuse"
 timeout = "15m"
 
 [[case]]
