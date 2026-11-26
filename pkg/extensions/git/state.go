@@ -463,6 +463,17 @@ func collectStagedObjectSet(ctx context.Context, gitDir string) (map[string]stru
 	return objects, nil
 }
 
+// symbolicHeadBody renders a symbolic HEAD's link target in the regular-file form
+// git reads as the same symbolic ref ("ref: <target>"). A target that would not
+// survive as a single ref line fails the checkpoint instead of publishing a HEAD
+// that points somewhere else or nowhere: the previous checkpoint stays live.
+func symbolicHeadBody(target string) ([]byte, error) {
+	if target == "" || strings.ContainsAny(target, "\n\r\x00") {
+		return nil, fmt.Errorf("git checkpoint: symbolic HEAD target %q cannot be recorded", target)
+	}
+	return []byte("ref: " + target + "\n"), nil
+}
+
 // shouldSkipGitObjectStatePath reports paths a checkpoint archive never needs to
 // carry. objects/ travels as packs, and hooks/ are executables that only the
 // mounting host could run: uploading them would ship code to the server and the
@@ -504,11 +515,31 @@ func archiveLocalGitStateDir(gitDir string) ([]byte, error) {
 		if err != nil {
 			return err
 		}
-		// A .git tree has no legitimate symlink, and the restore refuses one
-		// (a link's target is followed long after the checkpoint sanitizer has
-		// walked the tree). Dropping it here keeps a repository that happens to
-		// carry one checkpointing and restoring instead of failing the upload.
+		// A .git tree has no legitimate symlink, and the restore refuses one (a
+		// link's target is followed long after the checkpoint sanitizer has walked
+		// the tree). The single exception is a symbolic HEAD — git writes one when
+		// core.preferSymlinkRefs is set — which is recorded in the regular-file
+		// form git reads as the same symbolic ref. Any other link is dropped, so a
+		// repository that happens to carry one still restores instead of failing
+		// its upload.
 		if info.Mode()&os.ModeSymlink != 0 {
+			if name != "HEAD" {
+				return nil
+			}
+			target, err := os.Readlink(p)
+			if err != nil {
+				return err
+			}
+			body, err := symbolicHeadBody(target)
+			if err != nil {
+				return err
+			}
+			if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(body)), Typeflag: tar.TypeReg}); err != nil {
+				return err
+			}
+			if _, err := tw.Write(body); err != nil {
+				return err
+			}
 			return nil
 		}
 		hdr, err := tar.FileInfoHeader(info, "")
@@ -912,9 +943,16 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 	}
 	if linkedCommonGitDir != "" {
 		// Re-check immediately before the swap: everything above ran with the
-		// common repository materialized and writable.
-		if _, err := linkedWorktreeGitDir(linkedCommonGitDir, w.gitDirRelPath(), w.worktreeAdminName()); err != nil {
+		// common repository materialized and writable, and the row itself can have
+		// been updated under the same workspace id meanwhile. The validated path
+		// has to be the one this restore resolved, or the swap would delete a
+		// directory the check never approved.
+		target, err := linkedWorktreeGitDir(linkedCommonGitDir, w.gitDirRelPath(), w.worktreeAdminName())
+		if err != nil {
 			return err
+		}
+		if target != gitDir {
+			return fmt.Errorf("git: linked workspace gitdir changed during restore (%q -> %q)", gitDir, target)
 		}
 	}
 	if err := os.RemoveAll(gitDir); err != nil {

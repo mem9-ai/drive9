@@ -159,10 +159,15 @@ pub async fn upsert(
     let g = |k: &str| v[k].as_str().unwrap_or("").to_string();
     // A linked worktree's gitdir_rel is an allow-listed shape, not a free path:
     // the mount republishes a tenant checkpoint at <common>/.git/<gitdir_rel>.
-    if g("workspace_kind") == "linked" || !g("common_workspace_id").is_empty() {
+    // The branch is selected from the normalized kind, exactly as the Go handler
+    // does — an empty kind defaults to "main" and the linked fields are ignored
+    // there, whatever common_workspace_id says.
+    let kind = g("workspace_kind");
+    let kind = if kind.trim().is_empty() { "main" } else { kind.trim() };
+    if kind == "linked" {
         let gitdir_rel = g("gitdir_rel");
         let worktree_name = g("worktree_name");
-        if worktree_name.is_empty() || gitdir_rel.is_empty() {
+        if worktree_name.trim().is_empty() || gitdir_rel.trim().is_empty() {
             return err_resp(400, "invalid gitdir_rel: gitdir_rel is required for a linked workspace");
         }
         if !gitdir_rel_is_valid(&gitdir_rel, &worktree_name) {
@@ -574,12 +579,18 @@ fn gitdir_rel_is_valid(gitdir_rel: &str, worktree_name: &str) -> bool {
     if gitdir_rel.len() > 1024 || gitdir_rel.contains('\\') || gitdir_rel.contains('\0') {
         return false;
     }
+    // The server bounds a worktree name to 255 bytes, so the simulator must too:
+    // otherwise a scenario accepts a registration production rejects.
+    if worktree_name.len() > 255 || worktree_name.trim().is_empty() {
+        return false;
+    }
     let rel = gitdir_rel.trim().strip_prefix(".git/").unwrap_or(gitdir_rel.trim());
     let parts: Vec<&str> = rel.split('/').collect();
     parts.len() == 2
         && parts[0] == "worktrees"
-        && parts[1] == worktree_name
-        && !worktree_name.is_empty()
+        && parts[1] == worktree_name.trim()
         && worktree_name != "."
         && worktree_name != ".."
+        && !worktree_name.contains('/')
+        && !worktree_name.contains('\\')
 }

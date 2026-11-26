@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	mysql "github.com/go-sql-driver/mysql"
 )
 
 // The OAuth subject columns are case-sensitive identities. Declaring them without
@@ -185,6 +187,47 @@ func TestEnsurePinnedCollationsConvertsExistingInstall(t *testing.T) {
 	}
 }
 
+// Binding writes take the schema gate, so a migration that has to remove the
+// unique subject index cannot overlap one: the write waits for the migration and
+// then runs with the index back in place.
+func TestInsertExternalBindingWaitsForSchemaLock(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	binding := &ExternalBinding{Provider: "slock", SubjectKey: "gated", TenantID: "t", CreatedAt: now, UpdatedAt: now}
+
+	inserted := make(chan error, 1)
+	holding := make(chan struct{})
+	release := make(chan struct{})
+	go func() {
+		_ = s.WithExternalBindingSchemaLock(ctx, func(lockCtx context.Context) error {
+			close(holding)
+			<-release
+			return nil
+		})
+	}()
+	<-holding
+	go func() { inserted <- s.InsertExternalBinding(ctx, binding) }()
+
+	select {
+	case err := <-inserted:
+		t.Fatalf("binding insert did not wait for the schema lock (err = %v)", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-inserted:
+		if err != nil {
+			t.Fatalf("binding insert after the lock was released: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("binding insert never completed after the schema lock was released")
+	}
+	if got, err := s.GetExternalBinding(ctx, "slock", "gated"); err != nil || got == nil {
+		t.Fatalf("binding was not stored: %v, %v", got, err)
+	}
+}
+
 // TiDB commits each DDL statement on its own, so a migration interrupted between
 // the index drop and its recreation leaves the column binary with no index. The
 // retry must restore the index instead of skipping the column as "already binary"
@@ -323,7 +366,7 @@ func freshControlStoreInDatabase(t *testing.T, collation string) *Store {
 	// MySQL caps a lock name at 64 characters.
 	sum := sha256.Sum256([]byte(t.Name()))
 	name := fmt.Sprintf("meta_fresh_%x", sum[:6])
-	admin, err := sql.Open("mysql", metaTestDSNWithDatabase(""))
+	admin, err := sql.Open("mysql", metaTestDSNWithDatabase(t, ""))
 	if err != nil {
 		t.Fatalf("open admin connection: %v", err)
 	}
@@ -336,14 +379,14 @@ func freshControlStoreInDatabase(t *testing.T, collation string) *Store {
 		t.Fatalf("create scratch database: %v", err)
 	}
 	t.Cleanup(func() {
-		cleanup, err := sql.Open("mysql", metaTestDSNWithDatabase(""))
+		cleanup, err := sql.Open("mysql", metaTestDSNWithDatabase(t, ""))
 		if err != nil {
 			return
 		}
 		defer func() { _ = cleanup.Close() }()
 		_, _ = cleanup.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", name))
 	})
-	store, err := Open(metaTestDSNWithDatabase(name))
+	store, err := Open(metaTestDSNWithDatabase(t, name))
 	if err != nil {
 		t.Fatalf("open scratch store: %v", err)
 	}
@@ -352,15 +395,14 @@ func freshControlStoreInDatabase(t *testing.T, collation string) *Store {
 }
 
 // metaTestDSNWithDatabase rewrites the test DSN onto another database (empty means
-// no database selected).
-func metaTestDSNWithDatabase(name string) string {
-	slash := strings.LastIndex(testDSN, "/")
-	query := ""
-	if q := strings.Index(testDSN, "?"); q >= 0 {
-		query = testDSN[q:]
+// no database selected). The DSN is parsed rather than sliced: a password may
+// contain any character the driver accepts, including "?" and "/".
+func metaTestDSNWithDatabase(t *testing.T, name string) string {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(testDSN)
+	if err != nil {
+		t.Fatalf("parse test DSN: %v", err)
 	}
-	if slash < 0 {
-		return testDSN
-	}
-	return testDSN[:slash] + "/" + name + query
+	cfg.DBName = name
+	return cfg.FormatDSN()
 }

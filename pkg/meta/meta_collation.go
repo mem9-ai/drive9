@@ -98,7 +98,13 @@ func ensurePinnedCollations(ctx context.Context, db *sql.DB, spec metaSchemaSpec
 			present[index.name] = indexed
 		}
 		if !strings.EqualFold(collation, target.collation) {
-			if err := pinColumnCollation(ctx, db, target, present); err != nil {
+			// Hold the binding-writer gate across the whole conversion: the unique
+			// subject index is absent between the drop and the recreate, and a write
+			// that slipped in there would make the recreate fail (or, worse, leave a
+			// duplicate subject binding behind on another engine).
+			if err := withExternalBindingSchemaLock(ctx, db, func(lockCtx context.Context) error {
+				return pinColumnCollation(lockCtx, db, target, present)
+			}); err != nil {
 				return err
 			}
 		}

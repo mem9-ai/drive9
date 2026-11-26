@@ -1842,14 +1842,20 @@ func (s *Store) InsertExternalBinding(ctx context.Context, b *ExternalBinding) (
 	if b == nil {
 		return fmt.Errorf("external binding is required")
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO tenant_external_bindings
-		(provider, subject_key, tenant_id, metadata_json, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?)`,
-		b.Provider, b.SubjectKey, b.TenantID, nullableBytes(b.MetadataJSON), b.CreatedAt.UTC(), b.UpdatedAt.UTC())
-	if isDuplicateEntry(err) {
-		return ErrDuplicate
-	}
-	return err
+	// The unique subject index can be absent for a moment while the schema
+	// migration converts its collation, so the insert runs under the schema gate
+	// the migration holds. It is a short statement; the caller's per-subject lock
+	// still covers the read-modify-write around it.
+	return s.WithExternalBindingSchemaLock(ctx, func(lockCtx context.Context) error {
+		_, err = s.db.ExecContext(lockCtx, `INSERT INTO tenant_external_bindings
+			(provider, subject_key, tenant_id, metadata_json, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			b.Provider, b.SubjectKey, b.TenantID, nullableBytes(b.MetadataJSON), b.CreatedAt.UTC(), b.UpdatedAt.UTC())
+		if isDuplicateEntry(err) {
+			return ErrDuplicate
+		}
+		return err
+	})
 }
 
 func (s *Store) DeleteExternalBinding(ctx context.Context, provider, subjectKey string) (err error) {
@@ -2753,6 +2759,69 @@ func compactTiDBCloudOrgClusterBindings(bindings []TenantTiDBCloudOrgBinding) []
 		return out[i].ClusterID < out[j].ClusterID
 	})
 	return out
+}
+
+// externalBindingSchemaLockName is the advisory lock that serializes binding
+// writers against a schema change that has to remove the unique subject index for
+// a moment. The per-subject lock cannot do that: the migration does not know which
+// subjects will be written.
+const externalBindingSchemaLockName = "d9_extbind_schema"
+
+// WithExternalBindingSchemaLock runs fn while holding the schema-level binding
+// lock. Binding writers take it too (InsertExternalBinding), so a migration that
+// has to drop the unique subject index — TiDB refuses a collation change while an
+// index covers the column (error 8200) — cannot overlap a write that would then
+// violate uniqueness once the index is recreated.
+func (s *Store) WithExternalBindingSchemaLock(ctx context.Context, fn func(context.Context) error) error {
+	return withExternalBindingSchemaLock(ctx, s.db, fn)
+}
+
+// withExternalBindingSchemaLock is the same gate for callers that hold the
+// database handle rather than a Store (the schema migration does).
+func withExternalBindingSchemaLock(ctx context.Context, db *sql.DB, fn func(context.Context) error) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "external_binding_schema_lock", start, &err)
+	if fn == nil {
+		return fmt.Errorf("external binding schema lock callback is required")
+	}
+	release, err := acquireMetaNamedLock(ctx, db, externalBindingSchemaLockName)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, release()) }()
+	return fn(ctx)
+}
+
+// acquireMetaNamedLock takes a database-scoped MySQL advisory lock and returns its
+// release. Both statements run on one connection, because the lock is
+// connection-local.
+func acquireMetaNamedLock(ctx context.Context, db *sql.DB, name string) (func() error, error) {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var got sql.NullInt64
+	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(CONCAT(?, DATABASE()), ?)", name, externalBindingLockTimeoutSeconds).Scan(&got); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if !got.Valid || got.Int64 != 1 {
+		_ = conn.Close()
+		return nil, fmt.Errorf("timed out waiting for %s named lock", name)
+	}
+	return func() error {
+		defer func() { _ = conn.Close() }()
+		releaseCtx, cancel := context.WithTimeout(context.Background(), externalBindingReleaseLockTimeout)
+		defer cancel()
+		var released sql.NullInt64
+		if err := conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(CONCAT(?, DATABASE()))", name).Scan(&released); err != nil {
+			return err
+		}
+		if !released.Valid || released.Int64 != 1 {
+			return fmt.Errorf("%s named lock was not held by current connection", name)
+		}
+		return nil
+	}, nil
 }
 
 func (s *Store) WithExternalBindingLock(ctx context.Context, provider, subjectKey string, fn func(context.Context) error) (err error) {

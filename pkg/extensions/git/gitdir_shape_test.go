@@ -273,6 +273,56 @@ func TestCheckpointArchiveDropsLinks(t *testing.T) {
 	}
 }
 
+// A symbolic HEAD (core.preferSymlinkRefs) is the one link a checkpoint has to
+// keep: it is recorded in the regular-file form git reads as the same ref, so the
+// restored gitdir still points at the workspace's branch.
+func TestCheckpointArchiveRecordsSymbolicHead(t *testing.T) {
+	gitBin(t)
+	src := t.TempDir()
+	run(t, src, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(src, "f.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, src, "add", "f.txt")
+	run(t, src, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "one")
+	headPath := filepath.Join(src, ".git", "HEAD")
+	if err := os.Remove(headPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("refs/heads/main", headPath); err != nil {
+		t.Fatal(err)
+	}
+
+	archive, err := archiveLocalGitStateDir(filepath.Join(src, ".git"))
+	if err != nil {
+		t.Fatalf("archiveLocalGitStateDir: %v", err)
+	}
+	dst := t.TempDir()
+	if err := extractGitArchive(archive, dst); err != nil {
+		t.Fatalf("extractGitArchive: %v", err)
+	}
+	info, err := os.Lstat(filepath.Join(dst, "HEAD"))
+	if err != nil {
+		t.Fatalf("HEAD missing from the archive: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("HEAD was archived as a link; the restore refuses those")
+	}
+	body, err := os.ReadFile(filepath.Join(dst, "HEAD"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "ref: refs/heads/main\n" {
+		t.Fatalf("HEAD = %q, want the symbolic ref", body)
+	}
+	// The recorded form is what git reads as the same symbolic ref. (The extracted
+	// tree has no object store of its own — the restore supplies it — so this
+	// asserts the ref file rather than running git against a half-built repo.)
+	if out := run(t, src, "symbolic-ref", "HEAD"); out != "refs/heads/main" {
+		t.Fatalf("source symbolic-ref = %q", out)
+	}
+}
+
 // tarEntry is one member of a test checkpoint archive: a regular file, or a
 // symlink when symlink is set.
 type tarEntry struct {
