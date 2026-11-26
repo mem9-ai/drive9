@@ -14,6 +14,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/extensions/core"
 	"github.com/mem9-ai/drive9/pkg/extensions/writeback"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 )
 
 type leaseTestHandle struct {
@@ -193,6 +194,12 @@ func (b *unlinkUploadBarrier) PreparePathUnlink(path string, survivor bool) func
 	finish := b.Writeback.PreparePathUnlink(path, survivor)
 	b.wait()
 	return finish
+}
+
+func (b *unlinkUploadBarrier) PreparePathUnlinkPhased(path string, survivor bool) (func(func() bool) error, func(), func() error, func()) {
+	cancelQueue, publish, finishCommitted, discard := b.Writeback.PreparePathUnlinkPhased(path, survivor)
+	b.wait()
+	return cancelQueue, publish, finishCommitted, discard
 }
 
 func TestSecondOpenDuringUnlinkKeepsAnonymousImage(t *testing.T) {
@@ -434,4 +441,177 @@ func TestRejectedUnlinkKeepsCleanReaderSeeingLiveWriteBuffer(t *testing.T) {
 
 	f.Release(nil, &gofuse.ReleaseIn{InHeader: header, Fh: writerFh})
 	f.Release(nil, &gofuse.ReleaseIn{InHeader: header, Fh: readerFh})
+}
+
+type phasedUnlinkPauseBarrier struct {
+	*writeback.Writeback
+	pauseBeforeCancel bool
+	pauseAfterCancel  bool
+	entered           chan struct{}
+	proceed           chan struct{}
+	once              sync.Once
+}
+
+func (b *phasedUnlinkPauseBarrier) wait() {
+	b.once.Do(func() { close(b.entered); <-b.proceed })
+}
+
+func (b *phasedUnlinkPauseBarrier) PreparePathUnlinkPhased(path string, survivor bool) (func(func() bool) error, func(), func() error, func()) {
+	cancelQueue, publish, finishCommitted, discard := b.Writeback.PreparePathUnlinkPhased(path, survivor)
+	wrappedCancel := func(aborted func() bool) error {
+		if b.pauseBeforeCancel {
+			b.wait()
+		}
+		err := cancelQueue(aborted)
+		if err == nil && b.pauseAfterCancel {
+			b.wait()
+		}
+		return err
+	}
+	return wrappedCancel, publish, finishCommitted, discard
+}
+
+// TestSelfFenceDuringRealWritebackUnlinkPreservesStagedState exercises a real
+// *writeback.Writeback (with staging Shadow, Pending index, WAL Journal, and
+// CommitQueue) across both self-fence windows of open-file unlink:
+//  1. self-fence fires while CancelQueue is blocked (must NOT block
+//     triggerSelfFence, must immediately fence sibling writes, and must leave
+//     Shadow/Pending/handles/namespace 100% intact);
+//  2. self-fence fires right after CancelQueue returns and before fenceMu
+//     publication (must return EIO and leave Shadow/Pending/handles/namespace
+//     100% intact without running irreversible publish/cache-eviction work).
+func TestSelfFenceDuringRealWritebackUnlinkPreservesStagedState(t *testing.T) {
+	cases := []struct {
+		name              string
+		pauseBeforeCancel bool
+		pauseAfterCancel  bool
+	}{
+		{name: "fence_during_cancel_queue", pauseBeforeCancel: true},
+		{name: "fence_between_cancel_and_publish", pauseAfterCancel: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := testbackend.NewBackend()
+			b.Seed("/held", []byte("initial-held"))
+			b.Seed("/other", []byte("other-data"))
+			srv := httptest.NewServer(b)
+			t.Cleanup(srv.Close)
+			cl := client.New(srv.URL, "")
+			terminal, err := core.New(cl, core.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ledger, err := staging.NewStaging(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			wb, err := writeback.New(writeback.Options{
+				Policy:   writeback.PolicyWriteBack,
+				SyncMode: "interactive",
+				Client:   cl,
+				Staging:  ledger,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+
+			// Stage local recovery bytes for /held directly into Shadow + Pending
+			// (representing an fsync'd write awaiting remote commit).
+			stagedPayload := []byte("staged-recovery-bytes")
+			if err := ledger.Shadow.WriteFull("/held", stagedPayload, 1); err != nil {
+				t.Fatalf("seed shadow: %v", err)
+			}
+			if _, err := ledger.Pending.PutWithBaseRev("/held", int64(len(stagedPayload)), staging.PendingNew, 1); err != nil {
+				t.Fatalf("seed pending: %v", err)
+			}
+
+			pause := &phasedUnlinkPauseBarrier{
+				Writeback:         wb,
+				pauseBeforeCancel: tc.pauseBeforeCancel,
+				pauseAfterCancel:  tc.pauseAfterCancel,
+				entered:           make(chan struct{}),
+				proceed:           make(chan struct{}),
+			}
+			var resumeOnce sync.Once
+			unblock := func() { resumeOnce.Do(func() { close(pause.proceed) }) }
+			t.Cleanup(unblock)
+
+			f, err := New(Options{Extensions: []fs.Handler{pause, terminal}, DefaultPermissions: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			binding := &layerMountBinding{}
+			binding.OnSelfFence(func() { wb.AbandonLayerForRollback() })
+			f.layerFence = binding
+
+			heldIno := lookupFacade(t, f, "held")
+			otherIno := lookupFacade(t, f, "other")
+			var heldOpen, otherOpen gofuse.OpenOut
+			if st := f.Open(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: heldIno}, Flags: syscall.O_RDWR}, &heldOpen); st != gofuse.OK {
+				t.Fatalf("open held: %v", st)
+			}
+			if st := f.Open(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: otherIno}, Flags: syscall.O_RDWR}, &otherOpen); st != gofuse.OK {
+				t.Fatalf("open other: %v", st)
+			}
+			// Buffer a live write on /held so an open reader also verifies handle state.
+			if n, st := f.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: heldIno}, Fh: heldOpen.Fh}, stagedPayload); n != uint32(len(stagedPayload)) || st != gofuse.OK {
+				t.Fatalf("write held: %d %v", n, st)
+			}
+
+			unlinked := make(chan gofuse.Status, 1)
+			go func() { unlinked <- f.Unlink(nil, rootHeader(), "held") }()
+			awaitUnlinkTest(t, pause.entered)
+
+			// triggerSelfFence must complete immediately without blocking behind unlink.
+			fenceDone := make(chan struct{})
+			go func() {
+				binding.triggerSelfFence("lease expired during real writeback unlink")
+				close(fenceDone)
+			}()
+			select {
+			case <-fenceDone:
+			case <-time.After(2 * time.Second):
+				unblock()
+				t.Fatal("triggerSelfFence blocked behind real writeback unlink")
+			}
+
+			// Sibling writes must immediately fail with EIO while unlink is still paused.
+			if n, st := f.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: otherIno}, Fh: otherOpen.Fh}, []byte("blocked")); n != 0 || st != gofuse.EIO {
+				unblock()
+				t.Fatalf("sibling write after self-fence = (%d, %v), want (0, EIO)", n, st)
+			}
+
+			// Resume unlink: must fail with EIO and preserve all local staged + handle + namespace state.
+			unblock()
+			if st := awaitUnlinkTest(t, unlinked); st != gofuse.EIO {
+				t.Fatalf("unlink status = %v, want EIO", st)
+			}
+			if !f.openIdx.HasOpenPath("/held") || f.isDeferredUnlink("/held") {
+				t.Fatal("rejected unlink altered open path or deferred unlink state")
+			}
+			if id, ok := f.inodes.GetInode("/held"); !ok || id != heldIno {
+				t.Fatal("rejected unlink removed /held inode mapping")
+			}
+			if !ledger.Pending.HasPending("/held") {
+				t.Fatal("rejected unlink removed staged Pending index entry for /held")
+			}
+			shadowBytes, err := ledger.Shadow.ReadAll("/held")
+			if err != nil || string(shadowBytes) != string(stagedPayload) {
+				t.Fatalf("staged shadow corrupted after rejected unlink: %q err=%v", string(shadowBytes), err)
+			}
+			buf := make([]byte, len(stagedPayload))
+			res, st := f.Read(nil, &gofuse.ReadIn{InHeader: gofuse.InHeader{NodeId: heldIno}, Fh: heldOpen.Fh, Size: uint32(len(stagedPayload))}, buf)
+			if st != gofuse.OK {
+				t.Fatalf("read held after rejected unlink: %v", st)
+			}
+			got, _ := res.Bytes(buf)
+			if string(got) != string(stagedPayload) {
+				t.Fatalf("held handle read = %q, want %q", string(got), string(stagedPayload))
+			}
+
+			f.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: otherIno}, Fh: otherOpen.Fh})
+			f.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: heldIno}, Fh: heldOpen.Fh})
+		})
+	}
 }

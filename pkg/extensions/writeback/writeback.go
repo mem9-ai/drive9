@@ -1164,13 +1164,25 @@ func (w *Writeback) Stop(ctx context.Context) error {
 // again after the facade has acquired the name.
 func (w *Writeback) WaitPathUnlinkUploads(p string) { w.waitUploaderPath(p) }
 
-// PreparePathUnlink captures live readers and waits for active transfers
-// before the facade decides whether the name may be removed. Clean-handle
-// snapshots are buffered locally until commit so a lease-loss rejection never
-// leaves stale snapshots installed on handles that must continue serving live
-// writes. The caller must invoke finish at least once (and may invoke
-// finish(false) after finish(true) if self-fence wins the publication race).
-func (w *Writeback) PreparePathUnlink(p string, hasSurvivor bool) func(bool) error {
+// PreparePathUnlinkPhased splits open-file unlink into:
+//  1. cancelQueue (runs without holding binding.fenceMu): cancels queued
+//     uploads and journals the unlink fence while holding the per-path lock
+//     and performing zero mutations to handles, Shadow, Pending, wbCache, or
+//     landed state.
+//  2. publish (runs under binding.fenceMu after verifying lease validity):
+//     fast, pure in-memory publication of handle unlink marks, clean-reader
+//     snapshots, shadow pins, and landed-state eviction.
+//  3. finishCommitted (runs after binding.fenceMu is released, only when
+//     publish succeeded): removes wbCache entries, releases the per-path lock,
+//     and persists clean-reader shadow copies.
+//  4. discard (runs on lease-loss or error rejection): releases the per-path
+//     lock and closes local prepared tempfiles without mutating live state.
+func (w *Writeback) PreparePathUnlinkPhased(p string, hasSurvivor bool) (
+	cancelQueue func(aborted func() bool) error,
+	publish func(),
+	finishCommitted func() error,
+	discard func(),
+) {
 	var handles []*bufferingHandle
 	var prepared []preparedUnlinkSnapshot
 	var snapshotErr error
@@ -1178,10 +1190,17 @@ func (w *Writeback) PreparePathUnlink(p string, hasSurvivor bool) func(bool) err
 	if !hasSurvivor {
 		handles, prepared, snapshotErr = w.prepareUnlinkSnapshots(p)
 	}
-	var marked []*bufferingHandle
-	var installed []installedUnlinkSnapshot
-	committed := false
-	discardPrepared := func() {
+	var pathUnlock func()
+	var stagedClean []preparedUnlinkSnapshot
+	releasePathLock := func() {
+		if pathUnlock != nil {
+			u := pathUnlock
+			pathUnlock = nil
+			u()
+		}
+	}
+	discard = func() {
+		releasePathLock()
 		for i := range prepared {
 			if prepared[i].file != nil {
 				_ = prepared[i].file.Close()
@@ -1189,68 +1208,114 @@ func (w *Writeback) PreparePathUnlink(p string, hasSurvivor bool) func(bool) err
 			}
 		}
 		prepared = nil
+		stagedClean = nil
 	}
-	rollbackInstalled := func() {
-		restoreMarked(marked)
-		marked = nil
-		for _, inst := range installed {
-			inst.h.mu.Lock()
-			if inst.setFile && inst.h.pendingFile == inst.file {
-				inst.h.pendingFile = nil
-				inst.h.pendingFileSize = 0
-				if inst.file != nil {
-					_ = inst.file.Close()
-				}
-			}
-			if inst.setImage {
-				inst.h.pendingImage = nil
-			}
-			inst.h.mu.Unlock()
+	cancelQueue = func(aborted func() bool) error {
+		isAborted := func() bool {
+			return w.rolledBack.Load() || (aborted != nil && aborted())
 		}
-		installed = nil
-	}
-	return func(commit bool) error {
-		if !commit {
-			discardPrepared()
-			if committed {
-				rollbackInstalled()
-				committed = false
-			}
-			return errLayerRolledBack
-		}
-		if w.rolledBack.Load() {
-			discardPrepared()
+		if isAborted() {
 			return errLayerRolledBack
 		}
 		if snapshotErr != nil {
-			discardPrepared()
 			return snapshotErr
 		}
+		if w.opts.Staging != nil && w.queue != nil {
+			unlock, err := w.queue.CancelPathPreserveLocalLocked(p, isAborted)
+			if err != nil {
+				if !errors.Is(err, errLayerRolledBack) {
+					w.submitOrphanedCacheForRollback(p, false)
+				}
+				return err
+			}
+			pathUnlock = unlock
+		} else if w.wbCache != nil {
+			unlock := w.pathLocks.lock(p)
+			if isAborted() {
+				unlock()
+				return errLayerRolledBack
+			}
+			pathUnlock = unlock
+		}
+		if isAborted() {
+			releasePathLock()
+			return errLayerRolledBack
+		}
+		return nil
+	}
+	publish = func() {
 		for _, h := range handles {
 			h.mu.Lock()
 			if !h.unlinked && !h.closed && h.path == p {
 				h.unlinked = true
-				marked = append(marked, h)
 			}
 			h.mu.Unlock()
 		}
-		var installErr error
-		installed, installErr = w.installPreparedUnlinkSnapshots(prepared)
+		stagedClean = w.installPreparedUnlinkSnapshotsInMemory(prepared)
 		prepared = nil
-		if installErr != nil {
-			rollbackInstalled()
-			return installErr
-		}
-		err := w.commitOpenUnlink(p, marked)
-		if err != nil {
-			rollbackInstalled()
-			if !errors.Is(err, errLayerRolledBack) {
-				w.submitOrphanedCacheForRollback(p, false)
+		if w.opts.Staging != nil && w.queue != nil {
+			shadow := w.opts.Staging.Shadow
+			if _, ok := w.pendingMeta(p); ok && shadow.Has(p) {
+				generation := shadow.ActiveGeneration(p)
+				var pin staging.PinGen
+				if w.unlinkedShadowPinFor(p) == 0 {
+					pin = shadow.Pin(p)
+				}
+				w.recordUnlinkedSnapshot(p, generation, pin)
 			}
+		}
+		w.forgetLanded(p)
+	}
+	finishCommitted = func() error {
+		if w.wbCache != nil {
+			w.wbCache.Remove(p)
+		}
+		releasePathLock()
+		var firstErr error
+		if w.opts.Staging != nil {
+			st := w.opts.Staging
+			for i := range stagedClean {
+				snap := stagedClean[i]
+				if err := st.Shadow.WriteFull(snap.h.path, snap.buf, snap.h.baseRev); err != nil {
+					if firstErr == nil {
+						firstErr = err
+					}
+					continue
+				}
+				contentGen := st.Shadow.ActiveGeneration(snap.h.path)
+				w.unlinkedMu.Lock()
+				pin, pinned := w.unlinkedShadowPin[snap.h.path]
+				w.unlinkedMu.Unlock()
+				if !pinned {
+					pin = st.Shadow.Pin(snap.h.path)
+				}
+				w.recordUnlinkedSnapshot(snap.h.path, contentGen, pin)
+			}
+		}
+		stagedClean = nil
+		return firstErr
+	}
+	return cancelQueue, publish, finishCommitted, discard
+}
+
+// PreparePathUnlink captures live readers and waits for active transfers
+// before the facade decides whether the name may be removed. Clean-handle
+// snapshots are buffered locally until commit so a lease-loss rejection never
+// leaves stale snapshots installed on handles that must continue serving live
+// writes.
+func (w *Writeback) PreparePathUnlink(p string, hasSurvivor bool) func(bool) error {
+	cancelQueue, publish, finishCommitted, discard := w.PreparePathUnlinkPhased(p, hasSurvivor)
+	return func(commit bool) error {
+		if !commit {
+			discard()
+			return errLayerRolledBack
+		}
+		if err := cancelQueue(nil); err != nil {
+			discard()
 			return err
 		}
-		committed = true
-		return nil
+		publish()
+		return finishCommitted()
 	}
 }
 
@@ -1261,13 +1326,6 @@ type preparedUnlinkSnapshot struct {
 	file   *os.File
 	size   int64
 	staged bool
-}
-
-type installedUnlinkSnapshot struct {
-	h        *bufferingHandle
-	file     *os.File
-	setFile  bool
-	setImage bool
 }
 
 func (w *Writeback) prepareUnlinkSnapshots(p string) ([]*bufferingHandle, []preparedUnlinkSnapshot, error) {
@@ -1327,9 +1385,8 @@ func (w *Writeback) prepareUnlinkSnapshots(p string) ([]*bufferingHandle, []prep
 	return handles, prepared, firstErr
 }
 
-func (w *Writeback) installPreparedUnlinkSnapshots(prepared []preparedUnlinkSnapshot) ([]installedUnlinkSnapshot, error) {
-	installed := make([]installedUnlinkSnapshot, 0, len(prepared))
-	var firstErr error
+func (w *Writeback) installPreparedUnlinkSnapshotsInMemory(prepared []preparedUnlinkSnapshot) []preparedUnlinkSnapshot {
+	var stagedClean []preparedUnlinkSnapshot
 	for i := range prepared {
 		snap := prepared[i]
 		h := snap.h
@@ -1341,82 +1398,19 @@ func (w *Writeback) installPreparedUnlinkSnapshots(prepared []preparedUnlinkSnap
 			}
 			continue
 		}
-		var inst installedUnlinkSnapshot
-		inst.h = h
 		if snap.file != nil {
 			h.pendingFile, h.pendingFileSize = snap.file, snap.size
-			inst.file = snap.file
-			inst.setFile = true
 		} else if h.pendingImage == nil {
 			h.pendingImage = snap.buf
-			inst.setImage = true
 		}
 		h.mu.Unlock()
-		if inst.setFile || inst.setImage {
-			installed = append(installed, inst)
-		}
 		if !snap.staged || snap.size == 0 || snap.file != nil {
 			w.recordUnlinkedSnapshot(h.path, 0, 0)
 			continue
 		}
-		st := w.opts.Staging
-		if err := st.Shadow.WriteFull(h.path, snap.buf, h.baseRev); err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		contentGen := st.Shadow.ActiveGeneration(h.path)
-		w.unlinkedMu.Lock()
-		pin, pinned := w.unlinkedShadowPin[h.path]
-		w.unlinkedMu.Unlock()
-		if !pinned {
-			pin = st.Shadow.Pin(h.path)
-		}
-		w.recordUnlinkedSnapshot(h.path, contentGen, pin)
+		stagedClean = append(stagedClean, snap)
 	}
-	return installed, firstErr
-}
-
-func (w *Writeback) commitOpenUnlink(p string, marked []*bufferingHandle) error {
-	// The name is going away NOW (the facade invokes this before FS.Unlink
-	// replies OK): the pending overlays must stop answering lookups for it,
-	// or a re-creator racing the deferred remote DELETE reads the old entry
-	// (unlink/14 row 4's EEXIST against the resurrected name). Open handles retain a pin on their staged generation.
-	ledger := w.opts.Staging != nil && w.queue != nil
-	if ledger {
-		shadow := w.opts.Staging.Shadow
-		if _, ok := w.pendingMeta(p); ok && shadow.Has(p) {
-			generation := shadow.ActiveGeneration(p)
-			var pin staging.PinGen
-			if w.unlinkedShadowPinFor(p) == 0 {
-				pin = shadow.Pin(p)
-			}
-			w.recordUnlinkedSnapshot(p, generation, pin)
-		}
-		// CancelPathPreserveLocal: a plain CancelPath also deletes the
-		// shadow pinned above, so the anonymous fd fell
-		// through to the recreated same-name file's bytes.
-		if err := w.queue.CancelPathPreserveLocal(p); err != nil {
-			// The unlink is failing: the descriptors must go on serving
-			// their name, and — the failed premise being that the durable
-			// staging survived — the replayable frames now correctly
-			// describe a file that was never unlinked.
-			restoreMarked(marked)
-			return err
-		}
-	}
-	if w.rolledBack.Load() {
-		restoreMarked(marked)
-		return errLayerRolledBack
-	}
-	if w.wbCache != nil {
-		unlock := w.pathLocks.lock(p)
-		w.wbCache.Remove(p)
-		unlock()
-	}
-	w.forgetLanded(p)
-	return nil
+	return stagedClean
 }
 
 // SetSurvivorLookup wires the facade's hardlink-alias probe.
