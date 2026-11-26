@@ -608,25 +608,28 @@ func TestMigrationConvertsUnderTheSchemaGate(t *testing.T) {
 	go func() { converted <- ensurePinnedCollations(workerCtx, db, spec) }()
 	t.Cleanup(cancelWorker)
 
-	// Positive evidence that the conversion is waiting for the gate: the gate's own
-	// statement, on a connection in this database that is not the holder's. Nothing
-	// else in this test takes a named lock, and the statement pins it to the gate.
+	// Positive evidence that the conversion is waiting for the gate: a statement on
+	// another connection in this database that starts with the gate's GET_LOCK. The
+	// pattern is anchored and the polling session is excluded, or the poll's own
+	// statement would match on MySQL, which substitutes the pattern into the text.
+	// It identifies a database-scoped named lock, which the migration lock and the
+	// per-subject lock are as well; nothing else in this test takes one.
 	//
 	// INFORMATION_SCHEMA.PROCESSLIST is deprecated on MySQL 8.4, but it is the one
-	// that can be read while another thread waits for a named lock:
-	// performance_schema.processlist does not answer in that state (it times out
-	// instead), and TiDB only has the INFORMATION_SCHEMA one.
+	// this test can use: on 8.4.13 performance_schema.processlist did not answer while
+	// a thread waited for a named lock (the poll timed out), and TiDB only has the
+	// INFORMATION_SCHEMA one.
 	// The statement as each engine reports it: TiDB keeps the parameter markers,
-	// MySQL substitutes them, so only the gate's shape is compared.
-	const gateWaitShape = "%GET_LOCK(CONCAT(%"
+	// MySQL substitutes them, so the anchored prefix is what both match.
+	const gateWaitPrefix = "SELECT GET_LOCK(CONCAT(%"
 	pollCtx, stopPoll := context.WithTimeout(ctx, 20*time.Second)
 	defer stopPoll()
 	waited := false
 	for {
 		var n int
 		err := db.QueryRowContext(pollCtx, `SELECT COUNT(*) FROM information_schema.processlist
-			WHERE db = DATABASE() AND id <> ? AND info LIKE ?`,
-			holderID, gateWaitShape).Scan(&n)
+			WHERE db = DATABASE() AND id <> CONNECTION_ID() AND id <> ? AND info LIKE ?`,
+			holderID, gateWaitPrefix).Scan(&n)
 		if err != nil && pollCtx.Err() != nil {
 			t.Fatalf("no connection waited for the gate, so the conversion did not take it: %v", err)
 		}

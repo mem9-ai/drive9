@@ -1185,8 +1185,8 @@ func TestRestoreKeepsTheBranchOnAHostWithSymlinkRefs(t *testing.T) {
 	}
 }
 
-// tarEntry is one member of a test checkpoint archive: a regular file, or a
-// symlink when symlink is set.
+// tarEntry is one member of a test checkpoint archive: a regular file, a symlink when
+// symlink is set, or a directory when dir is set.
 type tarEntry struct {
 	name    string
 	body    string
