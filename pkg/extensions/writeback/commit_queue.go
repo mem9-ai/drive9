@@ -800,13 +800,45 @@ func (cq *CommitQueue) CancelPathPreserveLocal(path string) error {
 	return cq.cancelPath(path, true)
 }
 
+// isAbandoned reports whether layer lease loss abandoned queued commits.
+func (cq *CommitQueue) isAbandoned() bool {
+	if cq == nil {
+		return false
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	return cq.abandoned
+}
+
+// PreserveAbortedUnlinkLocked marks any live non-conflict PendingIndex entry
+// on path as PendingConflict while the caller holds cq.lockPath(path). Used
+// when AcquireCancelPathLock stripped queued entries before lease loss aborted
+// an unlink: AbandonLayer() no longer sees those stripped entries in cq.queue,
+// so the caller must preserve the generation as a conflict to prevent restart
+// recovery from auto-uploading an abandoned generation.
+func (cq *CommitQueue) PreserveAbortedUnlinkLocked(path string) {
+	if cq == nil || cq.index == nil {
+		return
+	}
+	meta, ok := cq.index.GetMeta(path)
+	if !ok || meta == nil || meta.Generation == 0 || meta.Kind == staging.PendingConflict {
+		return
+	}
+	if _, err := cq.index.MarkConflictIfGeneration(path, meta.Generation); err != nil {
+		safeLogPrintf("commit queue: preserving fenced write for %s: %v", path, err)
+	}
+}
+
 // AcquireCancelPathLock cancels queued or in-flight uploads for path and
 // acquires the per-path lock WITHOUT writing any WAL marker or mutating local
 // shadow/index state. Callers then decide (e.g. under a fast lease fence)
 // whether to proceed to FinishCancelPathLocked or release the lock and abort
 // with zero WAL/local side effects.
 func (cq *CommitQueue) AcquireCancelPathLock(path string, aborted func() bool) (func(), error) {
-	if aborted != nil && aborted() {
+	isAborted := func() bool {
+		return cq.isAbandoned() || (aborted != nil && aborted())
+	}
+	if isAborted() {
 		return nil, errLayerRolledBack
 	}
 	// First pass without the path lock: an in-flight upload holds that lock
@@ -815,12 +847,18 @@ func (cq *CommitQueue) AcquireCancelPathLock(path string, aborted func() bool) (
 		cancel()
 	}
 	unlock := cq.lockPath(path)
-	if aborted != nil && aborted() {
+	if isAborted() {
+		cq.PreserveAbortedUnlinkLocked(path)
 		unlock()
 		return nil, errLayerRolledBack
 	}
 	for _, cancel := range cq.cancelPathEntries(path) {
 		cancel()
+	}
+	if isAborted() {
+		cq.PreserveAbortedUnlinkLocked(path)
+		unlock()
+		return nil, errLayerRolledBack
 	}
 	return unlock, nil
 }
@@ -1537,6 +1575,10 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 }
 
 func (cq *CommitQueue) finishCancelPathLocked(path string, preserveLocal bool) error {
+	if cq.isAbandoned() {
+		cq.PreserveAbortedUnlinkLocked(path)
+		return errLayerRolledBack
+	}
 	hadLocal := false
 	var removalErr error
 	hadShadow := cq.shadows != nil && cq.shadows.Has(path)

@@ -663,6 +663,38 @@ func (f *FS) flushDeferredUnlinksUnder(dir string) error {
 	return nil
 }
 
+func (f *FS) drainDeferredUnlinks(ctx context.Context) error {
+	f.mu.Lock()
+	var pending []*deferredUnlink
+	for _, entry := range f.deferredUnlinks {
+		if !f.openIdx.HasOpenInode(entry.ino) {
+			pending = append(pending, entry)
+		}
+	}
+	f.mu.Unlock()
+	for _, entry := range pending {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := f.runDeferredUnlink(entry, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *FS) closedDeferredUnlinkCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, entry := range f.deferredUnlinks {
+		if !f.openIdx.HasOpenInode(entry.ino) {
+			n++
+		}
+	}
+	return n
+}
+
 // touchParentMtime advances the parent directory's mtime after a namespace
 // mutation inside it (v1 touchDirectoryChangeTime): rmdir/mkdir rows compare
 // parent mtimes around child changes.
@@ -838,6 +870,10 @@ func (f *FS) Drain(ctx context.Context) mountcontrol.DrainResponse {
 		resp.Finish(time.Now().UTC())
 		return resp
 	}
+	if !runPhase("deferred_unlinks", func() error { return f.drainDeferredUnlinks(ctx) }) {
+		resp.Finish(time.Now().UTC())
+		return resp
+	}
 	if !runPhase("notifications", func() error { return f.notifications.wait(ctx) }) {
 		resp.Finish(time.Now().UTC())
 		return resp
@@ -852,6 +888,11 @@ func (f *FS) Drain(ctx context.Context) mountcontrol.DrainResponse {
 				resp.Fail("pending_work_remaining", f.mountPt, fmt.Errorf("%s: %d entries remain", reason, n))
 			}
 			break
+		}
+	}
+	if resp.OK {
+		if n := f.closedDeferredUnlinkCount(); n > 0 {
+			resp.Fail("pending_work_remaining", f.mountPt, fmt.Errorf("deferred_unlinks: %d entries remain", n))
 		}
 	}
 	f.snapshotDrainPending(&resp)
@@ -2051,8 +2092,31 @@ func (f *FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, o
 
 var openNameSeed = maphash.MakeSeed()
 
+func (f *FS) openNameStripe(path string) int {
+	return int(maphash.String(openNameSeed, path) % uint64(len(f.openNames)))
+}
+
 func (f *FS) openNameLock(path string) *sync.RWMutex {
-	return &f.openNames[maphash.String(openNameSeed, path)%uint64(len(f.openNames))]
+	return &f.openNames[f.openNameStripe(path)]
+}
+
+func (f *FS) lockOpenNamePair(a, b string) func() {
+	sa, sb := f.openNameStripe(a), f.openNameStripe(b)
+	if sa == sb {
+		mu := &f.openNames[sa]
+		mu.Lock()
+		return mu.Unlock
+	}
+	if sa > sb {
+		sa, sb = sb, sa
+	}
+	first, second := &f.openNames[sa], &f.openNames[sb]
+	first.Lock()
+	second.Lock()
+	return func() {
+		second.Unlock()
+		first.Unlock()
+	}
 }
 
 func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string) gofuse.Status {
@@ -2089,24 +2153,29 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 		// Preparation may block on an upload or a clean reader. Keep the
 		// name, open index and replayable staged writes intact meanwhile.
 		var (
-			acquireLock      func(func() bool) error
-			publishUnlink    func()
-			persistAndUnlock func() error
-			rollbackPublish  func()
-			discardUnlink    func()
-			finishLegacy     func(bool) error
+			acquireLock    func(func() bool) error
+			commitUnlink   func() error
+			finalizeUnlink func()
+			abortUnlink    func()
+			finishLegacy   func(bool) error
 		)
 		for _, h := range f.chain.Handlers() {
 			if prep, ok := h.(interface {
-				PreparePathUnlinkPhased(string, bool) (func(func() bool) error, func(), func() error, func(), func())
+				PrepareOpenUnlink(string, string) (func(func() bool) error, func() error, func(), func())
 			}); ok {
-				acquireLock, publishUnlink, persistAndUnlock, rollbackPublish, discardUnlink = prep.PreparePathUnlinkPhased(child, survivor != "")
+				acquireLock, commitUnlink, finalizeUnlink, abortUnlink = prep.PrepareOpenUnlink(child, survivor)
 				break
 			}
 			if prep, ok := h.(interface {
 				PreparePathUnlink(string, bool) func(bool) error
 			}); ok {
-				finishLegacy = prep.PreparePathUnlink(child, survivor != "")
+				rawFinish := prep.PreparePathUnlink(child, survivor != "")
+				var once sync.Once
+				var legacyErr error
+				finishLegacy = func(commit bool) error {
+					once.Do(func() { legacyErr = rawFinish(commit) })
+					return legacyErr
+				}
 				break
 			}
 		}
@@ -2119,22 +2188,49 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 			fenced := binding.fenced.Load()
 			binding.fenceMu.Unlock()
 			if fenced {
-				if discardUnlink != nil {
-					discardUnlink()
+				if abortUnlink != nil {
+					abortUnlink()
 				} else if finishLegacy != nil {
 					_ = finishLegacy(false)
 				}
 				return gofuse.EIO
 			}
 		}
-		// Phase 1 (off binding.fenceMu): cancel in-flight uploads and acquire
-		// the per-path lock with ZERO WAL writes and ZERO mutations to handles,
-		// Shadow, Pending, wbCache, or landed state.
+		// Step 1 (off binding.fenceMu): cancel in-flight uploads and acquire
+		// the per-path lock(s) with ZERO WAL writes and ZERO mutations to
+		// handles, Shadow, Pending, wbCache, or landed state.
 		if acquireLock != nil {
 			if err := acquireLock(isFenced); err != nil {
-				if discardUnlink != nil {
-					discardUnlink()
+				if abortUnlink != nil {
+					abortUnlink()
 				}
+				if isFenced() {
+					return gofuse.EIO
+				}
+				return fs.StatusOf(err)
+			}
+		}
+		// Step 2 (under binding.fenceMu, zero handle/disk locks): linearize
+		// lease validity before any durable or in-memory mutation.
+		if binding != nil {
+			binding.fenceMu.Lock()
+			fenced := binding.fenced.Load()
+			binding.fenceMu.Unlock()
+			if fenced {
+				if abortUnlink != nil {
+					abortUnlink()
+				} else if finishLegacy != nil {
+					_ = finishLegacy(false)
+				}
+				return gofuse.EIO
+			}
+		}
+		// Step 3 (off binding.fenceMu, while holding openNameLock + per-path
+		// lock): persist WAL JournalUnlink / survivor migration BEFORE mutating
+		// handles, openIdx, inodes, or deferredUnlinks. If persistence fails,
+		// all live state remains untouched.
+		if commitUnlink != nil {
+			if err := commitUnlink(); err != nil {
 				if isFenced() {
 					return gofuse.EIO
 				}
@@ -2148,59 +2244,18 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 				return fs.StatusOf(err)
 			}
 		}
-		// Phase 2 (under binding.fenceMu, pure in-memory): linearize lease
-		// validity with namespace + handle publication. If self-fence won,
-		// discard with zero WAL writes and zero mutations to local state.
-		var savedOpen []*fileHandle
 		pending := &deferredUnlink{path: child, ino: ino}
-		if binding != nil {
-			binding.fenceMu.Lock()
-			if binding.fenced.Load() {
-				binding.fenceMu.Unlock()
-				if discardUnlink != nil {
-					discardUnlink()
-				} else if finishLegacy != nil {
-					_ = finishLegacy(false)
-				}
-				return gofuse.EIO
-			}
-		}
-		if publishUnlink != nil {
-			publishUnlink()
-		}
-		savedOpen = f.openIdx.SnapshotPath(child)
-		f.openIdx.UnlinkPath(child)
 		pending.mu.Lock()
+		if survivor != "" {
+			f.openIdx.RetargetPath(child, survivor)
+		} else {
+			f.openIdx.UnlinkPath(child)
+		}
 		f.inodes.RemoveLinkPreserve(child)
 		if iok {
 			f.mu.Lock()
 			f.deferredUnlinks[child] = pending
 			f.mu.Unlock()
-		}
-		if binding != nil {
-			binding.fenceMu.Unlock()
-		}
-		// Phase 3 (off binding.fenceMu, while still holding gate, per-path
-		// lock, and pending.mu): write WAL JournalUnlink, persist clean-reader
-		// shadows, remove wbCache, and release the per-path lock last so no
-		// recreated same-name file can race Shadow writes.
-		if persistAndUnlock != nil {
-			if err := persistAndUnlock(); err != nil {
-				if rollbackPublish != nil {
-					rollbackPublish()
-				}
-				f.openIdx.RestoreUnlinkedPath(child, savedOpen)
-				if iok {
-					f.inodes.RestoreLinkPreserve(child, ino)
-					f.mu.Lock()
-					if f.deferredUnlinks[child] == pending {
-						delete(f.deferredUnlinks, child)
-					}
-					f.mu.Unlock()
-				}
-				pending.mu.Unlock()
-				return fs.StatusOf(err)
-			}
 		}
 		for _, h := range f.chain.Handlers() {
 			if survivor != "" {
@@ -2212,11 +2267,14 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 				mark.MarkPathUnlinked(child)
 			}
 		}
+		if finalizeUnlink != nil {
+			finalizeUnlink()
+		}
 		f.markNameNegative(child)
 		f.touchParentMtime(header.NodeId)
 		f.mutated(fs.EventDelete, child)
 		pending.mu.Unlock()
-		// The last Release may have completed while PreparePathUnlink was
+		// The last Release may have completed while PrepareOpenUnlink was
 		// preparing the anonymous handle state, before registration existed.
 		// Recheck after publication so that close cannot strand the delete.
 		if iok {
@@ -2306,6 +2364,8 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 	if oldPath == newPath {
 		return gofuse.OK
 	}
+	unlockNames := f.lockOpenNamePair(oldPath, newPath)
+	defer unlockNames()
 	f.debugf("rename start old=%s new=%s", oldPath, newPath)
 	// Land hidden children before their parent moves (or is replaced).
 	// The unlink handlers preserve open descriptors' anonymous data. A

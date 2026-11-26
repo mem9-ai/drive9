@@ -201,10 +201,10 @@ func (b *unlinkUploadBarrier) PreparePathUnlink(path string, survivor bool) func
 	return finish
 }
 
-func (b *unlinkUploadBarrier) PreparePathUnlinkPhased(path string, survivor bool) (func(func() bool) error, func(), func() error, func(), func()) {
-	acquireLock, publish, persistAndUnlock, rollbackPublish, discard := b.Writeback.PreparePathUnlinkPhased(path, survivor)
+func (b *unlinkUploadBarrier) PrepareOpenUnlink(path, survivor string) (func(func() bool) error, func() error, func(), func()) {
+	acquireLock, commit, finalize, abort := b.Writeback.PrepareOpenUnlink(path, survivor)
 	b.wait()
-	return acquireLock, publish, persistAndUnlock, rollbackPublish, discard
+	return acquireLock, commit, finalize, abort
 }
 
 func TestSecondOpenDuringUnlinkKeepsAnonymousImage(t *testing.T) {
@@ -279,16 +279,18 @@ type blockingCommitUnlink struct {
 	onceRollback  sync.Once
 }
 
-func (b *blockingCommitUnlink) PreparePathUnlink(string, bool) func(bool) error {
-	return func(commit bool) error {
-		if !commit {
-			b.onceRollback.Do(func() { close(b.rollbackSeen) })
-			return nil
-		}
+func (b *blockingCommitUnlink) PrepareOpenUnlink(string, string) (func(func() bool) error, func() error, func(), func()) {
+	acquire := func(func() bool) error {
 		b.onceEnter.Do(func() { close(b.commitEntered) })
 		<-b.commitProceed
 		return nil
 	}
+	commit := func() error { return nil }
+	finalize := func() {}
+	abort := func() {
+		b.onceRollback.Do(func() { close(b.rollbackSeen) })
+	}
+	return acquire, commit, finalize, abort
 }
 
 // TestSelfFenceNotBlockedBySlowUnlinkCommit verifies that holding an open-file
@@ -461,8 +463,8 @@ func (b *phasedUnlinkPauseBarrier) wait() {
 	b.once.Do(func() { close(b.entered); <-b.proceed })
 }
 
-func (b *phasedUnlinkPauseBarrier) PreparePathUnlinkPhased(path string, survivor bool) (func(func() bool) error, func(), func() error, func(), func()) {
-	acquireLock, publish, persistAndUnlock, rollbackPublish, discard := b.Writeback.PreparePathUnlinkPhased(path, survivor)
+func (b *phasedUnlinkPauseBarrier) PrepareOpenUnlink(path, survivor string) (func(func() bool) error, func() error, func(), func()) {
+	acquireLock, commit, finalize, abort := b.Writeback.PrepareOpenUnlink(path, survivor)
 	wrappedAcquire := func(aborted func() bool) error {
 		if b.pauseBeforeCancel {
 			b.wait()
@@ -473,7 +475,7 @@ func (b *phasedUnlinkPauseBarrier) PreparePathUnlinkPhased(path string, survivor
 		}
 		return err
 	}
-	return wrappedAcquire, publish, persistAndUnlock, rollbackPublish, discard
+	return wrappedAcquire, commit, finalize, abort
 }
 
 // TestSelfFenceDuringRealWritebackUnlinkPreservesStagedState exercises a real
@@ -704,6 +706,10 @@ func TestOpenUnlinkPersistFailureRollsBackAndAllowsContinuedWrite(t *testing.T) 
 			holdPut.Store(true)
 			putStarted := make(chan struct{}, 4)
 			release := make(chan struct{})
+			var releaseOnce sync.Once
+			closeRelease := func() {
+				releaseOnce.Do(func() { close(release) })
+			}
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if strings.HasSuffix(r.URL.Path, "/held") && holdPut.Load() && (r.Method == http.MethodPut || r.Method == http.MethodPost) {
 					select {
@@ -719,11 +725,7 @@ func TestOpenUnlinkPersistFailureRollsBackAndAllowsContinuedWrite(t *testing.T) 
 				}
 				b.ServeHTTP(w, r)
 			}))
-			t.Cleanup(func() {
-				holdPut.Store(false)
-				close(release)
-				srv.Close()
-			})
+			t.Cleanup(srv.Close)
 
 			cl := client.New(srv.URL, "")
 			cl.SetSmallFileThresholdForTests(1 << 20)
@@ -743,6 +745,10 @@ func TestOpenUnlinkPersistFailureRollsBackAndAllowsContinuedWrite(t *testing.T) 
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+			t.Cleanup(func() {
+				holdPut.Store(false)
+				closeRelease()
+			})
 			terminal, err := core.New(cl, core.Options{})
 			if err != nil {
 				t.Fatal(err)
@@ -830,6 +836,7 @@ func TestOpenUnlinkPersistFailureRollsBackAndAllowsContinuedWrite(t *testing.T) 
 				t.Fatalf("restore shadow dir: %v", err)
 			}
 			holdPut.Store(false)
+			closeRelease()
 			deadline := time.Now().Add(5 * time.Second)
 			for {
 				if node, ok := b.Node("/held"); ok && string(node.Data) == string(v1) {

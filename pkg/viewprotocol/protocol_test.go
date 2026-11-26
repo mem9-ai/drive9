@@ -161,6 +161,12 @@ func TestClassifyClientAndViewDataRoutes(t *testing.T) {
 }
 
 func TestPathWithinBaseRootAndRedirectConfinement(t *testing.T) {
+	for _, raw := range []string{"//", "///"} {
+		root, err := CanonicalizeViewPath(raw)
+		require.NoError(t, err)
+		require.Equal(t, "/", root)
+		require.True(t, PathWithinBaseRoot(root, "/workspace/a.txt"))
+	}
 	require.True(t, PathWithinBaseRoot("/", "/"))
 	require.True(t, PathWithinBaseRoot("/", "/workspace/a.txt"))
 	require.True(t, PathWithinBaseRoot("/workspace", "/workspace"))

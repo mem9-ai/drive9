@@ -6,12 +6,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 func TestSwitchJournalRecoversTornTrailingFrameAndRejectsMidFileCorruption(t *testing.T) {
@@ -73,13 +75,19 @@ func TestSwitchJournalRecoversTornTrailingFrameAndRejectsMidFileCorruption(t *te
 			damaged := tc.mutate(validRaw, fullRaw)
 			require.NoError(t, os.WriteFile(priorPath, damaged, 0o600))
 			var diagnostic bytes.Buffer
-			writer := log.Writer()
-			log.SetOutput(&diagnostic)
-			t.Cleanup(func() { log.SetOutput(writer) })
+			prevLogger := logger.L()
+			core := zapcore.NewCore(
+				zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()),
+				zapcore.AddSync(&diagnostic),
+				zap.DebugLevel,
+			)
+			logger.Set(zap.New(core))
+			t.Cleanup(func() { logger.Set(prevLogger) })
 
 			reopened, err := OpenExistingSwitchJournal(priorPath)
 			require.NoError(t, err)
-			require.Contains(t, diagnostic.String(), fmt.Sprintf("discarded %d bytes from a torn mount switch journal tail", len(damaged)-len(validRaw)))
+			require.Contains(t, diagnostic.String(), "discarded torn mount switch journal tail")
+			require.Contains(t, diagnostic.String(), fmt.Sprintf(`"bytes":%d`, len(damaged)-len(validRaw)))
 			st, err := os.Stat(priorPath)
 			require.NoError(t, err)
 			require.Equal(t, int64(len(validRaw)), st.Size())

@@ -1167,43 +1167,54 @@ func (w *Writeback) Stop(ctx context.Context) error {
 // again after the facade has acquired the name.
 func (w *Writeback) WaitPathUnlinkUploads(p string) { w.waitUploaderPath(p) }
 
-// PreparePathUnlinkPhased splits open-file unlink into:
-//  1. acquireLock (runs without holding binding.fenceMu): cancels queued
-//     uploads and acquires the per-path lock with ZERO WAL writes and ZERO
-//     mutations to handles, Shadow, Pending, wbCache, or landed state.
-//  2. publish (runs under binding.fenceMu after verifying lease validity):
-//     fast, pure in-memory publication of handle unlink marks, clean-reader
-//     snapshots, shadow pins, and landed-state eviction.
-//  3. persistAndUnlock (runs after binding.fenceMu is released, while still
-//     holding the per-path lock and FUSE name gate): journals the WAL
-//     JournalUnlink marker, writes clean-reader shadows, removes wbCache
-//     entries, and releases the per-path lock ONLY after all shadow/cache
-//     work completes so a recreated same-name file can never be overwritten.
-//  4. rollbackPublish (runs if persistAndUnlock fails): restores in-memory
-//     handle unlink marks, installed snapshots, and shadow pins.
-//  5. discard (runs on lease-loss or error rejection before publish): releases
-//     the per-path lock and closes local prepared tempfiles with zero side
-//     effects on WAL or live state.
-func (w *Writeback) PreparePathUnlinkPhased(p string, hasSurvivor bool) (
+// PrepareOpenUnlink coordinates open-file unlink across both anonymous
+// last-link unlinks (survivor == "") and hardlink-survivor unlinks
+// (survivor != ""):
+//  1. acquireLock (runs off binding.fenceMu): cancels queued uploads on p and
+//     acquires w.pathLocks(p) (or w.lockRenamePaths(p, survivor)) with ZERO WAL
+//     writes and ZERO mutations to handles, Shadow, Pending, wbCache, or landed
+//     state.
+//  2. commit (runs off binding.fenceMu after lease validity is confirmed, while
+//     holding the FUSE name gate + path lock(s), BEFORE mutating openIdx,
+//     inodes, or deferredUnlinks):
+//     - For survivor == "": runs FinishCancelPathLocked first; if that fails,
+//       releases locks and leaves all in-memory state untouched. Only after
+//       durable WAL persistence succeeds does it mark open handles anonymous,
+//       wake stage-name waiters, install clean-reader snapshots (never
+//       clobbering a newer staged shadow, and falling back to in-memory
+//       pendingImage if best-effort Shadow.WriteFull fails), pin the shadow
+//       linearized under regMu against Release, and remove wbCache[p].
+//     - For survivor != "": migrates Pending/Shadow/CommitQueue and wbCache
+//       state from p onto survivor under lockRenamePaths(p, survivor) without
+//       marking handles anonymous or pinning unlinkedShadow[p], keeping both
+//       path locks held across RetargetPath until finalize.
+//  3. finalize (runs after FUSE updates openIdx/inodes and invokes
+//     RetargetPath/MarkPathUnlinked): rebinds stagedCacheGen on migrated
+//     handles, releases path lock(s), and submits migrated wbCache if no open
+//     handle still owns it.
+//  4. abort (runs on lease-loss or pre-commit failure): preserves any stripped
+//     queued entry as PendingConflict on rollback, releases path lock(s), and
+//     closes unused prepared tempfiles.
+func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 	acquireLock func(aborted func() bool) error,
-	publish func(),
-	persistAndUnlock func() error,
-	rollbackPublish func(),
-	discard func(),
+	commit func() error,
+	finalize func(),
+	abort func(),
 ) {
-	var handles []*bufferingHandle
+	hasSurvivor := survivor != "" && survivor != p
 	var prepared []preparedUnlinkSnapshot
 	var snapshotErr error
 	w.waitUploaderPath(p)
-	if !hasSurvivor {
-		handles, prepared, snapshotErr = w.prepareUnlinkSnapshots(p)
+	if hasSurvivor {
+		w.waitUploaderPath(survivor)
+	} else {
+		_, prepared, snapshotErr = w.prepareUnlinkSnapshots(p)
 	}
 	var (
 		pathUnlock  func()
-		marked      []*bufferingHandle
-		installed   []installedUnlinkSnapshot
-		stagedClean []preparedUnlinkSnapshot
-		addedPin    staging.PinGen
+		movedCache  bool
+		oldCacheGen uint64
+		newCacheGen uint64
 	)
 	releasePathLock := func() {
 		if pathUnlock != nil {
@@ -1212,8 +1223,7 @@ func (w *Writeback) PreparePathUnlinkPhased(p string, hasSurvivor bool) (
 			u()
 		}
 	}
-	discard = func() {
-		releasePathLock()
+	closePrepared := func() {
 		for i := range prepared {
 			if prepared[i].file != nil {
 				_ = prepared[i].file.Close()
@@ -1221,7 +1231,49 @@ func (w *Writeback) PreparePathUnlinkPhased(p string, hasSurvivor bool) (
 			}
 		}
 		prepared = nil
-		stagedClean = nil
+	}
+	reenqueueCanceledSourceLocked := func() {
+		if w.rolledBack.Load() || w.opts.Staging == nil || w.queue == nil {
+			return
+		}
+		st := w.opts.Staging
+		if st.Pending != nil && st.Pending.HasPending(p) && st.Shadow != nil && st.Shadow.Has(p) && !w.queue.HasPath(p) {
+			if entry := w.queue.recoveredEntry(p); entry != nil {
+				entry.PayloadBaseRev, entry.PayloadBaseRevSet = 0, false
+				if enqErr := w.queue.Enqueue(entry); enqErr != nil {
+					safeLogPrintf("writeback: re-driving %s after failed open unlink: %v", p, enqErr)
+				}
+			}
+		}
+	}
+	abort = func() {
+		hadLock := pathUnlock != nil
+		if hadLock {
+			if w.rolledBack.Load() && w.queue != nil {
+				w.queue.PreserveAbortedUnlinkLocked(p)
+			} else {
+				reenqueueCanceledSourceLocked()
+			}
+		}
+		releasePathLock()
+		if hadLock && !w.rolledBack.Load() {
+			w.submitOrphanedCacheForRollback(p, false)
+		}
+		closePrepared()
+	}
+	rollbackFailedCommit := func() {
+		if w.rolledBack.Load() {
+			if w.queue != nil {
+				w.queue.PreserveAbortedUnlinkLocked(p)
+			}
+		} else {
+			reenqueueCanceledSourceLocked()
+		}
+		releasePathLock()
+		if !w.rolledBack.Load() {
+			w.submitOrphanedCacheForRollback(p, false)
+		}
+		closePrepared()
 	}
 	acquireLock = func(aborted func() bool) error {
 		isAborted := func() bool {
@@ -1233,13 +1285,36 @@ func (w *Writeback) PreparePathUnlinkPhased(p string, hasSurvivor bool) (
 		if snapshotErr != nil {
 			return snapshotErr
 		}
+		w.waitUploaderPath(p)
+		if hasSurvivor {
+			w.waitUploaderPath(survivor)
+			if w.queue != nil {
+				for _, cancel := range w.queue.cancelPathEntries(p) {
+					cancel()
+				}
+			}
+			pathUnlock = w.lockRenamePaths(p, survivor)
+			if w.queue != nil {
+				for _, cancel := range w.queue.cancelPathEntries(p) {
+					cancel()
+				}
+			}
+			if isAborted() {
+				if w.queue != nil {
+					w.queue.PreserveAbortedUnlinkLocked(p)
+				}
+				releasePathLock()
+				return errLayerRolledBack
+			}
+			return nil
+		}
 		if w.opts.Staging != nil && w.queue != nil {
 			unlock, err := w.queue.AcquireCancelPathLock(p, isAborted)
 			if err != nil {
 				return err
 			}
 			pathUnlock = unlock
-		} else if w.wbCache != nil {
+		} else {
 			unlock := w.pathLocks.lock(p)
 			if isAborted() {
 				unlock()
@@ -1248,103 +1323,219 @@ func (w *Writeback) PreparePathUnlinkPhased(p string, hasSurvivor bool) (
 			pathUnlock = unlock
 		}
 		if isAborted() {
+			if w.queue != nil {
+				w.queue.PreserveAbortedUnlinkLocked(p)
+			}
 			releasePathLock()
 			return errLayerRolledBack
 		}
 		return nil
 	}
-	publish = func() {
-		for _, h := range handles {
-			h.mu.Lock()
-			if !h.unlinked && !h.closed && h.path == p {
-				h.unlinked = true
-				h.wakeStageNameWaitersLocked()
-				marked = append(marked, h)
-			}
-			h.mu.Unlock()
-		}
-		installed, stagedClean = w.installPreparedUnlinkSnapshotsInMemory(prepared)
-		prepared = nil
-		if w.opts.Staging != nil && w.queue != nil {
-			shadow := w.opts.Staging.Shadow
-			if _, ok := w.pendingMeta(p); ok && shadow.Has(p) {
-				generation := shadow.ActiveGeneration(p)
-				var pin staging.PinGen
-				if w.unlinkedShadowPinFor(p) == 0 {
-					pin = shadow.Pin(p)
-					addedPin = pin
+	commit = func() error {
+		if hasSurvivor {
+			if w.opts.Staging != nil && w.opts.Staging.Pending != nil {
+				srcGen, _, srcConflict, srcLive := w.pendingImageState(p)
+				dstGen, _, dstConflict, dstLive := w.pendingImageState(survivor)
+				switch {
+				case srcLive:
+					if (dstLive || dstConflict) && dstGen > srcGen {
+						if w.queue != nil {
+							if err := w.queue.FinishCancelPathLocked(p, false); err != nil {
+								rollbackFailedCommit()
+								return err
+							}
+						}
+					} else {
+						fence := renameFence{movedAt: time.Now()}
+						if dstGen != 0 {
+							fence.preGen = map[string]uint64{survivor: dstGen}
+						}
+						if _, err := w.retargetQueuedImageLocked(p, survivor, fence); err != nil {
+							rollbackFailedCommit()
+							return err
+						}
+					}
+				case srcConflict:
+					if (dstLive || dstConflict) && dstGen > srcGen {
+						if w.queue != nil {
+							if err := w.queue.FinishCancelPathLocked(p, false); err != nil {
+								rollbackFailedCommit()
+								return err
+							}
+						}
+					} else {
+						if w.queue != nil {
+							if err := w.queue.CancelQueuedForRename(p); err != nil {
+								rollbackFailedCommit()
+								return err
+							}
+						}
+						fence := renameFence{movedAt: time.Now()}
+						if dstGen != 0 {
+							fence.preGen = map[string]uint64{survivor: dstGen}
+						}
+						if _, err := w.conflictTransitionLocked(context.Background(), p, survivor, fence, false); err != nil {
+							rollbackFailedCommit()
+							return err
+						}
+					}
+				default:
+					if w.queue != nil {
+						if err := w.queue.FinishCancelPathLocked(p, false); err != nil {
+							rollbackFailedCommit()
+							return err
+						}
+					}
 				}
-				w.recordUnlinkedSnapshot(p, generation, pin)
 			}
+			if w.queue != nil {
+				w.queue.RenameTerminalFailure(p, survivor, nil)
+			}
+			if w.wbCache != nil {
+				if remMeta, ok := w.wbCache.GetMeta(p); ok && remMeta != nil {
+					srcPutGen := remMeta.PutGen()
+					dstMeta, dstOK := w.wbCache.GetMeta(survivor)
+					if dstOK && dstMeta != nil && dstMeta.PutGen() > srcPutGen {
+						w.wbCache.Remove(p)
+					} else {
+						oldCacheGen = remMeta.Generation
+						movedCache = w.wbCache.RenamePending(p, survivor)
+						if !movedCache {
+							rollbackFailedCommit()
+							return fmt.Errorf("writeback: moving staged cache %s -> %s failed", p, survivor)
+						}
+						if survMeta, sok := w.wbCache.GetMeta(survivor); sok && survMeta != nil {
+							newCacheGen = survMeta.Generation
+						}
+					}
+				}
+				w.wbCache.RekeyViewLoss(p, survivor)
+			}
+			w.forgetLanded(p)
+			return nil
 		}
-		w.forgetLanded(p)
-	}
-	persistAndUnlock = func() error {
-		defer releasePathLock()
+
+		// No surviving hardlink: persist WAL JournalUnlink / shadow cancel
+		// BEFORE mutating handles or snapshots in memory.
+		w.regMu.Lock()
+		hasLiveBefore := len(w.liveByPath[p]) > 0
+		w.regMu.Unlock()
 		if w.opts.Staging != nil && w.queue != nil {
-			if err := w.queue.FinishCancelPathLocked(p, true); err != nil {
-				w.submitOrphanedCacheForRollback(p, false)
+			if err := w.queue.FinishCancelPathLocked(p, hasLiveBefore); err != nil {
+				rollbackFailedCommit()
 				return err
 			}
 		}
-		if w.opts.Staging != nil {
+
+		hasStagedShadow := false
+		var stagedGen staging.ContentGen
+		if w.opts.Staging != nil && w.queue != nil {
 			st := w.opts.Staging
-			for i := range stagedClean {
-				snap := stagedClean[i]
-				if err := st.Shadow.WriteFull(snap.h.path, snap.buf, snap.h.baseRev); err != nil {
-					return err
-				}
-				contentGen := st.Shadow.ActiveGeneration(snap.h.path)
-				w.unlinkedMu.Lock()
-				pin, pinned := w.unlinkedShadowPin[snap.h.path]
-				w.unlinkedMu.Unlock()
-				if !pinned {
-					pin = st.Shadow.Pin(snap.h.path)
-					if addedPin == 0 && snap.h.path == p {
-						addedPin = pin
-					}
-				}
-				w.recordUnlinkedSnapshot(snap.h.path, contentGen, pin)
+			if _, ok := w.pendingMeta(p); ok && st.Shadow != nil && st.Shadow.Has(p) {
+				hasStagedShadow = true
+				stagedGen = st.Shadow.ActiveGeneration(p)
 			}
 		}
-		stagedClean = nil
+
+		for i := range prepared {
+			snap := prepared[i]
+			h := snap.h
+			h.mu.Lock()
+			if h.closed || h.buf != nil || h.dirty || h.mutSeq != snap.seq || hasStagedShadow {
+				h.mu.Unlock()
+				if snap.file != nil {
+					_ = snap.file.Close()
+				}
+				continue
+			}
+			if snap.file != nil {
+				h.pendingFile, h.pendingFileSize = snap.file, snap.size
+				h.mu.Unlock()
+				continue
+			}
+			if h.pendingImage == nil {
+				h.pendingImage = snap.buf
+			}
+			h.mu.Unlock()
+			if snap.staged && snap.size > 0 && w.opts.Staging != nil && w.opts.Staging.Shadow != nil {
+				st := w.opts.Staging
+				if werr := st.Shadow.WriteFull(p, snap.buf, h.baseRev); werr != nil {
+					// Clean up any partial shadow file so Shadow.PendingBytes()
+					// never blocks view switches; h.pendingImage serves reads.
+					st.Shadow.Remove(p)
+				} else {
+					hasStagedShadow = true
+					stagedGen = st.Shadow.ActiveGeneration(p)
+				}
+			}
+		}
+		prepared = nil
+
+		// Linearize handle anonymous marking + shadow pinning under regMu so a
+		// concurrent last-handle Release (untrackAndLast under regMu) cannot
+		// miss dropUnlinkedShadow or drop the shadow before we pin it.
+		var dropOrphanedLocal bool
+		w.regMu.Lock()
+		liveSet := w.liveByPath[p]
+		if len(liveSet) > 0 {
+			for h := range liveSet {
+				h.mu.Lock()
+				if !h.unlinked && !h.closed && h.path == p {
+					h.unlinked = true
+					h.wakeStageNameWaitersLocked()
+				}
+				h.mu.Unlock()
+			}
+			if hasStagedShadow && w.opts.Staging != nil && w.opts.Staging.Shadow != nil {
+				pin := w.unlinkedShadowPinFor(p)
+				if pin == 0 {
+					pin = w.opts.Staging.Shadow.Pin(p)
+				}
+				w.recordUnlinkedSnapshot(p, stagedGen, pin)
+			} else {
+				w.recordUnlinkedSnapshot(p, 0, 0)
+			}
+		} else {
+			dropOrphanedLocal = true
+		}
+		w.regMu.Unlock()
+
+		if dropOrphanedLocal && w.opts.Staging != nil {
+			if w.opts.Staging.Shadow != nil {
+				w.opts.Staging.Shadow.Remove(p)
+			}
+			if w.opts.Staging.Pending != nil {
+				w.opts.Staging.Pending.Remove(p)
+			}
+		}
 		if w.wbCache != nil {
 			w.wbCache.Remove(p)
 		}
+		w.forgetLanded(p)
 		return nil
 	}
-	rollbackPublish = func() {
-		restoreMarked(marked)
-		marked = nil
-		for _, inst := range installed {
-			inst.h.mu.Lock()
-			if inst.setFile && inst.h.pendingFile == inst.file {
-				inst.h.pendingFile = nil
-				inst.h.pendingFileSize = 0
-				if inst.file != nil {
-					_ = inst.file.Close()
+	finalize = func() {
+		if hasSurvivor && movedCache && oldCacheGen != 0 && newCacheGen != 0 {
+			w.regMu.Lock()
+			cands := make([]*bufferingHandle, 0, len(w.liveByPath[survivor]))
+			for cand := range w.liveByPath[survivor] {
+				cands = append(cands, cand)
+			}
+			w.regMu.Unlock()
+			for _, cand := range cands {
+				cand.mu.Lock()
+				if cand.path == survivor && cand.stagedCacheGen == oldCacheGen {
+					cand.stagedCacheGen = newCacheGen
 				}
+				cand.mu.Unlock()
 			}
-			if inst.setImage {
-				inst.h.pendingImage = nil
-			}
-			inst.h.mu.Unlock()
 		}
-		installed = nil
-		stagedClean = nil
-		if addedPin != 0 && w.opts.Staging != nil {
-			w.unlinkedMu.Lock()
-			if w.unlinkedShadowPin[p] == addedPin {
-				delete(w.unlinkedShadowPin, p)
-				delete(w.unlinkedShadowGen, p)
-				delete(w.unlinkedShadow, p)
-			}
-			w.unlinkedMu.Unlock()
-			w.opts.Staging.Shadow.Unpin(addedPin)
-			addedPin = 0
+		releasePathLock()
+		if hasSurvivor && movedCache && w.uploader != nil && !w.hasUnclosedStagedCacheOwner(survivor) {
+			w.uploader.Submit(survivor)
 		}
 	}
-	return acquireLock, publish, persistAndUnlock, rollbackPublish, discard
+	return acquireLock, commit, finalize, abort
 }
 
 // PreparePathUnlink captures live readers and waits for active transfers
@@ -1353,21 +1544,24 @@ func (w *Writeback) PreparePathUnlinkPhased(p string, hasSurvivor bool) (
 // leaves stale snapshots installed on handles that must continue serving live
 // writes.
 func (w *Writeback) PreparePathUnlink(p string, hasSurvivor bool) func(bool) error {
-	acquireLock, publish, persistAndUnlock, rollbackPublish, discard := w.PreparePathUnlinkPhased(p, hasSurvivor)
-	return func(commit bool) error {
-		if !commit {
-			discard()
+	survivor := ""
+	if hasSurvivor && w.survivorOf != nil {
+		survivor, _ = w.survivorOf(p)
+	}
+	acquireLock, commit, finalize, abort := w.PrepareOpenUnlink(p, survivor)
+	return func(doCommit bool) error {
+		if !doCommit {
+			abort()
 			return errLayerRolledBack
 		}
 		if err := acquireLock(nil); err != nil {
-			discard()
+			abort()
 			return err
 		}
-		publish()
-		if err := persistAndUnlock(); err != nil {
-			rollbackPublish()
+		if err := commit(); err != nil {
 			return err
 		}
+		finalize()
 		return nil
 	}
 }
@@ -1404,6 +1598,7 @@ func (w *Writeback) prepareUnlinkSnapshots(p string) ([]*bufferingHandle, []prep
 	for _, ch := range submitting {
 		<-ch
 	}
+	w.waitUploaderPath(p)
 	var prepared []preparedUnlinkSnapshot
 	var firstErr error
 	for _, h := range clean {
@@ -1436,50 +1631,6 @@ func (w *Writeback) prepareUnlinkSnapshots(p string) ([]*bufferingHandle, []prep
 		})
 	}
 	return handles, prepared, firstErr
-}
-
-type installedUnlinkSnapshot struct {
-	h        *bufferingHandle
-	file     *os.File
-	setFile  bool
-	setImage bool
-}
-
-func (w *Writeback) installPreparedUnlinkSnapshotsInMemory(prepared []preparedUnlinkSnapshot) ([]installedUnlinkSnapshot, []preparedUnlinkSnapshot) {
-	installed := make([]installedUnlinkSnapshot, 0, len(prepared))
-	var stagedClean []preparedUnlinkSnapshot
-	for i := range prepared {
-		snap := prepared[i]
-		h := snap.h
-		h.mu.Lock()
-		if h.closed || h.buf != nil || h.dirty || h.mutSeq != snap.seq {
-			h.mu.Unlock()
-			if snap.file != nil {
-				_ = snap.file.Close()
-			}
-			continue
-		}
-		var inst installedUnlinkSnapshot
-		inst.h = h
-		if snap.file != nil {
-			h.pendingFile, h.pendingFileSize = snap.file, snap.size
-			inst.file = snap.file
-			inst.setFile = true
-		} else if h.pendingImage == nil {
-			h.pendingImage = snap.buf
-			inst.setImage = true
-		}
-		h.mu.Unlock()
-		if inst.setFile || inst.setImage {
-			installed = append(installed, inst)
-		}
-		if !snap.staged || snap.size == 0 || snap.file != nil {
-			w.recordUnlinkedSnapshot(h.path, 0, 0)
-			continue
-		}
-		stagedClean = append(stagedClean, snap)
-	}
-	return installed, stagedClean
 }
 
 // SetSurvivorLookup wires the facade's hardlink-alias probe.
@@ -2424,6 +2575,10 @@ func (w *Writeback) dispatch(ctx context.Context, op *fs.Op, next fs.Next) (fs.R
 			statErr = nil
 		}
 		if statErr != nil {
+			if w.rolledBack.Load() {
+				rollback()
+				return fs.Result{}, errLayerRolledBack
+			}
 			// nothing remote; a lazy-created path never landed. Local
 			// discard is enough, but queued entries must still die.
 			if w.queue != nil {
@@ -5270,9 +5425,11 @@ func (h *bufferingHandle) Release(ctx context.Context) (boundaryErr error) {
 	h.stagedToCache = false
 	h.mu.Unlock()
 	if staged && !unlinked && h.w.uploader != nil && h.w.wbCache != nil {
-		checkPath, checkUnlock := h.lockStagePath()
-		_, hasStagedMeta := h.w.wbCache.GetMeta(checkPath)
-		checkUnlock()
+		var hasStagedMeta bool
+		if checkPath, checkUnlock := h.lockLinkedStagePath(); checkUnlock != nil {
+			_, hasStagedMeta = h.w.wbCache.GetMeta(checkPath)
+			checkUnlock()
+		}
 		if hasStagedMeta {
 			useCache := true
 			if dirty {
@@ -5296,7 +5453,14 @@ func (h *bufferingHandle) Release(ctx context.Context) (boundaryErr error) {
 					uploadUnlock()
 					uploadUnlock = nil
 				}
-				submitPath, submitPathUnlock := h.lockStagePath()
+				submitPath, submitPathUnlock := h.lockLinkedStagePath()
+				if submitPathUnlock == nil {
+					finishWritebackClose()
+					if h.inner != nil {
+						_ = h.inner.Release(ctx)
+					}
+					return nil
+				}
 				h.mu.Lock()
 				if h.unlinked {
 					h.mu.Unlock()
@@ -5343,7 +5507,14 @@ func (h *bufferingHandle) Release(ctx context.Context) (boundaryErr error) {
 				uploadUnlock()
 				uploadUnlock = nil
 			}
-			submitPath, submitPathUnlock := h.lockStagePath()
+			submitPath, submitPathUnlock := h.lockLinkedStagePath()
+			if submitPathUnlock == nil {
+				finishWritebackClose()
+				if h.inner != nil {
+					_ = h.inner.Release(ctx)
+				}
+				return nil
+			}
 			h.mu.Lock()
 			if h.unlinked {
 				h.mu.Unlock()
@@ -5465,7 +5636,7 @@ func (h *bufferingHandle) releaseMigrated(ctx context.Context, e fs.Handle) erro
 	if snapshotFile != nil {
 		_ = snapshotFile.Close()
 	}
-	if h.w.debounce != nil {
+	if h.w.debounce != nil && !fs.IsRejectedOpen(ctx) {
 		h.w.debounce.Cancel(path)
 	}
 	// An anonymous descriptor still owns its unlink snapshot; the LAST one
@@ -8934,27 +9105,6 @@ func (h *bufferingHandle) lockLinkedStagePath() (string, func()) {
 			return path, lock.unlock
 		}
 		lock.unlock()
-	}
-}
-
-// lockStagePath locks w.pathLocks for h's current path, retrying if a
-// concurrent retarget moved h.path before the path lock was acquired. While
-// the returned unlock is held, any retarget that also holds w.pathLocks (via
-// lockRenamePaths) cannot move h away from the returned pathname.
-func (h *bufferingHandle) lockStagePath() (string, func()) {
-	for {
-		h.mu.Lock()
-		p := h.path
-		h.mu.Unlock()
-		h.w.notifyTestGate("stage:pathLock")
-		unlock := h.w.pathLocks.lock(p)
-		h.mu.Lock()
-		same := h.path == p
-		h.mu.Unlock()
-		if same {
-			return p, unlock
-		}
-		unlock()
 	}
 }
 

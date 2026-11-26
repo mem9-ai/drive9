@@ -74,6 +74,12 @@ func (f *FS) referencePreflight(viewLocalState bool) ReexecPreflightResult {
 	if n := f.heldLockCount(); n > 0 {
 		refuse("fuse_locks", "FUSE locks are held", n)
 	}
+	f.mu.Lock()
+	deferredCount := len(f.deferredUnlinks)
+	f.mu.Unlock()
+	if deferredCount > 0 {
+		refuse("deferred_unlinks", "pending deferred unlinks exist", deferredCount)
+	}
 	// Extensions hold their own in-memory state (session xattrs, lazy
 	// buffers); ask each through the framework's ReexecGater capability.
 	for _, h := range f.chain.Handlers() {

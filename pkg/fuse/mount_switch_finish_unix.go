@@ -210,7 +210,10 @@ func (s *mountViewSwitch) reverifyPendingTargetLeaseLocked(
 			targetLease.StopRenew()
 		}
 		if s.pendingTarget != nil {
-			_ = s.pendingTarget.stop(context.Background())
+			if serr := s.pendingTarget.stop(context.Background()); serr != nil {
+				resp := s.recoveringResp(dec, serr)
+				return nil, &resp
+			}
 			s.pendingTarget = nil
 		}
 		targetLease = &layerMountBinding{
@@ -238,7 +241,9 @@ func (s *mountViewSwitch) markRevokedLocked(dec mountstate.SwitchReceipt, cause 
 		s.pendingLease = nil
 	}
 	if s.pendingTarget != nil {
-		_ = s.pendingTarget.stop(context.Background())
+		if serr := s.pendingTarget.stop(context.Background()); serr != nil {
+			return s.recoveringResp(dec, errors.Join(cause, serr))
+		}
 		s.pendingTarget = nil
 		s.pendingInstalled = false
 	}

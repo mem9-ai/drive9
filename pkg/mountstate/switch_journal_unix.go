@@ -13,13 +13,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 
+	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/pingcap/failpoint"
+	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
 )
 
@@ -313,7 +314,7 @@ func (j *SwitchJournal) truncateTornTailLocked(validEnd, removed int) error {
 	if err := j.file.Sync(); err != nil {
 		return err
 	}
-	log.Printf("drive9: discarded %d bytes from a torn mount switch journal tail", removed)
+	logger.L().Warn("discarded torn mount switch journal tail", zap.Int("bytes", removed))
 	return nil
 }
 

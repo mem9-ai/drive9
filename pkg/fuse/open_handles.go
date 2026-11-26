@@ -74,6 +74,26 @@ func (idx *OpenHandleIndex) UnlinkPath(p string) {
 	delete(idx.byPath, p)
 }
 
+// RetargetPath rebinds open handles keyed at oldPath onto a surviving hardlink
+// alias newPath without marking them anonymous.
+func (idx *OpenHandleIndex) RetargetPath(oldPath, newPath string) {
+	if oldPath == newPath || newPath == "" {
+		return
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	handles := idx.byPath[oldPath]
+	if len(handles) == 0 {
+		return
+	}
+	for fh := range handles {
+		fh.path = newPath
+		delete(idx.unlinked, fh)
+		addHandleToSet(idx.byPath, newPath, fh)
+	}
+	delete(idx.byPath, oldPath)
+}
+
 // RestoreUnlinkedPath reverses UnlinkPath for handles still open on p when a
 // durable unlink commit fails after in-memory publication.
 func (idx *OpenHandleIndex) RestoreUnlinkedPath(p string, handles []*fileHandle) {
