@@ -364,7 +364,7 @@ func OpenContext(ctx context.Context, dsn string) (*Store, error) {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 	s := &Store{db: db, apiKeys: newAPIKeyResolveCache()}
-	if err := s.migrate(); err != nil {
+	if err := s.migrate(ctx); err != nil {
 		_ = mysqlutil.CloseInstrumented(db)
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
@@ -387,8 +387,7 @@ var tidbCloudFreeQuotaLockTimeoutSeconds = 5
 
 const tidbCloudFreeQuotaReleaseLockTimeout = 5 * time.Second
 
-func (s *Store) migrate() (err error) {
-	ctx := context.Background()
+func (s *Store) migrate(ctx context.Context) (err error) {
 	releaseLock, err := acquireMetaSchemaMigrationLock(ctx, s.db)
 	if err != nil {
 		return fmt.Errorf("acquire meta schema migration lock: %w", err)

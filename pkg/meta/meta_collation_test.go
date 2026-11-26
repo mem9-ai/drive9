@@ -208,7 +208,10 @@ func TestInsertExternalBindingWaitsForSchemaLock(t *testing.T) {
 	acquireErr := make(chan error, 1)
 	t.Cleanup(func() {
 		closeRelease()
-		<-holderDone
+		select {
+		case <-holderDone:
+		case <-time.After(30 * time.Second):
+		}
 	})
 	go func() {
 		defer close(holderDone)
@@ -330,7 +333,7 @@ func TestPinnedCollationRecoveryIsSerializedWithWriters(t *testing.T) {
 		t.Fatalf("crash state = %q, want the case-insensitive column without its index", got)
 	}
 	// A write into that gap fails closed rather than trusting the missing index.
-	if err := s.InsertExternalBinding(ctx, &ExternalBinding{
+	if err := s.InsertExternalBinding(context.Background(), &ExternalBinding{
 		Provider: "slock", SubjectKey: "into-the-gap", TenantID: "t", CreatedAt: now, UpdatedAt: now,
 	}); err == nil {
 		t.Fatal("insert succeeded while the unique subject index was missing")
@@ -351,7 +354,10 @@ func TestPinnedCollationRecoveryIsSerializedWithWriters(t *testing.T) {
 	}()
 	t.Cleanup(func() {
 		closeRelease()
-		<-holderDone
+		select {
+		case <-holderDone:
+		case <-time.After(30 * time.Second):
+		}
 	})
 	select {
 	case <-holding:
@@ -376,7 +382,7 @@ func TestPinnedCollationRecoveryIsSerializedWithWriters(t *testing.T) {
 	recovered := make(chan error, 1)
 	go func() {
 		defer func() { workerDone <- struct{}{} }()
-		reopened, err := Open(testDSN)
+		reopened, err := OpenContext(workersCtx, testDSN)
 		if err == nil {
 			_ = reopened.Close()
 		}
@@ -547,6 +553,32 @@ func TestPinnedCollationReportsAnExtraCoveringIndex(t *testing.T) {
 	if got := collationAndIndexState(t, db, "tenant_external_bindings", "subject_key", "uk_external_binding_subject"); got != "collation=utf8mb4_general_ci indexed=true" {
 		t.Fatalf("state = %q, want the column untouched and the contract index still present", got)
 	}
+}
+
+// A same-named but wrong-shaped index is neither the contract's index nor an
+// undeclared one, and TiDB refuses the collation change while it covers the column,
+// so it has to be dropped before the change and recreated as the contract declares.
+func TestPinnedCollationConvertsUnderAWrongShapedIndex(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	db := s.DB()
+	dropIndex(t, db, "tenant_external_bindings", "uk_external_binding_subject")
+	if _, err := db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings MODIFY COLUMN subject_key VARCHAR(512) COLLATE utf8mb4_general_ci NOT NULL"); err != nil {
+		t.Fatalf("downgrade the column: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE tenant_external_bindings ADD INDEX uk_external_binding_subject (provider, subject_key)"); err != nil {
+		t.Fatalf("add the non-unique same-named index: %v", err)
+	}
+	if got := collationAndIndexState(t, db, "tenant_external_bindings", "subject_key", "uk_external_binding_subject"); got != "collation=utf8mb4_general_ci indexed=true" {
+		t.Fatalf("setup state = %q, want the case-insensitive column with a non-unique index", got)
+	}
+
+	reopened, err := Open(testDSN)
+	if err != nil {
+		t.Fatalf("migration did not convert under a wrong-shaped index: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	assertPinnedCollationAndIndex(t, reopened.DB(), "tenant_external_bindings", "subject_key", "uk_external_binding_subject")
 }
 
 // A same-named index that is not unique is not proof that uniqueness is enforced:

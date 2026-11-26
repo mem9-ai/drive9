@@ -961,12 +961,19 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 // landed between the two would otherwise let the check approve a target the swap
 // does not write (and delete the directory the check approved).
 func (g *Git) swapLinkedGitDir(w *workspace, expectedCommonGitDir, expectedGitDir, preparedGitDir string) error {
-	// Resolve the common workspace before taking the workspace's write lock: resolving
-	// another workspace takes g.mu, which the reload path holds while it takes a
-	// workspace's lock, so calling it inside the frozen section would invert the order
-	// into a deadlock. Everything the section acts on is read from the frozen values.
+	// Hold the registry across the lookup, the check and the swap: the common
+	// workspace must not leave g.workspaces while the swap runs, or the check would
+	// approve a repository the swap then writes under. The order is g.mu -> w.mu,
+	// which is the order the reload path uses, so it cannot deadlock.
 	commonID := w.commonWorkspaceID()
-	common := g.workspaceByID(commonID)
+	return g.withRegistryReadLock(func() error {
+		return g.swapLinkedGitDirLocked(w, commonID, expectedCommonGitDir, expectedGitDir, preparedGitDir)
+	})
+}
+
+// swapLinkedGitDirLocked is swapLinkedGitDir with the workspace registry held.
+func (g *Git) swapLinkedGitDirLocked(w *workspace, commonID, expectedCommonGitDir, expectedGitDir, preparedGitDir string) error {
+	common := g.workspaceByIDLocked(commonID)
 	if common == nil || common.id == w.id {
 		return fmt.Errorf("git: linked workspace common repository went away during restore")
 	}

@@ -233,6 +233,26 @@ func (g *Git) workspaceByID(id string) *workspace {
 	}
 	g.mu.RLock()
 	defer g.mu.RUnlock()
+	return g.workspaceByIDLocked(id)
+}
+
+// withRegistryReadLock runs fn with the workspace registry read-locked. The restore
+// keeps it across the target check and the swap so a reload cannot remove or replace
+// the workspaces the check resolved; the order is g.mu -> w.mu, the same one the
+// reload path uses.
+func (g *Git) withRegistryReadLock(fn func() error) error {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return fn()
+}
+
+// workspaceByIDLocked is workspaceByID for a caller that already holds g.mu. The
+// restore path holds it across the target check and the swap, so a reload cannot
+// remove the common workspace the check resolved.
+func (g *Git) workspaceByIDLocked(id string) *workspace {
+	if id == "" {
+		return nil
+	}
 	for _, w := range g.workspaces {
 		if w.id == id {
 			return w

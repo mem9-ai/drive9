@@ -458,6 +458,46 @@ func TestSwapLinkedGitDirReplacesTheAdminDir(t *testing.T) {
 	}
 }
 
+// The registry is held across the check and the swap, so a reload cannot remove or
+// replace the workspaces the check resolved.
+func TestRegistryReadLockBlocksAReload(t *testing.T) {
+	g := &Git{localRoot: t.TempDir()}
+	g.workspaces = []*workspace{{id: "main", root: "/repo", workspaceKind: "main"}}
+
+	inside := make(chan struct{})
+	leave := make(chan struct{})
+	sectionDone := make(chan struct{})
+	go func() {
+		defer close(sectionDone)
+		_ = g.withRegistryReadLock(func() error {
+			close(inside)
+			<-leave
+			return nil
+		})
+	}()
+	<-inside
+
+	reloadDone := make(chan struct{})
+	go func() {
+		g.mu.Lock()
+		g.workspaces = nil
+		g.mu.Unlock()
+		close(reloadDone)
+	}()
+	select {
+	case <-reloadDone:
+		t.Fatal("a registry rewrite applied while the restore section held the registry")
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(leave)
+	<-sectionDone
+	select {
+	case <-reloadDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the registry rewrite never applied after the section ended")
+	}
+}
+
 // tarEntry is one member of a test checkpoint archive: a regular file, or a
 // symlink when symlink is set.
 type tarEntry struct {

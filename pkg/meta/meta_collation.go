@@ -207,8 +207,21 @@ func syncPinnedCollation(ctx context.Context, q metaQueryer, target metaCollatio
 			}
 		}
 		if len(extra) > 0 {
-			return fmt.Errorf("%s.%s collation is not pinned and the column is covered by index(es) %s that the schema contract does not declare; drop or rename them so the migration can convert the column",
+			return fmt.Errorf("%s.%s collation is not pinned and the column is covered by index(es) %s that the schema contract does not declare; drop them (renaming keeps them covering the column) so the migration can convert it",
 				target.table, target.column, strings.Join(extra, ", "))
+		}
+		// A covering index the contract does not recognise has to go before the change
+		// as well, or TiDB refuses the MODIFY: a same-named but wrong-shaped index is
+		// in the contract by name, not by shape, so it is neither present nor in the
+		// extra list. It is recreated below as the contract declares it.
+		for _, index := range target.indexes {
+			if !wrongShape[index.name] {
+				continue
+			}
+			if _, err := q.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s DROP INDEX %s", target.table, index.name)); err != nil && !isIgnorableMetaSchemaError(err) {
+				return fmt.Errorf("drop %s.%s before the collation change: %w", target.table, index.name, err)
+			}
+			wrongShape[index.name] = false
 		}
 		if err := pinColumnCollation(ctx, q, target, present); err != nil {
 			return err
