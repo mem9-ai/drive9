@@ -406,11 +406,11 @@ func (s *Store) migrate() (err error) {
 	if err := dropObsoleteMetaIndexes(ctx, s.db); err != nil {
 		return err
 	}
-	// Before the diff: an old installation has the subject columns indexed, and
+	// Before the diff: an old installation has the pinned columns indexed, and
 	// TiDB refuses a collation change on an indexed column, so the conversion has
 	// to run (and rebuild the indexes) before the repair planner would issue a
 	// bare MODIFY for the mismatch it is about to observe.
-	if err := ensureBinarySubjectKeyCollation(ctx, s.db); err != nil {
+	if err := ensurePinnedCollations(ctx, s.db, spec); err != nil {
 		return err
 	}
 	diffs, err := diffMetaSchema(ctx, s.db, spec)
@@ -443,115 +443,6 @@ func (s *Store) migrate() (err error) {
 		return &metaSchemaDiffError{diffs: diffs}
 	}
 	return nil
-}
-
-// binarySubjectKeyColumns are the OAuth subject columns whose comparison must be
-// byte-exact. The index is part of the entry because TiDB refuses
-// "MODIFY COLUMN ... COLLATE" while an index covers the column (error 8200), so
-// the index around the column is dropped and recreated around the change.
-var binarySubjectKeyColumns = []struct {
-	table      string
-	column     string
-	definition string
-	indexName  string
-	indexSQL   string
-	// duplicateCheckSQL is set for the unique index: recreating it must not turn
-	// into a raw duplicate-key failure, so a retry preflights the key space.
-	duplicateCheckSQL string
-}{
-	{
-		table:      "tenant_external_bindings",
-		column:     "subject_key",
-		definition: "VARCHAR(512) COLLATE utf8mb4_bin NOT NULL",
-		indexName:  "uk_external_binding_subject",
-		indexSQL:   "ALTER TABLE tenant_external_bindings ADD UNIQUE INDEX uk_external_binding_subject (provider, subject_key)",
-		duplicateCheckSQL: `SELECT COUNT(*) FROM (
-			SELECT 1 FROM tenant_external_bindings
-			GROUP BY provider, subject_key HAVING COUNT(*) > 1) AS dup`,
-	},
-	{
-		table:      "tenant_api_keys",
-		column:     "issued_by_subject_key",
-		definition: "VARCHAR(512) COLLATE utf8mb4_bin NOT NULL DEFAULT ''",
-		indexName:  "idx_api_keys_issuer",
-		indexSQL:   "ALTER TABLE tenant_api_keys ADD INDEX idx_api_keys_issuer (tenant_id, issued_by_provider, issued_by_subject_key, status, created_at)",
-	},
-}
-
-// ensureBinarySubjectKeyCollation converts an existing control plane to the
-// byte-exact subject comparison the schema contract declares. A case-insensitive
-// collation makes the OAuth subject lookup treat "SUBJ" and "subj" as the same
-// identity, which hands the caller another tenant's owner key; fresh installs get
-// the collation from CREATE TABLE, and this is the migration for the rest.
-//
-// The change itself is data-preserving: the old collation was case-insensitive, so
-// two rows differing only by case could not coexist and the binary comparison can
-// only distinguish values that were previously folded together.
-func ensureBinarySubjectKeyCollation(ctx context.Context, db *sql.DB) error {
-	for _, target := range binarySubjectKeyColumns {
-		exists, collation, err := metaColumnCollation(ctx, db, target.table, target.column)
-		if err != nil {
-			return err
-		}
-		if !exists {
-			// The table or column does not exist yet; applying the schema
-			// statements creates it with the pinned collation and indexes.
-			continue
-		}
-		indexed, err := metaIndexExists(ctx, db, target.table, target.indexName)
-		if err != nil {
-			return err
-		}
-		if !strings.EqualFold(collation, "utf8mb4_bin") {
-			if indexed {
-				if _, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s DROP INDEX %s", target.table, target.indexName)); err != nil {
-					return fmt.Errorf("drop %s.%s before collation change: %w", target.table, target.indexName, err)
-				}
-				indexed = false
-			}
-			if _, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s %s", target.table, target.column, target.definition)); err != nil {
-				return fmt.Errorf("pin %s.%s collation: %w", target.table, target.column, err)
-			}
-		}
-		// The index is restored independently of the collation branch. TiDB commits
-		// each DDL statement on its own, so a run interrupted between DROP INDEX and
-		// ADD INDEX — or between MODIFY COLUMN and ADD INDEX — leaves a column that is
-		// already binary, and skipping the restore here would leave the schema
-		// contract permanently unsatisfiable (the planner refuses to recreate a
-		// unique index on an existing table).
-		if indexed {
-			continue
-		}
-		if target.duplicateCheckSQL != "" {
-			var duplicates int64
-			if err := db.QueryRowContext(ctx, target.duplicateCheckSQL).Scan(&duplicates); err != nil {
-				return fmt.Errorf("check %s.%s duplicates: %w", target.table, target.indexName, err)
-			}
-			if duplicates > 0 {
-				return fmt.Errorf("refusing to recreate %s.%s: %d duplicate rows", target.table, target.indexName, duplicates)
-			}
-		}
-		if _, err := db.ExecContext(ctx, target.indexSQL); err != nil {
-			return fmt.Errorf("restore %s.%s: %w", target.table, target.indexName, err)
-		}
-	}
-	return nil
-}
-
-// metaColumnCollation reports whether the column exists and, when it does, the
-// collation the database reports for it.
-func metaColumnCollation(ctx context.Context, db *sql.DB, table, column string) (bool, string, error) {
-	var collation sql.NullString
-	err := db.QueryRowContext(ctx, `SELECT collation_name FROM information_schema.columns
-		WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`,
-		table, column).Scan(&collation)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, "", nil
-	}
-	if err != nil {
-		return false, "", fmt.Errorf("read %s.%s collation: %w", table, column, err)
-	}
-	return true, collation.String, nil
 }
 
 func acquireMetaSchemaMigrationLock(ctx context.Context, db *sql.DB) (func() error, error) {
@@ -797,7 +688,7 @@ func metaInitSchemaStatements() []string {
 		// case-sensitive identities from the OAuth provider, so both columns pin
 		// utf8mb4_bin: under a case-insensitive collation "SUBJ" resolves to the
 		// binding stored for "subj" and the caller is handed another tenant's key.
-		// ensureBinarySubjectKeyCollation converts existing installations (TiDB
+		// ensurePinnedCollations converts existing installations (TiDB
 		// refuses a collation change on an indexed column, so the indexes around
 		// the two columns are rebuilt).
 		`CREATE TABLE IF NOT EXISTS tenant_external_bindings (
@@ -1210,12 +1101,13 @@ func diffMetaTableMetaWithObservedIndexes(table metaTableSpec, meta metaTableMet
 			continue
 		}
 		if spec.collation != "" && !strings.EqualFold(col.collation, spec.collation) {
+			// Reported, not repaired: ensurePinnedCollations owns the conversion,
+			// because a bare MODIFY cannot run while an index covers the column.
 			diffs = append(diffs, metaSchemaDiff{
 				kind:       metaSchemaDiffColumnType,
 				tableName:  table.name,
 				columnName: name,
 				detail:     fmt.Sprintf("%s schema contract: %s column collation = %q, want %s", table.name, name, col.collation, spec.collation),
-				repairSQL:  spec.modifySQL,
 			})
 			continue
 		}
@@ -1679,16 +1571,6 @@ func isSafeModifyColumnRepairSQL(diff metaSchemaDiff) bool {
 	}
 	if diff.tableName == "org_object_backends" && diff.columnName == "secret_cipher" {
 		return n == "alter table org_object_backends modify column secret_cipher varbinary(8192) null"
-	}
-	// Pinning the collation of an OAuth subject column is data-preserving in the
-	// direction that matters: the old collation was case-insensitive, so two rows
-	// that differ only by case could not both exist and the binary comparison can
-	// only distinguish more values, never fewer.
-	if diff.tableName == "tenant_external_bindings" && diff.columnName == "subject_key" {
-		return n == "alter table tenant_external_bindings modify column subject_key varchar(512) collate utf8mb4_bin not null"
-	}
-	if diff.tableName == "tenant_api_keys" && diff.columnName == "issued_by_subject_key" {
-		return n == "alter table tenant_api_keys modify column issued_by_subject_key varchar(512) collate utf8mb4_bin not null default ''"
 	}
 	return false
 }
