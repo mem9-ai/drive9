@@ -144,3 +144,133 @@ func TestExtractGitArchiveRefusesEntriesOutsideExtractionRoot(t *testing.T) {
 		t.Fatalf("HEAD not extracted: %v", err)
 	}
 }
+
+// The archive can create symlinks of its own, and a later entry can be written
+// through them: lexical cleaning cannot see that, so extraction must refuse to
+// follow any link out of the tree. This is the reported sequence — links that
+// fold to "." and then a write that resolves outside the extraction root.
+func TestExtractGitArchiveRefusesSymlinkChainEscape(t *testing.T) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	writeLink := func(name, target string) {
+		t.Helper()
+		if err := tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeSymlink, Linkname: target}); err != nil {
+			t.Fatalf("write symlink header %q: %v", name, err)
+		}
+	}
+	writeLink("..self", ".")
+	writeLink("..up", "..self/..")
+	writeLink("..up/..self", ".")
+	writeLink("..common", "..up/..self/..")
+	body := []byte("#!/bin/sh\necho pwned\n")
+	if err := tw.WriteHeader(&tar.Header{Name: "..common/hooks/pre-commit", Mode: 0o755, Size: int64(len(body)), Typeflag: tar.TypeReg}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	parent := t.TempDir()
+	dst := filepath.Join(parent, "worktrees", "tmp")
+	if err := extractGitArchive(buf.Bytes(), dst); err == nil {
+		t.Fatal("extractGitArchive accepted a symlink chain that writes outside the extraction root")
+	}
+	// Nothing may have landed outside the extraction root.
+	for _, outside := range []string{
+		filepath.Join(parent, "hooks", "pre-commit"),
+		filepath.Join(parent, "worktrees", "hooks", "pre-commit"),
+	} {
+		if _, err := os.Stat(outside); err == nil {
+			t.Fatalf("archive wrote outside the extraction root: %s", outside)
+		}
+	}
+}
+
+// In-tree symlinks are legitimate (a checkpoint may carry "HEAD" aliases), so a
+// link whose target stays inside the root must still extract.
+func TestExtractGitArchiveAllowsInRootSymlink(t *testing.T) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	body := []byte("ref: refs/heads/main\n")
+	if err := tw.WriteHeader(&tar.Header{Name: "HEAD", Mode: 0o644, Size: int64(len(body)), Typeflag: tar.TypeReg}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "HEAD-alias", Typeflag: tar.TypeSymlink, Linkname: "HEAD"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dst := t.TempDir()
+	if err := extractGitArchive(buf.Bytes(), dst); err != nil {
+		t.Fatalf("extractGitArchive refused an in-root symlink: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dst, "HEAD-alias"))
+	if err != nil {
+		t.Fatalf("read through in-root symlink: %v", err)
+	}
+	if string(got) != string(body) {
+		t.Fatalf("HEAD-alias = %q, want %q", got, body)
+	}
+}
+
+// The worktree admin path must be a real directory: the tenant-controlled common
+// checkpoint can plant "worktrees -> refs" (or "-> ."), which a restore would then
+// replace instead of an admin directory.
+func TestLinkedWorktreeGitDirRefusesSymlinkedComponents(t *testing.T) {
+	root := t.TempDir()
+	common := filepath.Join(root, "repo", ".git")
+	if err := os.MkdirAll(filepath.Join(common, "refs", "heads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// "worktrees" as a link into the branch store.
+	if err := os.Symlink("refs", filepath.Join(common, "worktrees")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := linkedWorktreeGitDir(common, "worktrees/heads"); err == nil {
+		t.Fatalf("linkedWorktreeGitDir = %q, want a refusal for a symlinked worktrees dir", got)
+	}
+	if err := os.Remove(filepath.Join(common, "worktrees")); err != nil {
+		t.Fatal(err)
+	}
+
+	// "worktrees" real, the admin dir itself a link to the hooks directory.
+	if err := os.MkdirAll(filepath.Join(common, "worktrees"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(common, "hooks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../hooks", filepath.Join(common, "worktrees", "wt")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := linkedWorktreeGitDir(common, "worktrees/wt"); err == nil {
+		t.Fatalf("linkedWorktreeGitDir = %q, want a refusal for a symlinked admin dir", got)
+	}
+
+	// A real admin directory still resolves.
+	if err := os.Remove(filepath.Join(common, "worktrees", "wt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(common, "worktrees", "wt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := linkedWorktreeGitDir(common, "worktrees/wt"); err != nil {
+		t.Fatalf("linkedWorktreeGitDir refused a real admin dir: %v", err)
+	}
+}

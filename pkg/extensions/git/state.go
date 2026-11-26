@@ -540,10 +540,23 @@ func archiveLocalGitStateDir(gitDir string) ([]byte, error) {
 }
 
 // extractGitArchive unpacks a checkpoint archive into dst.
+//
+// The archive is tenant-supplied, and a lexical containment check is not
+// containment: an entry can create a symlink ("..self" -> ".") through which a
+// later entry writes, so filepath.Join plus os.WriteFile lands bytes outside dst
+// — a hook in the common repository's hooks directory, for instance. Every
+// operation therefore goes through an os.Root opened on dst, which resolves
+// symlinks and refuses any that leave the tree, and the lexical checks stay as
+// the cheap early rejection.
 func extractGitArchive(content []byte, dst string) error {
 	if err := os.MkdirAll(dst, 0o755); err != nil {
 		return err
 	}
+	root, err := os.OpenRoot(dst)
+	if err != nil {
+		return fmt.Errorf("git archive: open extraction root: %w", err)
+	}
+	defer func() { _ = root.Close() }()
 	gz, err := gzip.NewReader(bytes.NewReader(content))
 	if err != nil {
 		return err
@@ -567,7 +580,7 @@ func extractGitArchive(content []byte, dst string) error {
 		// inside the extraction root: an absolute name or one that climbs out
 		// is refused outright rather than skipped, because a partially
 		// extracted admin directory is still adopted by the restore below.
-		if filepath.IsAbs(name) || name == ".." || strings.HasPrefix(name, ".."+string(filepath.Separator)) {
+		if !filepath.IsLocal(name) {
 			return fmt.Errorf("git archive: entry %q is outside the extraction root", hdr.Name)
 		}
 		// A repository nested in the restored gitdir is not something this
@@ -576,35 +589,38 @@ func extractGitArchive(content []byte, dst string) error {
 		if first := strings.Split(filepath.ToSlash(name), "/")[0]; first == ".git" {
 			return fmt.Errorf("git archive: entry %q nests a repository inside the git directory", hdr.Name)
 		}
-		target := filepath.Join(dst, name)
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(target, 0o755); err != nil {
-				return err
+			if err := root.MkdirAll(name, 0o755); err != nil {
+				return fmt.Errorf("git archive: create directory %q: %w", hdr.Name, err)
 			}
 		case tar.TypeSymlink:
-			// A checkpoint archive is untrusted input: a link pointing
-			// outside the extracted tree must never materialize.
+			// A link pointing outside the tree must never materialize, and the
+			// root refuses to write through one that does.
 			if !validateGitArchiveLinkname(hdr.Linkname) {
 				return fmt.Errorf("git archive: symlink %q escapes the extraction root", hdr.Linkname)
 			}
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return err
+			if dir := filepath.Dir(name); dir != "." {
+				if err := root.MkdirAll(dir, 0o755); err != nil {
+					return fmt.Errorf("git archive: create directory for %q: %w", hdr.Name, err)
+				}
 			}
-			_ = os.Remove(target)
-			if err := os.Symlink(hdr.Linkname, target); err != nil {
-				return err
+			_ = root.Remove(name)
+			if err := root.Symlink(hdr.Linkname, name); err != nil {
+				return fmt.Errorf("git archive: create symlink %q: %w", hdr.Name, err)
 			}
 		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return err
+			if dir := filepath.Dir(name); dir != "." {
+				if err := root.MkdirAll(dir, 0o755); err != nil {
+					return fmt.Errorf("git archive: create directory for %q: %w", hdr.Name, err)
+				}
 			}
 			data, err := io.ReadAll(tr)
 			if err != nil {
 				return err
 			}
-			if err := os.WriteFile(target, data, fs.FileMode(hdr.Mode)&0o777|0o600); err != nil {
-				return err
+			if err := root.WriteFile(name, data, fs.FileMode(hdr.Mode)&0o777|0o600); err != nil {
+				return fmt.Errorf("git archive: write %q: %w", hdr.Name, err)
 			}
 		}
 	}
@@ -900,6 +916,13 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 	if !gitDirLooksUsable(ctx, tmpGitDir) {
 		return fmt.Errorf("restored git state is missing a usable HEAD")
 	}
+	if linkedCommonGitDir != "" {
+		// Re-check immediately before the swap: everything above ran with the
+		// common repository materialized and writable.
+		if err := ensureWorktreeAdminPathIsReal(linkedCommonGitDir, w.gitDirRelPath()); err != nil {
+			return err
+		}
+	}
 	if err := os.RemoveAll(gitDir); err != nil {
 		return err
 	}
@@ -963,7 +986,55 @@ func linkedWorktreeGitDir(commonGitDir, gitDirRel string) (string, error) {
 	if !strings.HasPrefix(target, filepath.Clean(commonGitDir)+string(filepath.Separator)) {
 		return "", fmt.Errorf("git: linked workspace gitdir %q escapes the common repository", gitDirRel)
 	}
+	// ...and no component may be a symlink: the common repository's own checkpoint
+	// is tenant-controlled, so it can plant "worktrees -> ." or "worktrees -> refs"
+	// and have this restore replace a directory git reads refs or hooks from. The
+	// lexical prefix check above cannot see that.
+	if err := ensureWorktreeAdminPathIsReal(commonGitDir, rel); err != nil {
+		return "", err
+	}
 	return target, nil
+}
+
+// ensureWorktreeAdminPathIsReal refuses a worktree admin path whose components
+// exist as symlinks (or as non-directories). The restore deletes and replaces
+// whatever this path names, so a link planted by the tenant-controlled common
+// checkpoint would redirect the replacement — "worktrees -> refs" makes
+// worktrees/<name> land in the branch store, "worktrees -> ." reaches the hooks
+// directory one level down.
+func ensureWorktreeAdminPathIsReal(commonGitDir, rel string) error {
+	baseReal, err := filepath.EvalSymlinks(commonGitDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Nothing restored yet: the restore creates real directories.
+			return nil
+		}
+		return fmt.Errorf("git: resolve common git dir: %w", err)
+	}
+	worktreesDir := filepath.Join(baseReal, "worktrees")
+	info, err := os.Lstat(worktreesDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("git: inspect worktrees directory: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("git: %q is not a worktrees directory", worktreesDir)
+	}
+	name := filepath.Base(filepath.FromSlash(rel))
+	adminDir := filepath.Join(worktreesDir, name)
+	info, err = os.Lstat(adminDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("git: inspect worktree admin path: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("git: worktree admin path %q is not a directory", adminDir)
+	}
+	return nil
 }
 
 // safeGitWorktreeAdminName reports whether name can be a worktree id below
