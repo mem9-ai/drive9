@@ -31,10 +31,12 @@ NOCSUM_LOCAL_ROOT="$WORK_ROOT/nocsum-local"
 REMOTE_ARCHIVE="/pack-integrity-${TS}.tar.gz"
 MANIFEST_PY="$RUN_DIR/pack_integrity_manifest.py"
 ARCHIVE_PY="$RUN_DIR/pack_integrity_archive.py"
+# This case tampers with the archive, so it needs the downloaded copy.
+PACK_DOWNLOAD_ARCHIVE=1
 LIB="$(cd "$(dirname "$0")" && pwd)/pack-integrity-lib.sh"
 export PACK_FILES WORK_ROOT SRC_LOCAL_ROOT RESTORE_LOCAL_ROOT CORRUPT_LOCAL_ROOT
 export FUTURE_LOCAL_ROOT NOCSUM_LOCAL_ROOT REMOTE_ARCHIVE MANIFEST_PY ARCHIVE_PY
-export TS LIB
+export TS LIB PACK_DOWNLOAD_ARCHIVE
 
 cleanup() {
     "$CLI" fs rm -r ":$REMOTE_ARCHIVE" >/dev/null 2>&1 || true
@@ -42,6 +44,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 check shell --req 'drive9-pack-integrity-fixture' --claim "pack-integrity-fixture-${PACK_FILES}-files" -- sh -c '
+    set -eu
     . "$LIB"
     write_pack_integrity_helpers
     mkdir -p "$WORK_ROOT"
@@ -50,11 +53,13 @@ check shell --req 'drive9-pack-integrity-fixture' --claim "pack-integrity-fixtur
 '
 
 check shell --req 'drive9-pack-integrity-roundtrip' --claim 'pack-unpack-count-and-sha256-match' -- sh -c '
+    set -eu
     . "$LIB"
     pack_integrity_roundtrip "$SRC_LOCAL_ROOT" "$RESTORE_LOCAL_ROOT" ":$REMOTE_ARCHIVE" "$PACK_FILES"
 '
 
 check shell --req 'drive9-pack-integrity-corrupt' --claim 'corrupt-archive-refused-without-install' -- sh -c '
+    set -eu
     . "$LIB"
     python3 "$ARCHIVE_PY" "$WORK_ROOT/archive.tar.gz" "$WORK_ROOT/corrupt.tar.gz" corrupt-entry
     "$CLI" fs cp "$WORK_ROOT/corrupt.tar.gz" ":$REMOTE_ARCHIVE" >/dev/null
@@ -67,6 +72,7 @@ check shell --req 'drive9-pack-integrity-corrupt' --claim 'corrupt-archive-refus
 '
 
 check shell --req 'drive9-pack-integrity-future-version' --claim 'future-version-refused' -- sh -c '
+    set -eu
     . "$LIB"
     python3 "$ARCHIVE_PY" "$WORK_ROOT/archive.tar.gz" "$WORK_ROOT/future.tar.gz" future-version
     "$CLI" fs cp "$WORK_ROOT/future.tar.gz" ":$REMOTE_ARCHIVE" >/dev/null
@@ -78,6 +84,7 @@ check shell --req 'drive9-pack-integrity-future-version' --claim 'future-version
 '
 
 check shell --req 'drive9-pack-integrity-missing-checksum' --claim 'archive-without-checksums-refused' -- sh -c '
+    set -eu
     . "$LIB"
     python3 "$ARCHIVE_PY" "$WORK_ROOT/archive.tar.gz" "$WORK_ROOT/nocsum.tar.gz" drop-checksums
     "$CLI" fs cp "$WORK_ROOT/nocsum.tar.gz" ":$REMOTE_ARCHIVE" >/dev/null

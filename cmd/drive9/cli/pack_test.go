@@ -1866,3 +1866,129 @@ func TestExtractPackArchiveRejectsMissingPerFileChecksum(t *testing.T) {
 		t.Fatalf("unpack error = %v, want it to name the unchecked file", err)
 	}
 }
+
+func TestExtractPackArchiveRejectsDuplicateManifest(t *testing.T) {
+	// A second manifest could otherwise downgrade the declared version and skip
+	// verification for the bytes that came before it.
+	entries := decodePackTarEntries(t, writeSmallPackArchive(t))
+	var out []packTarEntry
+	for _, entry := range entries {
+		out = append(out, entry)
+		if entry.name == packManifestEntryName {
+			var manifest map[string]any
+			if err := json.Unmarshal(entry.body, &manifest); err != nil {
+				t.Fatalf("decode manifest: %v", err)
+			}
+			manifest["version"] = 1.0
+			body, err := json.Marshal(manifest)
+			if err != nil {
+				t.Fatalf("encode manifest: %v", err)
+			}
+			out = append(out, packTarEntry{name: packManifestEntryName, mode: 0o644, typeflag: tar.TypeReg, body: body})
+		}
+	}
+	_, err := extractPackArchive(context.Background(), bytes.NewReader(encodePackTarEntries(t, out)), unpackOptions{
+		LocalRoot: t.TempDir(),
+		Replace:   true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "duplicate "+packManifestEntryName) {
+		t.Fatalf("unpack error = %v, want a duplicate manifest rejection", err)
+	}
+}
+
+func TestExtractPackArchiveRejectsDuplicateChecksums(t *testing.T) {
+	entries := decodePackTarEntries(t, writeSmallPackArchive(t))
+	var out []packTarEntry
+	for _, entry := range entries {
+		out = append(out, entry)
+		if entry.name == packChecksumEntryName {
+			out = append(out, packTarEntry{name: packChecksumEntryName, mode: 0o644, typeflag: tar.TypeReg, body: []byte(`{"format":"drive9.pack.v1","version":2,"entries":{}}`)})
+		}
+	}
+	_, err := extractPackArchive(context.Background(), bytes.NewReader(encodePackTarEntries(t, out)), unpackOptions{
+		LocalRoot: t.TempDir(),
+		Replace:   true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "duplicate "+packChecksumEntryName) {
+		t.Fatalf("unpack error = %v, want a duplicate checksum rejection", err)
+	}
+}
+
+func TestExtractPackArchiveRejectsUnlistedStagedFile(t *testing.T) {
+	// An entry the manifest never names must not be installed unverified.
+	entries := decodePackTarEntries(t, writeSmallPackArchive(t))
+	entries = append(entries, packTarEntry{
+		name:     packArchiveEntryPrefix + "repo/nested/evil.txt",
+		mode:     0o644,
+		typeflag: tar.TypeReg,
+		body:     []byte("not in the manifest\n"),
+	})
+	_, err := extractPackArchive(context.Background(), bytes.NewReader(encodePackTarEntries(t, entries)), unpackOptions{
+		LocalRoot: t.TempDir(),
+		Replace:   true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "/repo/nested/evil.txt") {
+		t.Fatalf("unpack error = %v, want the unlisted file named", err)
+	}
+}
+
+func TestExtractPackArchiveAcceptsVersionZeroArchive(t *testing.T) {
+	// Archives written before the version field existed decode as 0; they are
+	// version 1 by definition and must still unpack.
+	entries := decodePackTarEntries(t, writeSmallPackArchive(t))
+	for i := range entries {
+		switch entries[i].name {
+		case packChecksumEntryName:
+			entries[i].body = nil
+		case packManifestEntryName:
+			var manifest map[string]any
+			if err := json.Unmarshal(entries[i].body, &manifest); err != nil {
+				t.Fatalf("decode manifest: %v", err)
+			}
+			delete(manifest, "version")
+			body, err := json.Marshal(manifest)
+			if err != nil {
+				t.Fatalf("encode manifest: %v", err)
+			}
+			entries[i].body = body
+		}
+	}
+	var kept []packTarEntry
+	for _, entry := range entries {
+		if entry.name == packChecksumEntryName {
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	localRoot := t.TempDir()
+	manifest, err := extractPackArchive(context.Background(), bytes.NewReader(encodePackTarEntries(t, kept)), unpackOptions{
+		LocalRoot: localRoot,
+		Replace:   true,
+	})
+	if err != nil {
+		t.Fatalf("extract version-zero archive: %v", err)
+	}
+	if manifest.Version != packMinFormatVersion {
+		t.Fatalf("version-zero manifest resolved to %d, want %d", manifest.Version, packMinFormatVersion)
+	}
+	assertFileContent(t, filepath.Join(localRoot, "overlay", "repo", "a.txt"), "alpha\n")
+}
+
+func TestExtractPackArchiveLeavesDestinationUntouchedOnChecksumFailure(t *testing.T) {
+	entries := decodePackTarEntries(t, writeSmallPackArchive(t))
+	for i := range entries {
+		if entries[i].name == packArchiveEntryPrefix+"repo/a.txt" {
+			entries[i].body = []byte("alphx\n")
+		}
+	}
+	localRoot := t.TempDir()
+	if _, err := extractPackArchive(context.Background(), bytes.NewReader(encodePackTarEntries(t, entries)), unpackOptions{
+		LocalRoot: localRoot,
+		Replace:   true,
+	}); err == nil {
+		t.Fatal("unpack accepted an archive whose content does not match its checksum")
+	}
+	if _, err := os.Stat(filepath.Join(localRoot, "overlay")); !os.IsNotExist(err) {
+		t.Fatalf("failed unpack installed content (overlay exists): err=%v", err)
+	}
+}

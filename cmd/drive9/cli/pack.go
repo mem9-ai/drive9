@@ -26,6 +26,10 @@ import (
 )
 
 const (
+	// packArchiveFormat is the archive magic. It stays v1 across format
+	// versions on purpose: the manifest's version field, not the magic, selects
+	// the reader behaviour, and changing the magic would make every existing
+	// archive unreadable.
 	packArchiveFormat      = "drive9.pack.v1"
 	packManifestEntryName  = ".drive9-pack-manifest.json"
 	packChecksumEntryName  = ".drive9-pack-checksums.json"
@@ -40,6 +44,11 @@ const (
 	packFormatVersion = 2
 	// packMinFormatVersion is the oldest version this binary can read.
 	packMinFormatVersion = 1
+	// maxPackChecksumBytes bounds the trailing checksum entry a reader will
+	// decode. It is archive-controlled, so it must not be unbounded; 100000
+	// entries need about 10 MiB, and this leaves headroom without letting a
+	// hostile archive allocate an arbitrary map.
+	maxPackChecksumBytes = 64 << 20
 )
 
 type packManifest struct {
@@ -376,10 +385,12 @@ func validatePackFormatVersion(version int) (int, error) {
 		return packMinFormatVersion, nil
 	case version >= packMinFormatVersion && version <= packFormatVersion:
 		return version, nil
-	default:
+	case version > packFormatVersion:
 		return 0, fmt.Errorf(
 			"unsupported pack archive version %d: this drive9 reads versions %d through %d, so upgrade drive9 before unpacking this archive",
 			version, packMinFormatVersion, packFormatVersion)
+	default:
+		return 0, fmt.Errorf("invalid pack archive version %d", version)
 	}
 }
 
@@ -546,6 +557,9 @@ func extractPackArchive(ctx context.Context, r io.Reader, opts unpackOptions) (*
 			return nil, fmt.Errorf("read pack entry: %w", err)
 		}
 		if hdr.Name == packManifestEntryName {
+			if sawManifest {
+				return nil, fmt.Errorf("invalid pack archive: duplicate %s", packManifestEntryName)
+			}
 			sawManifest = true
 			if err := json.NewDecoder(tr).Decode(&manifest); err != nil {
 				return nil, fmt.Errorf("decode pack manifest: %w", err)
@@ -564,8 +578,11 @@ func extractPackArchive(ctx context.Context, r io.Reader, opts unpackOptions) (*
 			if !sawManifest {
 				return nil, fmt.Errorf("invalid pack archive: %s must follow the manifest", packChecksumEntryName)
 			}
+			if sums != nil {
+				return nil, fmt.Errorf("invalid pack archive: duplicate %s", packChecksumEntryName)
+			}
 			decoded := packChecksums{}
-			if err := json.NewDecoder(tr).Decode(&decoded); err != nil {
+			if err := json.NewDecoder(io.LimitReader(tr, maxPackChecksumBytes)).Decode(&decoded); err != nil {
 				return nil, fmt.Errorf("decode pack checksums: %w", err)
 			}
 			sums = &decoded
@@ -1218,9 +1235,10 @@ type packDirTime struct {
 }
 
 // verifyPackChecksums compares the staged tree against the archive's trailing
-// checksum entry before anything is installed. A mismatch means the archive is
-// truncated, corrupted, or was rebuilt by hand; installing it would silently
-// replace local work with the damaged copy.
+// checksum entry before anything is installed. It walks what was actually
+// extracted instead of trusting the manifest: an entry the manifest does not
+// name is as much a corruption as a file whose bytes changed, and a manifest
+// entry that never arrived must not pass because its checksum was never read.
 func verifyPackChecksums(stageRoot string, manifest *packManifest, sums *packChecksums) error {
 	if sums == nil {
 		return fmt.Errorf("invalid pack archive: version %d archive is missing %s", manifest.Version, packChecksumEntryName)
@@ -1231,38 +1249,66 @@ func verifyPackChecksums(stageRoot string, manifest *packManifest, sums *packChe
 	if _, err := validatePackFormatVersion(sums.Version); err != nil {
 		return err
 	}
-	files := 0
-	for _, entry := range manifest.Entries {
-		if entry.Type != "file" {
-			continue
-		}
-		files++
-		want, ok := sums.Entries[entry.Path]
-		if !ok {
-			return fmt.Errorf("invalid pack archive: no checksum for %q", entry.Path)
-		}
-		rel := strings.TrimSuffix(strings.TrimPrefix(entry.Path, "/"), "/")
-		target, err := safeOverlayTarget(stageRoot, rel)
+	if sums.Version != manifest.Version {
+		return fmt.Errorf("invalid pack archive: checksum entry declares version %d but the manifest declares %d", sums.Version, manifest.Version)
+	}
+	overlay := filepath.Join(stageRoot, "overlay")
+	staged := make(map[string]int64, len(sums.Entries))
+	walkErr := filepath.WalkDir(overlay, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		gotSum, gotSize, err := fileSHA256(target)
-		if err != nil {
-			return fmt.Errorf("checksum staged %q: %w", entry.Path, err)
+		if !d.Type().IsRegular() {
+			return nil
 		}
-		if gotSize != want.Size || gotSum != want.SHA256 {
+		rel, err := filepath.Rel(overlay, path)
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		staged["/"+filepath.ToSlash(rel)] = info.Size()
+		return nil
+	})
+	if walkErr != nil {
+		return fmt.Errorf("scan staged pack tree: %w", walkErr)
+	}
+	for path, size := range staged {
+		want, ok := sums.Entries[path]
+		if !ok {
+			return fmt.Errorf("invalid pack archive: staged file %q is not covered by %s", path, packChecksumEntryName)
+		}
+		gotSum, gotSize, err := regularFileSHA256(filepath.Join(overlay, strings.TrimPrefix(path, "/")))
+		if err != nil {
+			return fmt.Errorf("checksum staged %q: %w", path, err)
+		}
+		if gotSize != want.Size || size != want.Size || gotSum != want.SHA256 {
 			return fmt.Errorf(
 				"pack content mismatch for %q: archive declares %d bytes sha256 %s, staged copy is %d bytes sha256 %s",
-				entry.Path, want.Size, want.SHA256, gotSize, gotSum)
+				path, want.Size, want.SHA256, gotSize, gotSum)
 		}
 	}
-	if len(sums.Entries) != files {
-		return fmt.Errorf("invalid pack archive: %d checksums for %d file entries", len(sums.Entries), files)
+	for path := range sums.Entries {
+		if _, ok := staged[path]; !ok {
+			return fmt.Errorf("invalid pack archive: %q is declared with a checksum but was not extracted", path)
+		}
 	}
 	return nil
 }
 
-func fileSHA256(path string) (string, int64, error) {
+// regularFileSHA256 hashes a staged file that WalkDir already classified as a
+// regular file. Lstat re-checks the type so a link swapped in after the walk is
+// reported instead of being followed out of the overlay.
+func regularFileSHA256(path string) (string, int64, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", 0, err
+	}
+	if !info.Mode().IsRegular() {
+		return "", 0, fmt.Errorf("staged object is not a regular file")
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return "", 0, err

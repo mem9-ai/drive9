@@ -23,10 +23,12 @@ SRC_LOCAL_ROOT="$WORK_ROOT/source-local"
 RESTORE_LOCAL_ROOT="$WORK_ROOT/restore-local"
 REMOTE_ARCHIVE="/pack-100k-${TS}.tar.gz"
 MANIFEST_PY="$RUN_DIR/pack_100k_manifest.py"
-ARCHIVE_PY="$RUN_DIR/pack_100k_archive.py"
+# The round-trip helper only downloads the finished archive when the caller
+# needs to tamper with it; this case only verifies the round trip.
+PACK_DOWNLOAD_ARCHIVE=0
 LIB="$(cd "$(dirname "$0")" && pwd)/pack-integrity-lib.sh"
 export PACK_FILES WORK_ROOT SRC_LOCAL_ROOT RESTORE_LOCAL_ROOT REMOTE_ARCHIVE
-export MANIFEST_PY ARCHIVE_PY TS LIB
+export MANIFEST_PY PACK_DOWNLOAD_ARCHIVE TS LIB
 
 cleanup() {
     "$CLI" fs rm -r ":$REMOTE_ARCHIVE" >/dev/null 2>&1 || true
@@ -34,6 +36,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 check shell --req 'drive9-pack-100k-fixture' --claim 'pack-100k-fixture-built' -- sh -c '
+    set -eu
     . "$LIB"
     write_pack_integrity_helpers
     mkdir -p "$WORK_ROOT"
@@ -42,6 +45,7 @@ check shell --req 'drive9-pack-100k-fixture' --claim 'pack-100k-fixture-built' -
 '
 
 check shell --req 'drive9-pack-100k-roundtrip' --claim 'pack-100k-count-and-sha256-match' -- sh -c '
+    set -eu
     . "$LIB"
     pack_integrity_roundtrip "$SRC_LOCAL_ROOT" "$RESTORE_LOCAL_ROOT" ":$REMOTE_ARCHIVE" "$PACK_FILES"
 '

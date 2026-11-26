@@ -36,6 +36,9 @@ for rec in sorted(records, key=lambda item: item["path"]):
     print(json.dumps(rec, sort_keys=True, separators=(",", ":")))
 PYEOF
 
+    if [ -z "${ARCHIVE_PY:-}" ]; then
+        return 0
+    fi
     cat > "$ARCHIVE_PY" <<'PYEOF'
 """Rewrite a pack archive the way a damaged or incompatible writer would.
 
@@ -112,7 +115,8 @@ while pos + BLOCK <= len(raw):
         continue
     if mode == "corrupt-entry" and name.startswith(b"entries/") and block[156:157] in (b"0", b"\0") and body:
         flipped = bytes([body[0] ^ 0xFF]) + body[1:]
-        out += block + flipped + b"\0" * (len(body) - len(flipped))
+        padding = (BLOCK - len(flipped) % BLOCK) % BLOCK
+        out += block + flipped + b"\0" * padding
         pos = consumed_end
         continue
     out += raw[pos:consumed_end]
@@ -153,5 +157,7 @@ pack_integrity_roundtrip() {
     files=$(find "$restore/overlay" -type f | wc -l | tr -d " ")
     test "$files" = "$count"
     diff -u "$WORK_ROOT/source-manifest.jsonl" "$WORK_ROOT/restore-manifest.jsonl"
-    "$CLI" fs cp "$archive" "$download" >/dev/null
+    if [ "${PACK_DOWNLOAD_ARCHIVE:-1}" = "1" ]; then
+        "$CLI" fs cp "$archive" "$download" >/dev/null
+    fi
 }
