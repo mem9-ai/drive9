@@ -455,6 +455,9 @@ var binarySubjectKeyColumns = []struct {
 	definition string
 	indexName  string
 	indexSQL   string
+	// duplicateCheckSQL is set for the unique index: recreating it must not turn
+	// into a raw duplicate-key failure, so a retry preflights the key space.
+	duplicateCheckSQL string
 }{
 	{
 		table:      "tenant_external_bindings",
@@ -462,6 +465,9 @@ var binarySubjectKeyColumns = []struct {
 		definition: "VARCHAR(512) COLLATE utf8mb4_bin NOT NULL",
 		indexName:  "uk_external_binding_subject",
 		indexSQL:   "ALTER TABLE tenant_external_bindings ADD UNIQUE INDEX uk_external_binding_subject (provider, subject_key)",
+		duplicateCheckSQL: `SELECT COUNT(*) FROM (
+			SELECT 1 FROM tenant_external_bindings
+			GROUP BY provider, subject_key HAVING COUNT(*) > 1) AS dup`,
 	},
 	{
 		table:      "tenant_api_keys",
@@ -483,43 +489,69 @@ var binarySubjectKeyColumns = []struct {
 // only distinguish values that were previously folded together.
 func ensureBinarySubjectKeyCollation(ctx context.Context, db *sql.DB) error {
 	for _, target := range binarySubjectKeyColumns {
-		var collation sql.NullString
-		err := db.QueryRowContext(ctx, `SELECT collation_name FROM information_schema.columns
-			WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`,
-			target.table, target.column).Scan(&collation)
-		if errors.Is(err, sql.ErrNoRows) {
-			// The table or column does not exist yet; applying the schema
-			// statements creates it with the pinned collation.
-			continue
-		}
+		exists, collation, err := metaColumnCollation(ctx, db, target.table, target.column)
 		if err != nil {
-			return fmt.Errorf("read %s.%s collation: %w", target.table, target.column, err)
+			return err
 		}
-		if !collation.Valid || strings.EqualFold(collation.String, "utf8mb4_bin") {
+		if !exists {
+			// The table or column does not exist yet; applying the schema
+			// statements creates it with the pinned collation and indexes.
 			continue
 		}
-		var indexed bool
-		if err := db.QueryRowContext(ctx, `SELECT EXISTS (
-				SELECT 1 FROM information_schema.statistics
-				WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?)`,
-			target.table, target.indexName).Scan(&indexed); err != nil {
-			return fmt.Errorf("read %s.%s index: %w", target.table, target.indexName, err)
+		indexed, err := metaIndexExists(ctx, db, target.table, target.indexName)
+		if err != nil {
+			return err
 		}
-		if indexed {
-			if _, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s DROP INDEX %s", target.table, target.indexName)); err != nil {
-				return fmt.Errorf("drop %s.%s before collation change: %w", target.table, target.indexName, err)
+		if !strings.EqualFold(collation, "utf8mb4_bin") {
+			if indexed {
+				if _, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s DROP INDEX %s", target.table, target.indexName)); err != nil {
+					return fmt.Errorf("drop %s.%s before collation change: %w", target.table, target.indexName, err)
+				}
+				indexed = false
+			}
+			if _, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s %s", target.table, target.column, target.definition)); err != nil {
+				return fmt.Errorf("pin %s.%s collation: %w", target.table, target.column, err)
 			}
 		}
-		if _, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s %s", target.table, target.column, target.definition)); err != nil {
-			return fmt.Errorf("pin %s.%s collation: %w", target.table, target.column, err)
-		}
+		// The index is restored independently of the collation branch. TiDB commits
+		// each DDL statement on its own, so a run interrupted between DROP INDEX and
+		// ADD INDEX — or between MODIFY COLUMN and ADD INDEX — leaves a column that is
+		// already binary, and skipping the restore here would leave the schema
+		// contract permanently unsatisfiable (the planner refuses to recreate a
+		// unique index on an existing table).
 		if indexed {
-			if _, err := db.ExecContext(ctx, target.indexSQL); err != nil {
-				return fmt.Errorf("restore %s.%s after collation change: %w", target.table, target.indexName, err)
+			continue
+		}
+		if target.duplicateCheckSQL != "" {
+			var duplicates int64
+			if err := db.QueryRowContext(ctx, target.duplicateCheckSQL).Scan(&duplicates); err != nil {
+				return fmt.Errorf("check %s.%s duplicates: %w", target.table, target.indexName, err)
 			}
+			if duplicates > 0 {
+				return fmt.Errorf("refusing to recreate %s.%s: %d duplicate rows", target.table, target.indexName, duplicates)
+			}
+		}
+		if _, err := db.ExecContext(ctx, target.indexSQL); err != nil {
+			return fmt.Errorf("restore %s.%s: %w", target.table, target.indexName, err)
 		}
 	}
 	return nil
+}
+
+// metaColumnCollation reports whether the column exists and, when it does, the
+// collation the database reports for it.
+func metaColumnCollation(ctx context.Context, db *sql.DB, table, column string) (bool, string, error) {
+	var collation sql.NullString
+	err := db.QueryRowContext(ctx, `SELECT collation_name FROM information_schema.columns
+		WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`,
+		table, column).Scan(&collation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, "", nil
+	}
+	if err != nil {
+		return false, "", fmt.Errorf("read %s.%s collation: %w", table, column, err)
+	}
+	return true, collation.String, nil
 }
 
 func acquireMetaSchemaMigrationLock(ctx context.Context, db *sql.DB) (func() error, error) {

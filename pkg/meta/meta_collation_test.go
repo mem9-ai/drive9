@@ -174,3 +174,77 @@ func TestEnsureBinarySubjectKeyCollationConvertsExistingInstall(t *testing.T) {
 		t.Fatalf("second ensureBinarySubjectKeyCollation: %v", err)
 	}
 }
+
+// TiDB commits each DDL statement on its own, so a migration interrupted between
+// the index drop and its recreation leaves the column binary with no index. The
+// retry must restore the index instead of skipping the column as "already binary"
+// — otherwise the schema planner refuses to recreate a unique index on an existing
+// table and every later startup fails.
+func TestBinarySubjectKeyCollationRestoresIndexAfterInterruptedRun(t *testing.T) {
+	cases := []struct {
+		name string
+		// prepare leaves the database in the state a crash between the two DDL
+		// statements would produce.
+		prepare func(t *testing.T, db *sql.DB)
+	}{
+		{
+			name: "crashed after MODIFY COLUMN",
+			prepare: func(t *testing.T, db *sql.DB) {
+				t.Helper()
+				// Column already binary, index missing.
+				if _, err := db.ExecContext(context.Background(),
+					"ALTER TABLE tenant_external_bindings DROP INDEX uk_external_binding_subject"); err != nil {
+					t.Fatalf("drop index: %v", err)
+				}
+			},
+		},
+		{
+			name: "crashed after DROP INDEX",
+			prepare: func(t *testing.T, db *sql.DB) {
+				t.Helper()
+				// Index missing and the column still case-insensitive.
+				if _, err := db.ExecContext(context.Background(),
+					"ALTER TABLE tenant_external_bindings DROP INDEX uk_external_binding_subject"); err != nil {
+					t.Fatalf("drop index: %v", err)
+				}
+				if _, err := db.ExecContext(context.Background(),
+					"ALTER TABLE tenant_external_bindings MODIFY COLUMN subject_key VARCHAR(512) COLLATE utf8mb4_general_ci NOT NULL"); err != nil {
+					t.Fatalf("downgrade column: %v", err)
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newControlStore(t)
+			tc.prepare(t, s.DB())
+
+			reopened, err := Open(testDSN)
+			if err != nil {
+				t.Fatalf("migration did not recover from an interrupted run: %v", err)
+			}
+			t.Cleanup(func() { _ = reopened.Close() })
+
+			var collation sql.NullString
+			if err := reopened.DB().QueryRowContext(context.Background(), `SELECT collation_name
+				FROM information_schema.columns
+				WHERE table_schema = DATABASE() AND table_name = 'tenant_external_bindings'
+					AND column_name = 'subject_key'`).Scan(&collation); err != nil {
+				t.Fatalf("read collation: %v", err)
+			}
+			if collation.String != "utf8mb4_bin" {
+				t.Fatalf("subject_key collation = %q, want utf8mb4_bin", collation.String)
+			}
+			var indexed bool
+			if err := reopened.DB().QueryRowContext(context.Background(), `SELECT EXISTS (
+					SELECT 1 FROM information_schema.statistics
+					WHERE table_schema = DATABASE() AND table_name = 'tenant_external_bindings'
+						AND index_name = 'uk_external_binding_subject')`).Scan(&indexed); err != nil {
+				t.Fatalf("read index: %v", err)
+			}
+			if !indexed {
+				t.Fatal("unique index was not restored after an interrupted run")
+			}
+		})
+	}
+}
