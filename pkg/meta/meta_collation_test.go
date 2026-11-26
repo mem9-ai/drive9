@@ -376,6 +376,7 @@ func TestPinnedCollationRecoveryIsSerializedWithWriters(t *testing.T) {
 			select {
 			case <-workerDone:
 			case <-time.After(30 * time.Second):
+				t.Errorf("a recovery worker did not exit after its context was canceled")
 			}
 		}
 	})
@@ -403,7 +404,11 @@ func TestPinnedCollationRecoveryIsSerializedWithWriters(t *testing.T) {
 		}
 	}
 	closeRelease()
-	<-holderDone
+	select {
+	case <-holderDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the schema-lock holder never exited after the gate was released")
+	}
 
 	select {
 	case err := <-recovered:
@@ -579,6 +584,9 @@ func TestPinnedCollationConvertsUnderAWrongShapedIndex(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = reopened.Close() })
 	assertPinnedCollationAndIndex(t, reopened.DB(), "tenant_external_bindings", "subject_key", "uk_external_binding_subject")
+	// The replacement has to be the contract's unique index, not just the same name.
+	assertPinnedCollationIndexShape(t, reopened.DB(), "tenant_external_bindings", "subject_key", "uk_external_binding_subject",
+		&metaCollationIndex{name: "uk_external_binding_subject", columns: []string{"provider", "subject_key"}, unique: true})
 }
 
 // A same-named index that is not unique is not proof that uniqueness is enforced:
@@ -653,8 +661,40 @@ func collationAndIndexState(t *testing.T, db *sql.DB, table, column, index strin
 
 func assertPinnedCollationAndIndex(t *testing.T, db *sql.DB, table, column, index string) {
 	t.Helper()
+	assertPinnedCollationIndexShape(t, db, table, column, index, nil)
+}
+
+// assertPinnedCollationIndexShape also checks the index is the contract's: same
+// uniqueness and columns. A name-only check would accept the wrong-shaped index this
+// migration is supposed to replace.
+func assertPinnedCollationIndexShape(t *testing.T, db *sql.DB, table, column, index string, shape *metaCollationIndex) {
+	t.Helper()
 	if got := collationAndIndexState(t, db, table, column, index); got != "collation=utf8mb4_bin indexed=true" {
 		t.Fatalf("%s.%s state = %q, want collation=utf8mb4_bin indexed=true", table, column, got)
+	}
+	want := shape
+	if want == nil {
+		for _, target := range metaPinnedCollationTargets(mustMetaSpec(t)) {
+			if target.table != table || target.column != column {
+				continue
+			}
+			for _, candidate := range target.indexes {
+				if candidate.name == index {
+					shapeCopy := candidate
+					want = &shapeCopy
+				}
+			}
+		}
+	}
+	if want == nil {
+		t.Fatalf("no contract index %s.%s to compare with", table, index)
+	}
+	present, healthy, err := metaIndexMatches(context.Background(), db, table, *want)
+	if err != nil {
+		t.Fatalf("read %s.%s shape: %v", table, index, err)
+	}
+	if !present || !healthy {
+		t.Fatalf("%s.%s is not the contract index shape (present=%v healthy=%v)", table, index, present, healthy)
 	}
 }
 

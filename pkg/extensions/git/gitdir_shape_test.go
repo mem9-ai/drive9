@@ -498,6 +498,45 @@ func TestRegistryReadLockBlocksAReload(t *testing.T) {
 	}
 }
 
+// The post-swap verification must not run under the registry read lock: with a writer
+// queued for g.mu, a nested read lock inside the section would block behind it while
+// the writer waits for the section to end.
+func TestVerifyLinkedRestoreTargetRunsOutsideTheRegistrySection(t *testing.T) {
+	localRoot := t.TempDir()
+	g := &Git{localRoot: localRoot}
+	mainWS := &workspace{id: "main", root: "/repo", workspaceKind: "main"}
+	linkedWS := &workspace{
+		id: "linked", root: "/repo/wt",
+		workspaceKind: "linked", commonID: "main", gitDirRel: "worktrees/wt", worktreeName: "wt",
+	}
+	g.workspaces = []*workspace{mainWS, linkedWS}
+	gitDir := filepath.Join(g.gitDirFor("/repo"), "worktrees", "wt")
+
+	// A writer queued for g.mu, then the verification: both have to complete.
+	writerQueued := make(chan struct{})
+	writerDone := make(chan struct{})
+	go func() {
+		g.mu.Lock()
+		// The writer is queued; a nested RLock would block behind it.
+		close(writerQueued)
+		g.mu.Unlock()
+		close(writerDone)
+	}()
+	<-writerQueued
+
+	verified := make(chan error, 1)
+	go func() { verified <- g.verifyLinkedRestoreTarget(linkedWS, gitDir) }()
+	select {
+	case err := <-verified:
+		if err != nil {
+			t.Fatalf("verify: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the post-swap verification blocked behind a queued registry writer")
+	}
+	<-writerDone
+}
+
 // tarEntry is one member of a test checkpoint archive: a regular file, or a
 // symlink when symlink is set.
 type tarEntry struct {

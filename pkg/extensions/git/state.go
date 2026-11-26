@@ -966,9 +966,14 @@ func (g *Git) swapLinkedGitDir(w *workspace, expectedCommonGitDir, expectedGitDi
 	// approve a repository the swap then writes under. The order is g.mu -> w.mu,
 	// which is the order the reload path uses, so it cannot deadlock.
 	commonID := w.commonWorkspaceID()
-	return g.withRegistryReadLock(func() error {
+	if err := g.withRegistryReadLock(func() error {
 		return g.swapLinkedGitDirLocked(w, commonID, expectedCommonGitDir, expectedGitDir, preparedGitDir)
-	})
+	}); err != nil {
+		return err
+	}
+	// A row that moved while the swap ran is reported instead of reported as done, so
+	// the next restore targets the new path rather than the mount serving the old one.
+	return g.verifyLinkedRestoreTarget(w, expectedGitDir)
 }
 
 // swapLinkedGitDirLocked is swapLinkedGitDir with the workspace registry held.
@@ -1004,10 +1009,11 @@ func (g *Git) swapLinkedGitDirLocked(w *workspace, commonID, expectedCommonGitDi
 	if err != nil {
 		return err
 	}
-	// A row that moved while the swap ran is reported instead of reported as done:
-	// the next restore targets the new path. This runs outside the frozen section,
-	// because resolving a workspace takes g.mu.
-	return g.verifyLinkedRestoreTarget(w, expectedGitDir)
+	// The post-swap verification deliberately runs outside both the frozen section and
+	// the registry read lock: it resolves a workspace (g.mu.RLock) and, with a writer
+	// queued for g.mu, a nested read lock inside the registry section would block
+	// behind that writer while the writer waits for the section to end.
+	return nil
 }
 
 // verifyLinkedRestoreTarget re-reads the linked identity after the swap and refuses to
