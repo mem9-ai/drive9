@@ -108,6 +108,104 @@ func TestRestoreRefusesNonWorktreeGitDirBeforeTouchingCommon(t *testing.T) {
 	}
 }
 
+// The on-disk checks in the resolver are what protect a mount whose local overlay was
+// written by a previous build, so they are pinned directly and at the restore level.
+func TestLinkedWorktreeGitDirRefusesSymlinkedComponents(t *testing.T) {
+	root := t.TempDir()
+	common := filepath.Join(root, "repo", ".git")
+	if err := os.MkdirAll(filepath.Join(common, "refs", "heads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// "worktrees" as a link into the branch store.
+	if err := os.Symlink("refs", filepath.Join(common, "worktrees")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := linkedWorktreeGitDir(common, "worktrees/heads", "heads"); err == nil {
+		t.Fatalf("linkedWorktreeGitDir = %q, want a refusal for a symlinked worktrees dir", got)
+	}
+	if err := os.Remove(filepath.Join(common, "worktrees")); err != nil {
+		t.Fatal(err)
+	}
+
+	// "worktrees" real, the admin dir itself a link.
+	if err := os.MkdirAll(filepath.Join(common, "worktrees"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(common, "hooks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../hooks", filepath.Join(common, "worktrees", "wt")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := linkedWorktreeGitDir(common, "worktrees/wt", "wt"); err == nil {
+		t.Fatalf("linkedWorktreeGitDir = %q, want a refusal for a symlinked admin dir", got)
+	}
+
+	// A real admin directory still resolves.
+	if err := os.Remove(filepath.Join(common, "worktrees", "wt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(common, "worktrees", "wt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := linkedWorktreeGitDir(common, "worktrees/wt", "wt"); err != nil || got != filepath.Join(common, "worktrees", "wt") {
+		t.Fatalf("linkedWorktreeGitDir = %q, %v; want the real admin dir", got, err)
+	}
+}
+
+// A restore with a checkpoint available, on a mount whose overlay already carries the
+// planted link: the refusal has to be the symlink one, not "checkpoint not available".
+func TestRestoreRefusesSymlinkedWorktreesWithACheckpoint(t *testing.T) {
+	localRoot := t.TempDir()
+	commonGitDir := filepath.Join(localRoot, "overlay", "repo", ".git")
+	if err := os.MkdirAll(filepath.Join(commonGitDir, "refs", "heads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("refs", filepath.Join(commonGitDir, "worktrees")); err != nil {
+		t.Fatal(err)
+	}
+	headPath := filepath.Join(commonGitDir, "refs", "heads", "heads")
+	if err := os.WriteFile(headPath, []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testbackend.NewBackend()
+	b.SeedGitWorkspaceFull("main", "/repo", "https://example.test/repo.git", strings.Repeat("a", 40))
+	b.SeedGitWorktree("linked", "/repo/wt", "https://example.test/repo.git", strings.Repeat("a", 40), "main", "worktrees/heads")
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	// A checkpoint exists, so the restore cannot stop at "not available".
+	seedGitState(t, ts.URL, "linked")
+	seedGitState(t, ts.URL, "main")
+
+	g, err := New(Options{Client: client.New(ts.URL, ""), LocalRoot: localRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainWS := &workspace{id: "main", root: "/repo", headCommit: strings.Repeat("a", 40), repoURL: "https://example.test/repo.git"}
+	linkedWS := &workspace{
+		id: "linked", root: "/repo/wt", headCommit: strings.Repeat("a", 40), repoURL: "https://example.test/repo.git",
+		workspaceKind: "linked", commonID: "main", gitDirRel: "worktrees/heads", worktreeName: "heads",
+	}
+	g.workspaces = []*workspace{mainWS, linkedWS}
+
+	err = g.restoreWorkspaceState(context.Background(), linkedWS)
+	if err == nil {
+		t.Fatal("restore accepted a symlinked worktrees directory")
+	}
+	if !strings.Contains(err.Error(), "worktrees") {
+		t.Fatalf("restore error = %v, want the symlinked worktrees refusal", err)
+	}
+	got, readErr := os.ReadFile(headPath)
+	if readErr != nil {
+		t.Fatalf("refs/heads/heads was removed by the refused restore: %v", readErr)
+	}
+	if string(got) != "ref: refs/heads/main\n" {
+		t.Fatalf("refs/heads/heads = %q, want the original content", got)
+	}
+}
+
 // The worktree admin path must be a real directory. The common repository's own
 // checkpoint is tenant-controlled, so it can plant "worktrees -> refs"; a restore
 // would then delete and replace the branch store instead of an admin directory.
@@ -187,10 +285,10 @@ func TestExtractGitArchiveRefusesEntriesOutsideExtractionRoot(t *testing.T) {
 
 // A link of its own is what makes a lexical path check meaningless: the reported
 // chain built from ".."-named components, and the same chain built from ordinary
-// names, both resolve the final write outside the extraction root. Neither may
-// land anything, and a plain link is refused too — the restore and every later git
-// command follow it long after the sanitizer ran.
-func TestExtractGitArchiveRefusesSymlinks(t *testing.T) {
+// names, both resolve a write outside the extraction root. A link entry is dropped
+// rather than created, so nothing lands outside and an older checkpoint still
+// restores.
+func TestExtractGitArchiveDropsSymlinks(t *testing.T) {
 	chains := []struct {
 		name   string
 		links  []tarEntry
@@ -227,9 +325,21 @@ func TestExtractGitArchiveRefusesSymlinks(t *testing.T) {
 			parent := t.TempDir()
 			dst := filepath.Join(parent, "worktrees", "tmp")
 			entries := append(append([]tarEntry{}, tc.links...), tc.finals...)
-			if err := extractGitArchive(tarArchive(t, entries...), dst); err == nil {
-				t.Fatal("extractGitArchive accepted a symlink entry")
+			if err := extractGitArchive(tarArchive(t, entries...), dst); err != nil {
+				t.Fatalf("a dropped link must not fail the extraction: %v", err)
 			}
+			// No link was created: the name may exist as a real directory (a later
+			// entry can create one), but never as a symlink.
+			for _, link := range tc.links {
+				info, err := os.Lstat(filepath.Join(dst, link.symlink))
+				if err == nil && info.Mode()&os.ModeSymlink != 0 {
+					t.Fatalf("link %q was extracted", link.symlink)
+				}
+				if err != nil && !os.IsNotExist(err) {
+					t.Fatalf("lstat %q: %v", link.symlink, err)
+				}
+			}
+			// ...and nothing landed outside the extraction root.
 			for _, outside := range []string{
 				filepath.Join(parent, "hooks", "pre-commit"),
 				filepath.Join(parent, "worktrees", "hooks", "pre-commit"),
@@ -498,10 +608,12 @@ func TestRegistryReadLockBlocksAReload(t *testing.T) {
 	}
 }
 
-// The post-swap verification must run after the registry section ends, and the section
-// must not wait on anything that a registry writer could be queued behind. The hook
-// holds the section open, so the writer is queued while the section is provably
-// running; the swap then has to finish with the writer.
+// The registry section must not take the registry again, and the swap must be inside
+// it. This stalls the section on the common workspace's write lock — i.e. after the
+// registry read lock is held — queues a registry writer there, releases, and requires
+// both the swap and the writer to finish. With the post-swap verification moved back
+// inside the section its second read lock queues behind that writer, which is waiting
+// for the section, and the swap never returns.
 func TestSwapLinkedGitDirCompletesWithAQueuedRegistryWriter(t *testing.T) {
 	localRoot := t.TempDir()
 	g := &Git{localRoot: localRoot}
@@ -521,21 +633,37 @@ func TestSwapLinkedGitDirCompletesWithAQueuedRegistryWriter(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sectionEntered := make(chan struct{})
-	leaveSection := make(chan struct{})
-	testHookSwapRegistrySection = func() {
-		close(sectionEntered)
-		<-leaveSection
+	// Stalling the common's root read holds the swap inside the registry section.
+	mainWS.mu.Lock() //nolint:staticcheck // the test holds the workspace lock deliberately
+	mainStalled := true
+	releaseMain := func() {
+		if mainStalled {
+			mainStalled = false
+			mainWS.mu.Unlock()
+		}
 	}
-	t.Cleanup(func() { testHookSwapRegistrySection = nil })
+	t.Cleanup(releaseMain)
 
 	swapErr := make(chan error, 1)
 	go func() { swapErr <- g.swapLinkedGitDir(linkedWS, commonGitDir, gitDir, prepared) }()
-	<-sectionEntered
 
-	// Queue a writer and wait until it is really waiting: while the hook holds the read
-	// lock, a failed TryRLock means a writer is pending (a successful one would hand out
-	// another reader). Signalling before the Lock call would leave a scheduling gap.
+	// Wait until the swap holds the registry: a failed TryLock (write) means a reader
+	// holds it, which in this test can only be the section.
+	registryHeld := false
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if !g.mu.TryLock() {
+			registryHeld = true
+			break
+		}
+		g.mu.Unlock()
+		time.Sleep(time.Millisecond)
+	}
+	if !registryHeld {
+		t.Fatal("the swap never entered its registry section")
+	}
+
+	// Queue a writer for the registry while the section is provably held.
 	writerSeen := make(chan struct{}, 1)
 	writerDone := make(chan struct{})
 	writerSawRegistry := make(chan int, 1)
@@ -548,8 +676,7 @@ func TestSwapLinkedGitDirCompletesWithAQueuedRegistryWriter(t *testing.T) {
 	}()
 	<-writerSeen
 	queued := false
-	queueDeadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(queueDeadline) {
+	for time.Now().Before(deadline) {
 		if g.mu.TryRLock() {
 			g.mu.RUnlock()
 			time.Sleep(time.Millisecond)
@@ -561,22 +688,15 @@ func TestSwapLinkedGitDirCompletesWithAQueuedRegistryWriter(t *testing.T) {
 	if !queued {
 		t.Fatal("the queued writer never reached the registry lock")
 	}
-	select {
-	case <-writerDone:
-		t.Fatal("the registry writer acquired g.mu while the swap section held it")
-	default:
-	}
 
-	// The swap must not need anything the queued writer holds; it finishes with the
-	// section, which lets the writer in, and only then verifies.
-	close(leaveSection)
+	releaseMain()
 	select {
 	case err := <-swapErr:
 		if err != nil {
 			t.Fatalf("swap: %v", err)
 		}
 	case <-time.After(15 * time.Second):
-		t.Fatal("the swap never completed with a registry writer queued; the verification must run outside the section")
+		t.Fatal("the swap never completed with a registry writer queued; nothing inside the section may take the registry again")
 	}
 	select {
 	case <-writerDone:

@@ -364,7 +364,7 @@ func OpenContext(ctx context.Context, dsn string) (*Store, error) {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 	s := &Store{db: db, apiKeys: newAPIKeyResolveCache()}
-	if err := s.migrate(ctx); err != nil {
+	if err := s.migrate(); err != nil {
 		_ = mysqlutil.CloseInstrumented(db)
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
@@ -387,7 +387,16 @@ var tidbCloudFreeQuotaLockTimeoutSeconds = 5
 
 const tidbCloudFreeQuotaReleaseLockTimeout = 5 * time.Second
 
-func (s *Store) migrate(ctx context.Context) (err error) {
+// migrate brings the control-plane schema up to the contract.
+//
+// It runs on its own context, not the caller's: OpenContext is called from the
+// startup retry with a short per-attempt deadline, and a migration that inherits it
+// fails mid-ALTER on a large table, leaves the statement running on the server, and
+// makes every later attempt wait behind it. The migration is bounded by the
+// migration lock instead, and the process gives up by exiting rather than by
+// aborting a statement it cannot roll back.
+func (s *Store) migrate() (err error) {
+	ctx := context.Background()
 	releaseLock, err := acquireMetaSchemaMigrationLock(ctx, s.db)
 	if err != nil {
 		return fmt.Errorf("acquire meta schema migration lock: %w", err)

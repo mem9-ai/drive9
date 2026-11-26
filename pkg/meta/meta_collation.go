@@ -259,29 +259,47 @@ func pinColumnCollation(ctx context.Context, q metaQueryer, target metaCollation
 	if !metaCollationRefusedOverIndex(err) {
 		return fmt.Errorf("pin %s.%s collation: %w", target.table, target.column, err)
 	}
+	// Drop the covering indexes, retry the change, then put them back.
 	var dropped []metaCollationIndex
+	var dropErr error
 	for _, index := range target.indexes {
 		if !present[index.name] {
 			continue
 		}
-		if _, dropErr := q.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s DROP INDEX %s", target.table, index.name)); dropErr != nil {
-			return fmt.Errorf("drop %s.%s before collation change: %w", target.table, index.name, dropErr)
+		if _, err := q.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s DROP INDEX %s", target.table, index.name)); err != nil {
+			dropErr = fmt.Errorf("drop %s.%s before collation change: %w", target.table, index.name, err)
+			break
 		}
 		dropped = append(dropped, index)
 	}
-	_, modifyErr := q.ExecContext(ctx, target.modifySQL)
-	// The indexes are restored whether or not the retry worked: leaving the table
-	// without them would be a worse state than the one this migration found.
+	var modifyErr error
+	if dropErr == nil {
+		if _, modifyErr = q.ExecContext(ctx, target.modifySQL); modifyErr != nil {
+			modifyErr = fmt.Errorf("pin %s.%s collation: %w", target.table, target.column, modifyErr)
+		}
+	}
+	// The indexes are restored whatever happened: leaving the table without them would
+	// be a worse state than the one this migration found. The restore runs on a context
+	// a cancelled caller cannot shorten, or an expired attempt would abandon a dropped
+	// index.
+	restoreCtx := context.WithoutCancel(ctx)
+	var restoreErr error
 	for _, index := range dropped {
-		if restoreErr := restoreMetaCollationIndex(ctx, q, target, index); restoreErr != nil {
-			return restoreErr
+		if err := restoreMetaCollationIndex(restoreCtx, q, target, index); err != nil {
+			if restoreErr == nil {
+				restoreErr = err
+			}
+			continue
 		}
 		present[index.name] = true
 	}
-	if modifyErr != nil {
-		return fmt.Errorf("pin %s.%s collation: %w", target.table, target.column, modifyErr)
+	if dropErr != nil {
+		return dropErr
 	}
-	return nil
+	if modifyErr != nil {
+		return modifyErr
+	}
+	return restoreErr
 }
 
 // restoreMetaCollationIndex recreates one index the contract requires. A unique

@@ -524,6 +524,7 @@ func archiveLocalGitStateDir(gitDir string) ([]byte, error) {
 		// its upload.
 		if info.Mode()&os.ModeSymlink != 0 {
 			if name != "HEAD" {
+				fmt.Fprintf(os.Stderr, "drive9: git checkpoint link dropped: %s (the restore refuses links)\n", name)
 				return nil
 			}
 			target, err := os.Readlink(p)
@@ -629,15 +630,15 @@ func extractGitArchive(content []byte, dst string) error {
 				return fmt.Errorf("git archive: create directory %q: %w", hdr.Name, err)
 			}
 		case tar.TypeSymlink:
-			// No link from a checkpoint may reach the tree that is swapped in.
-			// A link's target is resolved by the restore and by every later git
-			// command, long after the sanitizer has walked the tree, so a link
-			// into the common repository ("index" -> "../../index",
-			// "config" -> "../../config") rewrites state outside the restored
-			// directory. A .git tree has no legitimate symlink, so refusing them
-			// closes the surface without stranding real checkpoints — the
-			// checkpoint writer skips links for the same reason.
-			return fmt.Errorf("git archive: symlink %q is not restorable", hdr.Name)
+			// No link from a checkpoint may reach the tree that is swapped in: a
+			// target is resolved by the restore and by every later git command, long
+			// after the sanitizer has walked the tree, so a link into the common
+			// repository ("index" -> "../../index", "config" -> "../../config")
+			// rewrites state outside the restored directory. The entry is dropped —
+			// not created, and not treated as a reason to fail — so a checkpoint
+			// written by an older build still restores. The writer drops links for the
+			// same reason and says so.
+			fmt.Fprintf(os.Stderr, "drive9: git checkpoint link dropped: %s (a link from a checkpoint would be followed after sanitization)\n", hdr.Name)
 		case tar.TypeReg:
 			if dir := filepath.Dir(name); dir != "." {
 				if err := root.MkdirAll(dir, 0o755); err != nil {
