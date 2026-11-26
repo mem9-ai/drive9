@@ -371,6 +371,79 @@ func TestGatedCallbackEndsWhenItsContextIsCanceled(t *testing.T) {
 	}
 }
 
+// The gate has to release the lock even when the callback panics, and a release that
+// cannot be confirmed must discard the session instead of pooling it with the lock
+// still held.
+func TestSchemaLockReleasesOnPanic(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	panicked := make(chan struct{})
+	func() {
+		defer func() {
+			if recover() != nil {
+				close(panicked)
+			}
+		}()
+		_ = s.WithExternalBindingSchemaLock(ctx, func(context.Context, *sql.Conn) error {
+			panic("callback panic")
+		})
+	}()
+	select {
+	case <-panicked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the callback panic did not propagate")
+	}
+
+	// The lock is free again: a short-timeout acquisition succeeds.
+	acquired := make(chan error, 1)
+	go func() {
+		acquired <- s.WithExternalBindingSchemaLock(ctx, func(context.Context, *sql.Conn) error { return nil })
+	}()
+	select {
+	case err := <-acquired:
+		if err != nil {
+			t.Fatalf("the schema lock was not released after a panic: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the schema lock stayed held after a panicking callback")
+	}
+}
+
+// A release that cannot be confirmed must not put a session back in the pool with the
+// advisory lock still held: the session is discarded.
+func TestNamedLockReleaseDiscardsAnUnconfirmedSession(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	lock, err := acquireMetaNamedLock(ctx, s.DB(), metaNamedLockSpec{
+		name:           "d9_test_unconfirmed_release",
+		databaseScoped: true,
+		timeoutSeconds: 5,
+	})
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	// Kill the session so RELEASE_LOCK cannot return a result. TiDB accepts the
+	// statement and closes the connection asynchronously.
+	_, _ = lock.conn.ExecContext(ctx, "KILL CONNECTION_ID()")
+	time.Sleep(50 * time.Millisecond)
+	if err := lock.release(); err == nil {
+		t.Fatalf("release on a dead session reported success")
+	}
+	// A later acquisition with a short timeout still works: the dead session was not
+	// reused for it.
+	again, err := acquireMetaNamedLock(ctx, s.DB(), metaNamedLockSpec{
+		name:           "d9_test_unconfirmed_release",
+		databaseScoped: true,
+		timeoutSeconds: 5,
+	})
+	if err != nil {
+		t.Fatalf("the lock was not available after an unconfirmed release: %v", err)
+	}
+	if err := again.release(); err != nil {
+		t.Fatalf("release the second acquisition: %v", err)
+	}
+}
+
 // A run that crashed after dropping the index leaves it missing; the recovery runs
 // under the same gate binding writers take, so a writer that arrives while the
 // index is absent waits for the repair instead of inserting into the gap.

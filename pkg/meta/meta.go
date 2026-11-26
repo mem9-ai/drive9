@@ -376,6 +376,7 @@ func (s *Store) DB() *sql.DB  { return s.db }
 
 const metaSchemaMigrateLockNamePrefix = "dat9_meta_schema_migrate:"
 const metaSchemaMigrateLockTimeoutSeconds = 30
+const metaSchemaMigrateReleaseLockTimeout = 5 * time.Second
 const externalBindingLockTimeoutSeconds = 90
 const externalBindingReleaseLockTimeout = 5 * time.Second
 const tidbCloudOrgBindingLockTimeoutSeconds = 90
@@ -455,47 +456,16 @@ func (s *Store) migrate() (err error) {
 }
 
 func acquireMetaSchemaMigrationLock(ctx context.Context, db *sql.DB) (func() error, error) {
-	conn, err := db.Conn(ctx)
+	lock, err := acquireMetaNamedLock(ctx, db, metaNamedLockSpec{
+		name:           metaSchemaMigrateLockNamePrefix,
+		databaseScoped: true,
+		timeoutSeconds: metaSchemaMigrateLockTimeoutSeconds,
+		releaseTimeout: metaSchemaMigrateReleaseLockTimeout,
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	var got sql.NullInt64
-	if err := conn.QueryRowContext(ctx,
-		"SELECT GET_LOCK(CONCAT(?, DATABASE()), ?)",
-		metaSchemaMigrateLockNamePrefix,
-		metaSchemaMigrateLockTimeoutSeconds,
-	).Scan(&got); err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	if !got.Valid {
-		_ = conn.Close()
-		return nil, fmt.Errorf("named lock returned NULL")
-	}
-	if got.Int64 != 1 {
-		_ = conn.Close()
-		return nil, fmt.Errorf("timed out waiting for named lock")
-	}
-
-	return func() error {
-		defer func() { _ = conn.Close() }()
-
-		var released sql.NullInt64
-		if err := conn.QueryRowContext(ctx,
-			"SELECT RELEASE_LOCK(CONCAT(?, DATABASE()))",
-			metaSchemaMigrateLockNamePrefix,
-		).Scan(&released); err != nil {
-			return err
-		}
-		if !released.Valid {
-			return fmt.Errorf("named lock release returned NULL")
-		}
-		if released.Int64 != 1 {
-			return fmt.Errorf("named lock was not held by current connection")
-		}
-		return nil
-	}, nil
+	return lock.release, nil
 }
 
 type metaColumnMeta struct {
@@ -1991,49 +1961,33 @@ func (s *Store) withTiDBCloudOrgBindingLock(ctx context.Context, organizationID,
 		return fmt.Errorf("tidbcloud org binding lock callback is required")
 	}
 	lockName := tidbCloudOrgBindingLockName(organizationID, clusterID, branchID)
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = conn.Close() }()
-
+	// The database suffix is resolved here rather than by CONCAT(?, DATABASE()) so the
+	// lock name stays exactly what earlier builds took: a lock name that differs by
+	// build would not exclude the other pod during a rolling deploy.
 	var databaseName sql.NullString
-	if err := conn.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&databaseName); err != nil {
+	if err := s.db.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&databaseName); err != nil {
 		return err
 	}
 	lockName = tenantPoolDatabaseLockName(lockName, databaseName.String)
 
-	// These parameterized operations own connection-local locks; TiDB must
-	// execute them each time instead of reusing a folded prepared plan.
-	var got sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT /*+ IGNORE_PLAN_CACHE() */ GET_LOCK(?, ?)", lockName, tidbCloudOrgBindingLockTimeoutSeconds).Scan(&got); err != nil {
+	lock, err := acquireMetaNamedLock(ctx, s.db, metaNamedLockSpec{
+		name:            lockName,
+		ignorePlanCache: true,
+		timeoutSeconds:  tidbCloudOrgBindingLockTimeoutSeconds,
+		releaseTimeout:  tidbCloudOrgBindingReleaseLockTimeout,
+	})
+	if err != nil {
 		return err
 	}
-	if !got.Valid {
-		return fmt.Errorf("tidbcloud org binding named lock returned NULL")
+	fnErr := fn(ctx, lock.conn)
+	if releaseErr := lock.release(); releaseErr != nil {
+		if fnErr == nil {
+			logger.Warn(ctx, "meta_named_lock_release_failed", zap.String("lock", lock.name), zap.Error(releaseErr))
+			return nil
+		}
+		return errors.Join(fnErr, releaseErr)
 	}
-	if got.Int64 != 1 {
-		return fmt.Errorf("timed out waiting for tidbcloud org binding named lock")
-	}
-	defer func() {
-		releaseCtx, cancel := context.WithTimeout(context.Background(), tidbCloudOrgBindingReleaseLockTimeout)
-		defer cancel()
-		var released sql.NullInt64
-		releaseErr := conn.QueryRowContext(releaseCtx, "SELECT /*+ IGNORE_PLAN_CACHE() */ RELEASE_LOCK(?)", lockName).Scan(&released)
-		if releaseErr != nil {
-			err = errors.Join(err, releaseErr)
-			return
-		}
-		if !released.Valid {
-			err = errors.Join(err, fmt.Errorf("tidbcloud org binding named lock release returned NULL"))
-			return
-		}
-		if released.Int64 != 1 {
-			err = errors.Join(err, fmt.Errorf("tidbcloud org binding named lock was not held by current connection"))
-		}
-	}()
-
-	return fn(ctx, conn)
+	return fnErr
 }
 
 func ensureTiDBCloudOrgBindingAvailable(ctx context.Context, q metaQueryExecer, tenantID, organizationID, clusterID, branchID string) error {
@@ -2821,10 +2775,16 @@ func withExternalBindingSchemaLock(ctx context.Context, db *sql.DB, fn func(cont
 	if fn == nil {
 		return fmt.Errorf("external binding schema lock callback is required")
 	}
-	release, err := acquireMetaNamedLock(ctx, db, externalBindingSchemaLockName)
+	lock, err := acquireMetaNamedLock(ctx, db, metaNamedLockSpec{
+		name:           externalBindingSchemaLockName,
+		databaseScoped: true,
+		timeoutSeconds: externalBindingLockTimeoutSeconds,
+		releaseTimeout: externalBindingReleaseLockTimeout,
+	})
 	if err != nil {
 		return err
 	}
+	release := lock
 	released := false
 	releaseNow := func() error {
 		released = true
@@ -2857,34 +2817,88 @@ func withExternalBindingSchemaLock(ctx context.Context, db *sql.DB, fn func(cont
 // acquireMetaNamedLock takes a database-scoped MySQL advisory lock and returns its
 // release. Both statements run on one connection, because the lock is
 // connection-local.
-type metaNamedLock struct {
-	conn *sql.Conn
-	name string
+// metaNamedLockSpec describes one advisory lock. Scoping the name to the database is
+// the default for this package; the TiDB Cloud locks are cluster-wide and use the
+// plan-cache hint because they are parameterized operations TiDB must not fold.
+type metaNamedLockSpec struct {
+	name            string
+	databaseScoped  bool
+	ignorePlanCache bool
+	timeoutSeconds  int
+	// releaseTimeout bounds the RELEASE_LOCK call. Each lock keeps its own value so a
+	// slow shutdown path cannot hold a caller longer than it used to.
+	releaseTimeout time.Duration
 }
 
-// acquireMetaNamedLock takes a database-scoped MySQL advisory lock. The lock is
-// connection-local, so the connection is returned with it and must be used for the
-// work the lock protects.
-func acquireMetaNamedLock(ctx context.Context, db *sql.DB, name string) (*metaNamedLock, error) {
+// metaNamedLock is an advisory lock held on one session. The session is part of the
+// lock: MySQL advisory locks are connection-local, so the work the lock protects has
+// to run on lock.conn.
+type metaNamedLock struct {
+	conn           *sql.Conn
+	name           string
+	releaseSQL     string
+	releaseArgs    []any
+	releaseTimeout time.Duration
+}
+
+func (s metaNamedLockSpec) getSQL() string {
+	hint := ""
+	if s.ignorePlanCache {
+		hint = "/*+ IGNORE_PLAN_CACHE() */ "
+	}
+	if s.databaseScoped {
+		return "SELECT " + hint + "GET_LOCK(CONCAT(?, DATABASE()), ?)"
+	}
+	return "SELECT " + hint + "GET_LOCK(?, ?)"
+}
+
+func (s metaNamedLockSpec) releaseSQLStmt() string {
+	hint := ""
+	if s.ignorePlanCache {
+		hint = "/*+ IGNORE_PLAN_CACHE() */ "
+	}
+	if s.databaseScoped {
+		return "SELECT " + hint + "RELEASE_LOCK(CONCAT(?, DATABASE()))"
+	}
+	return "SELECT " + hint + "RELEASE_LOCK(?)"
+}
+
+// acquireMetaNamedLock takes one advisory lock and returns the session that holds it.
+func acquireMetaNamedLock(ctx context.Context, db *sql.DB, spec metaNamedLockSpec) (*metaNamedLock, error) {
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return nil, err
 	}
 	var got sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(CONCAT(?, DATABASE()), ?)", name, externalBindingLockTimeoutSeconds).Scan(&got); err != nil {
+	if err := conn.QueryRowContext(ctx, spec.getSQL(), spec.name, spec.timeoutSeconds).Scan(&got); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
-	if !got.Valid || got.Int64 != 1 {
+	if !got.Valid {
 		_ = conn.Close()
-		return nil, fmt.Errorf("timed out waiting for %s named lock", name)
+		return nil, fmt.Errorf("%s named lock returned NULL", spec.name)
 	}
-	return &metaNamedLock{conn: conn, name: name}, nil
+	if got.Int64 != 1 {
+		_ = conn.Close()
+		return nil, fmt.Errorf("timed out waiting for %s named lock", spec.name)
+	}
+	releaseTimeout := spec.releaseTimeout
+	if releaseTimeout <= 0 {
+		releaseTimeout = externalBindingReleaseLockTimeout
+	}
+	return &metaNamedLock{
+		conn:           conn,
+		name:           spec.name,
+		releaseSQL:     spec.releaseSQLStmt(),
+		releaseArgs:    []any{spec.name},
+		releaseTimeout: releaseTimeout,
+	}, nil
 }
 
+// release gives the lock back and closes the session. A release that cannot be
+// confirmed keeps the lock on the server, so the session is discarded instead of
+// being returned to the pool where another caller could inherit it.
 func (l *metaNamedLock) release() error {
-	// A session that could not confirm the release keeps the lock on the server, so it
-	// must not go back to the pool where another caller could inherit it.
 	var releaseErr error
 	defer func() {
 		if releaseErr != nil {
@@ -2892,15 +2906,20 @@ func (l *metaNamedLock) release() error {
 		}
 		_ = l.conn.Close()
 	}()
-	releaseCtx, cancel := context.WithTimeout(context.Background(), externalBindingReleaseLockTimeout)
+	releaseCtx, cancel := context.WithTimeout(context.Background(), l.releaseTimeout)
 	defer cancel()
 	var released sql.NullInt64
-	if err := l.conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(CONCAT(?, DATABASE()))", l.name).Scan(&released); err != nil {
+	if err := l.conn.QueryRowContext(releaseCtx, l.releaseSQL, l.releaseArgs...).Scan(&released); err != nil {
 		releaseErr = err
 		return err
 	}
-	if !released.Valid || released.Int64 != 1 {
-		return fmt.Errorf("%s named lock was not held by current connection", l.name)
+	if !released.Valid {
+		releaseErr = fmt.Errorf("%s named lock release returned NULL", l.name)
+		return releaseErr
+	}
+	if released.Int64 != 1 {
+		releaseErr = fmt.Errorf("%s named lock was not held by current connection", l.name)
+		return releaseErr
 	}
 	return nil
 }
@@ -2911,42 +2930,24 @@ func (s *Store) WithExternalBindingLock(ctx context.Context, provider, subjectKe
 	if fn == nil {
 		return fmt.Errorf("external binding lock callback is required")
 	}
-	lockName := externalBindingLockName(provider, subjectKey)
-	conn, err := s.db.Conn(ctx)
+	lock, err := acquireMetaNamedLock(ctx, s.db, metaNamedLockSpec{
+		name:           externalBindingLockName(provider, subjectKey),
+		databaseScoped: true,
+		timeoutSeconds: externalBindingLockTimeoutSeconds,
+		releaseTimeout: externalBindingReleaseLockTimeout,
+	})
 	if err != nil {
 		return err
 	}
-	defer func() { _ = conn.Close() }()
-
-	var got sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(CONCAT(?, DATABASE()), ?)", lockName, externalBindingLockTimeoutSeconds).Scan(&got); err != nil {
-		return err
-	}
-	if !got.Valid {
-		return fmt.Errorf("external binding named lock returned NULL")
-	}
-	if got.Int64 != 1 {
-		return fmt.Errorf("timed out waiting for external binding named lock")
-	}
-	defer func() {
-		releaseCtx, cancel := context.WithTimeout(context.Background(), externalBindingReleaseLockTimeout)
-		defer cancel()
-		var released sql.NullInt64
-		releaseErr := conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(CONCAT(?, DATABASE()))", lockName).Scan(&released)
-		if releaseErr != nil {
-			err = errors.Join(err, releaseErr)
-			return
+	fnErr := fn(ctx)
+	if releaseErr := lock.release(); releaseErr != nil {
+		if fnErr == nil {
+			logger.Warn(ctx, "meta_named_lock_release_failed", zap.String("lock", lock.name), zap.Error(releaseErr))
+			return nil
 		}
-		if !released.Valid {
-			err = errors.Join(err, fmt.Errorf("external binding named lock release returned NULL"))
-			return
-		}
-		if released.Int64 != 1 {
-			err = errors.Join(err, fmt.Errorf("external binding named lock was not held by current connection"))
-		}
-	}()
-
-	return fn(ctx)
+		return errors.Join(fnErr, releaseErr)
+	}
+	return fnErr
 }
 
 func (s *Store) WithTenantPoolLock(ctx context.Context, poolID string, fn func(context.Context) error) (err error) {
@@ -2959,49 +2960,32 @@ func (s *Store) WithTenantPoolLock(ctx context.Context, poolID string, fn func(c
 	if lockName == "" {
 		return fmt.Errorf("pool_id is required")
 	}
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = conn.Close() }()
-
+	// The database suffix is resolved here rather than by CONCAT(?, DATABASE()) so the
+	// lock name stays exactly what earlier builds took.
 	var databaseName sql.NullString
-	if err := conn.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&databaseName); err != nil {
+	if err := s.db.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&databaseName); err != nil {
 		return err
 	}
 	lockName = tenantPoolDatabaseLockName(lockName, databaseName.String)
 
-	// These parameterized operations own connection-local locks; TiDB must
-	// execute them each time instead of reusing a folded prepared plan.
-	var got sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT /*+ IGNORE_PLAN_CACHE() */ GET_LOCK(?, ?)", lockName, tenantPoolLockTimeoutSeconds).Scan(&got); err != nil {
+	lock, err := acquireMetaNamedLock(ctx, s.db, metaNamedLockSpec{
+		name:            lockName,
+		ignorePlanCache: true,
+		timeoutSeconds:  tenantPoolLockTimeoutSeconds,
+		releaseTimeout:  tenantPoolReleaseLockTimeout,
+	})
+	if err != nil {
 		return err
 	}
-	if !got.Valid {
-		return fmt.Errorf("tenant pool named lock returned NULL")
+	fnErr := fn(ctx)
+	if releaseErr := lock.release(); releaseErr != nil {
+		if fnErr == nil {
+			logger.Warn(ctx, "meta_named_lock_release_failed", zap.String("lock", lock.name), zap.Error(releaseErr))
+			return nil
+		}
+		return errors.Join(fnErr, releaseErr)
 	}
-	if got.Int64 != 1 {
-		return fmt.Errorf("timed out waiting for tenant pool named lock")
-	}
-	defer func() {
-		releaseCtx, cancel := context.WithTimeout(context.Background(), tenantPoolReleaseLockTimeout)
-		defer cancel()
-		var released sql.NullInt64
-		releaseErr := conn.QueryRowContext(releaseCtx, "SELECT /*+ IGNORE_PLAN_CACHE() */ RELEASE_LOCK(?)", lockName).Scan(&released)
-		if releaseErr != nil {
-			err = errors.Join(err, releaseErr)
-			return
-		}
-		if !released.Valid {
-			err = errors.Join(err, fmt.Errorf("tenant pool named lock release returned NULL"))
-			return
-		}
-		if released.Int64 != 1 {
-			err = errors.Join(err, fmt.Errorf("tenant pool named lock was not held by current connection"))
-		}
-	}()
-
-	return fn(ctx)
+	return fnErr
 }
 
 func externalBindingLockName(provider, subjectKey string) string {

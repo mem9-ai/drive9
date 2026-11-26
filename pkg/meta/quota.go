@@ -462,56 +462,30 @@ func (s *Store) AcquireTiDBCloudFreeQuotaLock(ctx context.Context, organizationI
 	if organizationID == "" {
 		return nil, fmt.Errorf("tidbcloud organization id is required")
 	}
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
-		return nil, err
-	}
-	closeOnError := true
-	defer func() {
-		if closeOnError {
-			_ = conn.Close()
-		}
-	}()
+	// The database suffix is resolved here rather than by CONCAT(?, DATABASE()) so the
+	// lock name stays exactly what earlier builds took.
 	var databaseName sql.NullString
-	if err := conn.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&databaseName); err != nil {
+	if err := s.db.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&databaseName); err != nil {
 		return nil, err
 	}
 	lockName := tenantPoolDatabaseLockName(tidbCloudFreeQuotaLockName(organizationID), databaseName.String)
-	var got sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT /*+ IGNORE_PLAN_CACHE() */ GET_LOCK(?, ?)", lockName, tidbCloudFreeQuotaLockTimeoutSeconds).Scan(&got); err != nil {
+	lock, err := acquireMetaNamedLock(ctx, s.db, metaNamedLockSpec{
+		name:            lockName,
+		ignorePlanCache: true,
+		timeoutSeconds:  tidbCloudFreeQuotaLockTimeoutSeconds,
+		releaseTimeout:  tidbCloudFreeQuotaReleaseLockTimeout,
+	})
+	if err != nil {
+		// A lock this call cannot get is busy, not broken: the caller retries later.
+		if strings.Contains(err.Error(), "timed out waiting") {
+			return nil, ErrTiDBCloudFreeQuotaBusy
+		}
 		return nil, err
 	}
-	if !got.Valid {
-		return nil, fmt.Errorf("tidbcloud free quota named lock returned NULL")
-	}
-	if got.Int64 != 1 {
-		return nil, ErrTiDBCloudFreeQuotaBusy
-	}
-	closeOnError = false
 	var once sync.Once
 	var releaseErr error
 	return func() error {
-		once.Do(func() {
-			defer func() {
-				if closeErr := conn.Close(); closeErr != nil {
-					releaseErr = errors.Join(releaseErr, closeErr)
-				}
-			}()
-			releaseCtx, cancel := context.WithTimeout(context.Background(), tidbCloudFreeQuotaReleaseLockTimeout)
-			defer cancel()
-			var released sql.NullInt64
-			if err := conn.QueryRowContext(releaseCtx, "SELECT /*+ IGNORE_PLAN_CACHE() */ RELEASE_LOCK(?)", lockName).Scan(&released); err != nil {
-				releaseErr = err
-				return
-			}
-			if !released.Valid {
-				releaseErr = fmt.Errorf("tidbcloud free quota named lock release returned NULL")
-				return
-			}
-			if released.Int64 != 1 {
-				releaseErr = fmt.Errorf("tidbcloud free quota named lock was not held by current connection")
-			}
-		})
+		once.Do(func() { releaseErr = lock.release() })
 		return releaseErr
 	}, nil
 }
