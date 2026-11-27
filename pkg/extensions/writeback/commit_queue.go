@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
@@ -194,13 +193,13 @@ type CommitQueue struct {
 	// subsequent non-shadow commit (wbCache), unlink, or final close can
 	// reclaim the orphaned shadow and release its quotaBytes.
 	retainedLiveShadows sync.Map
-	extentGlobs       []globMatcher
-	extentMatchCutoff int64
-	extentMinSize     int64
-	index             *staging.PendingIndex
-	journal           *staging.Journal
-	wg                sync.WaitGroup
-	stopped           bool
+	extentGlobs         []globMatcher
+	extentMatchCutoff   int64
+	extentMinSize       int64
+	index               *staging.PendingIndex
+	journal             *staging.Journal
+	wg                  sync.WaitGroup
+	stopped             bool
 	// abandoned is set by AbandonLayer when the mounted layer was rolled
 	// back. When true, Enqueue returns errLayerRolledBack and commitOne
 	// skips tryAutoResolveConflict, going straight to terminal failure so
@@ -243,8 +242,8 @@ type CommitQueue struct {
 	// larger than maxPending so Enqueue never blocks.
 	workCh chan *CommitEntry
 
-	zeroTruncateDelay      time.Duration
-	onCancelPrefixSnapshot atomic.Pointer[func(prefix string)]
+	zeroTruncateDelay time.Duration
+	testGate          func(string)
 	// extentTakeover arms the extent content-layout commit branch
 	// (SetExtentTakeover).
 	extentTakeover bool
@@ -388,19 +387,17 @@ func (cq *CommitQueue) ReclaimRetainedShadow(path string, gen staging.ContentGen
 	if cq == nil || cq.shadows == nil || path == "" {
 		return
 	}
-	cq.retainedShadows.Delete(path)
-	if stored, ok := cq.retainedLiveShadows.Load(path); ok {
-		storedGen, _ := stored.(staging.ContentGen)
-		if gen == 0 {
-			gen = storedGen
-		}
-		if storedGen == gen {
-			cq.retainedLiveShadows.Delete(path)
+	if gen == 0 {
+		if stored, ok := cq.retainedLiveShadows.Load(path); ok {
+			gen, _ = stored.(staging.ContentGen)
 		}
 	}
-	if gen != 0 {
-		cq.shadows.RemoveIfGeneration(path, gen)
+	if gen == 0 {
+		return
 	}
+	cq.retainedShadows.CompareAndDelete(path, gen)
+	cq.retainedLiveShadows.CompareAndDelete(path, gen)
+	cq.shadows.RemoveIfGeneration(path, gen)
 }
 
 // ReclaimOrphanRetainedShadow removes any shadow generation retained for an
@@ -410,10 +407,19 @@ func (cq *CommitQueue) ReclaimOrphanRetainedShadow(path string) {
 	if cq == nil || cq.shadows == nil || path == "" {
 		return
 	}
-	cq.retainedShadows.Delete(path)
-	if stored, ok := cq.retainedLiveShadows.LoadAndDelete(path); ok {
+	if stored, ok := cq.retainedLiveShadows.Load(path); ok {
 		if gen, gok := stored.(staging.ContentGen); gok && gen != 0 {
+			cq.retainedShadows.CompareAndDelete(path, gen)
+			cq.retainedLiveShadows.CompareAndDelete(path, gen)
 			cq.shadows.RemoveIfGeneration(path, gen)
+			return
+		}
+	}
+	if cur, ok := cq.retainedShadows.Load(path); ok {
+		if gen, gok := cur.(staging.ContentGen); gok && gen != 0 && !cq.HasPath(path) {
+			if cq.retainedShadows.CompareAndDelete(path, gen) {
+				cq.shadows.RemoveIfGeneration(path, gen)
+			}
 		}
 	}
 }
@@ -740,14 +746,42 @@ func (cq *CommitQueue) WaitPathTimeout(path string, pollInterval time.Duration) 
 // busy-path metadata ops (chmod/unlink/rename on just-written files) must
 // use this deadline loop instead.
 func (cq *CommitQueue) WaitPathDeadline(path string, timeout time.Duration) bool {
+	return cq.WaitPathContext(context.Background(), path, timeout)
+}
+
+// WaitPathContext waits until path is idle, respecting ctx cancellation and
+// timeout, and returns false if path remains busy when either expires.
+func (cq *CommitQueue) WaitPathContext(ctx context.Context, path string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for !cq.WaitPathTimeout(path, 0) {
-		if !time.Now().Before(deadline) {
+		if !time.Now().Before(deadline) || (ctx != nil && ctx.Err() != nil) {
 			return false
 		}
-		time.Sleep(50 * time.Millisecond)
+		timer := time.NewTimer(50 * time.Millisecond)
+		if ctx != nil {
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				return false
+			}
+		} else {
+			<-timer.C
+		}
+		timer.Stop()
 	}
 	return true
+}
+
+// InFlight reports whether a worker is actively committing path right now.
+func (cq *CommitQueue) InFlight(path string) bool {
+	if cq == nil {
+		return false
+	}
+	cq.mu.Lock()
+	_, ok := cq.inFlight[path]
+	cq.mu.Unlock()
+	return ok
 }
 
 // ClearPathCommitErr retires a remembered terminal failure for a pathname
@@ -1159,8 +1193,8 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 		return true
 	})
 	cq.mu.Unlock()
-	if fn := cq.onCancelPrefixSnapshot.Load(); fn != nil && *fn != nil {
-		(*fn)(prefix)
+	if cq.testGate != nil {
+		cq.testGate("cancelPrefix:afterSnapshot")
 	}
 
 	for _, cancel := range cancels {
@@ -1171,7 +1205,9 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 	// cq.mu (respecting pathLocks -> cq.mu lock order) so each path's pending
 	// metadata and active shadow generation are observed coherently from the
 	// exact same staged write, and any write staged after maxPendingAtCancel /
-	// maxShadowAtCancel is left completely untouched.
+	// maxShadowAtCancel is left completely untouched. targetOrder contains only
+	// unlanded pending/shadow entries under the removed/renamed prefix (bounded
+	// by active local staging, not total remote files in the directory).
 	sort.Strings(targetOrder)
 	var eligible []*cancelTarget
 	var heldUnlocks []func()

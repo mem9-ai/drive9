@@ -284,8 +284,9 @@ func TestFacadeRejectsInvalidNamespaceNamesWithoutPollutingDrain(t *testing.T) {
 				}
 			}
 
-			// Decomposed Unicode (NFD) must be canonicalized to NFC across inode and
-			// staging keys rather than creating a distinct non-canonical local entry.
+			// Decomposed Unicode (NFD) must be canonicalized to NFC across Create,
+			// Lookup, Open, Rename, and Unlink so NFD callers never hit ENOENT or
+			// leave stranded staging behind on Unlink.
 			var nfdOut gofuse.CreateOut
 			if st := f.Create(nil, &gofuse.CreateIn{
 				InHeader: gofuse.InHeader{NodeId: 1},
@@ -294,6 +295,32 @@ func TestFacadeRejectsInvalidNamespaceNamesWithoutPollutingDrain(t *testing.T) {
 			}, "cafe\u0301.txt", &nfdOut); st != gofuse.OK {
 				t.Fatalf("Create NFD name: %v", st)
 			}
+			// Unlanded Lookup with NFD spelling must find the NFC-registered inode.
+			var nfdLookup gofuse.EntryOut
+			if st := f.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "cafe\u0301.txt", &nfdLookup); st != gofuse.OK {
+				t.Fatalf("Lookup NFD while unlanded: %v, want OK", st)
+			}
+			if nfdLookup.NodeId != nfdOut.NodeId {
+				t.Fatalf("Lookup NFD NodeId = %d, want %d", nfdLookup.NodeId, nfdOut.NodeId)
+			}
+			// Secondary Open on that inode while still unlanded must also succeed.
+			var nfdOpen2 gofuse.OpenOut
+			if st := f.Open(nil, &gofuse.OpenIn{
+				InHeader: gofuse.InHeader{NodeId: nfdOut.NodeId},
+				Flags:    uint32(syscall.O_RDWR),
+			}, &nfdOpen2); st != gofuse.OK {
+				t.Fatalf("secondary Open NFD while unlanded: %v", st)
+			}
+			f.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: nfdOut.NodeId}, Fh: nfdOpen2.Fh})
+
+			if _, st := f.Write(nil, &gofuse.WriteIn{
+				InHeader: gofuse.InHeader{NodeId: nfdOut.NodeId},
+				Fh:       nfdOut.Fh,
+				Offset:   0,
+				Size:     4,
+			}, []byte("cafe")); st != gofuse.OK {
+				t.Fatalf("Write NFD: %v", st)
+			}
 			_ = f.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: nfdOut.NodeId}, Fh: nfdOut.Fh})
 			f.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: nfdOut.NodeId}, Fh: nfdOut.Fh})
 			if _, ok := f.inodes.GetInode("/caf\u00e9.txt"); !ok {
@@ -301,6 +328,20 @@ func TestFacadeRejectsInvalidNamespaceNamesWithoutPollutingDrain(t *testing.T) {
 			}
 			if _, ok := f.inodes.GetInode("/cafe\u0301.txt"); ok {
 				t.Fatal("unexpected un-normalized NFD inode key /cafe\\u0301.txt")
+			}
+			// Self-rename with NFD oldName -> NFC newName must be a clean no-op.
+			if st := f.Rename(nil, &gofuse.RenameIn{
+				InHeader: gofuse.InHeader{NodeId: 1},
+				Newdir:   1,
+			}, "cafe\u0301.txt", "caf\u00e9.txt"); st != gofuse.OK {
+				t.Fatalf("self-Rename NFD->NFC: %v", st)
+			}
+			// Unlink with NFD spelling must purge /café.txt staging and inode cleanly.
+			if st := f.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "cafe\u0301.txt"); st != gofuse.OK {
+				t.Fatalf("Unlink NFD: %v", st)
+			}
+			if reason, count := wb.DrainPending(); reason != "" || count != 0 {
+				t.Fatalf("DrainPending after NFD Unlink = (%q, %d), want (\"\", 0)", reason, count)
 			}
 
 			// Sentinel-based client.ErrInvalidPath classification must return EINVAL

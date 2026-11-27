@@ -22,9 +22,11 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"go.uber.org/zap"
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/mem9-ai/drive9/pkg/extensions/core"
 	"github.com/mem9-ai/drive9/pkg/fs"
@@ -142,7 +144,7 @@ type FS struct {
 	mu            sync.Mutex
 	releaseWaitCh chan struct{}
 	server        *gofuse.Server
-	startErr error
+	startErr      error
 	// unmounted records that the go-fuse serve loop finished (OnUnmount
 	// fires unconditionally, clean or abnormal — the mount-exit
 	// classification uses the kernel mountinfo instead).
@@ -3674,6 +3676,17 @@ func (f *FS) childOf(parentIno uint64, name string) (string, gofuse.Status) {
 	// contract).
 	if len(name) > posixNameMax {
 		return "", gofuse.Status(syscall.ENAMETOOLONG)
+	}
+	// Normalize valid UTF-8 names to NFC (matching drive9-server and
+	// pathutil.Canonicalize) across every FUSE operation so NFD spellings from
+	// macOS callers address the exact same inode, openIdx, and staging keys as
+	// Create/Rename; invalid UTF-8 bytes stay untouched so creation rejects them
+	// with EINVAL while Unlink/Rmdir can still clean up legacy local state.
+	if utf8.ValidString(name) && !norm.NFC.IsNormalString(name) {
+		name = norm.NFC.String(name)
+		if len(name) > posixNameMax {
+			return "", gofuse.Status(syscall.ENAMETOOLONG)
+		}
 	}
 	parent, ok := f.inodes.GetPath(parentIno)
 	if !ok {

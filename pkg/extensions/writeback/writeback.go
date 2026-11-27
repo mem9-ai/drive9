@@ -25,8 +25,10 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
@@ -403,9 +405,16 @@ type bufferingHandle struct {
 	// objGen identifies the file object incarnation for co-open handles born
 	// from a local creation (survives isNew->false landings and renames).
 	objGen uint64
-	// remoteReadMu serializes Read's remote fallback on inner==nil handles with
-	// unlink/rename-over snapshotting (lock order: remoteReadMu -> mu).
-	remoteReadMu sync.RWMutex
+	// linkedReadCount / linkedReadsIdle / unlinkSnapDone fence linked Read tiers
+	// against unlink/rename-over under h.mu alone (no multi-handle lock order).
+	linkedReadCount int32
+	linkedReadsIdle chan struct{}
+	unlinkSnapDone  chan struct{}
+	// delegatedDirty marks a handle whose dirty buffer was discarded on a
+	// sibling propagation budget error because a co-open writer's buffer already
+	// holds a superset of its acknowledged bytes; Flush/Sync/Release flushes
+	// remaining dirty siblings of objGen instead of publishing stale bytes.
+	delegatedDirty bool
 	// hasMinTrunc and minTruncSize record the lowest ftruncate watermark
 	// since the last shadow spill on this handle so shrink-then-regrow clears
 	// stale shadow ranges before extending sparsely.
@@ -932,6 +941,7 @@ func New(opts Options) (*Writeback, error) {
 			}
 		}
 		q.PathLock = w.pathLocks.lock
+		q.testGate = w.notifyTestGate
 		w.queue = q
 		if opts.LazyStaging {
 			opts.Staging.Pending.SetJournalSyncOnPut(false)
@@ -1447,8 +1457,31 @@ func (w *Writeback) ReexecRefusal() (string, int) {
 	return "", 0
 }
 
+func normalizePathNFCIfValid(p string) string {
+	if p == "" || p == "/" || !utf8.ValidString(p) || norm.NFC.IsNormalString(p) {
+		return p
+	}
+	return norm.NFC.String(p)
+}
+
+func normalizeOpNFC(op *fs.Op) *fs.Op {
+	if op == nil {
+		return nil
+	}
+	p1 := normalizePathNFCIfValid(op.Path)
+	p2 := normalizePathNFCIfValid(op.Path2)
+	if p1 == op.Path && p2 == op.Path2 {
+		return op
+	}
+	cp := *op
+	cp.Path = p1
+	cp.Path2 = p2
+	return &cp
+}
+
 // Do implements fs.Handler.
 func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
+	op = normalizeOpNFC(op)
 	switch op.Kind {
 	case fs.OpLookup, fs.OpGetAttr:
 		// pendingIndex overlay: a lazily created file exists from Create
@@ -1743,9 +1776,9 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			// may promote a placeholder onto extent layout.
 			if w.queue != nil && w.queue.HasPath(op.Path) {
 				if _, serr := w.opts.Client.StatCtx(ctx, w.remotePath(op.Path)); serr != nil && client.IsNotFound(serr) {
-					w.waitPathCommit(op.Path)
+					w.waitPathCommitCtx(ctx, op.Path)
 				} else if w.opts.ExtentOpener != nil && flags&(uint32(syscall.O_WRONLY)|uint32(syscall.O_RDWR)) != 0 {
-					w.waitPathCommit(op.Path)
+					w.waitPathCommitCtx(ctx, op.Path)
 				}
 			}
 			// Same visibility for the .dat/.meta track: a staged image is
@@ -1847,7 +1880,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			st, statErr = *op.OpenAttr, nil
 		} else {
 			if w.opts.ExtentOpener != nil && w.queue != nil && w.queue.HasPath(op.Path) {
-				w.waitPathCommit(op.Path)
+				w.waitPathCommitCtx(ctx, op.Path)
 			}
 			// A nonexclusive kernel CREATE goes through the chain first so
 			// dircache negative rows, complete listings, and session-created
@@ -1869,7 +1902,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			// async queue but has not landed yet. Wait for OUR entry (it is
 			// this mount's own data) instead of claiming a fresh empty
 			// create that would race the queued image.
-			if w.waitPathCommit(op.Path) {
+			if w.waitPathCommitCtx(ctx, op.Path) {
 				st, statErr = w.probeExisting(ctx, next, op.Path)
 			}
 		}
@@ -1991,7 +2024,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 						}
 					}
 					if w.queue != nil {
-						if !w.waitPathCommit(op.Path) {
+						if !w.waitPathCommitCtx(ctx, op.Path) {
 							return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
 						}
 					}
@@ -2008,7 +2041,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 							rev, meta, uerr := w.uploader.uploadSyncWithMetadata(ctx, op.Path)
 							if uerr != nil {
 								if w.uploader.IsLedgerOwnedError(uerr) {
-									if !w.waitPathCommit(op.Path) {
+									if !w.waitPathCommitCtx(ctx, op.Path) {
 										return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
 									}
 									if ferr := w.pathTerminalFailure(op.Path); ferr != nil {
@@ -2061,7 +2094,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					var handoffUnlock func()
 					for {
 						if w.queue != nil && w.queue.HasPath(op.Path) {
-							if !w.waitPathCommit(op.Path) {
+							if !w.waitPathCommitCtx(ctx, op.Path) {
 								return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
 							}
 						}
@@ -2139,7 +2172,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		under := op.Kind == fs.OpRmdir
 		prefix := strings.TrimSuffix(op.Path, "/") + "/"
 		if w.queue != nil {
-			w.waitPathCommit(op.Path)
+			w.waitPathCommitCtx(ctx, op.Path)
 			if under {
 				w.queue.WaitPrefixTimeout(prefix, 10*time.Second)
 			}
@@ -2321,9 +2354,9 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		}
 		if w.queue != nil {
 			for _, p := range srcAliases {
-				w.waitPathCommit(p)
+				w.waitPathCommitCtx(ctx, p)
 			}
-			w.waitPathCommit(op.Path2)
+			w.waitPathCommitCtx(ctx, op.Path2)
 		}
 		if w.wbCache != nil && w.uploader != nil {
 			for _, p := range srcAliases {
@@ -2378,7 +2411,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				if w.uploader.IsLedgerOwnedError(err) {
 					// The ledger owns this image; the queue lands it. Wait
 					// for THAT instead of publishing the superseded pair.
-					w.waitPathCommit(p)
+					w.waitPathCommitCtx(ctx, p)
 					return nil
 				}
 				return err
@@ -2421,7 +2454,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			// A wait failure means the queue still owns the old path (or a
 			// descendant): renaming now would let that commit resurrect the
 			// OLD name after the move, so fail the rename retryably.
-			if !w.waitPathCommit(op.Path) || !w.waitPathCommit(op.Path2) {
+			if !w.waitPathCommitCtx(ctx, op.Path) || !w.waitPathCommitCtx(ctx, op.Path2) {
 				return fs.Result{}, &fs.StatusError{Path: op.Path, Status: gofuse.EAGAIN}
 			}
 			// A DIRECTORY rename must drain its descendants too: a child's
@@ -2869,7 +2902,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			// enqueue, so journaling past an in-flight upload would be lost
 			// and a remote chmod would 404 a path the server has not seen.
 			if w.queue != nil && w.queue.HasPath(op.Path) {
-				if !w.waitPathCommit(op.Path) {
+				if !w.waitPathCommitCtx(ctx, op.Path) {
 					return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
 				}
 			}
@@ -2904,7 +2937,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					// processed asynchronously, so the queue entry can appear
 					// after the checks above): wait for the landing and retry
 					// the remote chmod once.
-					if w.waitPathCommit(op.Path) {
+					if w.waitPathCommitCtx(ctx, op.Path) {
 						res, err = next(ctx, op)
 					}
 				} else if w.uploader != nil && w.uploader.InFlight(op.Path) {
@@ -3002,7 +3035,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			truncAliases := w.inodeAliasPaths(w.fileInoOf(op.Path, op.Ino, true), op.Path)
 			if w.queue != nil {
 				for _, p := range truncAliases {
-					if w.queue.HasPath(p) && !w.waitPathCommit(p) {
+					if w.queue.HasPath(p) && !w.waitPathCommitCtx(ctx, p) {
 						return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
 					}
 				}
@@ -3018,7 +3051,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 								// The ledger owns this image; its queue entry
 								// lands it. Truncating below would race the
 								// landing — wait it out first.
-								if !w.waitPathCommit(p) {
+								if !w.waitPathCommitCtx(ctx, p) {
 									return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
 								}
 							} else {
@@ -3513,6 +3546,16 @@ func (w *Writeback) pathHasLocalImage(h *bufferingHandle) bool {
 	return false
 }
 
+func (h *bufferingHandle) endLinkedRead() {
+	h.mu.Lock()
+	h.linkedReadCount--
+	if h.linkedReadCount <= 0 && h.linkedReadsIdle != nil {
+		close(h.linkedReadsIdle)
+		h.linkedReadsIdle = nil
+	}
+	h.mu.Unlock()
+}
+
 // Read implements fs.Handle.
 func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
 	// A migrated descriptor reads through the engine: its bytes are the
@@ -3520,7 +3563,33 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 	if e := h.extentHandle(); e != nil {
 		return e.Read(ctx, off, dest)
 	}
-	h.mu.Lock()
+	linkedReadActive := false
+	finishLinkedRead := func() {
+		if linkedReadActive {
+			linkedReadActive = false
+			h.endLinkedRead()
+		}
+	}
+	defer finishLinkedRead()
+
+	for {
+		h.mu.Lock()
+		if h.unlinked && h.unlinkSnapDone != nil {
+			waitSnap := h.unlinkSnapDone
+			h.mu.Unlock()
+			select {
+			case <-waitSnap:
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			}
+			continue
+		}
+		if !h.unlinked {
+			h.linkedReadCount++
+			linkedReadActive = true
+		}
+		break
+	}
 	if h.unlinked && h.pendingImage != nil {
 		if off < 0 || off >= int64(len(h.pendingImage)) {
 			h.mu.Unlock()
@@ -3570,23 +3639,26 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 			}
 		}
 		h.mu.Unlock()
-		// Read-your-writes across fds (v1 readSamePathDirtyHandleVisibleRange):
-		// an unflushed dirty buffer is POSIX-visible to every fd of the
-		// file — including sibling handles opened on a still-unlanded create.
-		if n, ok, lerr := h.readLiveWriter(ctx, off, dest); lerr != nil {
-			return 0, lerr
-		} else if ok {
-			return n, nil
-		}
-		// #984 sibling visibility: the inode's newest uncommitted image —
-		// an fd-truncate owner's buffer, or any dirty sibling writer's —
-		// serves readers on ANY pathname of the inode (hardlink aliases
-		// included). Fail-closed EAGAIN after a bounded retry when the
-		// image holder stays busy; never stale bytes.
-		if n, ok, err := h.w.readVisibleSiblingImage(ctx, h, off, dest); err != nil {
-			return 0, err
-		} else if ok {
-			return n, nil
+		if !unlinked {
+			h.w.notifyTestGate("read:beforeLiveWriter")
+			// Read-your-writes across fds (v1 readSamePathDirtyHandleVisibleRange):
+			// an unflushed dirty buffer is POSIX-visible to every fd of the
+			// file — including sibling handles opened on a still-unlanded create.
+			if n, ok, lerr := h.readLiveWriter(ctx, off, dest); lerr != nil {
+				return 0, lerr
+			} else if ok {
+				return n, nil
+			}
+			// #984 sibling visibility: the inode's newest uncommitted image —
+			// an fd-truncate owner's buffer, or any dirty sibling writer's —
+			// serves readers on ANY pathname of the inode (hardlink aliases
+			// included). Fail-closed EAGAIN after a bounded retry when the
+			// image holder stays busy; never stale bytes.
+			if n, ok, err := h.w.readVisibleSiblingImage(ctx, h, off, dest); err != nil {
+				return 0, err
+			} else if ok {
+				return n, nil
+			}
 		}
 		if isNew && !reopenedNoCreat {
 			return 0, nil // nothing written yet
@@ -3677,7 +3749,6 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 			return n, nil
 		}
 		if h.inner == nil {
-			h.remoteReadMu.RLock()
 			h.mu.Lock()
 			curPath := h.path
 			unlinkedNow := h.unlinked
@@ -3687,7 +3758,6 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 			pinnedFileSize := h.pendingFileSize
 			h.mu.Unlock()
 			if unlinkedNow {
-				h.remoteReadMu.RUnlock()
 				if pinnedFile != nil {
 					if off < 0 || off >= pinnedFileSize {
 						return 0, nil
@@ -3709,19 +3779,16 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 				}
 				return 0, fs.ErrNotFound
 			}
-			// For linked handles, prefer a landed remote image ahead of an
-			// open-time pendingImage/pendingShadowGen capture so a sibling
-			// write that subsequently landed and drained is visible. Holding
-			// remoteReadMu.RLock prevents OpUnlink / rename-over from deleting
-			// or replacing curPath until this remote read completes.
-			if !stillNew && !h.w.hasLiveUnlandedCreate(curPath) {
-				n, ok, rerr := h.w.readRemoteRangeFallback(ctx, curPath, off, dest)
-				h.remoteReadMu.RUnlock()
-				if ok || rerr != nil {
+			// For linked handles without a terminal commit failure, prefer a
+			// landed remote image ahead of an open-time pendingImage/pendingShadowGen
+			// capture so a sibling write that subsequently landed and drained is
+			// visible. If the pending write terminally failed (never landed), keep
+			// serving the captured local image below instead of stale remote bytes.
+			// linkedReadCount fences OpUnlink/rename-over until this read returns.
+			if !stillNew && !h.w.hasLiveUnlandedCreate(curPath) && h.w.pathTerminalFailure(curPath) == nil {
+				if n, ok, rerr := h.w.readRemoteRangeFallback(ctx, curPath, off, dest); ok || rerr != nil {
 					return n, rerr
 				}
-			} else {
-				h.remoteReadMu.RUnlock()
 			}
 			h.mu.Lock()
 			if h.pendingImage != nil {
@@ -3783,6 +3850,7 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 		h.mu.Lock()
 		if h.buf == nil {
 			h.mu.Unlock()
+			finishLinkedRead()
 			return h.Read(ctx, off, dest)
 		}
 	}
@@ -3811,7 +3879,12 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 func (h *bufferingHandle) readLiveWriter(ctx context.Context, off int64, dest []byte) (int, bool, error) {
 	h.mu.Lock()
 	path := h.path
+	unlinked := h.unlinked
+	myObjGen := h.objGen
 	h.mu.Unlock()
+	if unlinked {
+		return 0, false, nil
+	}
 	writer := h.w.dirtyLiveWriterAtPath(path, h)
 	if writer == nil {
 		return 0, false, nil
@@ -3819,6 +3892,9 @@ func (h *bufferingHandle) readLiveWriter(ctx context.Context, off int64, dest []
 	writer.mu.Lock()
 	defer writer.mu.Unlock()
 	if !writer.dirty || writer.buf == nil || writer.unlinked {
+		return 0, false, nil
+	}
+	if myObjGen != 0 && writer.objGen != 0 && writer.objGen != myObjGen {
 		return 0, false, nil
 	}
 	if err := writer.ensureBufferLocked(ctx); err != nil || writer.buf == nil {
@@ -3876,7 +3952,16 @@ func (h *bufferingHandle) Write(ctx context.Context, off int64, data []byte) err
 		releaseCoOpen()
 		coObjGen = targetObj
 		h.w.notifyTestGate("write:coOpenEntering")
-		coUnlock = h.w.coOpenLocks.lock(objLockKey(coObjGen))
+		if h.w.testGateHook.Load() != nil {
+			if u, ok := h.w.coOpenLocks.tryLock(objLockKey(coObjGen)); ok {
+				coUnlock = u
+			} else {
+				h.w.notifyTestGate("write:coOpenContended")
+				coUnlock = h.w.coOpenLocks.lock(objLockKey(coObjGen))
+			}
+		} else {
+			coUnlock = h.w.coOpenLocks.lock(objLockKey(coObjGen))
+		}
 		h.w.notifyTestGate("write:coOpenAcquired")
 	}
 	if coObjGen != 0 && h.buf == nil && !h.trunc && !h.unlinked && !h.appendParticipant() {
@@ -3954,6 +4039,7 @@ func (h *bufferingHandle) Write(ctx context.Context, off int64, data []byte) err
 	h.maybeSpillLivePartsLocked(off)
 	h.wgen++
 	h.dirty = true
+	h.delegatedDirty = false
 	// Stamp the mutation epoch (#984): sibling readers compare epochs to
 	// serve the inode's newest uncommitted image.
 	h.mutSeq = h.w.nextMutSeq()
@@ -4077,7 +4163,7 @@ func (h *bufferingHandle) DrainFlush(ctx context.Context) (err error) {
 				return flight.err
 			}
 			if !curDirty && curGen <= flight.gen {
-				if !h.w.waitPathCommit(curPath) {
+				if !h.w.waitPathCommitCtx(ctx, curPath) {
 					return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
 				}
 				if ferr := h.w.pathTerminalFailure(curPath); ferr != nil {
@@ -4090,7 +4176,7 @@ func (h *bufferingHandle) DrainFlush(ctx context.Context) (err error) {
 		if h.closed {
 			h.mu.Unlock()
 			unlockFlush()
-			if !h.w.waitPathCommit(curPath) {
+			if !h.w.waitPathCommitCtx(ctx, curPath) {
 				return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
 			}
 			if ferr := h.w.pathTerminalFailure(curPath); ferr != nil {
@@ -4206,7 +4292,7 @@ func (h *bufferingHandle) DrainFlush(ctx context.Context) (err error) {
 		if err != nil {
 			return err
 		}
-		if !h.w.waitPathCommit(uploadPath) {
+		if !h.w.waitPathCommitCtx(ctx, uploadPath) {
 			return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
 		}
 		// The queue finished the path, but "finished" includes a terminal
@@ -4757,6 +4843,9 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 		}
 		return h.flushMigratedMode(ctx)
 	}
+	if err := h.flushDelegatedDirtySiblings(ctx, true); err != nil {
+		return err
+	}
 	// interactive mode: fsync is a durability barrier served by
 	// the local staging ledger — stage + async enqueue, and the queue lands the
 	// remote commit; no full-queue wait (WAN mounts would otherwise block
@@ -4862,6 +4951,9 @@ func (h *bufferingHandle) Flush(ctx context.Context) (err error) {
 	// entered the engine handle during that window without touching a released
 	// engine handle.
 	if handled, ferr := h.flushLiveExtent(ctx, false); handled {
+		return ferr
+	}
+	if ferr := h.flushDelegatedDirtySiblings(ctx, false); ferr != nil {
 		return ferr
 	}
 	callerCtx := ctx
@@ -5112,6 +5204,7 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 		return h.releaseMigrated(ctx, e)
 	}
 	h.mu.Unlock()
+	_ = h.flushDelegatedDirtySiblings(ctx, false)
 	h.w.notifyTestGate("release:flushMu")
 	h.flushMu.Lock()
 	flushUnlocked := false
@@ -5608,6 +5701,9 @@ func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64, generation
 			if rev > h.baseRev {
 				h.baseRev = rev
 			}
+			if !h.dirty && h.stagedCacheGen == cacheGeneration {
+				h.trunc = false
+			}
 			h.cacheAncestorGens = removeCacheAncestorGen(h.cacheAncestorGens, cacheGeneration)
 		case source == pendingGenQueue && generation != 0 && h.supersededPendingGen == generation && h.supersededPendingSource == source:
 			if rev > 0 {
@@ -5994,6 +6090,7 @@ func (h *bufferingHandle) completeStagedLanding(rev, size int64, snapshotID stri
 	certified = h.stagedSnapshotID == snapshotID &&
 		(h.buf == nil || h.buf.ContentVersion() == h.stagedContentVersion)
 	if certified {
+		h.trunc = false
 		h.visTrunc = false
 		h.armRemoteRestoreLocked(size)
 		if resetDirty {
@@ -6227,11 +6324,9 @@ func (w *Writeback) markUnlinked(p string, under bool) {
 // must stay anonymous.
 func restoreMarked(marked []*bufferingHandle) {
 	for _, h := range marked {
-		h.remoteReadMu.Lock()
 		h.mu.Lock()
 		h.unlinked = false
 		h.mu.Unlock()
-		h.remoteReadMu.Unlock()
 	}
 }
 
@@ -6242,58 +6337,70 @@ func restoreMarked(marked []*bufferingHandle) {
 // bytes.
 func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHandle, error) {
 	prefix := strings.TrimSuffix(p, "/") + "/"
-	var candidates, clean, marked []*bufferingHandle
-	var submitting []chan struct{}
+	type cleanSnapTarget struct {
+		h    *bufferingHandle
+		done chan struct{}
+	}
+	var clean []cleanSnapTarget
+	var marked []*bufferingHandle
+	var submitting, readDrains, otherSnapWaits []chan struct{}
 	w.liveSet.Range(func(key, _ any) bool {
 		h := key.(*bufferingHandle)
 		h.mu.Lock()
 		match := h.path == p || (under && strings.HasPrefix(h.path, prefix))
-		if match && h.submitDone != nil {
+		if !match {
+			h.mu.Unlock()
+			return true
+		}
+		if h.submitDone != nil {
 			submitting = append(submitting, h.submitDone)
 		}
-		if match && !h.unlinked {
-			candidates = append(candidates, h)
+		if !h.unlinked {
+			h.unlinked = true
+			marked = append(marked, h)
+			if h.buf == nil && !h.isNew && !h.dirty && h.pendingImage == nil && h.pendingFile == nil && h.pendingShadowGen == 0 {
+				snapCh := make(chan struct{})
+				h.unlinkSnapDone = snapCh
+				clean = append(clean, cleanSnapTarget{h: h, done: snapCh})
+			}
+		} else if h.unlinkSnapDone != nil {
+			otherSnapWaits = append(otherSnapWaits, h.unlinkSnapDone)
+		}
+		if h.linkedReadCount > 0 {
+			if h.linkedReadsIdle == nil {
+				h.linkedReadsIdle = make(chan struct{})
+			}
+			readDrains = append(readDrains, h.linkedReadsIdle)
 		}
 		h.mu.Unlock()
 		return true
 	})
-	for _, h := range candidates {
-		// Acquire remoteReadMu.Lock before flipping h.unlinked so any in-flight
-		// readRemoteRangeFallback on h finishes against the pre-unlink object.
-		// Keep remoteReadMu.Lock held on clean handles until their snapshot is
-		// populated so concurrent Reads never see h.unlinked without a snapshot.
-		h.remoteReadMu.Lock()
-		h.mu.Lock()
-		match := h.path == p || (under && strings.HasPrefix(h.path, prefix))
-		keepReadLock := false
-		if match && !h.unlinked {
-			h.unlinked = true
-			marked = append(marked, h)
-			if h.buf == nil && !h.isNew && !h.dirty {
-				clean = append(clean, h)
-				keepReadLock = true
-			}
-		}
-		h.mu.Unlock()
-		if !keepReadLock {
-			h.remoteReadMu.Unlock()
-		}
-	}
 	for _, ch := range submitting {
 		<-ch
 	}
+	for _, ch := range readDrains {
+		<-ch
+	}
 	var firstErr error
-	for _, h := range clean {
+	for _, ct := range clean {
 		var err error
 		if w.opts.Staging != nil {
-			err = w.snapshotUnlinkedClean(h)
+			err = w.snapshotUnlinkedClean(ct.h)
 		} else {
-			err = w.snapshotUnlinkedImage(h)
+			err = w.snapshotUnlinkedImage(ct.h)
 		}
-		h.remoteReadMu.Unlock()
+		ct.h.mu.Lock()
+		if ct.h.unlinkSnapDone == ct.done {
+			ct.h.unlinkSnapDone = nil
+		}
+		ct.h.mu.Unlock()
+		close(ct.done)
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
+	}
+	for _, ch := range otherSnapWaits {
+		<-ch
 	}
 	return marked, firstErr
 }
@@ -7614,6 +7721,46 @@ func (w *Writeback) dirtySiblingBytesForObj(objGen uint64, skip *bufferingHandle
 	return best, found
 }
 
+func (h *bufferingHandle) flushDelegatedDirtySiblings(ctx context.Context, syncBarrier bool) error {
+	h.mu.Lock()
+	delegated := h.delegatedDirty
+	objGen := h.objGen
+	unlinked := h.unlinked
+	h.mu.Unlock()
+	if !delegated || objGen == 0 || unlinked {
+		return nil
+	}
+	h.w.regMu.Lock()
+	siblings := make([]*bufferingHandle, 0, len(h.w.liveByObj[objGen]))
+	for sib := range h.w.liveByObj[objGen] {
+		if sib != h {
+			siblings = append(siblings, sib)
+		}
+	}
+	h.w.regMu.Unlock()
+	for _, sib := range siblings {
+		sib.mu.Lock()
+		dirty := sib.dirty && sib.buf != nil && !sib.unlinked && !sib.closed
+		sib.mu.Unlock()
+		if !dirty {
+			continue
+		}
+		var ferr error
+		if syncBarrier {
+			ferr = sib.Sync(ctx)
+		} else {
+			ferr = sib.Flush(ctx)
+		}
+		if ferr != nil {
+			return ferr
+		}
+	}
+	h.mu.Lock()
+	h.delegatedDirty = false
+	h.mu.Unlock()
+	return nil
+}
+
 // propagateSiblingWriteByObj mirrors an acknowledged non-append write onto
 // co-open buffered sibling handles sharing objGen (both before and after the
 // creation's initial remote landing). Callers hold w.coOpenLocks.lock(objLockKey(objGen)).
@@ -7636,14 +7783,29 @@ func (w *Writeback) propagateSiblingWriteByObj(objGen uint64, writer *bufferingH
 			sib.flags&uint32(syscall.O_ACCMODE) != uint32(syscall.O_RDONLY)
 		if eligible {
 			wasDirty := sib.dirty
-			_ = sib.buf.EnsurePartsForWrite(off, int64(len(data)))
-			if _, err := sib.buf.Write(off, data); err == nil {
+			pErr := sib.buf.EnsurePartsForWrite(off, int64(len(data)))
+			if pErr == nil {
+				_, pErr = sib.buf.Write(off, data)
+			}
+			if pErr == nil {
 				sib.wgen++
 				if !wasDirty {
 					sib.buf.ClearDirty()
 				}
 				if writeSeq > sib.mutSeq {
 					sib.mutSeq = writeSeq
+				}
+			} else {
+				// writer.buf already holds a strict superset of sib's earlier
+				// co-open writes plus this new write. Discard sib's incomplete
+				// buffer so it frees duplicate budget memory and can never
+				// overwrite writer's landed bytes with a stale image.
+				writebuffer.Discard(&sib.buf)
+				sib.baseLoaded = false
+				sib.dirty = false
+				sib.visTrunc = false
+				if wasDirty {
+					sib.delegatedDirty = true
 				}
 			}
 		}
@@ -7674,6 +7836,7 @@ func (w *Writeback) rebaseSiblingsOnOpenTrunc(objGen uint64, owner *bufferingHan
 			writebuffer.Discard(&sib.buf)
 			sib.baseLoaded = false
 			sib.dirty = false
+			sib.delegatedDirty = false
 			sib.visTrunc = false
 			sib.pendingImage = nil
 			sib.baseSize = 0
@@ -7770,6 +7933,7 @@ func (w *Writeback) waitForShadowQuota(ctx context.Context, requiredBytes int64)
 		return false
 	}
 	stallDeadline := time.Now().Add(shadowQuotaBackpressureTimeout)
+	absDeadline := time.Now().Add(2 * shadowQuotaBackpressureTimeout)
 	lastQuota := sh.QuotaBytes()
 	notifiedGate := false
 	for !sh.ByteQuotaAvailable(requiredBytes) {
@@ -7780,14 +7944,15 @@ func (w *Writeback) waitForShadowQuota(ctx context.Context, requiredBytes int64)
 			notifiedGate = true
 			w.notifyTestGate("shadow:quotaWait")
 		}
-		if ctx.Err() != nil {
+		now := time.Now()
+		if ctx.Err() != nil || now.After(absDeadline) {
 			return false
 		}
 		curQuota := sh.QuotaBytes()
 		if curQuota < lastQuota {
 			lastQuota = curQuota
-			stallDeadline = time.Now().Add(shadowQuotaBackpressureTimeout)
-		} else if time.Now().After(stallDeadline) {
+			stallDeadline = now.Add(shadowQuotaBackpressureTimeout)
+		} else if now.After(stallDeadline) {
 			return false
 		}
 		waitCh := sh.QuotaChanged()
@@ -8144,6 +8309,10 @@ func (w *Writeback) pendingBaseRevOf(path string) (int64, bool) {
 // wait expired with the path still busy (the caller surfaces EAGAIN); an
 // unbounded budget (negative) never reports false.
 func (w *Writeback) waitPathCommit(path string) bool {
+	return w.waitPathCommitCtx(context.Background(), path)
+}
+
+func (w *Writeback) waitPathCommitCtx(ctx context.Context, path string) bool {
 	if w.queue == nil {
 		return true // no async queue: nothing to wait for (nil-safe)
 	}
@@ -8152,22 +8321,31 @@ func (w *Writeback) waitPathCommit(path string) bool {
 		w.queue.WaitPath(path)
 		return true
 	case budget == 0:
-		// Default 5s stall window: if background workers are actively completing
-		// earlier queued commits, keep waiting in 5s slices up to 60s so heavy
-		// sequential bursts do not surface spurious EAGAIN to foreground opens
-		// or truncates; a genuinely stalled backend still fails at 5s.
-		maxDeadline := time.Now().Add(60 * time.Second)
+		// Default 5s slice (bounded at 15s total, cancelable via ctx): extend
+		// only when path's own commit sequence advances or path is still queued
+		// behind actively draining work. Once path itself is in flight and made
+		// no progress in 5s, stop instead of letting unrelated commits stall
+		// this FUSE worker.
+		maxDeadline := time.Now().Add(15 * time.Second)
 		for {
 			prevClock := w.queue.CommitClock()
-			if w.queue.WaitPathDeadline(path, 5*time.Second) {
+			prevPathSeq := w.queue.CommitSeq(path)
+			wasInFlight := w.queue.InFlight(path)
+			if w.queue.WaitPathContext(ctx, path, 5*time.Second) {
 				return true
 			}
-			if time.Now().After(maxDeadline) || w.queue.CommitClock() == prevClock {
+			if (ctx != nil && ctx.Err() != nil) || time.Now().After(maxDeadline) {
+				return false
+			}
+			if w.queue.CommitSeq(path) > prevPathSeq {
+				continue
+			}
+			if wasInFlight || w.queue.CommitClock() == prevClock {
 				return false
 			}
 		}
 	default:
-		return w.queue.WaitPathDeadline(path, budget)
+		return w.queue.WaitPathContext(ctx, path, budget)
 	}
 }
 
@@ -8375,6 +8553,9 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 		}
 		h.mu.Lock()
 		h.retireDirtyLocked(commitGen)
+		if !supersededBySibling {
+			h.trunc = false
+		}
 		h.landed = true
 		h.isNew = false
 		if committedRev > 0 {
@@ -8587,10 +8768,7 @@ func (h *bufferingHandle) truncateLocal(ctx context.Context, size int64) error {
 	if err := h.buf.Truncate(size); err != nil {
 		return err
 	}
-	if !h.hasMinTrunc || size < h.minTruncSize {
-		h.hasMinTrunc = true
-		h.minTruncSize = size
-	}
+	h.noteMinTruncLocked(size)
 	if h.liveSpillFile != nil {
 		_ = h.liveSpillFile.Truncate(size)
 	}
@@ -8600,6 +8778,28 @@ func (h *bufferingHandle) truncateLocal(ctx context.Context, size int64) error {
 	h.mutSeq = h.w.nextMutSeq()
 	h.w.armBypass(h.path, h.baseRev, size, "setattr-size")
 	return nil
+}
+
+func (h *bufferingHandle) noteMinTruncLocked(size int64) {
+	if !h.hasMinTrunc || size < h.minTruncSize {
+		h.hasMinTrunc = true
+		h.minTruncSize = size
+	}
+}
+
+func (h *bufferingHandle) shadowWaitQuotaBytesLocked() int64 {
+	if h.buf == nil {
+		return 0
+	}
+	reqBytes := h.buf.Size()
+	if reqBytes >= commitInlineStreamThreshold && (h.isNew || h.trunc || reqBytes > h.buf.RemoteSize()) {
+		if mem := h.buf.MemoryUsage(); mem > 0 && mem < reqBytes {
+			reqBytes = mem
+		} else if ps := h.buf.PartSize(); ps > 0 && ps < reqBytes {
+			reqBytes = ps
+		}
+	}
+	return reqBytes
 }
 
 func (h *bufferingHandle) ensureBuffer(ctx context.Context) error {
@@ -9016,21 +9216,7 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 	// and release quotaBytes instead of immediately failing with ENOSPC.
 	if st != nil && st.Shadow != nil {
 		h.mu.Lock()
-		reqBytes := int64(0)
-		if h.buf != nil {
-			reqBytes = h.buf.Size()
-			if reqBytes >= commitInlineStreamThreshold && (h.isNew || h.trunc || reqBytes > h.buf.RemoteSize()) {
-				// Sparse files charge only resident/written coverage, not
-				// logical holes; clamp the pre-lock wait estimate to in-memory
-				// usage (at least one part) so >quota logical sparse sizes do
-				// not short-circuit backpressure.
-				if mem := h.buf.MemoryUsage(); mem > 0 && mem < reqBytes {
-					reqBytes = mem
-				} else if ps := h.buf.PartSize(); ps > 0 && ps < reqBytes {
-					reqBytes = ps
-				}
-			}
-		}
+		reqBytes := h.shadowWaitQuotaBytesLocked()
 		h.mu.Unlock()
 		w.waitForShadowQuota(ctx, reqBytes)
 	}
@@ -9153,9 +9339,10 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 			}
 		}
 		if stageErr != nil {
+			retryWaitBytes := h.shadowWaitQuotaBytesLocked()
 			h.mu.Unlock()
 			unlock()
-			if errors.Is(stageErr, syscall.ENOSPC) && quotaAttempt < 4 && w.waitForShadowQuota(ctx, size) {
+			if errors.Is(stageErr, syscall.ENOSPC) && quotaAttempt < 4 && w.waitForShadowQuota(ctx, retryWaitBytes) {
 				continue
 			}
 			return stageErr
@@ -9264,6 +9451,7 @@ func (h *bufferingHandle) spillToShadow(st *staging.Staging, stagePath string, b
 		return fmt.Errorf("writeback: spill without part size: %s", stagePath)
 	}
 	size := buf.Size()
+	hadShadowBefore := st.Shadow.Has(stagePath)
 	// Clear stale shadow bytes beyond any shrink watermark (or from a prior
 	// unspilled incarnation on a zero-base create/truncate) before skipping
 	// unloaded zero-extended parts below.
@@ -9284,6 +9472,7 @@ func (h *bufferingHandle) spillToShadow(st *staging.Staging, stagePath string, b
 		h.hasMinTrunc = false
 		h.minTruncSize = 0
 	}
+	preLoopShadowSize := st.Shadow.Size(stagePath)
 	// v1's spill wrote only the parts the writer touched: a one-byte
 	// write at 2GiB+1 or an ftruncate(1GiB) never materialized 1-2GiB of
 	// zeros on disk, keeping both disk blocks and ShadowStore.quotaBytes
@@ -9303,6 +9492,16 @@ func (h *bufferingHandle) spillToShadow(st *staging.Staging, stagePath string, b
 		}
 	}
 	var deferredEvict []int
+	rollbackPartialSpill := func() {
+		for idx := range preEvicted {
+			buf.EvictPart(idx)
+		}
+		if !hadShadowBefore {
+			st.Shadow.Remove(stagePath)
+		} else if preLoopShadowSize >= 0 && st.Shadow.Size(stagePath) > preLoopShadowSize {
+			_ = st.Shadow.Truncate(stagePath, preLoopShadowSize, baseRev)
+		}
+	}
 	for start := int64(0); start < size; start += partSize {
 		partIdx := int(start / partSize)
 		partNum := partIdx + 1
@@ -9317,28 +9516,27 @@ func (h *bufferingHandle) spillToShadow(st *staging.Staging, stagePath string, b
 		// these parts, so charge them past the budget instead of refusing the
 		// close (a refusal left the file unclosable until other memory freed).
 		if err := buf.ForceEnsurePartsForWrite(start, end-start); err != nil {
+			rollbackPartialSpill()
 			return err
 		}
 		data := buf.PartData(partNum)
 		if int64(len(data)) < end-start {
+			rollbackPartialSpill()
 			return fmt.Errorf("writeback: spill short part %d of %s", partNum, stagePath)
 		}
 		if _, err := st.Shadow.WriteAt(stagePath, start, data[:end-start], baseRev); err != nil {
+			rollbackPartialSpill()
 			return err
 		}
 		if !retainBuffer {
-			// Only evict immediately when this part was ALREADY evicted into
-			// RestorePart / liveSpillFile before spillToShadow began; parts
-			// resident in buf.parts have no external copy until the entire
-			// spill + Truncate succeeds and RestorePart switches to st.Shadow.
-			if preEvicted[partIdx] {
-				buf.EvictPart(partIdx)
-			} else {
-				deferredEvict = append(deferredEvict, partIdx)
-			}
+			// Defer eviction of all written parts until the entire spill +
+			// Truncate succeeds so a mid-spill ENOSPC rollback never loses
+			// bytes from buf or liveSpillFile.
+			deferredEvict = append(deferredEvict, partIdx)
 		}
 	}
 	if err := st.Shadow.Truncate(stagePath, size, baseRev); err != nil {
+		rollbackPartialSpill()
 		return err
 	}
 	// Switch the buffer's authoritative backing onto st.Shadow AFTER copying
@@ -10131,6 +10329,23 @@ func (l *stripedLocks) lock(path string) func() {
 	l.mu.Unlock()
 	m.Lock()
 	return m.Unlock
+}
+
+func (l *stripedLocks) tryLock(path string) (func(), bool) {
+	l.mu.Lock()
+	if l.m == nil {
+		l.m = map[string]*sync.Mutex{}
+	}
+	m := l.m[path]
+	if m == nil {
+		m = &sync.Mutex{}
+		l.m[path] = m
+	}
+	l.mu.Unlock()
+	if !m.TryLock() {
+		return nil, false
+	}
+	return m.Unlock, true
 }
 
 // extentRoutesImage reports whether THIS handle's current image is one the

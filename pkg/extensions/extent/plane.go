@@ -364,7 +364,7 @@ func (h *Handler) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, e
 		br := h.opts.Engine.Bridge
 		filtered := res.Entries[:0]
 		for _, entry := range res.Entries {
-			if br.IsSentinel(childPath(op.Path, entry.Name)) {
+			if strings.Contains(entry.Name, ".d9open-") && br.IsSentinel(childPath(op.Path, entry.Name)) {
 				continue
 			}
 			filtered = append(filtered, entry)

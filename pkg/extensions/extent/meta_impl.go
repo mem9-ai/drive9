@@ -2600,7 +2600,7 @@ func (b *Bridge) DropDeletedOpen(sentinel string) {
 // whose names happen to contain ".d9open-" are never registered and return
 // false.
 func (b *Bridge) IsSentinel(local string) bool {
-	if b == nil || local == "" {
+	if b == nil || !strings.Contains(local, ".d9open-") {
 		return false
 	}
 	b.mu.Lock()
