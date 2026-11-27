@@ -201,7 +201,7 @@ func (b *unlinkUploadBarrier) PreparePathUnlink(path string, survivor bool) func
 	return finish
 }
 
-func (b *unlinkUploadBarrier) PrepareOpenUnlink(path, survivor string) (func(func() bool) error, func() error, func(), func()) {
+func (b *unlinkUploadBarrier) PrepareOpenUnlink(path, survivor string) (func(func() bool) error, func(func() bool, func() bool) error, func(), func()) {
 	acquireLock, commit, finalize, abort := b.Writeback.PrepareOpenUnlink(path, survivor)
 	b.wait()
 	return acquireLock, commit, finalize, abort
@@ -279,13 +279,18 @@ type blockingCommitUnlink struct {
 	onceRollback  sync.Once
 }
 
-func (b *blockingCommitUnlink) PrepareOpenUnlink(string, string) (func(func() bool) error, func() error, func(), func()) {
+func (b *blockingCommitUnlink) PrepareOpenUnlink(string, string) (func(func() bool) error, func(func() bool, func() bool) error, func(), func()) {
 	acquire := func(func() bool) error {
 		b.onceEnter.Do(func() { close(b.commitEntered) })
 		<-b.commitProceed
 		return nil
 	}
-	commit := func() error { return nil }
+	commit := func(_ func() bool, linearizeNoWAL func() bool) error {
+		if linearizeNoWAL != nil && !linearizeNoWAL() {
+			return fs.ErrNotFound
+		}
+		return nil
+	}
 	finalize := func() {}
 	abort := func() {
 		b.onceRollback.Do(func() { close(b.rollbackSeen) })
@@ -463,7 +468,7 @@ func (b *phasedUnlinkPauseBarrier) wait() {
 	b.once.Do(func() { close(b.entered); <-b.proceed })
 }
 
-func (b *phasedUnlinkPauseBarrier) PrepareOpenUnlink(path, survivor string) (func(func() bool) error, func() error, func(), func()) {
+func (b *phasedUnlinkPauseBarrier) PrepareOpenUnlink(path, survivor string) (func(func() bool) error, func(func() bool, func() bool) error, func(), func()) {
 	acquireLock, commit, finalize, abort := b.Writeback.PrepareOpenUnlink(path, survivor)
 	wrappedAcquire := func(aborted func() bool) error {
 		if b.pauseBeforeCancel {

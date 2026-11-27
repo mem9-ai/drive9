@@ -867,7 +867,37 @@ func (cq *CommitQueue) AcquireCancelPathLock(path string, aborted func() bool) (
 // when !preserveLocal) while the caller holds the per-path lock returned by
 // AcquireCancelPathLock.
 func (cq *CommitQueue) FinishCancelPathLocked(path string, preserveLocal bool) error {
-	return cq.finishCancelPathLocked(path, preserveLocal)
+	_, err := cq.finishCancelPathLocked(path, preserveLocal, nil)
+	return err
+}
+
+// FinishCancelPathLockedWithAbort is FinishCancelPathLocked with an external
+// lease-loss predicate checked before any WAL or disk mutation. It reports
+// whether a durable WAL marker or durable shadow removal was committed.
+func (cq *CommitQueue) FinishCancelPathLockedWithAbort(path string, preserveLocal bool, aborted func() bool) (bool, error) {
+	return cq.finishCancelPathLocked(path, preserveLocal, aborted)
+}
+
+// JournalRenameMarkerLocked cancels any remaining queue entries for path and
+// appends a durable JournalUnlink marker while the caller already holds the
+// path lock. Returns (false, nil) when no WAL journal is configured.
+func (cq *CommitQueue) JournalRenameMarkerLocked(path string, aborted func() bool) (bool, error) {
+	if cq == nil {
+		return false, nil
+	}
+	if cq.isAbandoned() || (aborted != nil && aborted()) {
+		return false, errLayerRolledBack
+	}
+	for _, cancel := range cq.cancelPathEntries(path) {
+		cancel()
+	}
+	if cq.journal == nil {
+		return false, nil
+	}
+	if err := cq.journal.AppendSync(staging.JournalEntry{Op: staging.JournalUnlink, Path: path}); err != nil {
+		return false, fmt.Errorf("journal rename marker for %s: %w", path, err)
+	}
+	return true, nil
 }
 
 // CancelEntryInFlight cancels EXACTLY the given entry — the targeted
@@ -1571,13 +1601,14 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 		return err
 	}
 	defer unlock()
-	return cq.finishCancelPathLocked(path, preserveLocal)
+	_, err = cq.finishCancelPathLocked(path, preserveLocal, nil)
+	return err
 }
 
-func (cq *CommitQueue) finishCancelPathLocked(path string, preserveLocal bool) error {
-	if cq.isAbandoned() {
+func (cq *CommitQueue) finishCancelPathLocked(path string, preserveLocal bool, aborted func() bool) (bool, error) {
+	if cq.isAbandoned() || (aborted != nil && aborted()) {
 		cq.PreserveAbortedUnlinkLocked(path)
-		return errLayerRolledBack
+		return false, errLayerRolledBack
 	}
 	hadLocal := false
 	var removalErr error
@@ -1627,7 +1658,7 @@ func (cq *CommitQueue) finishCancelPathLocked(path string, preserveLocal bool) e
 		}
 		dropPending()
 		cq.clearTerminalFailure(path)
-		return nil
+		return false, nil
 	}
 	// AppendSync, not Append: the marker is what fences the frames of this
 	// name after a power loss, so it has to be on disk before the local state
@@ -1645,7 +1676,7 @@ func (cq *CommitQueue) finishCancelPathLocked(path string, preserveLocal bool) e
 		}
 		dropPending()
 		cq.clearTerminalFailure(path)
-		return nil
+		return true, nil
 	}
 	safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", path, appendErr)
 	// A marker that could not be fsynced fences nothing, so BOTH policies must
@@ -1674,7 +1705,7 @@ func (cq *CommitQueue) finishCancelPathLocked(path string, preserveLocal bool) e
 			cq.index.Remove(path)
 		}
 		cq.clearTerminalFailure(path)
-		return nil
+		return true, nil
 	}
 	// The recovery source survived or its absence cannot be proven. Keep the
 	// pending entry (the overlay stays discoverable), re-drive the upload
@@ -1688,7 +1719,7 @@ func (cq *CommitQueue) finishCancelPathLocked(path string, preserveLocal bool) e
 			}
 		}
 	}
-	return fmt.Errorf("commit queue: unlink of %s is not crash-durable: WAL marker failed (%v) and the staged image could not be confirmed removed", path, appendErr)
+	return false, fmt.Errorf("commit queue: unlink of %s is not crash-durable: WAL marker failed (%v) and the staged image could not be confirmed removed", path, appendErr)
 }
 
 // isEntryCanceled checks whether this specific entry was canceled by
@@ -3503,6 +3534,9 @@ func (cq *CommitQueue) clearTerminalFailure(path string) {
 func (cq *CommitQueue) CancelQueuedForRename(path string) error {
 	if cq == nil {
 		return nil
+	}
+	if cq.isAbandoned() {
+		return errLayerRolledBack
 	}
 	for _, cancel := range cq.cancelPathEntries(path) {
 		cancel()

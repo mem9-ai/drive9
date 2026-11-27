@@ -195,6 +195,17 @@ func (idx *OpenHandleIndex) Path(fh *fileHandle) (string, bool) {
 	return "", false
 }
 
+// CurrentOrLastPath returns fh's tracked path under idx.mu, avoiding data races
+// with concurrent RetargetPath / RenamePathPrefix updates.
+func (idx *OpenHandleIndex) CurrentOrLastPath(fh *fileHandle) string {
+	if fh == nil {
+		return ""
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	return fh.path
+}
+
 func addHandleToSet[K comparable](m map[K]map[*fileHandle]struct{}, key K, fh *fileHandle) {
 	set, ok := m[key]
 	if !ok {

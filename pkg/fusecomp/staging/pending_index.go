@@ -682,6 +682,118 @@ func (t *PendingConflictTransfer) Commit() (bool, error) {
 	return true, nil
 }
 
+// RestoreKindIfGeneration restores path's Kind when its generation still
+// matches expectedGen. Used to undo pre-publication MarkConflictIfGeneration
+// when BeginConflictTransfer fails before moving any payload.
+func (idx *PendingIndex) RestoreKindIfGeneration(path string, expectedGen uint64, kind PendingKind) {
+	if idx == nil || expectedGen == 0 || kind == PendingConflict {
+		return
+	}
+	pl := idx.acquirePathLock(path)
+	defer idx.releasePathLock(path, pl)
+	var snapshot *WriteBackMeta
+	idx.mu.Lock()
+	if src, ok := idx.items[path]; ok && src != nil && src.Generation == expectedGen {
+		src.Kind = kind
+		cp := cloneWriteBackMeta(src)
+		snapshot = &cp
+	}
+	idx.mu.Unlock()
+	if snapshot != nil {
+		_ = idx.writeMetaFile(snapshot)
+	}
+}
+
+// restoreSourceKindLocked restores oldPath's pre-transfer Kind in memory (and
+// best-effort on disk) while both endpoint path locks are held.
+func (t *PendingConflictTransfer) restoreSourceKindLocked() {
+	if t == nil || t.prepared == nil || t.prepared.Kind == PendingConflict {
+		return
+	}
+	var snapshot *WriteBackMeta
+	t.idx.mu.Lock()
+	if src, ok := t.idx.items[t.oldPath]; ok && src != nil && src.Generation == t.expectedOldGen {
+		src.Kind = t.prepared.Kind
+		cp := cloneWriteBackMeta(src)
+		snapshot = &cp
+	}
+	t.idx.mu.Unlock()
+	if snapshot != nil {
+		_ = t.idx.writeMetaFile(snapshot)
+	}
+}
+
+// RollbackPrePublish undoes an uncommitted pre-publication transfer (including
+// reversing an already-renamed shadow payload when the destination had no live
+// incumbent) and restores the source entry's original Kind.
+func (t *PendingConflictTransfer) RollbackPrePublish() {
+	if t == nil || t.closed {
+		return
+	}
+	defer t.release()
+	if t.payloadMoved && !t.destWasLive && t.shadows != nil {
+		_ = t.shadows.Rename(t.newPath, t.oldPath)
+		t.payloadMoved = false
+	}
+	if t.destReplaced || !t.destWasLive {
+		_ = os.Remove(filepath.Join(t.idx.dir, HashPath(t.newPath)+".meta"))
+		t.idx.mu.Lock()
+		delete(t.idx.items, t.newPath)
+		t.idx.mu.Unlock()
+	}
+	if !t.payloadMoved && (t.shadows == nil || t.shadows.Has(t.oldPath)) {
+		t.restoreSourceKindLocked()
+	}
+}
+
+// CommitReversible commits a pre-publication transfer like Commit, except if
+// fences fail or persisting the destination .meta fails when the destination
+// had no live incumbent, it reverses the payload move back to oldPath, removes
+// the prepared destination witness, and restores oldPath's original Kind.
+func (t *PendingConflictTransfer) CommitReversible() (bool, error) {
+	if t == nil || t.closed || t.prepared == nil {
+		return false, nil
+	}
+	defer t.release()
+
+	rollbackToSource := func() {
+		if t.destWasLive {
+			return
+		}
+		if t.payloadMoved && t.shadows != nil {
+			_ = t.shadows.Rename(t.newPath, t.oldPath)
+			t.payloadMoved = false
+		}
+		_ = os.Remove(filepath.Join(t.idx.dir, HashPath(t.newPath)+".meta"))
+		t.idx.mu.Lock()
+		delete(t.idx.items, t.newPath)
+		t.idx.mu.Unlock()
+		if t.shadows == nil || t.shadows.Has(t.oldPath) {
+			t.restoreSourceKindLocked()
+		}
+	}
+
+	if ok := t.fencesHold(); !ok {
+		rollbackToSource()
+		return false, nil
+	}
+	if err := t.idx.writeMetaFile(t.prepared); err != nil {
+		rollbackToSource()
+		return false, err
+	}
+	t.idx.mu.Lock()
+	cp := *t.prepared
+	t.idx.items[t.newPath] = &cp
+	delete(t.idx.items, t.oldPath)
+	cleared := t.idx.clearCommittedFencesLocked(t.oldPath, t.newPath)
+	t.idx.mu.Unlock()
+
+	_ = os.Remove(filepath.Join(t.idx.dir, HashPath(t.oldPath)+".meta"))
+	t.idx.removeFenceFiles(cleared)
+	safeLogPrintf("pending: reversible entry moved %s -> %s (gen %d -> %d)", t.oldPath, t.newPath, t.expectedOldGen, t.prepared.Generation)
+	return true, nil
+}
+
 // Abort rolls the transaction back. Before any payload move it is exact: an
 // empty destination only needs the prepared file removed, a live destination
 // was never touched, and the old name keeps its entry and payload either way.

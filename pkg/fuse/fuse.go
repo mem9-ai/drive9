@@ -600,6 +600,10 @@ func (f *FS) maybeRunDeferredUnlink(ino uint64) {
 // during I/O. Waiters recheck ownership after acquiring the entry's lock: a
 // completed deletion must never run again against a replacement object.
 func (f *FS) runDeferredUnlink(pending *deferredUnlink, requireClosed bool) error {
+	return f.runDeferredUnlinkWithContext(nil, pending, requireClosed)
+}
+
+func (f *FS) runDeferredUnlinkWithContext(parentCtx context.Context, pending *deferredUnlink, requireClosed bool) error {
 	pending.mu.Lock()
 	defer pending.mu.Unlock()
 	f.mu.Lock()
@@ -611,9 +615,12 @@ func (f *FS) runDeferredUnlink(pending *deferredUnlink, requireClosed bool) erro
 	path := pending.path
 	// A name rebound to a newer inode is not the old object's to delete.
 	if cur, ok := f.inodes.GetInode(path); !ok || cur == pending.ino {
-		// Detached budget: release completes deletion before replying, even
-		// if the caller's original request has already been cancelled.
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if parentCtx == nil {
+			// Detached budget: release completes deletion before replying, even
+			// if the caller's original request has already been cancelled.
+			parentCtx = context.Background()
+		}
+		ctx, cancel := context.WithTimeout(parentCtx, 30*time.Second)
 		defer cancel()
 		if _, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpUnlink, Path: path}); err != nil && fs.StatusOf(err) != gofuse.ENOENT {
 			return err
@@ -676,7 +683,7 @@ func (f *FS) drainDeferredUnlinks(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := f.runDeferredUnlink(entry, true); err != nil {
+		if err := f.runDeferredUnlinkWithContext(ctx, entry, true); err != nil {
 			return err
 		}
 	}
@@ -1005,7 +1012,7 @@ func (f *FS) flushOpenHandles(ctx context.Context) error {
 		}
 		hctx, cf := context.WithTimeout(ctx, 30*time.Second)
 		if ferr := h.h.Flush(hctx); ferr != nil {
-			err = errors.Join(err, fmt.Errorf("flush open handle %s: %w", h.path, ferr))
+			err = errors.Join(err, fmt.Errorf("flush open handle %s: %w", f.openIdx.CurrentOrLastPath(h), ferr))
 		}
 		cf()
 	}
@@ -2137,9 +2144,55 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 			}
 		}
 	}
-	gate := f.openNameLock(child)
-	gate.Lock()
-	defer gate.Unlock()
+	unlockGate := func() func() {
+		mu := f.openNameLock(child)
+		mu.Lock()
+		return mu.Unlock
+	}()
+	survivor := ""
+	candSurv := ""
+	for attempt := 0; attempt < 64; attempt++ {
+		if !f.openIdx.HasOpenPath(child) {
+			survivor = ""
+			break
+		}
+		ino0, ok0 := f.inodes.GetInode(child)
+		if !ok0 {
+			survivor = ""
+			break
+		}
+		surv0 := candSurv
+		candSurv = ""
+		if surv0 == "" || surv0 == child {
+			surv0, _ = f.inodes.SurvivorOfInode(ino0, child)
+		}
+		if surv0 == "" || surv0 == child {
+			survivor = ""
+			break
+		}
+		unlockGate()
+		unlockGate = f.lockOpenNamePair(child, surv0)
+		if !f.openIdx.HasOpenPath(child) {
+			survivor = ""
+			break
+		}
+		ino1, ok1 := f.inodes.GetInode(child)
+		if !ok1 {
+			survivor = ""
+			break
+		}
+		if survIno, sok := f.inodes.GetInode(surv0); sok && survIno == ino1 {
+			survivor = surv0
+			break
+		}
+		surv1, _ := f.inodes.SurvivorOfInode(ino1, child)
+		if surv1 == "" || surv1 == child {
+			survivor = ""
+			break
+		}
+		candSurv = surv1
+	}
+	defer unlockGate()
 	f.debugf("unlink start path=%s parent_ino=%d name=%s", child, header.NodeId, name)
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
@@ -2149,19 +2202,25 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 		// the last close — deferring the delete keeps fd reads working in a
 		// sync core with no local data plane.
 		ino, iok := f.inodes.GetInode(child)
-		survivor, _ := f.inodes.SurvivorOfInode(ino, child)
+		if !iok || survivor == child {
+			survivor = ""
+		} else if survivor != "" {
+			if survIno, sok := f.inodes.GetInode(survivor); !sok || survIno != ino {
+				survivor = ""
+			}
+		}
 		// Preparation may block on an upload or a clean reader. Keep the
 		// name, open index and replayable staged writes intact meanwhile.
 		var (
 			acquireLock    func(func() bool) error
-			commitUnlink   func() error
+			commitUnlink   func(func() bool, func() bool) error
 			finalizeUnlink func()
 			abortUnlink    func()
 			finishLegacy   func(bool) error
 		)
 		for _, h := range f.chain.Handlers() {
 			if prep, ok := h.(interface {
-				PrepareOpenUnlink(string, string) (func(func() bool) error, func() error, func(), func())
+				PrepareOpenUnlink(string, string) (func(func() bool) error, func(func() bool, func() bool) error, func(), func())
 			}); ok {
 				acquireLock, commitUnlink, finalizeUnlink, abortUnlink = prep.PrepareOpenUnlink(child, survivor)
 				break
@@ -2183,18 +2242,22 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 		isFenced := func() bool {
 			return binding != nil && binding.fenced.Load()
 		}
-		if binding != nil {
+		linearizeNoWAL := func() bool {
+			if binding == nil {
+				return true
+			}
 			binding.fenceMu.Lock()
 			fenced := binding.fenced.Load()
 			binding.fenceMu.Unlock()
-			if fenced {
-				if abortUnlink != nil {
-					abortUnlink()
-				} else if finishLegacy != nil {
-					_ = finishLegacy(false)
-				}
-				return gofuse.EIO
+			return !fenced
+		}
+		if isFenced() {
+			if abortUnlink != nil {
+				abortUnlink()
+			} else if finishLegacy != nil {
+				_ = finishLegacy(false)
 			}
+			return gofuse.EIO
 		}
 		// Step 1 (off binding.fenceMu): cancel in-flight uploads and acquire
 		// the per-path lock(s) with ZERO WAL writes and ZERO mutations to
@@ -2212,25 +2275,21 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 		}
 		// Step 2 (under binding.fenceMu, zero handle/disk locks): linearize
 		// lease validity before any durable or in-memory mutation.
-		if binding != nil {
-			binding.fenceMu.Lock()
-			fenced := binding.fenced.Load()
-			binding.fenceMu.Unlock()
-			if fenced {
-				if abortUnlink != nil {
-					abortUnlink()
-				} else if finishLegacy != nil {
-					_ = finishLegacy(false)
-				}
-				return gofuse.EIO
+		if !linearizeNoWAL() {
+			if abortUnlink != nil {
+				abortUnlink()
+			} else if finishLegacy != nil {
+				_ = finishLegacy(false)
 			}
+			return gofuse.EIO
 		}
 		// Step 3 (off binding.fenceMu, while holding openNameLock + per-path
 		// lock): persist WAL JournalUnlink / survivor migration BEFORE mutating
-		// handles, openIdx, inodes, or deferredUnlinks. If persistence fails,
-		// all live state remains untouched.
+		// handles, openIdx, inodes, or deferredUnlinks. When no WAL/Pending
+		// write occurs, commitUnlink re-checks linearizeNoWAL() before mutating
+		// handles or wbCache so self-fence never drops local recovery state.
 		if commitUnlink != nil {
-			if err := commitUnlink(); err != nil {
+			if err := commitUnlink(isFenced, linearizeNoWAL); err != nil {
 				if isFenced() {
 					return gofuse.EIO
 				}
@@ -2243,6 +2302,8 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 				}
 				return fs.StatusOf(err)
 			}
+		} else if !linearizeNoWAL() {
+			return gofuse.EIO
 		}
 		pending := &deferredUnlink{path: child, ino: ino}
 		pending.mu.Lock()
@@ -2251,7 +2312,9 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 		} else {
 			f.openIdx.UnlinkPath(child)
 		}
+		siblings := f.inodes.SurvivingAliases(child)
 		f.inodes.RemoveLinkPreserve(child)
+		f.dropSiblingRows(child, siblings)
 		if iok {
 			f.mu.Lock()
 			f.deferredUnlinks[child] = pending
@@ -3034,7 +3097,7 @@ func (f *FS) dispatchPath(nodeid, fh uint64) (string, bool) {
 		// The inode guard keeps a number from one handle table from
 		// answering for the other when the two fh spaces collide.
 		if h, ok := f.handles.get(fh); ok && h.ino == nodeid {
-			return h.path, true
+			return f.openIdx.CurrentOrLastPath(h), true
 		}
 		// Directory descriptors (opendir handles) resolve the same way: an
 		// fstat by dirfd on a detached directory keeps answering from its
