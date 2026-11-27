@@ -4,6 +4,7 @@ package fuse
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -1829,5 +1830,125 @@ func TestRound10MornyxReviewRegressions(t *testing.T) {
 			require.Equal(t, gofuse.ENOENT, linkSt)
 		}
 		f.Release(nil, &gofuse.ReleaseIn{InHeader: lHdr, Fh: lOut.Fh})
+	})
+
+	t.Run("startup_transfer_backup_recovery_preserves_backups_on_meta_or_rename_fault_and_retries_cleanly", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("chmod permission fault injection requires non-root")
+		}
+		seedMidMoveCrash := func(t *testing.T) (string, string, string, string) {
+			t.Helper()
+			baseDir := filepath.Join(t.TempDir(), "ledger")
+			st, err := staging.NewStaging(baseDir)
+			require.NoError(t, err)
+
+			require.NoError(t, st.Shadow.WriteFull("/src", []byte("src-newer-bytes"), 2))
+			srcGen, err := st.Pending.Put("/src", int64(len("src-newer-bytes")), staging.PendingOverwrite)
+			require.NoError(t, err)
+
+			require.NoError(t, st.Shadow.WriteFull("/dst", []byte("dst-orig-bytes"), 1))
+			dstGen, err := st.Pending.Put("/dst", int64(len("dst-orig-bytes")), staging.PendingOverwrite)
+			require.NoError(t, err)
+
+			marked, mErr := st.Pending.MarkConflictIfGeneration("/src", srcGen)
+			require.NoError(t, mErr)
+			require.True(t, marked)
+			tx, begun, err := st.Pending.BeginConflictTransfer("/src", "/dst", srcGen, dstGen, st.Shadow)
+			require.NoError(t, err)
+			require.True(t, begun)
+
+			// Simulate crash mid-MovePayloadReversible: destination .meta.unlinkbak + .shadow.unlinkbak
+			// and witness .meta are written, while /dst.shadow is absent (before Rename(/src -> /dst)).
+			dstHash := staging.HashPath("/dst")
+			pendingDir := filepath.Join(baseDir, "pending")
+			shadowDir := filepath.Join(baseDir, "shadow")
+			origDstMeta, ok := st.Pending.GetMeta("/dst")
+			require.True(t, ok)
+			origDstMetaRaw, err := json.Marshal(origDstMeta)
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(filepath.Join(pendingDir, dstHash+".meta.unlinkbak"), origDstMetaRaw, 0o600))
+			backedUp, err := st.Shadow.BackupForTransfer("/dst")
+			require.NoError(t, err)
+			require.True(t, backedUp)
+			// Overwrite /dst.meta with witness conflict meta carrying /src's size (15 bytes vs 14 bytes).
+			witnessMeta := `{"path":"/dst","size":15,"kind":"conflict","generation":999}`
+			require.NoError(t, os.WriteFile(filepath.Join(pendingDir, dstHash+".meta"), []byte(witnessMeta), 0o600))
+
+			tx.Abort() // close locks; re-seed the exact mid-crash on-disk layout after Abort cleans up
+			st.Close()
+
+			require.NoError(t, os.WriteFile(filepath.Join(pendingDir, dstHash+".meta.unlinkbak"), origDstMetaRaw, 0o600))
+			require.NoError(t, os.WriteFile(filepath.Join(shadowDir, dstHash+".shadow.unlinkbak"), []byte("dst-orig-bytes"), 0o600))
+			_ = os.Remove(filepath.Join(shadowDir, dstHash+".shadow"))
+			require.NoError(t, os.WriteFile(filepath.Join(pendingDir, dstHash+".meta"), []byte(witnessMeta), 0o600))
+			return baseDir, pendingDir, shadowDir, dstHash
+		}
+
+		// Case 1: .meta write failure (read-only pendingDir) must surface an error,
+		// must NOT rename .shadow.unlinkbak onto .shadow (avoiding witness .meta + old bytes mismatch),
+		// and must preserve both .unlinkbak files so recovery succeeds once writable!
+		baseDir1, pendingDir1, shadowDir1, dstHash1 := seedMidMoveCrash(t)
+		require.NoError(t, os.Chmod(pendingDir1, 0o555))
+		t.Cleanup(func() { _ = os.Chmod(pendingDir1, 0o755) })
+
+		stFail1, err := staging.NewStaging(baseDir1)
+		if err == nil {
+			err = stFail1.Recover()
+			stFail1.Close()
+		}
+		require.Error(t, err, "meta restore write failure must fail startup recovery")
+		_, err = os.Stat(filepath.Join(shadowDir1, dstHash1+".shadow"))
+		require.ErrorIs(t, err, os.ErrNotExist, "shadow backup must not be moved before .meta restore succeeds")
+		_, err = os.Stat(filepath.Join(shadowDir1, dstHash1+".shadow.unlinkbak"))
+		require.NoError(t, err, ".shadow.unlinkbak must remain intact for retry")
+		_, err = os.Stat(filepath.Join(pendingDir1, dstHash1+".meta.unlinkbak"))
+		require.NoError(t, err, ".meta.unlinkbak must remain intact for retry")
+
+		require.NoError(t, os.Chmod(pendingDir1, 0o755))
+		stRecovered1, err := staging.NewStaging(baseDir1)
+		require.NoError(t, err)
+		t.Cleanup(stRecovered1.Close)
+		require.NoError(t, stRecovered1.Recover())
+		meta1, ok := stRecovered1.Pending.GetMeta("/dst")
+		require.True(t, ok)
+		require.Equal(t, staging.PendingOverwrite, meta1.Kind)
+		require.EqualValues(t, len("dst-orig-bytes"), meta1.Size)
+		gotBytes1, err := stRecovered1.Shadow.ReadAll("/dst")
+		require.NoError(t, err)
+		require.Equal(t, "dst-orig-bytes", string(gotBytes1))
+		_, err = os.Stat(filepath.Join(pendingDir1, dstHash1+".meta.unlinkbak"))
+		require.ErrorIs(t, err, os.ErrNotExist)
+		_, err = os.Stat(filepath.Join(shadowDir1, dstHash1+".shadow.unlinkbak"))
+		require.ErrorIs(t, err, os.ErrNotExist)
+
+		// Case 2: .shadow.unlinkbak rename failure (read-only shadowDir) must surface an error
+		// and preserve both .unlinkbak files so recovery succeeds once writable!
+		baseDir2, pendingDir2, shadowDir2, dstHash2 := seedMidMoveCrash(t)
+		require.NoError(t, os.Chmod(shadowDir2, 0o555))
+		t.Cleanup(func() { _ = os.Chmod(shadowDir2, 0o755) })
+
+		stFail2, err := staging.NewStaging(baseDir2)
+		if err == nil {
+			err = stFail2.Recover()
+			stFail2.Close()
+		}
+		require.Error(t, err, "shadow backup rename failure must fail startup recovery")
+		_, err = os.Stat(filepath.Join(shadowDir2, dstHash2+".shadow.unlinkbak"))
+		require.NoError(t, err, ".shadow.unlinkbak must remain intact after rename failure")
+		_, err = os.Stat(filepath.Join(pendingDir2, dstHash2+".meta.unlinkbak"))
+		require.NoError(t, err, ".meta.unlinkbak must remain intact after rename failure")
+
+		require.NoError(t, os.Chmod(shadowDir2, 0o755))
+		stRecovered2, err := staging.NewStaging(baseDir2)
+		require.NoError(t, err)
+		t.Cleanup(stRecovered2.Close)
+		require.NoError(t, stRecovered2.Recover())
+		meta2, ok := stRecovered2.Pending.GetMeta("/dst")
+		require.True(t, ok)
+		require.Equal(t, staging.PendingOverwrite, meta2.Kind)
+		require.EqualValues(t, len("dst-orig-bytes"), meta2.Size)
+		gotBytes2, err := stRecovered2.Shadow.ReadAll("/dst")
+		require.NoError(t, err)
+		require.Equal(t, "dst-orig-bytes", string(gotBytes2))
 	})
 }

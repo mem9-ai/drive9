@@ -2338,31 +2338,32 @@ func (s *ShadowStore) DiscardTransferBackup(remotePath string) {
 // AdoptRecoveredHashFile registers <dir>/<hash>.shadow under __hash:<hash> if
 // ShadowStore.RecoverFromDisk already ran before PendingIndex reconciled a
 // mid-transfer .unlinkbak backup.
-func (s *ShadowStore) AdoptRecoveredHashFile(hash string) {
+func (s *ShadowStore) AdoptRecoveredHashFile(hash string) error {
 	if s == nil || hash == "" {
-		return
+		return nil
 	}
 	sp := filepath.Join(s.dir, hash+".shadow")
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, exists := s.files["__hash:"+hash]; exists {
-		return
+		return nil
 	}
 	for p := range s.files {
 		if !strings.HasPrefix(p, "__hash:") && HashPath(p) == hash {
-			return
+			return nil
 		}
 	}
 	fd, err := os.OpenFile(sp, os.O_RDWR, 0o644)
 	if err != nil {
-		return
+		return err
 	}
 	fi, serr := fd.Stat()
 	if serr != nil {
 		_ = fd.Close()
-		return
+		return serr
 	}
 	s.files["__hash:"+hash] = &ShadowFile{fd: fd, size: fi.Size()}
+	return nil
 }
 
 func isRegular(e os.DirEntry) bool {
