@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
@@ -242,7 +243,8 @@ type CommitQueue struct {
 	// larger than maxPending so Enqueue never blocks.
 	workCh chan *CommitEntry
 
-	zeroTruncateDelay time.Duration
+	zeroTruncateDelay      time.Duration
+	onCancelPrefixSnapshot atomic.Pointer[func(prefix string)]
 	// extentTakeover arms the extent content-layout commit branch
 	// (SetExtentTakeover).
 	extentTakeover bool
@@ -1157,6 +1159,9 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 		return true
 	})
 	cq.mu.Unlock()
+	if fn := cq.onCancelPrefixSnapshot.Load(); fn != nil && *fn != nil {
+		(*fn)(prefix)
+	}
 
 	for _, cancel := range cancels {
 		cancel()

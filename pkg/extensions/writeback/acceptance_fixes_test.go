@@ -974,15 +974,40 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 		ts := httptest.NewServer(b)
 		t.Cleanup(ts.Close)
 		cl := client.New(ts.URL, "")
-		wbcache, _ := staging.NewWriteBackCache(t.TempDir())
-		wb, _ := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCache: wbcache})
+		wbcache, err := staging.NewWriteBackCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCache: wbcache})
+		if err != nil {
+			t.Fatal(err)
+		}
 		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
-		terminal, _ := core.New(cl, core.Options{})
-		ch, _ := fs.NewChain(wb, terminal)
+		terminal, err := core.New(cl, core.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ch, err := fs.NewChain(wb, terminal)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		waitGateOrErr := func(gate <-chan struct{}, errCh <-chan error, desc string) {
+			t.Helper()
+			timer := time.NewTimer(5 * time.Second)
+			defer timer.Stop()
+			select {
+			case <-gate:
+			case werr := <-errCh:
+				t.Fatalf("%s exited early before reaching gate: %v", desc, werr)
+			case <-timer.C:
+				t.Fatalf("timed out waiting for %s", desc)
+			}
+		}
 
 		// 1. Concurrent non-overlapping writes across co-open handles: pause A
-		// at write:beforePropagate while B concurrently writes byte 1, then
-		// verify BOTH descriptors hold "AB" (neither drops the other's byte).
+		// at write:beforePropagate while B concurrently enters Write and blocks
+		// on coOpenLocks, then verify BOTH descriptors hold "AB" before flush.
 		a, err := ch.Dispatch(ctx, &fs.Op{
 			Kind: fs.OpCreate, Path: "/race-ab",
 			Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644, HasMode: true,
@@ -1005,14 +1030,31 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 		}
 
 		aEntered := make(chan struct{})
+		bEntering := make(chan struct{})
+		bAcquired := make(chan struct{})
 		allowA := make(chan struct{})
-		var aOnce sync.Once
+		var aOnce, bEnterOnce, bAcqOnce, allowAOnce sync.Once
+		releaseAllowA := func() { allowAOnce.Do(func() { close(allowA) }) }
+		t.Cleanup(func() {
+			wb.testGateHook.Store(nil)
+			releaseAllowA()
+		})
+		var watchB atomic.Bool
 		hookAB := func(gate string) {
-			if gate == "write:beforePropagate" {
+			switch gate {
+			case "write:beforePropagate":
 				aOnce.Do(func() {
 					close(aEntered)
 					<-allowA
 				})
+			case "write:coOpenEntering":
+				if watchB.Load() {
+					bEnterOnce.Do(func() { close(bEntering) })
+				}
+			case "write:coOpenAcquired":
+				if watchB.Load() {
+					bAcqOnce.Do(func() { close(bAcquired) })
+				}
 			}
 		}
 		wb.testGateHook.Store(&hookAB)
@@ -1020,10 +1062,18 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 		aDone := make(chan error, 1)
 		bDone := make(chan error, 1)
 		go func() { aDone <- a.Handle.Write(ctx, 0, []byte("A")) }()
-		<-aEntered
+		waitGateOrErr(aEntered, aDone, "A write:beforePropagate")
+
+		watchB.Store(true)
 		go func() { bDone <- bH.Handle.Write(ctx, 1, []byte("B")) }()
-		// Let B contend on coOpenLocks, then release A.
-		close(allowA)
+		waitGateOrErr(bEntering, bDone, "B write:coOpenEntering")
+		select {
+		case <-bAcquired:
+			t.Fatal("B acquired coOpenLocks before A released it")
+		default:
+		}
+		releaseAllowA()
+		waitGateOrErr(bAcquired, bDone, "B write:coOpenAcquired")
 		if err := <-aDone; err != nil {
 			t.Fatal(err)
 		}
@@ -1032,7 +1082,19 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 		}
 		wb.testGateHook.Store(nil)
 
-		// Close A first, then B last (so B's Flush/Release owns final image).
+		// Verify BOTH descriptors hold "AB" BEFORE flushing either handle.
+		bufA := make([]byte, 4)
+		nA, err := a.Handle.Read(ctx, 0, bufA)
+		if err != nil || string(bufA[:nA]) != "AB" {
+			t.Fatalf("descriptor A pre-flush Read = (%q, %v), want AB", string(bufA[:nA]), err)
+		}
+		bufB := make([]byte, 4)
+		nB, err := bH.Handle.Read(ctx, 0, bufB)
+		if err != nil || string(bufB[:nB]) != "AB" {
+			t.Fatalf("descriptor B pre-flush Read = (%q, %v), want AB", string(bufB[:nB]), err)
+		}
+
+		// Close A first, then B last, and verify backend persistence.
 		_ = a.Handle.Flush(ctx)
 		_ = a.Handle.Release(ctx)
 		_ = bH.Handle.Flush(ctx)
@@ -1062,7 +1124,12 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 		truncEntered := make(chan struct{})
 		writeEntering := make(chan struct{})
 		allowTrunc := make(chan struct{})
-		var truncOnce, writeOnce sync.Once
+		var truncOnce, writeOnce, allowTruncOnce sync.Once
+		releaseAllowTrunc := func() { allowTruncOnce.Do(func() { close(allowTrunc) }) }
+		t.Cleanup(func() {
+			wb.testGateHook.Store(nil)
+			releaseAllowTrunc()
+		})
 		hookTrunc := func(gate string) {
 			switch gate {
 			case "openTrunc:coOpenLocked":
@@ -1083,21 +1150,25 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 			err error
 		}
 		t2Ch := make(chan truncOpenRes, 1)
+		t2ErrCh := make(chan error, 1)
 		go func() {
 			r, oerr := ch.Dispatch(ctx, &fs.Op{
 				Kind: fs.OpCreate, Path: "/trunc-interleave",
 				Flags: uint32(syscall.O_WRONLY | syscall.O_TRUNC),
 			})
+			if oerr != nil {
+				t2ErrCh <- oerr
+			}
 			t2Ch <- truncOpenRes{res: r, err: oerr}
 		}()
-		<-truncEntered
+		waitGateOrErr(truncEntered, t2ErrCh, "openTrunc:coOpenLocked")
 
 		s1WriteDone := make(chan error, 1)
 		go func() {
 			s1WriteDone <- s1.Handle.Write(ctx, 2, []byte("Y"))
 		}()
-		<-writeEntering
-		close(allowTrunc)
+		waitGateOrErr(writeEntering, s1WriteDone, "s1 write:coOpenEntering")
+		releaseAllowTrunc()
 
 		t2Out := <-t2Ch
 		if t2Out.err != nil {
@@ -1138,9 +1209,8 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
 
-		// Stage an old conflicted entry under /sub/old.bin and verify CancelPrefix
-		// removes both its PendingIndex and ShadowStore while leaving a newer
-		// path lock-protected write untouched if staged after the snapshot.
+		// Stage an old conflicted entry under /sub/old.bin and an older version
+		// on /sub/replace.bin before CancelPrefix captures its watermarks.
 		if err := ledger.Shadow.WriteFull("/sub/old.bin", []byte("old-shadow"), 0); err != nil {
 			t.Fatal(err)
 		}
@@ -1150,41 +1220,76 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 		if err := ledger.Pending.MarkConflict("/sub/old.bin"); err != nil {
 			t.Fatal(err)
 		}
+		if err := ledger.Shadow.WriteFull("/sub/replace.bin", []byte("stale"), 0); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ledger.Pending.PutWithBaseRev("/sub/replace.bin", 5, staging.PendingNew, 0); err != nil {
+			t.Fatal(err)
+		}
 
-		// Hold pathLock on /sub/new.bin across CancelPrefix's snapshot to
-		// simulate a concurrent writer completing its Shadow + Pending pair
-		// right as CancelPrefix runs!
-		unlockNew := wb.pathLocks.lock("/sub/new.bin")
+		snapCaptured := make(chan struct{})
+		allowCancel := make(chan struct{})
+		var snapOnce, allowOnce sync.Once
+		releaseCancel := func() { allowOnce.Do(func() { close(allowCancel) }) }
+		t.Cleanup(func() {
+			wb.queue.onCancelPrefixSnapshot.Store(nil)
+			releaseCancel()
+		})
+		hookSnap := func(prefix string) {
+			if prefix == "/sub/" {
+				snapOnce.Do(func() {
+					close(snapCaptured)
+					<-allowCancel
+				})
+			}
+		}
+		wb.queue.onCancelPrefixSnapshot.Store(&hookSnap)
+
 		cancelDone := make(chan struct{})
 		go func() {
 			defer close(cancelDone)
 			wb.queue.CancelPrefix("/sub/")
 		}()
-		// Stage /sub/new.bin while holding its pathLock (allocates newer
-		// generations than CancelPrefix's snapshot if CancelPrefix already
-		// entered, or gets fenced coherently if before). Either way, Pending
-		// and Shadow must NEVER end up half-deleted!
-		if err := ledger.Shadow.WriteFull("/sub/new.bin", []byte("coherent-new"), 0); err != nil {
-			unlockNew()
-			t.Fatal(err)
+		select {
+		case <-snapCaptured:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for CancelPrefix snapshot gate")
 		}
-		if _, err := ledger.Pending.PutWithBaseRev("/sub/new.bin", 12, staging.PendingNew, 0); err != nil {
-			unlockNew()
-			t.Fatal(err)
-		}
-		unlockNew()
-		<-cancelDone
 
-		hasPend := ledger.Pending.HasPending("/sub/new.bin")
-		hasShad := ledger.Shadow.Has("/sub/new.bin")
-		if hasPend != hasShad {
-			t.Fatalf("incoherent CancelPrefix state on /sub/new.bin: hasPending=%v hasShadow=%v", hasPend, hasShad)
+		// Publish a replacement pair on /sub/replace.bin AFTER CancelPrefix
+		// captured maxPendingAtCancel/maxShadowAtCancel; both items must survive!
+		unlockRep := wb.pathLocks.lock("/sub/replace.bin")
+		if err := ledger.Shadow.WriteFull("/sub/replace.bin", []byte("coherent-new"), 0); err != nil {
+			unlockRep()
+			t.Fatal(err)
+		}
+		if _, err := ledger.Pending.PutWithBaseRev("/sub/replace.bin", 12, staging.PendingNew, 0); err != nil {
+			unlockRep()
+			t.Fatal(err)
+		}
+		unlockRep()
+
+		releaseCancel()
+		select {
+		case <-cancelDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for CancelPrefix completion")
+		}
+		wb.queue.onCancelPrefixSnapshot.Store(nil)
+
+		if !ledger.Pending.HasPending("/sub/replace.bin") || !ledger.Shadow.Has("/sub/replace.bin") {
+			t.Fatalf("expected post-snapshot /sub/replace.bin pair to survive: hasPending=%v hasShadow=%v",
+				ledger.Pending.HasPending("/sub/replace.bin"), ledger.Shadow.Has("/sub/replace.bin"))
+		}
+		gotPayload, err := ledger.Shadow.ReadAll("/sub/replace.bin")
+		if err != nil || string(gotPayload) != "coherent-new" {
+			t.Fatalf("/sub/replace.bin shadow = (%q, %v), want coherent-new", string(gotPayload), err)
 		}
 		if ledger.Pending.HasPending("/sub/old.bin") || ledger.Shadow.Has("/sub/old.bin") {
 			t.Fatal("expected /sub/old.bin to be purged by CancelPrefix")
 		}
-		ledger.Pending.Remove("/sub/new.bin")
-		ledger.Shadow.Remove("/sub/new.bin")
+		ledger.Pending.Remove("/sub/replace.bin")
+		ledger.Shadow.Remove("/sub/replace.bin")
 	})
 
 	t.Run("reopen-bypass-size-without-ledger-does-not-put-on-open", func(t *testing.T) {
@@ -1198,12 +1303,24 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 		}))
 		t.Cleanup(ts.Close)
 		cl := client.New(ts.URL, "")
-		wbcache, _ := staging.NewWriteBackCache(t.TempDir())
-		wb, _ := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCache: wbcache})
+		wbcache, err := staging.NewWriteBackCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCache: wbcache})
+		if err != nil {
+			t.Fatal(err)
+		}
 		wb.wbCacheMaxBytes = 32 << 10
 		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
-		terminal, _ := core.New(cl, core.Options{})
-		ch, _ := fs.NewChain(wb, terminal)
+		terminal, err := core.New(cl, core.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ch, err := fs.NewChain(wb, terminal)
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		h1, err := ch.Dispatch(ctx, &fs.Op{
 			Kind: fs.OpCreate, Path: "/oversize-no-ledger",
@@ -1303,5 +1420,335 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 		bh.landed = true
 		bh.mu.Unlock()
 		_ = multi.Handle.Release(ctx)
+	})
+
+	t.Run("post-landing-coopen-writes-preserve-both-descriptors", func(t *testing.T) {
+		for _, closeOrder := range []string{"creator-last", "reopener-last"} {
+			t.Run(closeOrder, func(t *testing.T) {
+				b := testbackend.NewBackend()
+				ts := httptest.NewServer(b)
+				t.Cleanup(ts.Close)
+				cl := client.New(ts.URL, "")
+				wbcache, err := staging.NewWriteBackCache(t.TempDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCache: wbcache})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+				terminal, err := core.New(cl, core.Options{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				ch, err := fs.NewChain(wb, terminal)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				h1, err := ch.Dispatch(ctx, &fs.Op{
+					Kind: fs.OpCreate, Path: "/post-land",
+					Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644, HasMode: true,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				h2, err := ch.Dispatch(ctx, &fs.Op{
+					Kind: fs.OpCreate, Path: "/post-land", Flags: uint32(syscall.O_RDWR),
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := h1.Handle.Write(ctx, 0, []byte("abc")); err != nil {
+					t.Fatal(err)
+				}
+				if err := h1.Handle.Flush(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if err := wb.Drain(ctx); err != nil {
+					t.Fatal(err)
+				}
+				// Now create has landed (isNew=false on both handles). Write "X"
+				// on creator h1 and "Y" on reopener h2, then commit in both orders!
+				if err := h1.Handle.Write(ctx, 0, []byte("X")); err != nil {
+					t.Fatal(err)
+				}
+				if err := h2.Handle.Write(ctx, 2, []byte("Y")); err != nil {
+					t.Fatal(err)
+				}
+				if closeOrder == "creator-last" {
+					_ = h2.Handle.Flush(ctx)
+					_ = h2.Handle.Release(ctx)
+					if err := wb.Drain(ctx); err != nil {
+						t.Fatal(err)
+					}
+					_ = h1.Handle.Flush(ctx)
+					_ = h1.Handle.Release(ctx)
+				} else {
+					_ = h1.Handle.Flush(ctx)
+					_ = h1.Handle.Release(ctx)
+					if err := wb.Drain(ctx); err != nil {
+						t.Fatal(err)
+					}
+					_ = h2.Handle.Flush(ctx)
+					_ = h2.Handle.Release(ctx)
+				}
+				if err := wb.Drain(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if n, ok := b.Node("/post-land"); !ok || string(n.Data) != "XbY" {
+					t.Fatalf("/post-land (%s) = (%v, %q), want XbY", closeOrder, ok, n.Data)
+				}
+			})
+		}
+	})
+
+	t.Run("unlinked-local-reader-serves-original-bytes-across-recreate", func(t *testing.T) {
+		b := testbackend.NewBackend()
+		ts := httptest.NewServer(b)
+		t.Cleanup(ts.Close)
+		cl := client.New(ts.URL, "")
+		wbcache, err := staging.NewWriteBackCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCache: wbcache})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stopSSETestWriteback(t, wb)
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+		terminal, err := core.New(cl, core.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ch, err := fs.NewChain(wb, terminal)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		w1, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/unlink-recreate",
+			Flags: uint32(syscall.O_CREAT | syscall.O_WRONLY), Mode: 0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w1.Handle.Write(ctx, 0, []byte("orig-v1")); err != nil {
+			t.Fatal(err)
+		}
+		r1, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/unlink-recreate", Flags: uint32(syscall.O_RDONLY),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w1.Handle.Write(ctx, 0, []byte("orig-v2")); err != nil {
+			t.Fatal(err)
+		}
+		_ = w1.Handle.Flush(ctx)
+		_ = w1.Handle.Release(ctx)
+		if err := wb.Drain(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		// Pause r1 inside readRemoteRangeFallback while concurrent Unlink +
+		// Recreate tries to replace /unlink-recreate with "REPLACEMENT".
+		inFallback := make(chan struct{})
+		allowFallback := make(chan struct{})
+		var fbOnce, allowOnce sync.Once
+		releaseFB := func() { allowOnce.Do(func() { close(allowFallback) }) }
+		t.Cleanup(func() {
+			wb.testGateHook.Store(nil)
+			releaseFB()
+		})
+		hookFB := func(gate string) {
+			if gate == "read:remoteFallback" {
+				fbOnce.Do(func() {
+					close(inFallback)
+					<-allowFallback
+				})
+			}
+		}
+		wb.testGateHook.Store(&hookFB)
+
+		type readRes struct {
+			data string
+			err  error
+		}
+		readDone := make(chan readRes, 1)
+		go func() {
+			buf := make([]byte, 32)
+			n, rerr := r1.Handle.Read(ctx, 0, buf)
+			readDone <- readRes{data: string(buf[:n]), err: rerr}
+		}()
+		select {
+		case <-inFallback:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for read:remoteFallback")
+		}
+
+		unlinkDone := make(chan error, 1)
+		go func() {
+			_, uerr := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/unlink-recreate"})
+			unlinkDone <- uerr
+		}()
+		// Unlink must wait on r1.remoteReadMu until readRemoteRangeFallback finishes.
+		select {
+		case uerr := <-unlinkDone:
+			t.Fatalf("Unlink completed before in-flight readRemoteRangeFallback released lock: %v", uerr)
+		default:
+		}
+		releaseFB()
+
+		rr := <-readDone
+		if rr.err != nil || rr.data != "orig-v2" {
+			t.Fatalf("in-flight Read = (%q, %v), want orig-v2", rr.data, rr.err)
+		}
+		if uerr := <-unlinkDone; uerr != nil {
+			t.Fatalf("Unlink: %v", uerr)
+		}
+		wb.testGateHook.Store(nil)
+
+		// Recreate /unlink-recreate with completely different bytes and land it.
+		w2, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/unlink-recreate",
+			Flags: uint32(syscall.O_CREAT | syscall.O_WRONLY), Mode: 0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w2.Handle.Write(ctx, 0, []byte("REPLACEMENT")); err != nil {
+			t.Fatal(err)
+		}
+		_ = w2.Handle.Flush(ctx)
+		_ = w2.Handle.Release(ctx)
+		if err := wb.Drain(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		// Anonymous r1 must STILL serve "orig-v2", never "REPLACEMENT"!
+		buf := make([]byte, 32)
+		n, err := r1.Handle.Read(ctx, 0, buf)
+		if err != nil || string(buf[:n]) != "orig-v2" {
+			t.Fatalf("post-unlink Read after recreate = (%q, %v), want orig-v2", string(buf[:n]), err)
+		}
+		_ = r1.Handle.Release(ctx)
+	})
+
+	t.Run("open-trunc-sweep-ignores-renamed-path-replacement", func(t *testing.T) {
+		b := testbackend.NewBackend()
+		ts := httptest.NewServer(b)
+		t.Cleanup(ts.Close)
+		cl := client.New(ts.URL, "")
+		wbcache, err := staging.NewWriteBackCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCache: wbcache})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+		terminal, err := core.New(cl, core.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ch, err := fs.NewChain(wb, terminal)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		orig, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/swap-f",
+			Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := orig.Handle.Write(ctx, 0, []byte("old-bytes")); err != nil {
+			t.Fatal(err)
+		}
+
+		truncPaused := make(chan struct{})
+		allowTrunc := make(chan struct{})
+		var pOnce, aOnce sync.Once
+		releaseTrunc := func() { aOnce.Do(func() { close(allowTrunc) }) }
+		t.Cleanup(func() {
+			wb.testGateHook.Store(nil)
+			releaseTrunc()
+		})
+		hook := func(gate string) {
+			if gate == "openTrunc:coOpenLocked" {
+				pOnce.Do(func() {
+					close(truncPaused)
+					<-allowTrunc
+				})
+			}
+		}
+		wb.testGateHook.Store(&hook)
+
+		tDone := make(chan fs.Result, 1)
+		tErr := make(chan error, 1)
+		go func() {
+			r, oerr := ch.Dispatch(ctx, &fs.Op{
+				Kind: fs.OpCreate, Path: "/swap-f",
+				Flags: uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+			})
+			if oerr != nil {
+				tErr <- oerr
+				return
+			}
+			tDone <- r
+		}()
+		select {
+		case <-truncPaused:
+		case oerr := <-tErr:
+			t.Fatalf("open O_TRUNC failed early: %v", oerr)
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for openTrunc:coOpenLocked")
+		}
+
+		// Simulate rename retargeting the original incarnation from /swap-f -> /swap-g,
+		// then creating a brand-new replacement handle at /swap-f holding "keep-me"!
+		wb.retarget("/swap-f", "/swap-g")
+		rep, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/swap-f",
+			Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := rep.Handle.Write(ctx, 0, []byte("keep-me")); err != nil {
+			t.Fatal(err)
+		}
+
+		releaseTrunc()
+		var tRes fs.Result
+		select {
+		case tRes = <-tDone:
+		case oerr := <-tErr:
+			t.Fatalf("open O_TRUNC failed: %v", oerr)
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for open O_TRUNC completion")
+		}
+		wb.testGateHook.Store(nil)
+
+		// Replacement handle at /swap-f MUST retain "keep-me", while retargeted
+		// orig at /swap-g was truncated to 0 bytes!
+		gotRep := make([]byte, 16)
+		n, err := rep.Handle.Read(ctx, 0, gotRep)
+		if err != nil || string(gotRep[:n]) != "keep-me" {
+			t.Fatalf("replacement /swap-f Read = (%q, %v), want keep-me", string(gotRep[:n]), err)
+		}
+		gotOrig := make([]byte, 16)
+		nOrig, err := orig.Handle.Read(ctx, 0, gotOrig)
+		if err != nil || nOrig != 0 {
+			t.Fatalf("truncated /swap-g Read = (%q, %d, %v), want empty", string(gotOrig[:nOrig]), nOrig, err)
+		}
+		_ = rep.Handle.Release(ctx)
+		_ = tRes.Handle.Release(ctx)
+		_ = orig.Handle.Release(ctx)
 	})
 }

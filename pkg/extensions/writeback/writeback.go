@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -227,6 +228,13 @@ type Writeback struct {
 	// liveByPath indexes open handles by path so create/release do not scan
 	// the whole liveSet (100k-file unzip made each close O(open handles)).
 	liveByPath map[string]map[*bufferingHandle]struct{}
+	// liveByObj indexes open handles sharing a creation-lineage objGen (under
+	// regMu) so co-open sibling write propagation and O_TRUNC sweeps bind to
+	// object identity across landings and renames.
+	liveByObj    map[uint64]map[*bufferingHandle]struct{}
+	nextObjGen   atomic.Uint64
+	objLandedMu  sync.Mutex
+	objLandedSeq map[uint64]uint64
 	// landedMu/landed is the recently-landed table (landedAt).
 	landedMu    sync.Mutex
 	landed      map[string]landedInfo
@@ -392,6 +400,12 @@ type bufferingHandle struct {
 	// still-unlanded local creation. Unlike the original O_CREAT handle it
 	// does not owe an empty-file publication if closed without mutations.
 	reopenedNoCreat bool
+	// objGen identifies the file object incarnation for co-open handles born
+	// from a local creation (survives isNew->false landings and renames).
+	objGen uint64
+	// remoteReadMu serializes Read's remote fallback on inner==nil handles with
+	// unlink/rename-over snapshotting (lock order: remoteReadMu -> mu).
+	remoteReadMu sync.RWMutex
 	// hasMinTrunc and minTruncSize record the lowest ftruncate watermark
 	// since the last shadow spill on this handle so shrink-then-regrow clears
 	// stale shadow ranges before extending sparsely.
@@ -609,7 +623,10 @@ func New(opts Options) (*Writeback, error) {
 		preload = writebuffer.MaxPreloadSize
 	}
 	w := &Writeback{opts: opts, root: root, preload: preload, interactive: opts.SyncMode == "interactive",
-		perfShim: &fusePerfCounters{}, liveByPath: make(map[string]map[*bufferingHandle]struct{})}
+		perfShim:     &fusePerfCounters{},
+		liveByPath:   make(map[string]map[*bufferingHandle]struct{}),
+		liveByObj:    make(map[uint64]map[*bufferingHandle]struct{}),
+		objLandedSeq: make(map[uint64]uint64)}
 	w.extentGlobs = extentGlobs
 	w.extentMatchCutoff = opts.ExtentThreshold
 	w.perfShim.enabled.Store(true)
@@ -1581,6 +1598,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				rev = res.Attr.Rev
 			}
 			h := &bufferingHandle{w: w, path: op.Path, inner: res.Handle, flags: flags,
+				objGen:   w.nextObjGen.Add(1),
 				baseSize: size, baseRev: rev, forceSync: hasSyncOpenFlag(flags)}
 			mode := op.Mode & 0o7777
 			if mode != 0o644 && mode != 0 {
@@ -1649,6 +1667,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			if flags&uint32(syscall.O_ACCMODE) == uint32(syscall.O_RDONLY) {
 				if attr, ok := w.pendingAttr(op.Path); ok {
 					h := &bufferingHandle{w: w, path: op.Path, flags: op.Flags,
+						objGen:   w.activeObjGenAtPath(op.Path),
 						baseSize: attr.Size, forceSync: hasSyncOpenFlag(op.Flags),
 						pendingImage:     w.capturePendingImage(op.Path),
 						pendingShadowGen: w.pinPendingShadow(op.Path)}
@@ -1690,6 +1709,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					image := w.capturePendingImage(op.Path)
 					if image != nil || shadowGen != 0 {
 						h := &bufferingHandle{w: w, path: op.Path, flags: op.Flags,
+							objGen:   w.activeObjGenAtPath(op.Path),
 							baseSize: size, forceSync: hasSyncOpenFlag(op.Flags),
 							pendingImage: image, pendingShadowGen: shadowGen}
 						// Same fence as the pendingAttr open above: the
@@ -1774,6 +1794,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			trunc := flags&uint32(syscall.O_TRUNC) != 0 &&
 				flags&(uint32(syscall.O_WRONLY)|uint32(syscall.O_RDWR)) != 0
 			h := &bufferingHandle{w: w, path: op.Path, inner: res.Handle, flags: op.Flags,
+				objGen:   w.activeObjGenAtPath(op.Path),
 				baseSize: attrSize(res), baseRev: attrRev(res), trunc: trunc,
 				forceSync: hasSyncOpenFlag(op.Flags)}
 			if h.baseRev == 0 {
@@ -1895,6 +1916,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			trunc := flags&uint32(syscall.O_TRUNC) != 0 &&
 				flags&(uint32(syscall.O_WRONLY)|uint32(syscall.O_RDWR)) != 0
 			h := &bufferingHandle{w: w, path: op.Path, inner: res.Handle, flags: op.Flags,
+				objGen:   w.activeObjGenAtPath(op.Path),
 				baseSize: st.Size, baseRev: st.Rev, trunc: trunc,
 				forceSync: hasSyncOpenFlag(op.Flags)}
 			if h.baseRev == 0 {
@@ -1926,6 +1948,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// on the presence bit alone).
 		mode := op.Mode & 0o7777
 		h := &bufferingHandle{w: w, path: op.Path, flags: op.Flags, isNew: true, baseRev: 0,
+			objGen:    w.nextObjGen.Add(1),
 			forceSync: hasSyncOpenFlag(op.Flags)}
 		if mode != 0o644 && mode != 0 {
 			h.pendingMode = mode
@@ -3654,12 +3677,29 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 			return n, nil
 		}
 		if h.inner == nil {
+			h.remoteReadMu.RLock()
 			h.mu.Lock()
 			curPath := h.path
 			unlinkedNow := h.unlinked
 			stillNew := h.isNew
+			pinnedImg := h.pendingImage
+			pinnedFile := h.pendingFile
+			pinnedFileSize := h.pendingFileSize
 			h.mu.Unlock()
 			if unlinkedNow {
+				h.remoteReadMu.RUnlock()
+				if pinnedFile != nil {
+					if off < 0 || off >= pinnedFileSize {
+						return 0, nil
+					}
+					return pinnedFile.ReadAt(dest, off)
+				}
+				if pinnedImg != nil {
+					if off < 0 || off >= int64(len(pinnedImg)) {
+						return 0, nil
+					}
+					return copy(dest, pinnedImg[off:]), nil
+				}
 				if h.pendingShadowGen != 0 && h.w.opts.Staging != nil {
 					gen := h.pendingShadowGen
 					n, rerr := h.w.opts.Staging.Shadow.ReadAtGen(gen, off, dest)
@@ -3671,11 +3711,17 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 			}
 			// For linked handles, prefer a landed remote image ahead of an
 			// open-time pendingImage/pendingShadowGen capture so a sibling
-			// write that subsequently landed and drained is visible.
+			// write that subsequently landed and drained is visible. Holding
+			// remoteReadMu.RLock prevents OpUnlink / rename-over from deleting
+			// or replacing curPath until this remote read completes.
 			if !stillNew && !h.w.hasLiveUnlandedCreate(curPath) {
-				if n, ok, rerr := h.w.readRemoteRangeFallback(ctx, curPath, off, dest); ok || rerr != nil {
+				n, ok, rerr := h.w.readRemoteRangeFallback(ctx, curPath, off, dest)
+				h.remoteReadMu.RUnlock()
+				if ok || rerr != nil {
 					return n, rerr
 				}
+			} else {
+				h.remoteReadMu.RUnlock()
 			}
 			h.mu.Lock()
 			if h.pendingImage != nil {
@@ -3806,7 +3852,7 @@ func (h *bufferingHandle) Write(ctx context.Context, off int64, data []byte) err
 	// every later Sync/Flush/Release publishes through the engine and never
 	// carries those acknowledged bytes.
 	var coUnlock func()
-	var coPath string
+	var coObjGen uint64
 	releaseCoOpen := func() {
 		if coUnlock != nil {
 			coUnlock()
@@ -3821,16 +3867,35 @@ func (h *bufferingHandle) Write(ctx context.Context, off int64, data []byte) err
 			releaseCoOpen()
 			return e.Write(ctx, off, data)
 		}
-		needCoOpen := (h.isNew || h.reopenedNoCreat) && !h.unlinked && !h.appendParticipant()
-		curPath := h.path
-		if !needCoOpen || curPath == "" || coPath == curPath {
+		needCoOpen := h.objGen != 0 && !h.unlinked && !h.appendParticipant()
+		if !needCoOpen || coObjGen == h.objGen {
 			break
 		}
+		targetObj := h.objGen
 		h.mu.Unlock()
 		releaseCoOpen()
-		coPath = curPath
+		coObjGen = targetObj
 		h.w.notifyTestGate("write:coOpenEntering")
-		coUnlock = h.w.coOpenLocks.lock(coPath)
+		coUnlock = h.w.coOpenLocks.lock(objLockKey(coObjGen))
+		h.w.notifyTestGate("write:coOpenAcquired")
+	}
+	if coObjGen != 0 && h.buf == nil && !h.trunc && !h.unlinked && !h.appendParticipant() {
+		// Pre-capture any dirty co-open sibling's bytes outside h.mu while
+		// holding coOpenLocks(coObjGen) so lazy buffer creation never misses a
+		// sibling write due to TryLock contention or post-landing isNew reset.
+		h.mu.Unlock()
+		sibImg, hasSib := h.w.dirtySiblingBytesForObj(coObjGen, h)
+		h.mu.Lock()
+		if e := h.migratedLocked(); e != nil {
+			h.mu.Unlock()
+			return e.Write(ctx, off, data)
+		}
+		if hasSib && h.buf == nil && !h.trunc && !h.unlinked && !h.appendParticipant() {
+			if err := h.seedBufferFromBytesLocked(sibImg); err != nil {
+				h.mu.Unlock()
+				return err
+			}
+		}
 	}
 	if err := h.ensureBufferLocked(ctx); err != nil {
 		h.mu.Unlock()
@@ -3892,8 +3957,8 @@ func (h *bufferingHandle) Write(ctx context.Context, off int64, data []byte) err
 	// Stamp the mutation epoch (#984): sibling readers compare epochs to
 	// serve the inode's newest uncommitted image.
 	h.mutSeq = h.w.nextMutSeq()
-	propagate := (h.isNew || h.reopenedNoCreat) && !h.unlinked && !h.appendParticipant()
-	writePath := h.path
+	propagate := h.objGen != 0 && !h.unlinked && !h.appendParticipant()
+	writeObjGen := h.objGen
 	writeOff := off
 	writeSeq := h.mutSeq
 	policy := h.w.opts.Policy
@@ -3902,7 +3967,7 @@ func (h *bufferingHandle) Write(ctx context.Context, off int64, data []byte) err
 
 	if propagate {
 		h.w.notifyTestGate("write:beforePropagate")
-		h.w.propagateUnlandedSiblingWrite(writePath, h, writeOff, data, writeSeq)
+		h.w.propagateSiblingWriteByObj(writeObjGen, h, writeOff, data, writeSeq)
 	}
 	releaseCoOpen()
 
@@ -5548,6 +5613,11 @@ func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64, generation
 			if rev > 0 {
 				h.baseRev = rev
 			}
+		case h.objGen != 0 && !h.appendParticipant() && rev > h.baseRev:
+			// Co-open handles sharing a creation objGen keep their buffers
+			// synchronized under coOpenLocks, so a sibling landing advances
+			// their CAS base to the landed revision.
+			h.baseRev = rev
 		}
 		h.mu.Unlock()
 	}
@@ -6012,6 +6082,14 @@ func (w *Writeback) trackLocked(h *bufferingHandle) {
 		w.liveByPath[h.path] = set
 	}
 	set[h] = struct{}{}
+	if h.objGen != 0 {
+		oset := w.liveByObj[h.objGen]
+		if oset == nil {
+			oset = make(map[*bufferingHandle]struct{})
+			w.liveByObj[h.objGen] = oset
+		}
+		oset[h] = struct{}{}
+	}
 }
 
 // hasOtherTrackedHandle reports whether any handle other than except is
@@ -6078,6 +6156,17 @@ func (w *Writeback) retireLocked(h *bufferingHandle) {
 			}
 		}
 	}
+	if h.objGen != 0 {
+		if oset := w.liveByObj[h.objGen]; oset != nil {
+			delete(oset, h)
+			if len(oset) == 0 {
+				delete(w.liveByObj, h.objGen)
+				w.objLandedMu.Lock()
+				delete(w.objLandedSeq, h.objGen)
+				w.objLandedMu.Unlock()
+			}
+		}
+	}
 	w.liveSet.Delete(h)
 }
 
@@ -6138,9 +6227,11 @@ func (w *Writeback) markUnlinked(p string, under bool) {
 // must stay anonymous.
 func restoreMarked(marked []*bufferingHandle) {
 	for _, h := range marked {
+		h.remoteReadMu.Lock()
 		h.mu.Lock()
 		h.unlinked = false
 		h.mu.Unlock()
+		h.remoteReadMu.Unlock()
 	}
 }
 
@@ -6151,7 +6242,7 @@ func restoreMarked(marked []*bufferingHandle) {
 // bytes.
 func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHandle, error) {
 	prefix := strings.TrimSuffix(p, "/") + "/"
-	var clean, marked []*bufferingHandle
+	var candidates, clean, marked []*bufferingHandle
 	var submitting []chan struct{}
 	w.liveSet.Range(func(key, _ any) bool {
 		h := key.(*bufferingHandle)
@@ -6160,19 +6251,34 @@ func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHand
 		if match && h.submitDone != nil {
 			submitting = append(submitting, h.submitDone)
 		}
-		// A descriptor that is ALREADY anonymous serves another object's
-		// snapshot: it must not be re-marked (and its stale, shorter
-		// snapshot must not make this operation's target look read-only).
+		if match && !h.unlinked {
+			candidates = append(candidates, h)
+		}
+		h.mu.Unlock()
+		return true
+	})
+	for _, h := range candidates {
+		// Acquire remoteReadMu.Lock before flipping h.unlinked so any in-flight
+		// readRemoteRangeFallback on h finishes against the pre-unlink object.
+		// Keep remoteReadMu.Lock held on clean handles until their snapshot is
+		// populated so concurrent Reads never see h.unlinked without a snapshot.
+		h.remoteReadMu.Lock()
+		h.mu.Lock()
+		match := h.path == p || (under && strings.HasPrefix(h.path, prefix))
+		keepReadLock := false
 		if match && !h.unlinked {
 			h.unlinked = true
 			marked = append(marked, h)
 			if h.buf == nil && !h.isNew && !h.dirty {
 				clean = append(clean, h)
+				keepReadLock = true
 			}
 		}
 		h.mu.Unlock()
-		return true
-	})
+		if !keepReadLock {
+			h.remoteReadMu.Unlock()
+		}
+	}
 	for _, ch := range submitting {
 		<-ch
 	}
@@ -6180,15 +6286,11 @@ func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHand
 	for _, h := range clean {
 		var err error
 		if w.opts.Staging != nil {
-			// v1 snapshotUnlinkedRemoteToShadow: a clean fd of the deleted
-			// name keeps a snapshot — its reads must survive the remote
-			// DELETE at last close.
 			err = w.snapshotUnlinkedClean(h)
 		} else {
-			// No shadow plane (the .dat/.meta cache track): keep the image
-			// on the handle itself.
 			err = w.snapshotUnlinkedImage(h)
 		}
+		h.remoteReadMu.Unlock()
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -6333,10 +6435,23 @@ func (w *Writeback) captureSnapshot(h *bufferingHandle, size int64) ([]byte, *os
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
 	defer cancel()
+	readChunk := func(off int64, dst []byte) (int, error) {
+		if h.inner != nil {
+			return h.inner.Read(ctx, off, dst)
+		}
+		n, ok, rerr := w.readRemoteRangeFallback(ctx, h.path, off, dst)
+		if rerr != nil {
+			return n, rerr
+		}
+		if !ok {
+			return 0, fs.ErrNotFound
+		}
+		return n, nil
+	}
 	if size <= unlinkedSnapshotMaxBytes {
 		buf := make([]byte, size)
 		if size > 0 {
-			n, err := h.inner.Read(ctx, 0, buf)
+			n, err := readChunk(0, buf)
 			if err != nil || int64(n) != size {
 				if err == nil {
 					err = io.ErrUnexpectedEOF
@@ -6357,7 +6472,7 @@ func (w *Writeback) captureSnapshot(h *bufferingHandle, size int64) ([]byte, *os
 			chunk = size - off
 		}
 		part := make([]byte, chunk)
-		n, rerr := h.inner.Read(ctx, off, part)
+		n, rerr := readChunk(off, part)
 		if int64(n) != chunk || (rerr != nil && rerr != io.EOF) {
 			_ = tmp.Close()
 			if rerr != nil {
@@ -6381,7 +6496,14 @@ func (w *Writeback) snapshotUnlinkedClean(h *bufferingHandle) error {
 	if st.Pending.HasPending(h.path) {
 		return nil // a staged image already serves post-delete reads
 	}
-	if h.inner == nil {
+	h.mu.Lock()
+	alreadySnap := h.pendingImage != nil || h.pendingFile != nil || h.pendingShadowGen != 0
+	isNew := h.isNew
+	h.mu.Unlock()
+	if alreadySnap {
+		return nil
+	}
+	if h.inner == nil && (w.opts.Client == nil || isNew) {
 		return nil
 	}
 	size := w.liveObjectSize(context.Background(), h)
@@ -6440,7 +6562,14 @@ func (w *Writeback) snapshotUnlinkedClean(h *bufferingHandle) error {
 // handle itself, so a rename-over or unlink keeps serving the OLD object's
 // bytes without a shadow plane.
 func (w *Writeback) snapshotUnlinkedImage(h *bufferingHandle) error {
-	if h.inner == nil {
+	h.mu.Lock()
+	alreadySnap := h.pendingImage != nil || h.pendingFile != nil
+	isNew := h.isNew
+	h.mu.Unlock()
+	if alreadySnap {
+		return nil
+	}
+	if h.inner == nil && (w.opts.Client == nil || isNew) {
 		return nil
 	}
 	size := w.liveObjectSize(context.Background(), h)
@@ -6917,6 +7046,7 @@ func (w *Writeback) openPendingWritable(op *fs.Op) (fs.Result, bool) {
 		attr = fs.Attr{Kind: fs.KindFile, Mode: 0o644, Size: size}
 	}
 	h := &bufferingHandle{w: w, path: op.Path, flags: flags,
+		objGen:   w.activeObjGenAtPath(op.Path),
 		baseSize: size, forceSync: hasSyncOpenFlag(flags),
 		pendingImage: image, pendingShadowGen: shadowGen}
 	if meta != nil {
@@ -7053,6 +7183,7 @@ func (w *Writeback) readRemoteRangeFallback(ctx context.Context, path string, of
 	if len(dest) == 0 {
 		return 0, true, nil
 	}
+	w.notifyTestGate("read:remoteFallback")
 	rp := w.remotePath(path)
 	rc, err := w.opts.Client.ReadStreamRange(ctx, rp, off, int64(len(dest)))
 	if err != nil {
@@ -7172,6 +7303,11 @@ func (w *Writeback) openLiveUnlandedHandle(ctx context.Context, op *fs.Op) (fs.R
 		size = src.buf.Size()
 	}
 	mode, hasMode := src.pendingMode, src.hasPendingMode
+	srcObjGen := src.objGen
+	if srcObjGen == 0 {
+		srcObjGen = w.nextObjGen.Add(1)
+		src.objGen = srcObjGen
+	}
 	src.mu.Unlock()
 
 	attr, ok := w.pendingAttr(op.Path)
@@ -7194,6 +7330,7 @@ func (w *Writeback) openLiveUnlandedHandle(ctx context.Context, op *fs.Op) (fs.R
 		flags:            flags,
 		isNew:            !isReadOnly,
 		reopenedNoCreat:  true,
+		objGen:           srcObjGen,
 		baseSize:         attr.Size,
 		baseRev:          0,
 		trunc:            trunc,
@@ -7225,10 +7362,11 @@ func (w *Writeback) openLiveUnlandedHandle(ctx context.Context, op *fs.Op) (fs.R
 	unlock()
 
 	if trunc {
-		// Serialize with co-open sibling Write + propagation so every sibling's
-		// pre-truncate bytes are discarded atomically with h's zero-length
-		// truncate initialization and post-truncate writes observe an empty base.
-		coUnlock := w.coOpenLocks.lock(op.Path)
+		// Serialize with co-open sibling Write + propagation by object identity
+		// (h.objGen) so only handles belonging to the truncated object discard
+		// pre-truncate bytes — even if a concurrent rename moves h/src and a
+		// new file replaces op.Path before coOpenLocks is acquired.
+		coUnlock := w.coOpenLocks.lock(objLockKey(h.objGen))
 		w.notifyTestGate("openTrunc:coOpenLocked")
 		if err := h.ensureBuffer(ctx); err != nil {
 			coUnlock()
@@ -7241,7 +7379,7 @@ func (w *Writeback) openLiveUnlandedHandle(ctx context.Context, op *fs.Op) (fs.R
 		h.wgen++
 		h.mutSeq = w.nextMutSeq()
 		h.mu.Unlock()
-		w.rebaseSiblingsOnOpenTrunc(op.Path, h)
+		w.rebaseSiblingsOnOpenTrunc(h.objGen, h)
 		coUnlock()
 		if w.opts.Policy == PolicyWriteBack && w.wbCache != nil {
 			if _, serr := h.stageToWriteCache(ctx, stageFullDurable); serr == nil {
@@ -7356,17 +7494,136 @@ func (w *Writeback) clearLinkedReaderPendingImages(path string) {
 	}
 }
 
-// propagateUnlandedSiblingWrite mirrors an acknowledged non-append write onto
-// co-open buffered sibling handles sharing the same local creation. Callers
-// hold w.coOpenLocks.lock(path) across their own buffer write and this call, so
-// concurrent non-overlapping writes across siblings never skip or drop ranges.
-func (w *Writeback) propagateUnlandedSiblingWrite(path string, writer *bufferingHandle, off int64, data []byte, writeSeq uint64) {
-	if w == nil || path == "" || len(data) == 0 {
+func objLockKey(objGen uint64) string {
+	return strconv.FormatUint(objGen, 10)
+}
+
+func (w *Writeback) activeObjGenAtPath(path string) uint64 {
+	if w == nil || path == "" {
+		return 0
+	}
+	w.regMu.Lock()
+	handles := make([]*bufferingHandle, 0, len(w.liveByPath[path]))
+	for h := range w.liveByPath[path] {
+		handles = append(handles, h)
+	}
+	w.regMu.Unlock()
+	for _, h := range handles {
+		h.mu.Lock()
+		ok := h.path == path && !h.unlinked && !h.closed && h.objGen != 0
+		gen := h.objGen
+		h.mu.Unlock()
+		if ok {
+			return gen
+		}
+	}
+	return 0
+}
+
+func (w *Writeback) recordObjLandedSeq(objGen, seq uint64) {
+	if w == nil || objGen == 0 || seq == 0 {
+		return
+	}
+	w.objLandedMu.Lock()
+	if seq > w.objLandedSeq[objGen] {
+		w.objLandedSeq[objGen] = seq
+	}
+	w.objLandedMu.Unlock()
+}
+
+func (w *Writeback) objLandedMutSeq(objGen uint64) uint64 {
+	if w == nil || objGen == 0 {
+		return 0
+	}
+	w.objLandedMu.Lock()
+	seq := w.objLandedSeq[objGen]
+	w.objLandedMu.Unlock()
+	return seq
+}
+
+func (w *Writeback) acknowledgeObjGenStage(objGen, wbGen uint64, exclude *bufferingHandle) {
+	if w == nil || objGen == 0 || wbGen == 0 {
 		return
 	}
 	w.regMu.Lock()
-	siblings := make([]*bufferingHandle, 0, len(w.liveByPath[path]))
-	for h := range w.liveByPath[path] {
+	siblings := make([]*bufferingHandle, 0, len(w.liveByObj[objGen]))
+	for h := range w.liveByObj[objGen] {
+		if h != exclude {
+			siblings = append(siblings, h)
+		}
+	}
+	w.regMu.Unlock()
+	for _, sib := range siblings {
+		sib.mu.Lock()
+		if !sib.unlinked && !sib.closed && !sib.appendParticipant() {
+			sib.cacheAncestorGens = mergeCacheAncestorGens(sib.cacheAncestorGens, wbGen)
+		}
+		sib.mu.Unlock()
+	}
+}
+
+func (w *Writeback) acknowledgeObjGenLanding(objGen uint64, rev int64, seq uint64) {
+	if w == nil || objGen == 0 {
+		return
+	}
+	w.recordObjLandedSeq(objGen, seq)
+	if rev <= 0 {
+		return
+	}
+	w.regMu.Lock()
+	siblings := make([]*bufferingHandle, 0, len(w.liveByObj[objGen]))
+	for h := range w.liveByObj[objGen] {
+		siblings = append(siblings, h)
+	}
+	w.regMu.Unlock()
+	for _, sib := range siblings {
+		sib.mu.Lock()
+		if !sib.unlinked && !sib.closed && !sib.appendParticipant() && rev > sib.baseRev {
+			sib.baseRev = rev
+		}
+		sib.mu.Unlock()
+	}
+}
+
+func (w *Writeback) dirtySiblingBytesForObj(objGen uint64, skip *bufferingHandle) ([]byte, bool) {
+	if w == nil || objGen == 0 {
+		return nil, false
+	}
+	w.regMu.Lock()
+	handles := make([]*bufferingHandle, 0, len(w.liveByObj[objGen]))
+	for h := range w.liveByObj[objGen] {
+		if h != skip {
+			handles = append(handles, h)
+		}
+	}
+	w.regMu.Unlock()
+	var best []byte
+	var bestSeq uint64
+	found := false
+	for _, sib := range handles {
+		sib.mu.Lock()
+		if !sib.unlinked && !sib.closed && sib.dirty && sib.buf != nil && sib.buf.CanMaterializeFull() {
+			if !found || sib.mutSeq >= bestSeq {
+				best = append([]byte(nil), sib.buf.Bytes()...)
+				bestSeq = sib.mutSeq
+				found = true
+			}
+		}
+		sib.mu.Unlock()
+	}
+	return best, found
+}
+
+// propagateSiblingWriteByObj mirrors an acknowledged non-append write onto
+// co-open buffered sibling handles sharing objGen (both before and after the
+// creation's initial remote landing). Callers hold w.coOpenLocks.lock(objLockKey(objGen)).
+func (w *Writeback) propagateSiblingWriteByObj(objGen uint64, writer *bufferingHandle, off int64, data []byte, writeSeq uint64) {
+	if w == nil || objGen == 0 || len(data) == 0 {
+		return
+	}
+	w.regMu.Lock()
+	siblings := make([]*bufferingHandle, 0, len(w.liveByObj[objGen]))
+	for h := range w.liveByObj[objGen] {
 		if h != writer {
 			siblings = append(siblings, h)
 		}
@@ -7374,14 +7631,17 @@ func (w *Writeback) propagateUnlandedSiblingWrite(path string, writer *buffering
 	w.regMu.Unlock()
 	for _, sib := range siblings {
 		sib.mu.Lock()
-		eligible := sib.path == path && !sib.unlinked && !sib.closed &&
-			sib.extent == nil && sib.buf != nil &&
-			(sib.isNew || sib.reopenedNoCreat) && !sib.appendParticipant() &&
+		eligible := sib.objGen == objGen && !sib.unlinked && !sib.closed &&
+			sib.extent == nil && sib.buf != nil && !sib.appendParticipant() &&
 			sib.flags&uint32(syscall.O_ACCMODE) != uint32(syscall.O_RDONLY)
 		if eligible {
+			wasDirty := sib.dirty
+			_ = sib.buf.EnsurePartsForWrite(off, int64(len(data)))
 			if _, err := sib.buf.Write(off, data); err == nil {
 				sib.wgen++
-				sib.dirty = true
+				if !wasDirty {
+					sib.buf.ClearDirty()
+				}
 				if writeSeq > sib.mutSeq {
 					sib.mutSeq = writeSeq
 				}
@@ -7391,14 +7651,18 @@ func (w *Writeback) propagateUnlandedSiblingWrite(path string, writer *buffering
 	}
 }
 
-// rebaseSiblingsOnOpenTrunc resets buffered bytes on sibling handles of path
-// when an open(O_TRUNC) truncates a still-local file to zero. Callers hold
-// w.coOpenLocks.lock(path), so sibling writes are strictly ordered either
-// before or after this reset (never retaining pre-truncate tails).
-func (w *Writeback) rebaseSiblingsOnOpenTrunc(path string, owner *bufferingHandle) {
+// rebaseSiblingsOnOpenTrunc resets buffered bytes on sibling handles sharing
+// objGen when an open(O_TRUNC) truncates a still-local file to zero. Callers
+// hold w.coOpenLocks.lock(objLockKey(objGen)), so sibling writes are strictly
+// ordered either before or after this reset and unrelated handles at a
+// recycled pathname are never touched.
+func (w *Writeback) rebaseSiblingsOnOpenTrunc(objGen uint64, owner *bufferingHandle) {
+	if w == nil || objGen == 0 {
+		return
+	}
 	w.regMu.Lock()
-	siblings := make([]*bufferingHandle, 0, len(w.liveByPath[path]))
-	for h := range w.liveByPath[path] {
+	siblings := make([]*bufferingHandle, 0, len(w.liveByObj[objGen]))
+	for h := range w.liveByObj[objGen] {
 		if h != owner {
 			siblings = append(siblings, h)
 		}
@@ -7406,7 +7670,7 @@ func (w *Writeback) rebaseSiblingsOnOpenTrunc(path string, owner *bufferingHandl
 	w.regMu.Unlock()
 	for _, sib := range siblings {
 		sib.mu.Lock()
-		if sib.path == path && !sib.unlinked && !sib.closed {
+		if sib.objGen == objGen && !sib.unlinked && !sib.closed {
 			writebuffer.Discard(&sib.buf)
 			sib.baseLoaded = false
 			sib.dirty = false
@@ -7983,6 +8247,8 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 	isNew := h.isNew
 	baseRev := h.baseRev
 	commitGen := h.wgen
+	commitMutSeq := h.mutSeq
+	commitObjGen := h.objGen
 	var newReader func() io.Reader
 	var image []byte
 	if size >= commitInlineStreamThreshold {
@@ -8012,20 +8278,8 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 		landBoundGen = h.w.wbCache.LossGenerationBound(commitPath, landBoundGen)
 	}
 
-	// Streamed commits report no revision (the protocol carries none and a
-	// bare re-read cannot be attributed): digest the exact bytes via a
-	// LOCAL replay of the buffer — the multipart contract requires an
-	// io.ReaderAt, so the upload reader itself cannot be teed — so a LATER
-	// conflict on this descriptor can prove the remote row still equals
-	// this handle's previous image, the only sound way to attribute a
-	// continuation base. SHA-256, streamed: the whole-file content identity
-	// the multipart protocol itself trusts (Complete's checksum), O(1)
-	// memory, and no size budget — the verified read-back streams in
-	// windows. The digest covers BOTH rev-less shapes: the bufferReader
-	// stream and the materialized image that still streams because it
-	// exceeds the direct-PUT threshold (image bytes hash directly).
 	var streamSum [sha256.Size]byte
-	{
+	computeStreamSum := func() {
 		d := sha256.New()
 		var cerr error
 		if image != nil {
@@ -8037,7 +8291,46 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 			copy(streamSum[:], d.Sum(nil))
 		}
 	}
-	committedRev, err := h.w.commitReaderOpt(ctx, commitPath, newReader, size, isNew && size == 0, baseRev)
+	computeStreamSum()
+
+	supersededBySibling := false
+	onSelfConflict := func() (func() io.Reader, int64, bool) {
+		h.mu.Lock()
+		if h.wgen != commitGen && h.buf != nil {
+			newSize := h.buf.Size()
+			if newSize < commitInlineStreamThreshold {
+				if err := h.buf.LoadMissingParts(); err == nil {
+					image = h.buf.Bytes()
+					size = int64(len(image))
+					commitGen = h.wgen
+					commitMutSeq = h.mutSeq
+					newReader = func() io.Reader { return bytes.NewReader(image) }
+					h.mu.Unlock()
+					computeStreamSum()
+					return newReader, size, false
+				}
+			} else {
+				image = nil
+				size = newSize
+				commitGen = h.wgen
+				commitMutSeq = h.mutSeq
+				newReader = func() io.Reader { return &bufferReader{h: h, size: size} }
+				h.mu.Unlock()
+				computeStreamSum()
+				return newReader, size, false
+			}
+		}
+		h.mu.Unlock()
+		if commitObjGen != 0 && h.w.objLandedMutSeq(commitObjGen) > commitMutSeq {
+			// A co-open sibling already landed a strictly newer mutation that
+			// incorporates our earlier write; do not republish our stale buffer.
+			supersededBySibling = true
+			return nil, 0, true
+		}
+		return newReader, size, false
+	}
+
+	committedRev, err := h.w.commitReaderOptHook(ctx, commitPath, newReader, size, isNew && size == 0, baseRev, onSelfConflict)
 	if isStatusEAGAIN(err) {
 		// The conflict path could not attribute the row. If this handle
 		// streamed a previous image the server still holds byte-exactly,
@@ -8053,55 +8346,55 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 					h.selfLandSize, h.selfLandSum = 0, [sha256.Size]byte{}
 					h.mu.Unlock()
 					baseRev = adopted.rev
-					committedRev, err = h.w.commitReaderOpt(ctx, commitPath, newReader, size, false, baseRev)
+					committedRev, err = h.w.commitReaderOptHook(ctx, commitPath, newReader, size, false, baseRev, onSelfConflict)
 				}
 			}
 		}
 	}
 	if err == nil {
-		if cachePutGen != 0 {
-			h.w.wbCache.RemoveIfPutGeneration(commitPath, cachePutGen)
-		}
-		// An inline commit published this image: any recorded loss for the name
-		// is superseded, including one left by a pruned pair (cacheGen == 0) —
-		// but only up to the generation this landing covers: a newer image that
-		// died while this upload was on the wire must keep its record.
-		h.w.wbCache.ClearViewLossIfGeneration(commitPath, landBoundGen)
-		// A rev-less streamed success still retires a queue-recorded failure for
-		// the name; landedAt returns early without a revision, so nothing else
-		// would clear it.
-		if committedRev <= 0 && h.w.queue != nil {
-			h.w.queue.ClearPathCommitErr(commitPath)
-		}
-		var crc uint32
-		var img []byte
-		if image != nil {
-			crc = crc32.ChecksumIEEE(image)
-			img = image
-		}
-		h.w.landedAt(commitPath, committedRev, size, crc, img)
-		h.w.clearLinkedReaderPendingImages(commitPath)
-		if h.w.commitSeeder != nil && image != nil && h.w.commitSeedAllowed(int64(len(image))) {
-			h.w.commitSeeder(commitPath, image, committedRev)
+		if !supersededBySibling {
+			if cachePutGen != 0 {
+				h.w.wbCache.RemoveIfPutGeneration(commitPath, cachePutGen)
+			}
+			h.w.wbCache.ClearViewLossIfGeneration(commitPath, landBoundGen)
+			if committedRev <= 0 && h.w.queue != nil {
+				h.w.queue.ClearPathCommitErr(commitPath)
+			}
+			var crc uint32
+			var img []byte
+			if image != nil {
+				crc = crc32.ChecksumIEEE(image)
+				img = image
+			}
+			h.w.landedAt(commitPath, committedRev, size, crc, img)
+			h.w.clearLinkedReaderPendingImages(commitPath)
+			h.w.acknowledgeObjGenLanding(commitObjGen, committedRev, commitMutSeq)
+			if h.w.commitSeeder != nil && image != nil && h.w.commitSeedAllowed(int64(len(image))) {
+				h.w.commitSeeder(commitPath, image, committedRev)
+			}
 		}
 		h.mu.Lock()
 		h.retireDirtyLocked(commitGen)
 		h.landed = true
 		h.isNew = false
 		if committedRev > 0 {
-			h.baseRev = committedRev
+			if committedRev > h.baseRev {
+				h.baseRev = committedRev
+			}
 			h.selfLandSize, h.selfLandSum = 0, [sha256.Size]byte{}
-		} else {
+		} else if !supersededBySibling {
 			// Rev-less streamed success: remember the content identity for
 			// the next write's continuation proof.
 			h.selfLandSize = size
 			h.selfLandSum = streamSum
 		}
 		h.mu.Unlock()
-		if h.w.opts.Policy == PolicyWriteSync || h.w.opts.Policy == PolicyCloseSync {
-			h.w.armBypass(commitPath, 0, size, "sync-commit")
+		if !supersededBySibling {
+			if h.w.opts.Policy == PolicyWriteSync || h.w.opts.Policy == PolicyCloseSync {
+				h.w.armBypass(commitPath, 0, size, "sync-commit")
+			}
+			h.w.invalidateRev(commitPath, committedRev, size)
 		}
-		h.w.invalidateRev(commitPath, committedRev, size)
 		err = h.applyPendingMode(ctx)
 	}
 	return err
@@ -8185,7 +8478,7 @@ func (w *Writeback) detachCommitContext(parent context.Context, size int64) (con
 // zero-byte file lands through the create endpoint first (v1 flushHandle's
 // CreateFileCtx), falling back to the conditional write — the two endpoints
 // differ server-side in permissions and event fan-out.
-func (w *Writeback) commitReaderOpt(ctx context.Context, path string, newReader func() io.Reader, size int64, emptyCreate bool, expectedRev int64) (int64, error) {
+func (w *Writeback) commitReaderOptHook(ctx context.Context, path string, newReader func() io.Reader, size int64, emptyCreate bool, expectedRev int64, onSelfConflict func() (func() io.Reader, int64, bool)) (int64, error) {
 	rp := w.remotePath(path)
 	// syncDataCommitContext + releaseTimeout: commits detach from the
 	// FUSE cancel channel (a kernel interrupt must not fail a server-side
@@ -8253,13 +8546,15 @@ func (w *Writeback) commitReaderOpt(ctx context.Context, path string, newReader 
 		if werr != nil {
 			if errors.Is(werr, client.ErrConflict) {
 				if st, serr := w.opts.Client.StatCtx(ctx, rp); serr == nil && st != nil {
-					// Retry only when the conflict did not advance the row
-					// (a transient reject of the same base) or when the
-					// remote revision is a landing of this mount's own
-					// image: anything else is a foreign write, and
-					// republishing the stale image at its revision is the
-					// CAS bypass this contract exists to prevent.
 					if st.Revision == expected || w.landedCoversInode(path, st.Revision) {
+						if st.Revision != expected && onSelfConflict != nil {
+							refreshedReader, refreshedSize, superseded := onSelfConflict()
+							if superseded {
+								return st.Revision, nil
+							}
+							newReader = refreshedReader
+							size = refreshedSize
+						}
 						expectedRev = st.Revision
 						continue
 					}
@@ -8311,6 +8606,24 @@ func (h *bufferingHandle) ensureBuffer(ctx context.Context) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.ensureBufferLocked(ctx)
+}
+
+func (h *bufferingHandle) seedBufferFromBytesLocked(data []byte) error {
+	if h.buf != nil {
+		return nil
+	}
+	buf := writebuffer.NewWriteBuffer(h.path, bufferedMaxTotal, 0)
+	buf.SetMemoryBudget(h.w.budget)
+	if len(data) > 0 {
+		if _, err := buf.Write(0, data); err != nil {
+			writebuffer.Discard(&buf)
+			return err
+		}
+		buf.ClearDirty()
+	}
+	h.buf = buf
+	h.baseLoaded = true
+	return nil
 }
 
 func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
@@ -9754,6 +10067,9 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 		h.supersededPendingSource = pendingGenCache
 		h.cacheAncestorGens = mergeCacheAncestorGens(cacheAncestors, wbGen)
 		h.mu.Unlock()
+	}
+	if h.objGen != 0 && !h.appendParticipant() {
+		h.w.acknowledgeObjGenStage(h.objGen, wbGen, h)
 	}
 	// v1 seeded the read cache with the staged image at the flush
 	// boundary: readers during the async landing serve these bytes instead
