@@ -10,20 +10,6 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="${REPO_ROOT}/scripts/publish-agent-archive.sh"
-WORK="$(mktemp -d)"
-BG_PGIDS_FILE="${WORK}/.bg-pgids"
-RELEASE_FILES_FILE="${WORK}/.release-files"
-: >"$BG_PGIDS_FILE"
-: >"$RELEASE_FILES_FILE"
-LAST_BG_PID=""
-
-register_bg_pgid() {
-  printf '%s\n' "$1" >>"$BG_PGIDS_FILE"
-}
-
-register_release_file() {
-  printf '%s\n' "$1" >>"$RELEASE_FILES_FILE"
-}
 
 pass() {
   echo "   ok: $*"
@@ -41,6 +27,21 @@ require_pgid_isolation() {
 }
 
 require_pgid_isolation
+
+WORK="$(mktemp -d)"
+BG_PGIDS_FILE="${WORK}/.bg-pgids"
+RELEASE_FILES_FILE="${WORK}/.release-files"
+: >"$BG_PGIDS_FILE"
+: >"$RELEASE_FILES_FILE"
+LAST_BG_PID=""
+
+register_bg_pgid() {
+  printf '%s\n' "$1" >>"$BG_PGIDS_FILE"
+}
+
+register_release_file() {
+  printf '%s\n' "$1" >>"$RELEASE_FILES_FILE"
+}
 
 spawn_isolated_bg() {
   local out_file=$1
@@ -122,6 +123,12 @@ set -euo pipefail
 root="${FAKE_REMOTE_ROOT:?}"
 ops_log="${FAKE_OPS_LOG:?}"
 fail_quota_file="${FAKE_FAIL_QUOTA_COUNT_FILE:-}"
+fail_backend_unavail_pattern="${FAKE_FAIL_BACKEND_UNAVAILABLE_PATTERN:-}"
+fail_backend_unavail_count_file="${FAKE_FAIL_BACKEND_UNAVAILABLE_COUNT_FILE:-}"
+fail_upload_eof_pattern="${FAKE_FAIL_UPLOAD_EOF_PATTERN:-}"
+fail_upload_eof_count_file="${FAKE_FAIL_UPLOAD_EOF_COUNT_FILE:-}"
+resumable_rm_pattern="${FAKE_RESUMABLE_RM_PATTERN:-}"
+resumable_rm_count_file="${FAKE_RESUMABLE_RM_COUNT_FILE:-}"
 fail_rm_pattern="${FAKE_FAIL_RM_PATTERN:-}"
 fail_stat_pattern="${FAKE_FAIL_STAT_PATTERN:-}"
 fail_ls_call="${FAKE_FAIL_LS_ON_CALL:-}"
@@ -420,6 +427,15 @@ rm)
     echo "fs rm: HTTP 503: upstream timeout" >&2
     exit 1
   fi
+  if [ -n "$resumable_rm_pattern" ] && [[ "$rel" == *"$resumable_rm_pattern"* ]] && [ -n "$resumable_rm_count_file" ] && [ -f "$resumable_rm_count_file" ]; then
+    rem_rm="$(cat "$resumable_rm_count_file")"
+    if [ "$rem_rm" -gt 0 ]; then
+      printf '%d\n' "$((rem_rm - 1))" >"$resumable_rm_count_file"
+      printf 'rm-resumable %s\n' "$rel" >>"$ops_log"
+      echo "fs rm: recursive delete in progress, retry to resume" >&2
+      exit 1
+    fi
+  fi
   target="${root}/${rel}"
   if [ ! -e "$target" ]; then
     echo "fs rm: HTTP 404: not found" >&2
@@ -461,6 +477,27 @@ cp)
       if [ "$remaining" -gt 0 ]; then
         printf '%d\n' "$((remaining - 1))" >"$fail_quota_file"
         echo "fs cp: tenant storage quota exceeded: server limit=100 used=100 reserved=0 pending=0 delta=10" >&2
+        exit 1
+      fi
+    fi
+    if [ -n "$fail_backend_unavail_pattern" ] && [[ "$rel" == *"$fail_backend_unavail_pattern"* ]] && [ -n "$fail_backend_unavail_count_file" ] && [ -f "$fail_backend_unavail_count_file" ]; then
+      rem_bu="$(cat "$fail_backend_unavail_count_file")"
+      if [ "$rem_bu" -gt 0 ]; then
+        printf '%d\n' "$((rem_bu - 1))" >"$fail_backend_unavail_count_file"
+        printf 'upload-backend-unavailable %s\n' "$rel" >>"$ops_log"
+        echo "fs cp: storage backend unavailable; contact support" >&2
+        exit 1
+      fi
+    fi
+    if [ -n "$fail_upload_eof_pattern" ] && [[ "$rel" == *"$fail_upload_eof_pattern"* ]] && [ -n "$fail_upload_eof_count_file" ] && [ -f "$fail_upload_eof_count_file" ]; then
+      rem_eof="$(cat "$fail_upload_eof_count_file")"
+      if [ "$rem_eof" -gt 0 ]; then
+        printf '%d\n' "$((rem_eof - 1))" >"$fail_upload_eof_count_file"
+        target="${root}/${rel}"
+        mkdir -p "$(dirname "$target")"
+        printf 'partial-in-flight\n' >"$target"
+        printf 'upload-ambiguous-eof %s\n' "$rel" >>"$ops_log"
+        echo "fs cp: unexpected EOF (connection reset by peer)" >&2
         exit 1
       fi
     fi
@@ -602,6 +639,7 @@ run_publisher_in() {
     DRIVE9_API_KEY="test-key" \
     DRIVE9_PUBLISHER="$FAKE_CLI" \
     DRIVE9_ARCHIVE_CLI_TARGETS="linux/amd64" \
+    DRIVE9_ARCHIVE_RETRY_DELAY="0" \
     DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY="0" \
     RUNNER_TEMP="${WORK}/runner" \
     FAKE_REMOTE_ROOT="$remote_root" \
@@ -730,6 +768,8 @@ err6_ttl="${WORK}/err6_ttl.log"
 err6_break_bad="${WORK}/err6_break_bad.log"
 err6_break_init="${WORK}/err6_break_init.log"
 err6_break_free="${WORK}/err6_break_free.log"
+err6_retry_zero="${WORK}/err6_retry_zero.log"
+err6_retry_delay="${WORK}/err6_retry_delay.log"
 set +e
 run_publisher "$R1" "$L6" env DRIVE9_ARCHIVE_RETAIN_COMMITS=invalid >/dev/null 2>&1
 bad_rc=$?
@@ -745,6 +785,10 @@ run_publisher "$R1" "$L6" env DRIVE9_ARCHIVE_LOCK_BREAK_OWNER="init" >/dev/null 
 bad_break_init_rc=$?
 run_publisher "$R1" "$L6" env DRIVE9_ARCHIVE_LOCK_BREAK_OWNER="free-abc" >/dev/null 2>"$err6_break_free"
 bad_break_free_rc=$?
+run_publisher "$R1" "$L6" env DRIVE9_ARCHIVE_RETRY_ATTEMPTS=0 >/dev/null 2>"$err6_retry_zero"
+bad_retry_zero_rc=$?
+run_publisher "$R1" "$L6" env DRIVE9_ARCHIVE_RETRY_DELAY=-1 >/dev/null 2>"$err6_retry_delay"
+bad_retry_delay_rc=$?
 set -e
 [ "$bad_rc" -ne 0 ] || fail "expected invalid DRIVE9_ARCHIVE_RETAIN_COMMITS to fail"
 [ "$overflow_rc" -ne 0 ] || fail "expected overflowing DRIVE9_ARCHIVE_RETAIN_COMMITS to fail"
@@ -757,6 +801,10 @@ grep -q "invalid DRIVE9_ARCHIVE_LOCK_BREAK_OWNER" "$err6_break_bad" || fail "exp
 grep -q "invalid DRIVE9_ARCHIVE_LOCK_BREAK_OWNER" "$err6_break_init" || fail "expected break_owner init validation message, got: $(cat "$err6_break_init")"
 [ "$bad_break_free_rc" -ne 0 ] || fail "expected DRIVE9_ARCHIVE_LOCK_BREAK_OWNER=free-abc to fail"
 grep -q "invalid DRIVE9_ARCHIVE_LOCK_BREAK_OWNER" "$err6_break_free" || fail "expected break_owner free-* validation message, got: $(cat "$err6_break_free")"
+[ "$bad_retry_zero_rc" -ne 0 ] || fail "expected DRIVE9_ARCHIVE_RETRY_ATTEMPTS=0 to fail"
+grep -q "invalid DRIVE9_ARCHIVE_RETRY_ATTEMPTS" "$err6_retry_zero" || fail "expected retry attempts validation message, got: $(cat "$err6_retry_zero")"
+[ "$bad_retry_delay_rc" -ne 0 ] || fail "expected DRIVE9_ARCHIVE_RETRY_DELAY=-1 to fail"
+grep -q "invalid DRIVE9_ARCHIVE_RETRY_DELAY" "$err6_retry_delay" || fail "expected retry delay validation message, got: $(cat "$err6_retry_delay")"
 pass "DRIVE9_ARCHIVE_RETAIN_COMMITS=0 and bounded validation (including token TTL and break_lock_owner) behave as expected"
 
 echo "== 7. Stale branch dispatch ranks globally, does not overwrite main's latest.json, and preserves main under retain_commits=1"
@@ -1161,6 +1209,7 @@ run_with_watchdog_expect_fail 15 "${WORK}/err13b2.log" \
     DRIVE9_API_KEY="test-key" \
     DRIVE9_PUBLISHER="$FAKE_CLI" \
     DRIVE9_ARCHIVE_CLI_TARGETS="linux/amd64" \
+    DRIVE9_ARCHIVE_RETRY_DELAY="0" \
     DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY="0" \
     FAKE_REMOTE_ROOT="$R13" \
     FAKE_OPS_LOG="$L13B2" \
@@ -1240,6 +1289,7 @@ run_with_watchdog_expect_fail 15 "${WORK}/err14b.log" \
     DRIVE9_API_KEY="test-key" \
     DRIVE9_PUBLISHER="$FAKE_CLI" \
     DRIVE9_ARCHIVE_CLI_TARGETS="linux/amd64" \
+    DRIVE9_ARCHIVE_RETRY_DELAY="0" \
     DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY="0" \
     FAKE_REMOTE_ROOT="$R14" \
     FAKE_OPS_LOG="$L14B" \
@@ -1268,6 +1318,7 @@ run_with_watchdog 20 "${WORK}/err14b2.log" \
     DRIVE9_API_KEY="test-key" \
     DRIVE9_PUBLISHER="$FAKE_CLI" \
     DRIVE9_ARCHIVE_CLI_TARGETS="linux/amd64" \
+    DRIVE9_ARCHIVE_RETRY_DELAY="0" \
     DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY="0" \
     FAKE_REMOTE_ROOT="$R14" \
     FAKE_OPS_LOG="$L14B2" \
@@ -1379,6 +1430,7 @@ run_with_watchdog_expect_fail 15 "${WORK}/err16b1.log" \
     DRIVE9_API_KEY="test-key" \
     DRIVE9_PUBLISHER="$FAKE_CLI" \
     DRIVE9_ARCHIVE_CLI_TARGETS="linux/amd64" \
+    DRIVE9_ARCHIVE_RETRY_DELAY="0" \
     DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY="0" \
     FAKE_REMOTE_ROOT="$R16" \
     FAKE_OPS_LOG="$L16B1" \
@@ -1398,6 +1450,7 @@ run_with_watchdog_expect_fail 15 "${WORK}/err16b2.log" \
     DRIVE9_API_KEY="test-key" \
     DRIVE9_PUBLISHER="$FAKE_CLI" \
     DRIVE9_ARCHIVE_CLI_TARGETS="linux/amd64" \
+    DRIVE9_ARCHIVE_RETRY_DELAY="0" \
     DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY="0" \
     FAKE_REMOTE_ROOT="$R16" \
     FAKE_OPS_LOG="$L16B2" \
@@ -1423,6 +1476,7 @@ run_with_watchdog 20 "${WORK}/err16b3.log" \
     DRIVE9_API_KEY="test-key" \
     DRIVE9_PUBLISHER="$FAKE_CLI" \
     DRIVE9_ARCHIVE_CLI_TARGETS="linux/amd64" \
+    DRIVE9_ARCHIVE_RETRY_DELAY="0" \
     DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY="0" \
     FAKE_REMOTE_ROOT="$R16" \
     FAKE_OPS_LOG="$L16B3" \
@@ -1451,6 +1505,7 @@ mkdir -p "$R17"
     DRIVE9_API_KEY="test-key" \
     DRIVE9_PUBLISHER="$FAKE_CLI" \
     DRIVE9_ARCHIVE_CLI_TARGETS="linux/amd64" \
+    DRIVE9_ARCHIVE_RETRY_DELAY="0" \
     DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY="0" \
     DRIVE9_ARCHIVE_RETAIN_COMMITS=5 \
     FAKE_REMOTE_ROOT="$R17" \
@@ -1485,6 +1540,7 @@ run_with_watchdog_expect_fail 15 "${WORK}/err18a.log" \
     DRIVE9_API_KEY="test-key" \
     DRIVE9_PUBLISHER="$FAKE_CLI" \
     DRIVE9_ARCHIVE_CLI_TARGETS="linux/amd64" \
+    DRIVE9_ARCHIVE_RETRY_DELAY="0" \
     DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY="0" \
     FAKE_REMOTE_ROOT="$R18" \
     FAKE_OPS_LOG="$L18A" \
@@ -1511,6 +1567,7 @@ run_with_watchdog 20 "${WORK}/err18b.log" \
     DRIVE9_API_KEY="test-key" \
     DRIVE9_PUBLISHER="$FAKE_CLI" \
     DRIVE9_ARCHIVE_CLI_TARGETS="linux/amd64" \
+    DRIVE9_ARCHIVE_RETRY_DELAY="0" \
     DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY="0" \
     FAKE_REMOTE_ROOT="$R18" \
     FAKE_OPS_LOG="$L18B" \
@@ -1585,6 +1642,7 @@ run_with_watchdog_expect_fail 15 "${WORK}/err20a.log" \
     DRIVE9_API_KEY="test-key" \
     DRIVE9_PUBLISHER="$FAKE_CLI" \
     DRIVE9_ARCHIVE_CLI_TARGETS="linux/amd64" \
+    DRIVE9_ARCHIVE_RETRY_DELAY="0" \
     DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY="0" \
     FAKE_REMOTE_ROOT="$R20" \
     FAKE_OPS_LOG="$L20A" \
@@ -1616,6 +1674,7 @@ run_with_watchdog_expect_fail 15 "${WORK}/err20b1.log" \
     DRIVE9_API_KEY="test-key" \
     DRIVE9_PUBLISHER="$FAKE_CLI" \
     DRIVE9_ARCHIVE_CLI_TARGETS="linux/amd64" \
+    DRIVE9_ARCHIVE_RETRY_DELAY="0" \
     DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY="0" \
     FAKE_REMOTE_ROOT="$R20" \
     FAKE_OPS_LOG="$L20B1" \
@@ -1643,6 +1702,7 @@ run_with_watchdog 20 "${WORK}/err20b2.log" \
     DRIVE9_API_KEY="test-key" \
     DRIVE9_PUBLISHER="$FAKE_CLI" \
     DRIVE9_ARCHIVE_CLI_TARGETS="linux/amd64" \
+    DRIVE9_ARCHIVE_RETRY_DELAY="0" \
     DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY="0" \
     FAKE_REMOTE_ROOT="$R20" \
     FAKE_OPS_LOG="$L20B2" \
@@ -1658,5 +1718,167 @@ assert_exists "${R20}/drive9/commits/${MAIN_NEW}/bin/drive9-linux-amd64"
 [ "$(jq -r '.commit_sha' "${R20}/drive9/latest.json")" = "$MAIN_NEW" ] || fail "B did not publish latest.json"
 assert_no_active_lease "$R20"
 pass "ambiguous CLI transport EOF (without SIGTERM) aborted without overlap, retained lock fail-closed, drained old rm, and recovered via owner-pinned break-glass"
+
+echo "== 21. Completed server 500 ('storage backend unavailable; contact support') retries in place and never wedges .publish-lock"
+R21="${WORK}/remote21"
+L21A="${WORK}/ops21a.log"
+L21B="${WORK}/ops21b.log"
+L21C="${WORK}/ops21c.log"
+mkdir -p "$R21"
+: >"$L21A"
+: >"$L21B"
+: >"$L21C"
+CNT21A="${WORK}/backend_unavail_21a.count"
+CNT21B="${WORK}/backend_unavail_21b.count"
+CNT21_LATEST="${WORK}/backend_unavail_21_latest.count"
+
+# 21a: Two transient 'storage backend unavailable; contact support' errors on checksums.txt
+# retry in place inside the same -a1 staging dir (without re-uploading source.tar.gz), promote, and release lock.
+printf '2\n' >"$CNT21A"
+run_publisher "$R21" "$L21A" env \
+  DRIVE9_ARCHIVE_RETAIN_COMMITS=5 \
+  DRIVE9_ARCHIVE_RETRY_ATTEMPTS=4 \
+  FAKE_FAIL_BACKEND_UNAVAILABLE_PATTERN="checksums.txt" \
+  FAKE_FAIL_BACKEND_UNAVAILABLE_COUNT_FILE="$CNT21A" >/dev/null
+assert_exists "${R21}/drive9/commits/${MAIN_NEW}/manifest.json"
+[ "$(jq -r '.commit_sha' "${R21}/drive9/latest.json")" = "$MAIN_NEW" ] || fail "21a: latest.json did not advance to MAIN_NEW"
+[ "$(cat "$CNT21A")" = "0" ] || fail "21a: expected both transient checksums.txt errors to be retried"
+[ "$(grep -c '^upload-backend-unavailable .*checksums\.txt$' "$L21A")" -eq 2 ] || fail "21a: expected 2 backend-unavailable attempts on checksums.txt"
+[ "$(grep -c '^upload .*source\.tar\.gz$' "$L21A")" -eq 1 ] || fail "21a: expected in-place retry without re-uploading source.tar.gz"
+assert_no_active_lease "$R21"
+
+# Also verify transient 'storage backend unavailable; contact support' on shared latest.json retries cleanly.
+R21L="${WORK}/remote21_latest"
+L21L="${WORK}/ops21_latest.log"
+mkdir -p "$R21L"
+: >"$L21L"
+printf '2\n' >"$CNT21_LATEST"
+run_publisher "$R21L" "$L21L" env \
+  DRIVE9_ARCHIVE_RETAIN_COMMITS=5 \
+  DRIVE9_ARCHIVE_RETRY_ATTEMPTS=4 \
+  FAKE_FAIL_BACKEND_UNAVAILABLE_PATTERN="latest.json" \
+  FAKE_FAIL_BACKEND_UNAVAILABLE_COUNT_FILE="$CNT21_LATEST" >/dev/null
+[ "$(cat "$CNT21_LATEST")" = "0" ] || fail "21a-latest: expected both transient latest.json errors to be retried"
+[ "$(jq -r '.commit_sha' "${R21L}/drive9/latest.json")" = "$MAIN_NEW" ] || fail "21a-latest: latest.json did not advance to MAIN_NEW"
+assert_no_active_lease "$R21L"
+
+# 21b: Persistent 'storage backend unavailable; contact support' exceeding DRIVE9_ARCHIVE_RETRY_ATTEMPTS
+# fails the run, cleans up untainted .staging/, and STILL releases .publish-lock (subsequent run needs no break_lock_owner).
+printf '5\n' >"$CNT21B"
+err21b="${WORK}/err21b.log"
+set +e
+run_publisher_in_with_arg "$REPO" "$R21" "$L21B" "$C4" \
+  RUNNER_TEMP="${WORK}/runner21b" \
+  DRIVE9_ARCHIVE_RETAIN_COMMITS=5 \
+  DRIVE9_ARCHIVE_RETRY_ATTEMPTS=2 \
+  FAKE_FAIL_BACKEND_UNAVAILABLE_PATTERN="checksums.txt" \
+  FAKE_FAIL_BACKEND_UNAVAILABLE_COUNT_FILE="$CNT21B" >/dev/null 2>"$err21b"
+rc21b=$?
+set -e
+[ "$rc21b" -ne 0 ] || fail "21b: expected exhausted backend-unavailable retries to fail"
+if grep -q "retaining archive lock" "$err21b"; then
+  fail "21b: completed server 500 must NOT retain archive lock fail-closed: $(cat "$err21b")"
+fi
+assert_no_active_lease "$R21"
+leftover_staging_21b="$(find "${R21}/drive9/.staging" -mindepth 1 -maxdepth 1 2>/dev/null || true)"
+[ -z "$leftover_staging_21b" ] || fail "21b: expected untainted staging dir to be cleaned up on exit, found: ${leftover_staging_21b}"
+
+# Subsequent publisher acquires lock immediately with wait=0 and no break_lock_owner.
+run_publisher_in_with_arg "$REPO" "$R21" "$L21C" "$C4" \
+  RUNNER_TEMP="${WORK}/runner21c" \
+  DRIVE9_ARCHIVE_RETAIN_COMMITS=5 \
+  DRIVE9_ARCHIVE_LOCK_WAIT_SECONDS=0 >/dev/null
+assert_exists "${R21}/drive9/commits/${C4}/manifest.json"
+assert_no_active_lease "$R21"
+pass "completed server 500 retried in place and released .publish-lock cleanly even when retries exhausted"
+
+echo "== 22. Ambiguous transport EOF inside invocation-private .staging abandons tainted staging dir, retries in fresh dir, and never wedges .publish-lock"
+R22="${WORK}/remote22"
+L22A="${WORK}/ops22a.log"
+L22B="${WORK}/ops22b.log"
+L22C="${WORK}/ops22c.log"
+mkdir -p "$R22"
+: >"$L22A"
+: >"$L22B"
+: >"$L22C"
+CNT22A="${WORK}/upload_eof_22a.count"
+CNT22B="${WORK}/upload_eof_22b.count"
+
+# 22a: Two ambiguous EOFs on .staging/.../drive9-linux-amd64 abandon -a1 and -a2 untouched and promote -a3.
+printf '2\n' >"$CNT22A"
+err22a="${WORK}/err22a.log"
+run_publisher "$R22" "$L22A" env \
+  DRIVE9_ARCHIVE_RETAIN_COMMITS=5 \
+  DRIVE9_ARCHIVE_RETRY_ATTEMPTS=4 \
+  FAKE_FAIL_UPLOAD_EOF_PATTERN=".staging/${MAIN_NEW}." \
+  FAKE_FAIL_UPLOAD_EOF_COUNT_FILE="$CNT22A" >/dev/null 2>"$err22a"
+assert_exists "${R22}/drive9/commits/${MAIN_NEW}/manifest.json"
+assert_exists "${R22}/drive9/commits/${MAIN_NEW}/bin/drive9-linux-amd64"
+[ "$(jq -r '.commit_sha' "${R22}/drive9/latest.json")" = "$MAIN_NEW" ] || fail "22a: latest.json did not advance to MAIN_NEW"
+grep -q "abandoning attempt 1/4" "$err22a" || fail "22a: expected staging rotation warning in stderr: $(cat "$err22a")"
+if grep -q '^rm drive9/\.staging/' "$L22A"; then
+  fail "22a: tainted staging attempts must be abandoned untouched, not rm -r'd immediately: $(grep '^rm ' "$L22A")"
+fi
+tainted_count_22a="$(find "${R22}/drive9/.staging" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
+[ "$tainted_count_22a" -eq 2 ] || fail "22a: expected 2 abandoned tainted staging dirs (-a1, -a2), found ${tainted_count_22a}"
+assert_no_active_lease "$R22"
+
+# 22b: Exhausting all staging attempts on ambiguous EOF still releases .publish-lock so subsequent runs are not wedged.
+printf '5\n' >"$CNT22B"
+err22b="${WORK}/err22b.log"
+set +e
+run_publisher_in_with_arg "$REPO" "$R22" "$L22B" "$C5" \
+  RUNNER_TEMP="${WORK}/runner22b" \
+  DRIVE9_ARCHIVE_RETAIN_COMMITS=5 \
+  DRIVE9_ARCHIVE_RETRY_ATTEMPTS=2 \
+  FAKE_FAIL_UPLOAD_EOF_PATTERN=".staging/${C5}." \
+  FAKE_FAIL_UPLOAD_EOF_COUNT_FILE="$CNT22B" >/dev/null 2>"$err22b"
+rc22b=$?
+set -e
+[ "$rc22b" -ne 0 ] || fail "22b: expected exhausted staging EOF retries to fail"
+if grep -q "retaining archive lock" "$err22b"; then
+  fail "22b: private .staging EOF must NOT wedge shared archive lock: $(cat "$err22b")"
+fi
+assert_missing "${R22}/drive9/commits/${C5}"
+if grep -q "^rm drive9/\.staging/${C5}\." "$L22B"; then
+  fail "22b: cleanup_on_exit must not rm -r tainted staging directories"
+fi
+assert_no_active_lease "$R22"
+
+# Subsequent publisher acquires lock immediately without break_lock_owner.
+run_publisher_in_with_arg "$REPO" "$R22" "$L22C" "$C5" \
+  RUNNER_TEMP="${WORK}/runner22c" \
+  DRIVE9_ARCHIVE_RETAIN_COMMITS=5 \
+  DRIVE9_ARCHIVE_LOCK_WAIT_SECONDS=0 >/dev/null
+assert_exists "${R22}/drive9/commits/${C5}/manifest.json"
+assert_no_active_lease "$R22"
+pass "ambiguous EOF in private .staging rotated staging dirs cleanly and never wedged .publish-lock"
+
+echo "== 23. Bounded resumable delete ('recursive delete in progress, retry to resume') retries to completion without retaining lock"
+R23="${WORK}/remote23"
+L23="${WORK}/ops23.log"
+mkdir -p "$R23"
+: >"$L23"
+seed_complete_commit "$R23" "$C1"
+seed_complete_commit "$R23" "$C2"
+seed_latest_index "$R23" "$C2"
+CNT23="${WORK}/resumable_rm_23.count"
+printf '3\n' >"$CNT23"
+err23="${WORK}/err23.log"
+
+run_publisher "$R23" "$L23" env \
+  DRIVE9_ARCHIVE_RETAIN_COMMITS=2 \
+  DRIVE9_ARCHIVE_RETRY_ATTEMPTS=2 \
+  FAKE_RESUMABLE_RM_PATTERN="commits/${C1}" \
+  FAKE_RESUMABLE_RM_COUNT_FILE="$CNT23" >/dev/null 2>"$err23"
+assert_missing "${R23}/drive9/commits/${C1}"
+assert_exists "${R23}/drive9/commits/${C2}/manifest.json"
+assert_exists "${R23}/drive9/commits/${MAIN_NEW}/manifest.json"
+[ "$(cat "$CNT23")" = "0" ] || fail "23: expected all 3 resumable delete passes to be retried"
+if grep -q "retaining archive lock" "$err23"; then
+  fail "23: resumable delete response must not retain archive lock: $(cat "$err23")"
+fi
+assert_no_active_lease "$R23"
+pass "bounded resumable delete retried past default retry_attempts and released .publish-lock cleanly"
 
 echo "ALL TESTS PASSED"

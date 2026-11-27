@@ -46,6 +46,8 @@ branch="${DRIVE9_ARCHIVE_BRANCH:-main}"
 latest_index_branch="${DRIVE9_ARCHIVE_LATEST_BRANCH:-main}"
 retain_commits="${DRIVE9_ARCHIVE_RETAIN_COMMITS:-20}"
 incomplete_grace_seconds="${DRIVE9_ARCHIVE_INCOMPLETE_GRACE_SECONDS:-3600}"
+retry_attempts="${DRIVE9_ARCHIVE_RETRY_ATTEMPTS:-4}"
+retry_delay="${DRIVE9_ARCHIVE_RETRY_DELAY:-3}"
 quota_retry_attempts="${DRIVE9_ARCHIVE_QUOTA_RETRY_ATTEMPTS:-6}"
 quota_retry_delay="${DRIVE9_ARCHIVE_QUOTA_RETRY_DELAY:-10}"
 lock_token_ttl_seconds="${DRIVE9_ARCHIVE_LOCK_TOKEN_TTL_SECONDS:-3600}"
@@ -58,6 +60,7 @@ remote_missing_status=42
 remote_conflict_status=43
 active_worktree=""
 active_remote_staging=""
+staging_attempt_uncertain=0
 pruned_any=0
 deferred_latest_prune=0
 lock_held=0
@@ -112,6 +115,12 @@ if ! [[ "$retain_commits" =~ ^(0|[1-9][0-9]{0,5})$ ]]; then
 fi
 if ! [[ "$incomplete_grace_seconds" =~ ^(0|[1-9][0-9]{0,6})$ ]]; then
   die "invalid DRIVE9_ARCHIVE_INCOMPLETE_GRACE_SECONDS: ${incomplete_grace_seconds}"
+fi
+if ! [[ "$retry_attempts" =~ ^[1-9][0-9]{0,2}$ ]]; then
+  die "invalid DRIVE9_ARCHIVE_RETRY_ATTEMPTS: ${retry_attempts}"
+fi
+if ! [[ "$retry_delay" =~ ^(0|[1-9][0-9]{0,3})$ ]]; then
+  die "invalid DRIVE9_ARCHIVE_RETRY_DELAY: ${retry_delay}"
 fi
 if ! [[ "$quota_retry_attempts" =~ ^[1-9][0-9]{0,2}$ ]]; then
   die "invalid DRIVE9_ARCHIVE_QUOTA_RETRY_ATTEMPTS: ${quota_retry_attempts}"
@@ -170,21 +179,64 @@ remote_ref() {
   printf ':%s' "$1"
 }
 
+retry_backoff_seconds() {
+  local attempt=$1
+  local delay="$retry_delay"
+  local i=1
+  if [ "$delay" -eq 0 ]; then
+    printf '0\n'
+    return 0
+  fi
+  while [ "$i" -lt "$attempt" ]; do
+    delay=$((delay * 2))
+    if [ "$delay" -gt 30 ]; then
+      delay=30
+      break
+    fi
+    i=$((i + 1))
+  done
+  printf '%s\n' "$delay"
+}
+
+is_auth_rejection() {
+  local err_file=$1
+  [ -f "$err_file" ] || return 1
+  grep -qiE '(HTTP 401|HTTP 403|invalid API key|missing or malformed Authorization header|missing tenant scope|scoped token cannot access endpoint|token expired|token revoked|unauthorized)' "$err_file"
+}
+
 remote_cat() {
   local path=$1
   local out=$2
   local err="${out}.stderr"
-  if remote fs cat "$(remote_ref "$path")" >"$out" 2>"$err"; then
-    rm -f "$err"
-    return 0
-  fi
-  if grep -qiE '(^|[^[:alnum:]])(not found|HTTP 404)([^[:alnum:]]|$)' "$err"; then
+  local attempt=1
+  local delay
+
+  while true; do
+    if remote fs cat "$(remote_ref "$path")" >"$out" 2>"$err"; then
+      rm -f "$err"
+      return 0
+    fi
+    if grep -qiE '(^|[^[:alnum:]])(not found|HTTP 404)([^[:alnum:]]|$)' "$err"; then
+      rm -f "$out" "$err"
+      return "$remote_missing_status"
+    fi
+    if is_auth_rejection "$err"; then
+      cat "$err" >&2
+      rm -f "$out" "$err"
+      return 1
+    fi
+    if [ "$attempt" -lt "$retry_attempts" ]; then
+      delay="$(retry_backoff_seconds "$attempt")"
+      warn "transient error reading ${path}; waiting ${delay}s before retrying (attempt ${attempt}/${retry_attempts})"
+      rm -f "$out" "$err"
+      sleep "$delay"
+      attempt=$((attempt + 1))
+      continue
+    fi
+    cat "$err" >&2
     rm -f "$out" "$err"
-    return "$remote_missing_status"
-  fi
-  cat "$err" >&2
-  rm -f "$out" "$err"
-  return 1
+    return 1
+  done
 }
 
 remote_ls() {
@@ -244,16 +296,28 @@ remote_stat_mtime() {
   return 1
 }
 
-is_definitive_remote_rejection() {
+is_completed_remote_response() {
   local err_file=$1
   [ -f "$err_file" ] || return 1
-  grep -qiE '(HTTP 400|HTTP 401|HTTP 403|HTTP 404|HTTP 409|HTTP 412|HTTP 413|HTTP 422|HTTP 429|not found|path already exists|already exists|directory not empty|invalid API key|token expired|token revoked|unauthorized|tenant storage quota exceeded)' "$err_file"
+  # Matches synchronous HTTP/JSON responses emitted by drive9-server only after
+  # the backend handler has returned (4xx rejections, quota rejections, and
+  # server-sanitized post-handler error literals from errJSONInternalStorage /
+  # writeBackendError). Excludes transport drops (EOF, reset, timeout) and
+  # upstream gateway 502/503/504 errors where the server handler may still run.
+  grep -qiE '(HTTP 400|HTTP 401|HTTP 403|HTTP 404|HTTP 409|HTTP 412|HTTP 413|HTTP 422|HTTP 429|not found|path already exists|already exists|directory not empty|invalid API key|missing or malformed Authorization header|missing tenant scope|scoped token cannot access endpoint|token expired|token revoked|unauthorized|tenant storage quota exceeded|tenant usage quota exceeded|tenant metadata error|storage backend unavailable; contact support|(^|: )internal storage error([[:space:]]|$)|(^|: )backend unavailable([[:space:]]|$)|recursive delete in progress, retry to resume)' "$err_file"
 }
 
-run_mutating_remote() {
-  local stdout_file=$1
-  local stderr_file=$2
-  shift 2
+is_retryable_completed_server_error() {
+  local err_file=$1
+  [ -f "$err_file" ] || return 1
+  grep -qiE '(storage backend unavailable; contact support|(^|: )internal storage error([[:space:]]|$)|(^|: )backend unavailable([[:space:]]|$)|recursive delete in progress, retry to resume|HTTP 429|too many requests)' "$err_file"
+}
+
+run_mutating_remote_scoped() {
+  local scope=$1
+  local stdout_file=$2
+  local stderr_file=$3
+  shift 3
   local rc=0
 
   mutation_in_flight=1
@@ -267,82 +331,206 @@ run_mutating_remote() {
   if [ "$aborted_by_signal" -eq 0 ]; then
     mutation_in_flight=0
   fi
-  if [ "$rc" -ne 0 ] && ! is_definitive_remote_rejection "$stderr_file"; then
-    # Sticky: an ambiguous transport/5xx/EOF/timeout failure cannot establish that
-    # an already-authenticated server mutation finished; retain the lock fail-closed
-    # on exit and never let subsequent operations erase this uncertainty.
-    mutation_uncertain=1
+  if [ "$rc" -ne 0 ] && ! is_completed_remote_response "$stderr_file"; then
+    case "$scope" in
+    staging)
+      # Invocation-private .staging/<sha>.<owner>-a<attempt> directories are
+      # never read by consumers or promoted once tainted; mark only this staging
+      # attempt uncertain so publish_commit abandons it without wedging the
+      # shared archive lock.
+      staging_attempt_uncertain=1
+      ;;
+    container)
+      # Permanent top-level container directories (/drive9, /drive9/commits,
+      # /drive9/.staging) are idempotent and never deleted or renamed.
+      ;;
+    *)
+      # Sticky: an ambiguous transport/gateway failure on a shared path
+      # (commits/*, latest.json, or aged .staging/* prune) cannot establish that
+      # an already-authenticated server mutation finished; retain the lock
+      # fail-closed on exit and never let subsequent operations erase it.
+      mutation_uncertain=1
+      ;;
+    esac
   fi
   return "$rc"
 }
 
-remote_rm_rf() {
-  local path=$1
+run_mutating_remote() {
+  run_mutating_remote_scoped shared "$@"
+}
+
+remote_rm_rf_scoped() {
+  local scope=$1
+  local path=$2
   local err="${work_root}/rm.stderr"
-  if run_mutating_remote /dev/null "$err" fs rm -r "$(remote_ref "$path")"; then
-    rm -f "$err"
-    return 0
-  fi
-  if grep -qiE '(^|[^[:alnum:]])(not found|HTTP 404)([^[:alnum:]]|$)' "$err"; then
-    rm -f "$err"
-    return 0
-  fi
-  if grep -qiE '(HTTP 401|HTTP 403|invalid API key|token expired|token revoked|unauthorized)' "$err"; then
+  local attempt=1
+  local max_rm_attempts="$retry_attempts"
+  local delay
+
+  while true; do
+    if run_mutating_remote_scoped "$scope" /dev/null "$err" fs rm -r "$(remote_ref "$path")"; then
+      rm -f "$err"
+      return 0
+    fi
+    if grep -qiE '(^|[^[:alnum:]])(not found|HTTP 404)([^[:alnum:]]|$)' "$err"; then
+      rm -f "$err"
+      return 0
+    fi
+    if is_auth_rejection "$err"; then
+      cat "$err" >&2
+      rm -f "$err"
+      return "$remote_auth_status"
+    fi
+    if grep -qi 'recursive delete in progress, retry to resume' "$err" && [ "$max_rm_attempts" -lt 16 ]; then
+      max_rm_attempts=16
+    fi
+    if [ "$attempt" -lt "$max_rm_attempts" ] && is_retryable_completed_server_error "$err"; then
+      if ! check_archive_lock_held; then
+        cat "$err" >&2
+        rm -f "$err"
+        return "$remote_auth_status"
+      fi
+      delay="$(retry_backoff_seconds "$attempt")"
+      info "transient/resumable server response removing ${path}; waiting ${delay}s before retrying (attempt ${attempt}/${max_rm_attempts})"
+      rm -f "$err"
+      sleep "$delay"
+      attempt=$((attempt + 1))
+      continue
+    fi
     cat "$err" >&2
     rm -f "$err"
-    return "$remote_auth_status"
-  fi
-  cat "$err" >&2
-  rm -f "$err"
-  return 1
+    return 1
+  done
+}
+
+remote_rm_rf() {
+  remote_rm_rf_scoped shared "$1"
+}
+
+remote_rm_rf_staging() {
+  remote_rm_rf_scoped staging "$1"
 }
 
 remote_cp_to_local() {
   local remote_path=$1
   local local_path=$2
-  remote fs cp "$(remote_ref "$remote_path")" "$local_path" >/dev/null
+  local err="${local_path}.stderr"
+  local attempt=1
+  local delay
+
+  while true; do
+    if remote fs cp "$(remote_ref "$remote_path")" "$local_path" >/dev/null 2>"$err"; then
+      rm -f "$err"
+      return 0
+    fi
+    if grep -qiE '(^|[^[:alnum:]])(not found|HTTP 404)([^[:alnum:]]|$)' "$err" || is_auth_rejection "$err"; then
+      cat "$err" >&2
+      rm -f "$local_path" "$err"
+      return 1
+    fi
+    if [ "$attempt" -lt "$retry_attempts" ]; then
+      delay="$(retry_backoff_seconds "$attempt")"
+      warn "transient error downloading ${remote_path}; waiting ${delay}s before retrying (attempt ${attempt}/${retry_attempts})"
+      rm -f "$local_path" "$err"
+      sleep "$delay"
+      attempt=$((attempt + 1))
+      continue
+    fi
+    cat "$err" >&2
+    rm -f "$local_path" "$err"
+    return 1
+  done
+}
+
+remote_mkdir_scoped() {
+  local scope=$1
+  local path=$2
+  local err="${work_root}/mkdir.stderr"
+  local attempt=1
+  local delay
+
+  while true; do
+    assert_archive_lock_held
+    if run_mutating_remote_scoped "$scope" /dev/null "$err" fs mkdir "$(remote_ref "$path")"; then
+      rm -f "$err"
+      return 0
+    fi
+    if grep -qiE '(path already exists|already exists|HTTP 409)' "$err"; then
+      rm -f "$err"
+      return 0
+    fi
+    if is_auth_rejection "$err"; then
+      lock_held=0
+      cat "$err" >&2
+      rm -f "$err"
+      return 1
+    fi
+    if [ "$attempt" -lt "$retry_attempts" ] && { [ "$scope" = "container" ] || is_retryable_completed_server_error "$err"; }; then
+      delay="$(retry_backoff_seconds "$attempt")"
+      info "transient error creating directory ${path}; waiting ${delay}s before retrying (attempt ${attempt}/${retry_attempts})"
+      rm -f "$err"
+      sleep "$delay"
+      attempt=$((attempt + 1))
+      continue
+    fi
+    cat "$err" >&2
+    rm -f "$err"
+    return 1
+  done
 }
 
 remote_mkdir() {
-  local path=$1
-  local err="${work_root}/mkdir.stderr"
-  if run_mutating_remote /dev/null "$err" fs mkdir "$(remote_ref "$path")"; then
-    rm -f "$err"
-    return 0
-  fi
-  if grep -qiE '(path already exists|already exists|HTTP 409)' "$err"; then
-    rm -f "$err"
-    return 0
-  fi
-  cat "$err" >&2
-  rm -f "$err"
-  return 1
+  remote_mkdir_scoped shared "$1"
+}
+
+remote_mkdir_container() {
+  remote_mkdir_scoped container "$1"
+}
+
+remote_mkdir_staging() {
+  remote_mkdir_scoped staging "$1"
 }
 
 remote_mv() {
   local old_path=$1
   local new_path=$2
   local err="${work_root}/mv.stderr"
-  if run_mutating_remote /dev/null "$err" fs mv "$(remote_ref "$old_path")" "$(remote_ref "$new_path")"; then
-    rm -f "$err"
-    return 0
-  fi
-  if grep -qiE '(^|[^[:alnum:]])(not found|HTTP 404)([^[:alnum:]]|$)' "$err"; then
-    rm -f "$err"
-    return "$remote_missing_status"
-  fi
-  if grep -qiE '(path already exists|already exists|HTTP 409)' "$err"; then
-    rm -f "$err"
-    return "$remote_conflict_status"
-  fi
-  if grep -qiE '(HTTP 401|HTTP 403|invalid API key|token expired|token revoked|unauthorized)' "$err"; then
+  local attempt=1
+  local delay
+
+  while true; do
+    assert_archive_lock_held
+    if run_mutating_remote_scoped shared /dev/null "$err" fs mv "$(remote_ref "$old_path")" "$(remote_ref "$new_path")"; then
+      rm -f "$err"
+      return 0
+    fi
+    if grep -qiE '(^|[^[:alnum:]])(not found|HTTP 404)([^[:alnum:]]|$)' "$err"; then
+      rm -f "$err"
+      return "$remote_missing_status"
+    fi
+    if grep -qiE '(path already exists|already exists|HTTP 409)' "$err"; then
+      rm -f "$err"
+      return "$remote_conflict_status"
+    fi
+    if is_auth_rejection "$err"; then
+      lock_held=0
+      cat "$err" >&2
+      rm -f "$err"
+      return "$remote_auth_status"
+    fi
+    if [ "$attempt" -lt "$retry_attempts" ] && is_retryable_completed_server_error "$err"; then
+      delay="$(retry_backoff_seconds "$attempt")"
+      info "transient server error promoting ${old_path} -> ${new_path}; waiting ${delay}s before retrying (attempt ${attempt}/${retry_attempts})"
+      rm -f "$err"
+      sleep "$delay"
+      attempt=$((attempt + 1))
+      continue
+    fi
     cat "$err" >&2
     rm -f "$err"
-    return "$remote_auth_status"
-  fi
-  cat "$err" >&2
-  rm -f "$err"
-  return 1
+    return 1
+  done
 }
 
 lock_ls() {
@@ -356,6 +544,11 @@ lock_ls() {
   if grep -qiE '(^|[^[:alnum:]])(not found|HTTP 404)([^[:alnum:]]|$)' "$err"; then
     rm -f "$out" "$err"
     return "$remote_missing_status"
+  fi
+  if is_auth_rejection "$err"; then
+    cat "$err" >&2
+    rm -f "$out" "$err"
+    return "$remote_auth_status"
   fi
   cat "$err" >&2
   rm -f "$out" "$err"
@@ -748,8 +941,11 @@ acquire_archive_lock() {
         remote_owner fs mkdir "$(remote_ref "$archive_root")" >/dev/null 2>&1 || true
         remote_owner fs mkdir "$(remote_ref "$archive_lock_path")" >/dev/null 2>&1 || true
         active_desc="initializing"
+      elif [ "$rc" -eq "$remote_auth_status" ]; then
+        die "failed to inspect archive lock ${archive_lock_path} (authentication rejected)"
       else
-        die "failed to inspect archive lock ${archive_lock_path}"
+        warn "transient failure inspecting archive lock ${archive_lock_path}; retrying until deadline"
+        active_desc="inspecting lock"
       fi
     fi
 
@@ -857,34 +1053,55 @@ release_archive_lock() {
   fi
 }
 
-remote_upload() {
-  local local_path=$1
-  local remote_path=$2
+remote_upload_impl() {
+  local scope=$1
+  local local_path=$2
+  local remote_path=$3
   local err="${work_root}/upload.stderr"
-  local max_attempts=1
-  local attempt=1
-  if [ "$pruned_any" -eq 1 ]; then
-    max_attempts="$quota_retry_attempts"
-  fi
+  local quota_attempt=1
+  local server_attempt=1
+  local delay
 
   info "upload ${remote_path}"
   while true; do
     assert_archive_lock_held
-    if run_mutating_remote /dev/null "$err" fs cp "$local_path" "$(remote_ref "$remote_path")"; then
+    if run_mutating_remote_scoped "$scope" /dev/null "$err" fs cp "$local_path" "$(remote_ref "$remote_path")"; then
       rm -f "$err"
       return 0
     fi
-    if [ "$pruned_any" -eq 1 ] && [ "$attempt" -lt "$max_attempts" ] && grep -qi 'tenant storage quota exceeded' "$err"; then
-      info "storage quota still draining after prune; waiting ${quota_retry_delay}s before retrying ${remote_path} (attempt ${attempt}/${max_attempts})"
+    if is_auth_rejection "$err"; then
+      lock_held=0
+      cat "$err" >&2
+      rm -f "$err"
+      return 1
+    fi
+    if [ "$pruned_any" -eq 1 ] && [ "$quota_attempt" -lt "$quota_retry_attempts" ] && grep -qi 'tenant storage quota exceeded' "$err"; then
+      info "storage quota still draining after prune; waiting ${quota_retry_delay}s before retrying ${remote_path} (attempt ${quota_attempt}/${quota_retry_attempts})"
       rm -f "$err"
       sleep "$quota_retry_delay"
-      attempt=$((attempt + 1))
+      quota_attempt=$((quota_attempt + 1))
+      continue
+    fi
+    if [ "$server_attempt" -lt "$retry_attempts" ] && is_retryable_completed_server_error "$err"; then
+      delay="$(retry_backoff_seconds "$server_attempt")"
+      info "transient server error uploading ${remote_path}; waiting ${delay}s before retrying (attempt ${server_attempt}/${retry_attempts})"
+      rm -f "$err"
+      sleep "$delay"
+      server_attempt=$((server_attempt + 1))
       continue
     fi
     cat "$err" >&2
     rm -f "$err"
     return 1
   done
+}
+
+remote_upload() {
+  remote_upload_impl shared "$1" "$2"
+}
+
+remote_upload_staging() {
+  remote_upload_impl staging "$1" "$2"
 }
 
 fetch_archive_branch() {
@@ -1073,15 +1290,15 @@ verify_remote_artifacts() {
   if [ ! -s "$checksums_file" ]; then
     die "empty checksum list for ${commit_path}"
   fi
-  rm -rf "$verify_dir"
-  mkdir -p "$verify_dir"
+  rm -rf "$verify_dir" || return 1
+  mkdir -p "$verify_dir" || return 1
 
   while read -r expected rel; do
     local out actual
     out="${verify_dir}/${rel}"
-    mkdir -p "$(dirname "$out")"
-    remote_cp_to_local "${commit_path}/${rel}" "$out"
-    actual="$(sha256sum "$out" | awk '{print $1}')"
+    mkdir -p "$(dirname "$out")" || return 1
+    remote_cp_to_local "${commit_path}/${rel}" "$out" || return 1
+    actual="$(sha256sum "$out" | awk '{print $1}')" || return 1
     if [ "$actual" != "$expected" ]; then
       die "remote checksum mismatch for ${commit_path}/${rel}"
     fi
@@ -1140,12 +1357,33 @@ remote_commit_self_state() {
   echo "complete"
 }
 
+stage_commit_artifacts() {
+  local artifact_dir=$1
+  local staging_path=$2
+  local binary_list="${artifact_dir}/binaries.list"
+  local binary
+
+  remote_mkdir_staging "$staging_path" || return 1
+  remote_mkdir_staging "${staging_path}/bin" || return 1
+  remote_upload_staging "${artifact_dir}/source.tar.gz" "${staging_path}/source.tar.gz" || return 1
+
+  (cd "$artifact_dir" && find bin -type f -name 'drive9-*' | sort) >"$binary_list" || return 1
+  while IFS= read -r binary; do
+    [ -n "$binary" ] || continue
+    remote_upload_staging "${artifact_dir}/${binary}" "${staging_path}/${binary}" || return 1
+  done <"$binary_list"
+
+  remote_upload_staging "${artifact_dir}/checksums.txt" "${staging_path}/checksums.txt" || return 1
+  verify_remote_artifacts "$staging_path" "${artifact_dir}/checksums.txt" || return 1
+  remote_upload_staging "${artifact_dir}/manifest.json" "${staging_path}/manifest.json" || return 1
+  return 0
+}
+
 publish_commit() {
   local sha=$1
   local artifact_dir="${artifact_root}/${sha}"
   local commit_path="${archive_root}/commits/${sha}"
-  local staging_path="${archive_staging_root}/${sha}.${lock_owner_id}"
-  local state mv_rc
+  local staging_path state mv_rc stage_attempt=1 delay
 
   state="$(remote_commit_self_state "$sha")"
   if [ "$state" = "complete" ]; then
@@ -1162,20 +1400,37 @@ publish_commit() {
 
   assert_archive_lock_held
 
-  remote_mkdir "$archive_root"
-  remote_mkdir "${archive_root}/commits"
-  remote_mkdir "$archive_staging_root"
-  remote_mkdir "$staging_path"
-  remote_mkdir "${staging_path}/bin"
+  remote_mkdir_container "$archive_root"
+  remote_mkdir_container "${archive_root}/commits"
+  remote_mkdir_container "$archive_staging_root"
 
-  active_remote_staging="$staging_path"
-  remote_upload "${artifact_dir}/source.tar.gz" "${staging_path}/source.tar.gz"
-  while IFS= read -r binary; do
-    remote_upload "${artifact_dir}/${binary}" "${staging_path}/${binary}"
-  done < <(cd "$artifact_dir" && find bin -type f -name 'drive9-*' | sort)
-  remote_upload "${artifact_dir}/checksums.txt" "${staging_path}/checksums.txt"
-  verify_remote_artifacts "$staging_path" "${artifact_dir}/checksums.txt"
-  remote_upload "${artifact_dir}/manifest.json" "${staging_path}/manifest.json"
+  while true; do
+    assert_archive_lock_held
+    staging_path="${archive_staging_root}/${sha}.${lock_owner_id}-a${stage_attempt}"
+    staging_attempt_uncertain=0
+    active_remote_staging="$staging_path"
+
+    if stage_commit_artifacts "$artifact_dir" "$staging_path"; then
+      break
+    fi
+
+    if [ "$staging_attempt_uncertain" -eq 1 ]; then
+      # Abandon this attempt-private staging directory untouched so no rm/mv
+      # overlaps a potentially still-running staging write; aged orphan staging
+      # cleanup reclaims it later without wedging the shared archive lock.
+      active_remote_staging=""
+      if [ "$stage_attempt" -lt "$retry_attempts" ]; then
+        delay="$(retry_backoff_seconds "$stage_attempt")"
+        warn "ambiguous failure staging ${sha} in ${staging_path}; abandoning attempt ${stage_attempt}/${retry_attempts} and retrying in a fresh staging directory after ${delay}s"
+        sleep "$delay"
+        stage_attempt=$((stage_attempt + 1))
+        continue
+      fi
+      die "failed to stage ${sha} after ${stage_attempt} attempt(s) due to ambiguous remote staging errors"
+    fi
+
+    return 1
+  done
 
   assert_archive_lock_held
   info "promote ${staging_path} -> ${commit_path}"
@@ -1184,15 +1439,19 @@ publish_commit() {
     return 0
   else
     mv_rc=$?
-    if [ "$mv_rc" -eq "$remote_conflict_status" ]; then
-      remote_rm_rf "$staging_path" >/dev/null 2>&1 || true
+    if [ "$mv_rc" -eq "$remote_conflict_status" ] || [ "$mv_rc" -eq "$remote_missing_status" ]; then
+      if [ "$mv_rc" -eq "$remote_conflict_status" ]; then
+        remote_rm_rf_staging "$staging_path" >/dev/null 2>&1 || true
+      fi
       active_remote_staging=""
       state="$(remote_commit_state "$sha" "$artifact_dir")"
       if [ "$state" = "complete" ]; then
         info "commit ${sha} already complete"
         return 0
       fi
-      die "cannot promote ${staging_path} to ${commit_path}: target already exists and is incomplete"
+      if [ "$mv_rc" -eq "$remote_conflict_status" ]; then
+        die "cannot promote ${staging_path} to ${commit_path}: target already exists and is incomplete"
+      fi
     fi
     die "failed to promote ${staging_path} to ${commit_path}"
   fi
@@ -1733,8 +1992,8 @@ resolve_commits() {
 
 cleanup_on_exit() {
   local exit_code=$?
-  if [ -n "${active_remote_staging:-}" ] && [ "$mutation_in_flight" -eq 0 ] && [ "$mutation_uncertain" -eq 0 ] && [ "$aborted_by_signal" -eq 0 ] && [ "$lock_held" -eq 1 ]; then
-    remote_rm_rf "$active_remote_staging" >/dev/null 2>&1 || true
+  if [ -n "${active_remote_staging:-}" ] && [ "$staging_attempt_uncertain" -eq 0 ] && [ "$mutation_in_flight" -eq 0 ] && [ "$mutation_uncertain" -eq 0 ] && [ "$aborted_by_signal" -eq 0 ] && [ "$lock_held" -eq 1 ]; then
+    remote_rm_rf_staging "$active_remote_staging" >/dev/null 2>&1 || true
     active_remote_staging=""
   fi
   release_archive_lock || true
