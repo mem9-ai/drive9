@@ -169,8 +169,8 @@ func NewEngine(cfg EngineConfig) *Engine {
 		OSCache:        true,
 		Readahead:      8 * blockSize,
 		Prefetch:       1,
-		MaxUpload:              chunkMaxUpload,
-		MaxDownload:            defaultMaxDownload,
+		MaxUpload:      chunkMaxUpload,
+		MaxDownload:    defaultMaxDownload,
 		// BufferSize is JuiceFS's TOTAL read/write buffering budget, and it
 		// is not just a soft throttle: the data reader derives its global
 		// read-ahead budget from it (80% of this value gates every read

@@ -2872,7 +2872,6 @@ func TestFreshEngineCreateVisibleBeforeCommit(t *testing.T) {
 	}
 }
 
-
 // Round-18: a later write covering only the MIDDLE of an earlier one keeps
 // the earlier write's suffix, and fsync publishes the composed image. The
 // extent plane has no deferred-commit mode, so the very first fsync already
@@ -2964,12 +2963,6 @@ func TestLocalLookupKeepsRecordedZeroMode(t *testing.T) {
 	}
 }
 
-
-
-
-
-
-
 // Round-19: the folded OpCreate flag contract holds for still-local files —
 // O_CREAT|O_EXCL answers EEXIST and O_TRUNC truncates.
 func TestLocalClaimFlagSemantics(t *testing.T) {
@@ -2998,9 +2991,6 @@ func TestLocalClaimFlagSemantics(t *testing.T) {
 		t.Fatalf("content after O_TRUNC + write = %q, want DATA (the truncate cleared nothing)", got)
 	}
 }
-
-
-
 
 // Round-20: a write appended to b.pending while another chunk's commit is
 // in flight survives that commit (the deletion is surgical).
@@ -3086,8 +3076,6 @@ func TestDeferredOverlayThreeWritesBackwards(t *testing.T) {
 	}
 }
 
-
-
 // Round-21: a same-inode write that survives another commit's cleanup
 // keeps its staged bytes (the reference scan counts it).
 func TestSameInodeSurvivorKeepsBytes(t *testing.T) {
@@ -3117,7 +3105,6 @@ func TestSameInodeSurvivorKeepsBytes(t *testing.T) {
 		t.Fatalf("survivor's staged bytes lost: ok=%v data=%q", ok, data)
 	}
 }
-
 
 // Round-22: the recovery constraint covers TRUNCATION-ONLY publication —
 // a replacement at the saved path is never truncated.
@@ -3201,8 +3188,6 @@ func TestRecoveryConstraintSurvivesFailure(t *testing.T) {
 	}
 }
 
-
-
 // Round-24: an ordinary SAME-OBJECT revision conflict on a bound
 // publication stays an ordinary conflict — the staged data survives for
 // the retry instead of being abandoned.
@@ -3239,7 +3224,6 @@ func TestBoundPublicationOrdinaryConflictKeepsState(t *testing.T) {
 	}
 }
 
-
 // Round-25: a bound publication with the revision CAS DISABLED (-1) still
 // carries the identity precondition on the direct-PUT route.
 func TestBoundDirectPutWithoutRevisionCAS(t *testing.T) {
@@ -3261,7 +3245,6 @@ func TestBoundDirectPutWithoutRevisionCAS(t *testing.T) {
 		t.Fatalf("replacement content = %q, want OTHER untouched", got)
 	}
 }
-
 
 // Round-26: the echoed completion identity binds the descriptor directly (no
 // post-create Stat round trip), and rejects an EXTENT replacement at the same
@@ -3326,12 +3309,6 @@ func TestIdentityBindsPublicationWindow(t *testing.T) {
 	}
 }
 
-
-
-
-
-
-
 // Round-60: an echo-less completion binds NOTHING, even when the occupant's
 // whole image matches byte for byte. Content is not identity — a byte-identical
 // replacement is a different object, and adopting its ID would let this
@@ -3364,7 +3341,6 @@ func TestEcholessCompletionBindsNothing(t *testing.T) {
 		t.Fatal("the refusal must persist across retries")
 	}
 }
-
 
 // Round-47: with no completion echo, an extent occupant that replaced OUR
 // landing BEFORE the classification Stat must not be adopted — its read
@@ -4010,7 +3986,6 @@ func TestFreshCreateMarkerDoesNotSurviveReuse(t *testing.T) {
 		t.Fatalf("a reopened path must not inherit the previous incarnation's create marker: %v", err)
 	}
 }
-
 
 // The capability boundary must be established BEFORE publishing: a server that
 // does not advertise completion_identity_v1 cannot give this descriptor an

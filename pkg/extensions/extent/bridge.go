@@ -146,10 +146,10 @@ type Bridge struct {
 	// read legitimately disagree with the server (replica lag); a revision
 	// recorded from someone else's write, or a publication minutes ago, gives
 	// a read nothing to wait for.
-	revAt    map[meta.Ino]time.Time
-	pending  map[meta.Ino][]pendingWrite
-	truncs   map[meta.Ino]int64  // truncate-only growth awaiting the next commit
-	truncSeq map[meta.Ino]uint64 // monotonic counter fencing b.truncs cleanup
+	revAt        map[meta.Ino]time.Time
+	pending      map[meta.Ino][]pendingWrite
+	truncs       map[meta.Ino]int64  // truncate-only growth awaiting the next commit
+	truncSeq     map[meta.Ino]uint64 // monotonic counter fencing b.truncs cleanup
 	retryRunning bool
 	retryStop    chan struct{}
 	retryOnce    sync.Once

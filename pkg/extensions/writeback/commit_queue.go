@@ -712,6 +712,40 @@ func (cq *CommitQueue) HasPath(path string) bool {
 	return cq.hasQueuedPathLocked(path) || cq.hasImmediatePathLocked(path)
 }
 
+// HasUncanceledPath reports whether path has at least one non-canceled entry in
+// flight, immediate execution, or the pending queue. Callers that re-enqueue
+// staged data after canceling an entry use HasUncanceledPath so a dying worker
+// between unlockPath() and endInFlight() cannot suppress re-enqueueing.
+func (cq *CommitQueue) HasUncanceledPath(path string) bool {
+	if cq == nil || path == "" {
+		return false
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	if cur := cq.inFlight[path]; cur != nil && !cur.canceled {
+		return true
+	}
+	for entry := range cq.immediate {
+		if entry != nil && entry.Path == path && !entry.canceled {
+			return true
+		}
+	}
+	if cq.queuedByPath != nil {
+		for entry := range cq.queuedByPath[path] {
+			if entry != nil && !entry.canceled {
+				return true
+			}
+		}
+		return false
+	}
+	for _, entry := range cq.queue {
+		if entry != nil && entry.Path == path && !entry.canceled {
+			return true
+		}
+	}
+	return false
+}
+
 // WaitPrefix blocks until all in-flight or queued commits under the given
 // prefix complete. Used by Rename to wait for descendant commits.
 func (cq *CommitQueue) WaitPrefix(prefix string) {

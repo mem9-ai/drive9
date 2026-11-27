@@ -1196,15 +1196,20 @@ func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 
 	s.mu.Lock()
 
+	oldHashKey := "__hash:" + HashPath(oldPath)
 	sf, ok := s.files[oldPath]
 	if !ok {
-		oldHashKey := "__hash:" + HashPath(oldPath)
 		if recovered, rOK := s.files[oldHashKey]; rOK {
 			sf = recovered
 			delete(s.files, oldHashKey)
 			s.files[oldPath] = sf
 			ok = true
 		}
+	} else if staleOldHashSF, rOK := s.files[oldHashKey]; rOK {
+		if staleOldHashSF != nil && staleOldHashSF != sf && staleOldHashSF.fd != nil {
+			_ = staleOldHashSF.fd.Close()
+		}
+		delete(s.files, oldHashKey)
 	}
 	if !ok {
 		s.mu.Unlock()

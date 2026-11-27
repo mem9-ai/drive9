@@ -15,10 +15,11 @@ const viewForgetWait = time.Second
 var errViewPrepareFailed = errors.New("mount view drain prepare failed")
 
 // prepareViewSwitch executes the 5 local preflight gates (v36 §6.3 #3):
-//  1-3. Open file handles (incl. closed-fd mmap), dir handles, held FUSE locks -> EBUSY.
-//  4.   current.Drain(ctx) -> PREPARE_FAILED (dirty data retained in current).
-//  5.   Extension ViewSwitchGater/ReexecGater + EntryNotify/InodeNotify/root fence
-//       + 1s waitForCleanup until nonRootKernelLookupCount == 0 + atIdle recheck -> EBUSY.
+//
+//	1-3. Open file handles (incl. closed-fd mmap), dir handles, held FUSE locks -> EBUSY.
+//	4.   current.Drain(ctx) -> PREPARE_FAILED (dirty data retained in current).
+//	5.   Extension ViewSwitchGater/ReexecGater + EntryNotify/InodeNotify/root fence
+//	     + 1s waitForCleanup until nonRootKernelLookupCount == 0 + atIdle recheck -> EBUSY.
 func (v *viewRequestFS) prepareViewSwitch(ctx context.Context, current *FS, notifier viewCacheNotifier, fenceRoot func(context.Context) error) (pause *viewPause, plan viewCacheInvalidation, err error) {
 	if current == nil || notifier == nil || fenceRoot == nil || v.currentTarget().fs != current {
 		return nil, plan, errViewGenerationConflict

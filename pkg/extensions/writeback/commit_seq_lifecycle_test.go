@@ -135,3 +135,49 @@ func TestCommitSeqLifecycleBounded(t *testing.T) {
 	}
 	single.End()
 }
+
+func TestHasUncanceledPathIgnoresCanceledInFlightAndQueuedEntries(t *testing.T) {
+	pending, err := staging.NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cq := NewCommitQueue(nil, nil, pending, nil, 1, 8)
+	t.Cleanup(cq.DrainAll)
+
+	const p = "/surv-dying.txt"
+	dyingInFlight := &CommitEntry{Path: p, canceled: true}
+	dyingQueued := &CommitEntry{Path: p, canceled: true}
+	dyingImmediate := &CommitEntry{Path: p, canceled: true}
+
+	cq.mu.Lock()
+	cq.inFlight[p] = dyingInFlight
+	cq.queue = append(cq.queue, dyingQueued)
+	cq.addQueuedLocked(dyingQueued)
+	cq.immediate[dyingImmediate] = struct{}{}
+	cq.mu.Unlock()
+
+	if !cq.HasPath(p) {
+		t.Fatal("HasPath must remain true while dying canceled entries are draining")
+	}
+	if cq.HasUncanceledPath(p) {
+		t.Fatal("HasUncanceledPath must ignore canceled entries across inFlight, immediate, and queue")
+	}
+
+	replacement := &CommitEntry{Path: p}
+	cq.mu.Lock()
+	cq.queue = append(cq.queue, replacement)
+	cq.addQueuedLocked(replacement)
+	cq.mu.Unlock()
+
+	if !cq.HasUncanceledPath(p) {
+		t.Fatal("HasUncanceledPath must report true once a non-canceled replacement entry is queued")
+	}
+
+	// Clean up synthetic entries before DrainAll.
+	cq.mu.Lock()
+	delete(cq.inFlight, p)
+	delete(cq.immediate, dyingImmediate)
+	cq.queue = nil
+	cq.rebuildQueuedIndexLocked()
+	cq.mu.Unlock()
+}

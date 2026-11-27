@@ -17,12 +17,12 @@ type LayerMountBindRequest struct {
 }
 
 type LayerMountLease struct {
-	LayerID          string    `json:"layer_id"`
-	MountID          string    `json:"mount_id"`
-	OperationID      string    `json:"operation_id"`
-	Fence            int64     `json:"fence"`
-	MountLeaseUntil  time.Time `json:"mount_lease_until"`
-	MountLeaseTTLMS  int64     `json:"mount_lease_ttl_ms"`
+	LayerID         string    `json:"layer_id"`
+	MountID         string    `json:"mount_id"`
+	OperationID     string    `json:"operation_id"`
+	Fence           int64     `json:"fence"`
+	MountLeaseUntil time.Time `json:"mount_lease_until"`
+	MountLeaseTTLMS int64     `json:"mount_lease_ttl_ms"`
 }
 
 type LayerMountRenewRequest struct {

@@ -1334,7 +1334,7 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 			return
 		}
 		st := w.opts.Staging
-		if m, mok := st.Pending.GetMeta(targetPath); mok && m != nil && m.Kind != staging.PendingConflict && st.Shadow != nil && st.Shadow.Has(targetPath) && !w.queue.HasPath(targetPath) {
+		if m, mok := st.Pending.GetMeta(targetPath); mok && m != nil && m.Kind != staging.PendingConflict && st.Shadow != nil && st.Shadow.Has(targetPath) && !w.queue.HasUncanceledPath(targetPath) {
 			if entry := w.queue.recoveredEntry(targetPath); entry != nil {
 				entry.PayloadBaseRev, entry.PayloadBaseRevSet = 0, false
 				if enqErr := w.queue.Enqueue(entry); enqErr != nil {

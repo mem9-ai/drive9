@@ -1718,10 +1718,13 @@ func TestRound10MornyxReviewRegressions(t *testing.T) {
 		f, err := New(Options{Extensions: []fs.Handler{wb, terminal}, DefaultPermissions: true})
 		require.NoError(t, err)
 
-		// 1. Open existing seeded file /live_iso (O_RDONLY) and unwritten O_CREAT handle at /reuse,
-		// unlink them, then create replacements with dirty live buffers, wbCache, and Shadow bytes;
-		// neither anonymous fd may read the replacement writer's dirty buffer or staged bytes!
-		b.Seed("/live_iso", []byte("orig-live"))
+		// 1. Stage a pending shadow on /live_iso (so PrepareOpenUnlink pins unlinkedShadowPin
+		// with h.pendingImage == nil, exercising the unlinked branch right before readLiveWriter!),
+		// open O_RDONLY, unlink, and create a replacement with an unflushed dirty live buffer!
+		b.Seed("/live_iso", []byte("remote-stale"))
+		require.NoError(t, ledger.Shadow.WriteFull("/live_iso", []byte("staged-orig-live"), 1))
+		_, err = ledger.Pending.Put("/live_iso", int64(len("staged-orig-live")), staging.PendingOverwrite)
+		require.NoError(t, err)
 		liveIno := lookupFacade(t, f, "live_iso")
 		liveHdr := gofuse.InHeader{NodeId: liveIno}
 		var liveOpen gofuse.OpenOut
@@ -1733,12 +1736,12 @@ func TestRound10MornyxReviewRegressions(t *testing.T) {
 		liveRepHdr := gofuse.InHeader{NodeId: liveRep.NodeId}
 		_, lwst := f.Write(nil, &gofuse.WriteIn{InHeader: liveRepHdr, Fh: liveRep.Fh}, []byte("DIRTY-LIVE-REPLACEMENT"))
 		require.Equal(t, gofuse.OK, lwst)
-		// Unflushed dirty replacement buffer is live in h.w.live["/live_iso"], yet old fd must still read "orig-live"!
+		// Unflushed dirty replacement buffer is live in h.w.live["/live_iso"], yet old fd must read its pinned "staged-orig-live"!
 		liveBuf := make([]byte, 32)
 		lrr, lrst := f.Read(nil, &gofuse.ReadIn{InHeader: liveHdr, Fh: liveOpen.Fh, Offset: 0, Size: 32}, liveBuf)
 		require.Equal(t, gofuse.OK, lrst)
 		gotLive, _ := lrr.Bytes(liveBuf)
-		require.Equal(t, "orig-live", string(gotLive))
+		require.Equal(t, "staged-orig-live", string(gotLive))
 		f.Release(nil, &gofuse.ReleaseIn{InHeader: liveHdr, Fh: liveOpen.Fh})
 		f.Release(nil, &gofuse.ReleaseIn{InHeader: liveRepHdr, Fh: liveRep.Fh})
 
