@@ -16,6 +16,7 @@ import (
 	"io"
 	"syscall"
 
+	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
 )
 
@@ -254,9 +255,19 @@ func (w *Writeback) newerVisibleTruncateImage(h *bufferingHandle, ownSeq uint64)
 // fence).
 func (w *Writeback) fenceRefreshAppendBase(ctx context.Context, h *bufferingHandle) ([]byte, int64, error) {
 	h.mu.Lock()
-	if h.unlinked || h.buf == nil || !h.buf.CanMaterializeFull() {
+	if h.unlinked || h.buf == nil {
 		h.mu.Unlock()
 		return nil, 0, nil
+	}
+	if !h.buf.CanMaterializeFull() && h.buf.Size() <= appendRefreshMaxBytes {
+		_ = h.buf.ForceEnsurePartsForWrite(0, h.buf.Size())
+		_ = h.buf.LoadMissingParts()
+	}
+	if !h.buf.CanMaterializeFull() {
+		baseRev := h.baseRev
+		ownTrunc, ownSeq := h.visTrunc && h.dirty, h.mutSeq
+		h.mu.Unlock()
+		return w.fenceCheckUnmaterializableAppend(ctx, h, baseRev, ownTrunc, ownSeq)
 	}
 	mine := append([]byte(nil), h.buf.Bytes()...)
 	baseRev := h.baseRev
@@ -326,6 +337,61 @@ func (w *Writeback) fenceRefreshAppendBase(ctx context.Context, h *bufferingHand
 		}
 	}
 	return mine, newestRev, nil
+}
+
+// fenceCheckUnmaterializableAppend guards append staging when h.buf cannot be
+// materialized within appendRefreshMaxBytes (e.g. spilled parts above 1 MiB or
+// a failed restore): if any sibling or remote revision advanced past h's base,
+// fail closed with EAGAIN so callers never adopt a foreign revision or
+// overwrite a concurrent append without its bytes.
+func (w *Writeback) fenceCheckUnmaterializableAppend(ctx context.Context, h *bufferingHandle, baseRev int64, ownTrunc bool, ownSeq uint64) ([]byte, int64, error) {
+	if ownTrunc {
+		return nil, 0, nil
+	}
+	candPaths := w.appendCandidatePaths(h)
+	candidates := make(map[string]struct{}, len(candPaths))
+	for _, p := range candPaths {
+		candidates[p] = struct{}{}
+	}
+	sibAdvanced := false
+	w.liveSet.Range(func(key, _ any) bool {
+		sib, ok := key.(*bufferingHandle)
+		if !ok || sib == h {
+			return true
+		}
+		sib.mu.Lock()
+		_, relevant := candidates[sib.path]
+		advanced := relevant && !sib.unlinked && !sib.closed && sib.buf != nil && sib.dirty && sib.mutSeq > ownSeq
+		sib.mu.Unlock()
+		if advanced {
+			sibAdvanced = true
+			return false
+		}
+		return true
+	})
+	if sibAdvanced {
+		return nil, 0, syscall.EAGAIN
+	}
+	for _, path := range candPaths {
+		if attr, ok := w.landedAttr(path); ok && attr.Rev > baseRev {
+			return nil, 0, syscall.EAGAIN
+		}
+	}
+	if w.opts.Client != nil {
+		for _, path := range candPaths {
+			st, err := w.opts.Client.StatCtx(ctx, w.remotePath(path))
+			if err != nil {
+				if !client.IsNotFound(err) {
+					return nil, 0, syscall.EAGAIN
+				}
+				continue
+			}
+			if st != nil && !st.IsDir && st.Revision > baseRev {
+				return nil, 0, syscall.EAGAIN
+			}
+		}
+	}
+	return nil, 0, nil
 }
 
 // adoptAppendImageLocked replaces the handle's buffer with a composed

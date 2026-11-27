@@ -2518,8 +2518,20 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 		if !ok || len(n1.Data) != 68<<20 {
 			t.Fatalf("/spilled-cs len = %d (ok=%v), want %d", len(n1.Data), ok, 68<<20)
 		}
-		if !bytes.Equal(n1.Data[:32], wantHead) {
-			t.Fatalf("persisted >64MiB Part 0 head = %q, want %q", n1.Data[:32], wantHead)
+		wantPart0 := append([]byte(nil), chunk...)
+		copy(wantPart0[16:], []byte("PATCH1"))
+		if !bytes.Equal(n1.Data[:8<<20], wantPart0) {
+			t.Fatal("persisted >64MiB Part 0 mismatch against full expected 8MiB chunk")
+		}
+		for partIdx := 1; partIdx < 8; partIdx++ {
+			start := partIdx * (8 << 20)
+			if !bytes.Equal(n1.Data[start:start+(8<<20)], chunk) {
+				t.Fatalf("persisted >64MiB evicted Part %d (@%d) corrupted", partIdx, start)
+			}
+		}
+		wantTail := bytes.Repeat([]byte("Tail"), 1<<20)
+		if !bytes.Equal(n1.Data[64<<20:], wantTail) {
+			t.Fatal("persisted >64MiB tail (64..68MiB) mismatch")
 		}
 
 		// Case 2 (<= 64 MiB): spill 68 MiB on c1 so Part 0 & Part 1 evict to
@@ -2567,12 +2579,13 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 		if !ok || len(n2.Data) != 16<<20 {
 			t.Fatalf("/spilled-cs-small len = %d (ok=%v), want %d", len(n2.Data), ok, 16<<20)
 		}
-		if !bytes.Equal(n2.Data[:16], []byte("SpilDataSpilData")) {
-			t.Fatalf("persisted <=64MiB Part 0 head = %q, want SpilDataSpilData", n2.Data[:16])
+		if !bytes.Equal(n2.Data[:8<<20], chunk) {
+			t.Fatal("persisted <=64MiB Part 0 (0..8MiB) mismatch against full expected chunk")
 		}
-		wantPart1Head := []byte("SpilDataPATCH2ta")
-		if !bytes.Equal(n2.Data[8<<20:(8<<20)+16], wantPart1Head) {
-			t.Fatalf("persisted <=64MiB Part 1 head = %q, want %q", n2.Data[8<<20:(8<<20)+16], wantPart1Head)
+		wantPart1 := append([]byte(nil), chunk...)
+		copy(wantPart1[8:], []byte("PATCH2"))
+		if !bytes.Equal(n2.Data[8<<20:16<<20], wantPart1) {
+			t.Fatal("persisted <=64MiB Part 1 (8..16MiB) mismatch against full expected chunk")
 		}
 	})
 
@@ -2717,7 +2730,137 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 		if serr := h2.Handle.Sync(ctx); serr != nil {
 			t.Fatalf("h2.Sync after remote recovered: %v", serr)
 		}
+		wantDelegated := append(append([]byte(nil), []byte("HDR:")...), bytes.Repeat([]byte("D"), 60<<10)...)
+		if n, ok := b.Node("/delegated-sync"); !ok || !bytes.Equal(n.Data, wantDelegated) {
+			t.Fatalf("/delegated-sync before Release = (ok=%v, len=%d), want %d bytes published by Sync", ok, len(n.Data), len(wantDelegated))
+		}
+		// Also verify two mutually delegated handles do not recurse on Sync.
+		if err := h1.Handle.Write(ctx, 0, []byte("NEW:")); err != nil {
+			t.Fatal(err)
+		}
+		if err := h1.Handle.Flush(ctx); err != nil {
+			t.Fatalf("h1.Flush: %v", err)
+		}
+		bh1 := writebackHandleOf(h1.Handle)
+		bh2 := writebackHandleOf(h2.Handle)
+		bh1.mu.Lock()
+		bh1.delegatedDirty = true
+		bh1.mu.Unlock()
+		bh2.mu.Lock()
+		bh2.delegatedDirty = true
+		bh2.mu.Unlock()
+		if serr := h2.Handle.Sync(ctx); serr != nil {
+			t.Fatalf("mutual delegatedDirty Sync: %v", serr)
+		}
 		_ = h2.Handle.Release(ctx)
 		_ = h1.Handle.Release(ctx)
+	})
+
+	t.Run("append-evicted-part-never-overwrites-foreign-append", func(t *testing.T) {
+		b := testbackend.NewBackend()
+		ts := httptest.NewServer(b)
+		t.Cleanup(ts.Close)
+		cl := client.New(ts.URL, "")
+		wbcache, err := staging.NewWriteBackCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		wb, err := New(Options{Policy: PolicyCloseSync, Client: cl, WriteCache: wbcache})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+		terminal, err := core.New(cl, core.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ch, err := fs.NewChain(wb, terminal)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Case A (<= 1 MiB with evicted uploadedParts[0]): CanMaterializeFull()
+		// is false until fenceRefreshAppendBase restores Part 0; a diverged
+		// foreign write must fail with EAGAIN instead of being overwritten.
+		if err := cl.WriteCtx(ctx, "/app-evicted.log", []byte("orig-base")); err != nil {
+			t.Fatal(err)
+		}
+		apSmall, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/app-evicted.log",
+			Flags: uint32(syscall.O_WRONLY | syscall.O_APPEND),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := apSmall.Handle.Write(ctx, 9, []byte(":local")); err != nil {
+			t.Fatal(err)
+		}
+		bhSmall := writebackHandleOf(apSmall.Handle)
+		bhSmall.mu.Lock()
+		savedSmall := append([]byte(nil), bhSmall.buf.Bytes()...)
+		bhSmall.buf.RestorePart = func(partNum int) ([]byte, error) {
+			return append([]byte(nil), savedSmall...), nil
+		}
+		bhSmall.buf.EvictPart(0)
+		if bhSmall.buf.CanMaterializeFull() {
+			bhSmall.mu.Unlock()
+			t.Fatal("expected CanMaterializeFull()=false after EvictPart(0)")
+		}
+		bhSmall.mu.Unlock()
+		if err := cl.WriteCtx(ctx, "/app-evicted.log", []byte("diverged-foreign-append")); err != nil {
+			t.Fatal(err)
+		}
+		if ferr := apSmall.Handle.Flush(ctx); !errors.Is(ferr, syscall.EAGAIN) {
+			t.Fatalf("Flush over diverged foreign write with evicted part = %v, want EAGAIN", ferr)
+		}
+		if n, ok := b.Node("/app-evicted.log"); !ok || string(n.Data) != "diverged-foreign-append" {
+			t.Fatalf("/app-evicted.log = (%v, %q), want diverged-foreign-append", ok, n.Data)
+		}
+		bhSmall.mu.Lock()
+		bhSmall.dirty = false
+		bhSmall.mu.Unlock()
+		_ = apSmall.Handle.Release(ctx)
+
+		// Case B (> 1 MiB with evicted uploadedParts[0]): Size() exceeds
+		// appendRefreshMaxBytes so fenceCheckUnmaterializableAppend runs,
+		// detects the advanced remote revision, and returns EAGAIN.
+		base2m := bytes.Repeat([]byte("A"), 2<<20)
+		if err := cl.WriteCtx(ctx, "/app-foreign.log", base2m); err != nil {
+			t.Fatal(err)
+		}
+		ap, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/app-foreign.log",
+			Flags: uint32(syscall.O_WRONLY | syscall.O_APPEND),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ap.Handle.Write(ctx, 2<<20, []byte(":local-tail")); err != nil {
+			t.Fatal(err)
+		}
+		bh := writebackHandleOf(ap.Handle)
+		bh.mu.Lock()
+		bh.buf.EvictPart(0)
+		if bh.buf.CanMaterializeFull() {
+			bh.mu.Unlock()
+			t.Fatal("expected >1MiB CanMaterializeFull()=false after EvictPart(0)")
+		}
+		bh.mu.Unlock()
+		foreign := append(append([]byte(nil), base2m...), []byte(":FOREIGN-APPEND")...)
+		if err := cl.WriteCtx(ctx, "/app-foreign.log", foreign); err != nil {
+			t.Fatal(err)
+		}
+
+		ferr := ap.Handle.Flush(ctx)
+		if !errors.Is(ferr, syscall.EAGAIN) {
+			t.Fatalf("Flush over foreign append with unmaterializable >1MiB buffer = %v, want EAGAIN", ferr)
+		}
+		if n, ok := b.Node("/app-foreign.log"); !ok || !bytes.Equal(n.Data, foreign) {
+			t.Fatalf("foreign append was overwritten: len=%d", len(n.Data))
+		}
+		bh.mu.Lock()
+		bh.dirty = false
+		bh.mu.Unlock()
+		_ = ap.Handle.Release(ctx)
 	})
 }

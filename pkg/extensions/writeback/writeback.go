@@ -3581,13 +3581,17 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 		h.mu.Lock()
 		if h.unlinked && h.unlinkSnap != nil {
 			waitSnap := h.unlinkSnap.done
-			h.mu.Unlock()
 			select {
 			case <-waitSnap:
-			case <-ctx.Done():
-				return 0, ctx.Err()
+			default:
+				h.mu.Unlock()
+				select {
+				case <-waitSnap:
+				case <-ctx.Done():
+					return 0, ctx.Err()
+				}
+				continue
 			}
-			continue
 		}
 		if !h.unlinked {
 			h.linkedReadCount++
@@ -4830,15 +4834,19 @@ func (w *Writeback) recordTransferFailure(path string, err error) {
 
 // Sync implements fs.Handle.
 func (h *bufferingHandle) Sync(ctx context.Context) error {
+	if err := h.flushDelegatedDirtySiblings(ctx, true); err != nil {
+		return err
+	}
+	return h.syncOwnState(ctx)
+}
+
+func (h *bufferingHandle) syncOwnState(ctx context.Context) error {
 	// Migrated: fsync publishes through the engine (JuiceFS close-to-open).
 	if e := h.extentHandle(); e != nil {
 		if err := e.Sync(ctx); err != nil {
 			return err
 		}
 		return h.flushMigratedMode(ctx)
-	}
-	if err := h.flushDelegatedDirtySiblings(ctx, true); err != nil {
-		return err
 	}
 	// interactive mode: fsync is a durability barrier served by
 	// the local staging ledger — stage + async enqueue, and the queue lands the
@@ -4936,7 +4944,14 @@ func (h *bufferingHandle) stagedLandingFence(path string) (supersedesGen, failur
 }
 
 // Flush implements fs.Handle.
-func (h *bufferingHandle) Flush(ctx context.Context) (err error) {
+func (h *bufferingHandle) Flush(ctx context.Context) error {
+	if ferr := h.flushDelegatedDirtySiblings(ctx, false); ferr != nil {
+		return ferr
+	}
+	return h.flushOwnState(ctx)
+}
+
+func (h *bufferingHandle) flushOwnState(ctx context.Context) (err error) {
 	// Migrated: a flush is the engine's flush, which publishes the slices
 	// the community writer has frozen. Reimplementing the close-to-open
 	// boundary here would upload the image a second time. If adoption installs
@@ -4945,9 +4960,6 @@ func (h *bufferingHandle) Flush(ctx context.Context) (err error) {
 	// entered the engine handle during that window without touching a released
 	// engine handle.
 	if handled, ferr := h.flushLiveExtent(ctx, false); handled {
-		return ferr
-	}
-	if ferr := h.flushDelegatedDirtySiblings(ctx, false); ferr != nil {
 		return ferr
 	}
 	callerCtx := ctx
@@ -6310,16 +6322,26 @@ const unlinkedSnapshotMaxBytes = 64 << 20
 // so Release cannot resurrect the path. Per-handle, so a re-created p stays
 // committable by its new writer (fh.Unlinked).
 func (w *Writeback) markUnlinked(p string, under bool) {
-	_, _ = w.markUnlinkedSnapshot(p, under)
+	marked, err := w.markUnlinkedSnapshot(p, under)
+	if err != nil {
+		for _, h := range marked {
+			h.mu.Lock()
+			h.unlinkSnap = nil
+			h.mu.Unlock()
+		}
+	}
 }
 
 // restoreMarked revives only the handles THIS operation marked: a previously
 // anonymous descriptor that was already serving another object's snapshot
-// must stay anonymous.
+// must stay anonymous. Clearing unlinkSnap atomically with h.unlinked = false
+// ensures overlapping rename-over scans observe the failed snapshot state right
+// up until restoration completes.
 func restoreMarked(marked []*bufferingHandle) {
 	for _, h := range marked {
 		h.mu.Lock()
 		h.unlinked = false
+		h.unlinkSnap = nil
 		h.mu.Unlock()
 	}
 }
@@ -6331,11 +6353,8 @@ func restoreMarked(marked []*bufferingHandle) {
 // bytes.
 func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHandle, error) {
 	prefix := strings.TrimSuffix(p, "/") + "/"
-	type cleanSnapTarget struct {
-		h  *bufferingHandle
-		st *unlinkSnapState
-	}
-	var clean []cleanSnapTarget
+	batchSnap := &unlinkSnapState{done: make(chan struct{})}
+	var clean []*bufferingHandle
 	var marked []*bufferingHandle
 	var submitting, readDrains []chan struct{}
 	var otherSnapWaits []*unlinkSnapState
@@ -6352,11 +6371,10 @@ func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHand
 		}
 		if !h.unlinked {
 			h.unlinked = true
+			h.unlinkSnap = batchSnap
 			marked = append(marked, h)
 			if h.buf == nil && !h.isNew && !h.dirty && h.pendingImage == nil && h.pendingFile == nil && h.pendingShadowGen == 0 {
-				snapSt := &unlinkSnapState{done: make(chan struct{})}
-				h.unlinkSnap = snapSt
-				clean = append(clean, cleanSnapTarget{h: h, st: snapSt})
+				clean = append(clean, h)
 			}
 		} else if h.unlinkSnap != nil {
 			otherSnapWaits = append(otherSnapWaits, h.unlinkSnap)
@@ -6380,20 +6398,13 @@ func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHand
 		}
 	}
 	var firstErr error
-	for _, ct := range clean {
+	for _, ch := range clean {
 		var err error
 		if w.opts.Staging != nil {
-			err = w.snapshotUnlinkedClean(ct.h)
+			err = w.snapshotUnlinkedClean(ch)
 		} else {
-			err = w.snapshotUnlinkedImage(ct.h)
+			err = w.snapshotUnlinkedImage(ch)
 		}
-		ct.st.err = err
-		ct.h.mu.Lock()
-		if ct.h.unlinkSnap == ct.st {
-			ct.h.unlinkSnap = nil
-		}
-		ct.h.mu.Unlock()
-		close(ct.st.done)
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -6404,6 +6415,17 @@ func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHand
 			firstErr = st.err
 		}
 	}
+	batchSnap.err = firstErr
+	if firstErr == nil {
+		for _, m := range marked {
+			m.mu.Lock()
+			if m.unlinkSnap == batchSnap {
+				m.unlinkSnap = nil
+			}
+			m.mu.Unlock()
+		}
+	}
+	close(batchSnap.done)
 	return marked, firstErr
 }
 
@@ -7922,21 +7944,29 @@ func (h *bufferingHandle) seedFromDirtySiblingForObj(objGen uint64) error {
 			return part, nil
 		}
 		curPath := h.path
+		if h.unlinked {
+			if st := h.w.opts.Staging; st != nil {
+				if pin := h.w.unlinkedShadowPinFor(curPath); pin != 0 {
+					if sn, serr := st.Shadow.ReadAtGen(pin, start, part); (serr == nil || errors.Is(serr, io.EOF)) && int64(sn) == end-start {
+						return part, nil
+					}
+				}
+			}
+			return nil, fmt.Errorf("co-open sibling part %d of unlinked %s unavailable", partNum, curPath)
+		}
 		if st := h.w.opts.Staging; st != nil && st.Pending.HasPending(curPath) {
 			if sn, serr := st.Shadow.ReadAt(curPath, start, part); (serr == nil || errors.Is(serr, io.EOF)) && int64(sn) == end-start {
 				return part, nil
 			}
 		}
-		if !h.unlinked {
-			lctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
-			defer cancel()
-			rn, rok, ferr := h.w.readRemoteRangeFallback(lctx, curPath, start, part)
-			if ferr != nil {
-				return nil, ferr
-			}
-			if rok && int64(rn) == end-start {
-				return part, nil
-			}
+		lctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+		defer cancel()
+		rn, rok, ferr := h.w.readRemoteRangeFallback(lctx, curPath, start, part)
+		if ferr != nil {
+			return nil, ferr
+		}
+		if rok && int64(rn) == end-start {
+			return part, nil
 		}
 		return nil, fmt.Errorf("co-open sibling part %d of %s unavailable", partNum, curPath)
 	}
@@ -7966,16 +7996,18 @@ func (h *bufferingHandle) flushDelegatedDirtySiblings(ctx context.Context, syncB
 		sib.mu.Lock()
 		sibPath := sib.path
 		needFlush := !sib.unlinked && !sib.closed && sib.isWritableCapableLocked() &&
-			((sib.dirty && sib.buf != nil) || (syncBarrier && (sib.stagedToCache || h.w.hasPendingLocalState(sibPath))))
+			((sib.dirty && sib.buf != nil) || (syncBarrier && (sib.stagedToCache || (!sib.delegatedDirty && h.w.hasPendingLocalState(sibPath)))))
 		sib.mu.Unlock()
 		if !needFlush {
 			continue
 		}
+		// Invoke syncOwnState / flushOwnState directly so delegated siblings
+		// never re-enter flushDelegatedDirtySiblings recursively.
 		var ferr error
 		if syncBarrier {
-			ferr = sib.Sync(ctx)
+			ferr = sib.syncOwnState(ctx)
 		} else {
-			ferr = sib.Flush(ctx)
+			ferr = sib.flushOwnState(ctx)
 		}
 		if ferr != nil {
 			return ferr
@@ -9752,6 +9784,7 @@ func (h *bufferingHandle) spillToShadow(st *staging.Staging, stagePath string, b
 		if end > size {
 			end = size
 		}
+		wasLoadedBeforeSpill := buf.IsPartLoaded(partIdx)
 		// The image was admitted by Write; the spill cannot stage it without
 		// these parts, so charge them past the budget instead of refusing the
 		// close (a refusal left the file unclosable until other memory freed).
@@ -9769,10 +9802,11 @@ func (h *bufferingHandle) spillToShadow(st *staging.Staging, stagePath string, b
 			return err
 		}
 		if !retainBuffer {
-			if preEvicted[partIdx] {
-				// RestorePart / liveSpillFile already holds this part on disk;
-				// evicting immediately bounds spill memory while keeping it
-				// recoverable on retry.
+			if preEvicted[partIdx] && !wasLoadedBeforeSpill {
+				// RestorePart / liveSpillFile already holds this unmodified part on
+				// disk; evicting immediately bounds spill memory while keeping it
+				// recoverable on retry. Back-written preEvicted parts were already
+				// loaded in memory and stay in deferredEvict until Truncate commits.
 				buf.EvictPart(partIdx)
 			} else {
 				// ReleaseCleanPart drops clean remote-backed parts immediately

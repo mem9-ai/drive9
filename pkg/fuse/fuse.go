@@ -190,6 +190,10 @@ type FS struct {
 	// budget is the process-wide memory budget (nil when disabled). Retained
 	// for the drain/status snapshot.
 	budget *membudget.Budget
+
+	unicodeSpellingsMu sync.Mutex
+	unicodeSpellings   map[string]map[string]struct{}
+	onInvalidateEntry  func(parentIno uint64, name string)
 }
 
 // New assembles the facade: chain, Context, and identity tables. Register
@@ -1625,6 +1629,7 @@ func (f *FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string
 	}
 	isDir := res.Attr != nil && res.Attr.IsDir()
 	f.fillEntryOut(child, res.Attr, isDir, out)
+	f.recordUnicodeSpelling(name, child)
 	return gofuse.OK
 }
 
@@ -2054,6 +2059,7 @@ func (f *FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, o
 	}
 	f.mutated(fs.EventWrite, child)
 	f.fillEntryOut(child, &mode, true, out)
+	f.recordUnicodeSpelling(name, child)
 	f.dirCacheUpsert(child, &mode)
 	caller := fs.CallerFrom(input.InHeader)
 	f.stampOwner(out.NodeId, caller)
@@ -2704,6 +2710,7 @@ func (f *FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name string,
 	f.mutated(fs.EventWrite, child)
 	isDir := res.Attr != nil && res.Attr.IsDir()
 	f.fillEntryOut(child, res.Attr, isDir, &out.EntryOut)
+	f.recordUnicodeSpelling(name, child)
 	f.dirCacheUpsert(child, res.Attr)
 	// v1 Create records the create mode on the inode entry
 	// (inodes.UpdateMode): the entry's mode is what later Landed settles and
@@ -3953,6 +3960,9 @@ func (f *FS) OwnerOf(path string) (uid, gid uint32, hasUID, hasGID bool) {
 
 // InvalidateEntry drops the kernel's cached dentry for parent/name.
 func (f *FS) InvalidateEntry(parentIno uint64, name string) {
+	if f.onInvalidateEntry != nil {
+		f.onInvalidateEntry(parentIno, name)
+	}
 	if s := f.currentServer(); s != nil {
 		f.notifyWg.Add(1)
 		go func() {
@@ -3962,21 +3972,55 @@ func (f *FS) InvalidateEntry(parentIno uint64, name string) {
 	}
 }
 
-// invalidateAlternateUnicodeSpellings drops cached kernel dentries for NFC/NFD
-// equivalents of a removed entry when they differ from rawName so an earlier
-// decomposed or composed Lookup cannot stay positively cached past Unlink/Rmdir.
+func (f *FS) recordUnicodeSpelling(rawName, canonChild string) {
+	canonName := pathpkg.Base(canonChild)
+	if rawName == "" || canonName == "" || rawName == canonName {
+		return
+	}
+	f.unicodeSpellingsMu.Lock()
+	if f.unicodeSpellings == nil {
+		f.unicodeSpellings = make(map[string]map[string]struct{})
+	}
+	set := f.unicodeSpellings[canonChild]
+	if set == nil {
+		set = make(map[string]struct{})
+		f.unicodeSpellings[canonChild] = set
+	}
+	set[rawName] = struct{}{}
+	f.unicodeSpellingsMu.Unlock()
+}
+
+// invalidateAlternateUnicodeSpellings drops cached kernel dentries for NFC,
+// NFD, and any previously looked-up mixed Unicode spellings of a removed entry
+// when they differ from rawName so an earlier Lookup cannot stay positively
+// cached past Unlink/Rmdir.
 func (f *FS) invalidateAlternateUnicodeSpellings(parentIno uint64, rawName, canonChild string) {
 	canonName := pathpkg.Base(canonChild)
 	if canonName == "" || canonName == "/" || canonName == "." {
 		return
 	}
-	if canonName != rawName {
-		f.InvalidateEntry(parentIno, canonName)
-	}
-	if utf8.ValidString(canonName) {
-		if nfdName := norm.NFD.String(canonName); nfdName != canonName && nfdName != rawName {
-			f.InvalidateEntry(parentIno, nfdName)
+	notified := map[string]struct{}{rawName: {}}
+	notify := func(sp string) {
+		if sp == "" {
+			return
 		}
+		if _, dup := notified[sp]; dup {
+			return
+		}
+		notified[sp] = struct{}{}
+		f.InvalidateEntry(parentIno, sp)
+	}
+	f.unicodeSpellingsMu.Lock()
+	recorded := f.unicodeSpellings[canonChild]
+	delete(f.unicodeSpellings, canonChild)
+	f.unicodeSpellingsMu.Unlock()
+
+	notify(canonName)
+	if utf8.ValidString(canonName) {
+		notify(norm.NFD.String(canonName))
+	}
+	for sp := range recorded {
+		notify(sp)
 	}
 }
 

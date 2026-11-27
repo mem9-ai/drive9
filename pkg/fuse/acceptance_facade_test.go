@@ -3,6 +3,7 @@ package fuse
 import (
 	"context"
 	"net/http/httptest"
+	"sync"
 	"syscall"
 	"testing"
 
@@ -358,6 +359,55 @@ func TestFacadeRejectsInvalidNamespaceNamesWithoutPollutingDrain(t *testing.T) {
 			}
 			if reason, count := wb.DrainPending(); reason != "" || count != 0 {
 				t.Fatalf("DrainPending after NFD Unlink = (%q, %d), want (\"\", 0)", reason, count)
+			}
+
+			// Mixed Unicode spelling ("ée\u0301.txt" -> canonical "/éé.txt"):
+			// positive Lookup of the mixed spelling followed by NFC Unlink must
+			// invalidate both the mixed spelling and full NFD ("e\u0301e\u0301.txt").
+			const (
+				mixedName = "\u00e9e\u0301.txt"
+				nfcDouble = "\u00e9\u00e9.txt"
+				nfdDouble = "e\u0301e\u0301.txt"
+			)
+			var dblCreate gofuse.CreateOut
+			if st := f.Create(nil, &gofuse.CreateIn{
+				InHeader: gofuse.InHeader{NodeId: 1},
+				Flags:    uint32(syscall.O_CREAT | syscall.O_RDWR),
+				Mode:     0o644,
+			}, nfcDouble, &dblCreate); st != gofuse.OK {
+				t.Fatalf("Create %q: %v", nfcDouble, st)
+			}
+			_ = f.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: dblCreate.NodeId}, Fh: dblCreate.Fh})
+			f.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: dblCreate.NodeId}, Fh: dblCreate.Fh})
+
+			var mixedOut gofuse.EntryOut
+			if st := f.Lookup(nil, &gofuse.InHeader{NodeId: 1}, mixedName, &mixedOut); st != gofuse.OK {
+				t.Fatalf("Lookup mixed spelling %q: %v, want OK", mixedName, st)
+			}
+			if mixedOut.NodeId != dblCreate.NodeId {
+				t.Fatalf("Lookup mixed spelling NodeId = %d, want %d", mixedOut.NodeId, dblCreate.NodeId)
+			}
+			var invalidatedMu sync.Mutex
+			invalidated := map[string]bool{}
+			f.onInvalidateEntry = func(_ uint64, invName string) {
+				invalidatedMu.Lock()
+				invalidated[invName] = true
+				invalidatedMu.Unlock()
+			}
+			if st := f.Unlink(nil, &gofuse.InHeader{NodeId: 1}, nfcDouble); st != gofuse.OK {
+				t.Fatalf("Unlink NFC %q: %v", nfcDouble, st)
+			}
+			f.onInvalidateEntry = nil
+			invalidatedMu.Lock()
+			gotMixedInv := invalidated[mixedName]
+			gotNFDInv := invalidated[nfdDouble]
+			invalidatedMu.Unlock()
+			if !gotMixedInv || !gotNFDInv {
+				t.Fatalf("Unlink NFC %q invalidated mixed=%v nfd=%v, want both true", nfcDouble, gotMixedInv, gotNFDInv)
+			}
+			var mixedAfterUnlink gofuse.EntryOut
+			if st := f.Lookup(nil, &gofuse.InHeader{NodeId: 1}, mixedName, &mixedAfterUnlink); st != gofuse.ENOENT {
+				t.Fatalf("Lookup mixed spelling after Unlink = %v, want ENOENT", st)
 			}
 
 			// Sentinel-based client.ErrInvalidPath classification must return EINVAL
