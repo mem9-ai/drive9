@@ -254,6 +254,7 @@ func TestShadowQuotaZeroLeakAcrossOverwriteUnlinkAndOpenUnlink(t *testing.T) {
 	b := testbackend.NewBackend()
 
 	var holdUploads atomic.Bool
+	uploadEntered := make(chan struct{}, 4)
 	releaseUploads := make(chan struct{})
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/status" {
@@ -261,6 +262,10 @@ func TestShadowQuotaZeroLeakAcrossOverwriteUnlinkAndOpenUnlink(t *testing.T) {
 			return
 		}
 		if holdUploads.Load() && (r.Method == http.MethodPut || r.Method == http.MethodPost) {
+			select {
+			case uploadEntered <- struct{}{}:
+			default:
+			}
 			select {
 			case <-releaseUploads:
 			case <-r.Context().Done():
@@ -402,7 +407,13 @@ func TestShadowQuotaZeroLeakAcrossOverwriteUnlinkAndOpenUnlink(t *testing.T) {
 		t.Fatalf("after open-unlink cleanup QuotaBytes = %d, want 0", got)
 	}
 
-	// Phase 3: RetainShadowForLanding followed by small wbCache commit + close -> QuotaBytes == 0.
+	// Phase 3: Deterministic RetainShadowForLanding followed by small wbCache
+	// commit + close -> verify shadow was retained across landing, then freed to 0.
+	releaseUploads = make(chan struct{})
+	for len(uploadEntered) > 0 {
+		<-uploadEntered
+	}
+	holdUploads.Store(true)
 	retRes, err := ch.Dispatch(ctx, &fs.Op{
 		Kind: fs.OpCreate, Path: "/retained.bin",
 		Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644, HasMode: true,
@@ -416,8 +427,13 @@ func TestShadowQuotaZeroLeakAcrossOverwriteUnlinkAndOpenUnlink(t *testing.T) {
 	if err := retRes.Handle.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
-	// Mutate handle to a small 8-byte image before the 128 KiB commit lands so
-	// completeStagedLanding retains the shadow, then close so wbCache lands it.
+	select {
+	case <-uploadEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("128 KiB upload for /retained.bin did not enter server gate")
+	}
+	// Mutate handle to a small 8-byte image WHILE the 128 KiB commit is held in
+	// flight so completeStagedLanding deterministically calls RetainShadowForLanding!
 	if _, err := ch.Dispatch(ctx, &fs.Op{
 		Kind: fs.OpSetAttr, Path: "/retained.bin", Size: 8, Handle: retRes.Handle, Ino: 100,
 	}); err != nil {
@@ -425,6 +441,17 @@ func TestShadowQuotaZeroLeakAcrossOverwriteUnlinkAndOpenUnlink(t *testing.T) {
 	}
 	if err := retRes.Handle.Write(ctx, 0, []byte("tiny-end")); err != nil {
 		t.Fatal(err)
+	}
+	// Release the in-flight 128 KiB upload and wait for CommitQueue to settle it.
+	holdUploads.Store(false)
+	close(releaseUploads)
+	if !wb.queue.WaitPathDeadline("/retained.bin", 5*time.Second) {
+		t.Fatal("timed out waiting for /retained.bin 128 KiB commit to finish")
+	}
+	// While retRes.Handle is still open, RetainShadowForLanding must have kept
+	// the shadow alive.
+	if got := ledger.Shadow.QuotaBytes(); got == 0 {
+		t.Fatal("expected shadow to remain retained while open handle holds post-stage edits")
 	}
 	_ = retRes.Handle.Flush(ctx)
 	_ = retRes.Handle.Release(ctx)
@@ -538,6 +565,16 @@ func TestShadowQuotaBackpressureWaitsForDrainAndRejectsTrueExcess(t *testing.T) 
 	if err := r2.Handle.Write(ctx, 0, bytes.Repeat([]byte("B"), 600<<10)); err != nil {
 		t.Fatal(err)
 	}
+	quotaWaitEntered := make(chan struct{})
+	var quotaGateOnce sync.Once
+	gateFn := func(gate string) {
+		if gate == "shadow:quotaWait" {
+			quotaGateOnce.Do(func() { close(quotaWaitEntered) })
+		}
+	}
+	wb.testGateHook.Store(&gateFn)
+	defer wb.testGateHook.Store(nil)
+
 	flushDone := make(chan error, 1)
 	go func() {
 		flushDone <- r2.Handle.Flush(ctx)
@@ -545,8 +582,10 @@ func TestShadowQuotaBackpressureWaitsForDrainAndRejectsTrueExcess(t *testing.T) 
 
 	select {
 	case ferr := <-flushDone:
-		t.Fatalf("second Flush returned before quota drained: err=%v", ferr)
-	case <-time.After(80 * time.Millisecond):
+		t.Fatalf("second Flush returned before reaching quota wait: err=%v", ferr)
+	case <-quotaWaitEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second Flush did not enter shadow:quotaWait gate")
 	}
 
 	// Unblock background commits so /first.bin lands and frees 800 KiB.
@@ -703,4 +742,334 @@ func TestInvalidPathsRejectedUpfrontAndPurgedOnUnlinkOrRmdir(t *testing.T) {
 	if got := ledger.Shadow.QuotaBytes(); got != 0 {
 		t.Fatalf("ShadowStore.QuotaBytes after Rmdir cleanup = %d, want 0", got)
 	}
+}
+
+// TestReviewEdgeCasesAndUploadCutConflictExcl covers the CI webdev/upload-cut-and-5xx
+// regression (O_CREAT|O_EXCL over a PendingConflict whose remote row is absent)
+// and PR review edge cases (interleaved multi-fd writes on unlanded creates,
+// reopened partial write after remote landing, O_RDONLY live-writer visibility
+// over wbCache, >=10MiB reopen without ledger not blocking on PUT, retried
+// spillToShadow preserving evicted part bytes, and CancelPrefix generation fencing).
+func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("excl-create-over-absent-pending-conflict-heals", func(t *testing.T) {
+		b := testbackend.NewBackend()
+		ts := httptest.NewServer(b)
+		t.Cleanup(ts.Close)
+		cl := client.New(ts.URL, "")
+		ledger, err := staging.NewStagingWithQuota(t.TempDir(), 0, 16)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(ledger.Close)
+		wbcache, err := staging.NewWriteBackCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		wb, err := New(Options{
+			Policy:     PolicyWriteBack,
+			SyncMode:   "interactive",
+			Client:     cl,
+			WriteCache: wbcache,
+			Staging:    ledger,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+		terminal, _ := core.New(cl, core.Options{})
+		ch, _ := fs.NewChain(wb, terminal)
+
+		// Simulate upload-cut-and-5xx: /mid/f-2.bin.part failed upload (PendingConflict)
+		// while remote file is absent.
+		if err := ledger.Shadow.WriteFull("/mid/f-2.bin.part", []byte("stale-cut"), 1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ledger.Pending.PutWithBaseRev("/mid/f-2.bin.part", 9, staging.PendingOverwrite, 1); err != nil {
+			t.Fatal(err)
+		}
+		if err := ledger.Pending.MarkConflict("/mid/f-2.bin.part"); err != nil {
+			t.Fatal(err)
+		}
+		// GNU cp retry opens with O_CREAT|O_EXCL|O_WRONLY after Lookup 404s.
+		res, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/mid/f-2.bin.part",
+			Flags: uint32(syscall.O_CREAT | syscall.O_EXCL | syscall.O_WRONLY),
+			Mode:  0o644, HasMode: true, Kernel: &gofuse.CreateIn{},
+		})
+		if err != nil {
+			t.Fatalf("O_CREAT|O_EXCL over absent PendingConflict failed: %v", err)
+		}
+		if err := res.Handle.Write(ctx, 0, bytes.Repeat([]byte("M"), 64<<10)); err != nil {
+			t.Fatal(err)
+		}
+		if err := res.Handle.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+		_ = res.Handle.Release(ctx)
+		if err := wb.Drain(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if reason, count := wb.DrainPending(); reason != "" || count != 0 {
+			t.Fatalf("DrainPending = (%q, %d), want empty", reason, count)
+		}
+	})
+
+	t.Run("interleaved-reopened-writes-reconcile", func(t *testing.T) {
+		b := testbackend.NewBackend()
+		ts := httptest.NewServer(b)
+		t.Cleanup(ts.Close)
+		cl := client.New(ts.URL, "")
+		wbcache, _ := staging.NewWriteBackCache(t.TempDir())
+		wb, _ := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCache: wbcache})
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+		terminal, _ := core.New(cl, core.Options{})
+		ch, _ := fs.NewChain(wb, terminal)
+
+		h1, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/interleave",
+			Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h2, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/interleave", Flags: uint32(syscall.O_RDWR),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := h1.Handle.Write(ctx, 0, []byte("A")); err != nil {
+			t.Fatal(err)
+		}
+		if err := h2.Handle.Write(ctx, 1, []byte("B")); err != nil {
+			t.Fatal(err)
+		}
+		if err := h1.Handle.Write(ctx, 2, []byte("C")); err != nil {
+			t.Fatal(err)
+		}
+		_ = h2.Handle.Flush(ctx)
+		_ = h2.Handle.Release(ctx)
+		_ = h1.Handle.Flush(ctx)
+		_ = h1.Handle.Release(ctx)
+		if err := wb.Drain(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if n, ok := b.Node("/interleave"); !ok || string(n.Data) != "ABC" {
+			t.Fatalf("/interleave = (%v, %q), want ABC", ok, n.Data)
+		}
+	})
+
+	t.Run("reopened-partial-write-after-landing-loads-base", func(t *testing.T) {
+		b := testbackend.NewBackend()
+		ts := httptest.NewServer(b)
+		t.Cleanup(ts.Close)
+		cl := client.New(ts.URL, "")
+		wbcache, _ := staging.NewWriteBackCache(t.TempDir())
+		wb, _ := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCache: wbcache})
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+		terminal, _ := core.New(cl, core.Options{})
+		ch, _ := fs.NewChain(wb, terminal)
+
+		h1, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/landed-base",
+			Flags: uint32(syscall.O_CREAT | syscall.O_WRONLY), Mode: 0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := h1.Handle.Write(ctx, 0, []byte("abc")); err != nil {
+			t.Fatal(err)
+		}
+		h2, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/landed-base", Flags: uint32(syscall.O_RDWR),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Land h1 and retire wbCache before h2 ever touches its buffer!
+		_ = h1.Handle.Flush(ctx)
+		_ = h1.Handle.Release(ctx)
+		if err := wb.Drain(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, hasMeta := wbcache.GetMeta("/landed-base"); hasMeta {
+			t.Fatal("expected wbCache entry to be retired after Drain")
+		}
+		// Partial write at offset 1 on h2 must compose onto "abc" -> "aXc"!
+		if err := h2.Handle.Write(ctx, 1, []byte("X")); err != nil {
+			t.Fatal(err)
+		}
+		_ = h2.Handle.Flush(ctx)
+		_ = h2.Handle.Release(ctx)
+		if err := wb.Drain(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if n, ok := b.Node("/landed-base"); !ok || string(n.Data) != "aXc" {
+			t.Fatalf("/landed-base = (%v, %q), want aXc", ok, n.Data)
+		}
+	})
+
+	t.Run("rdonly-reopen-sees-subsequent-sibling-write", func(t *testing.T) {
+		b := testbackend.NewBackend()
+		b.Seed("/existing", []byte("v0"))
+		ts := httptest.NewServer(b)
+		t.Cleanup(ts.Close)
+		cl := client.New(ts.URL, "")
+		wbcache, _ := staging.NewWriteBackCache(t.TempDir())
+		wb, _ := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCache: wbcache})
+		stopSSETestWriteback(t, wb)
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+		terminal, _ := core.New(cl, core.Options{})
+		ch, _ := fs.NewChain(wb, terminal)
+
+		w1, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/existing", Flags: uint32(syscall.O_WRONLY)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w1.Handle.Write(ctx, 0, []byte("v1")); err != nil {
+			t.Fatal(err)
+		}
+		if err := w1.Handle.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		r1, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/existing", Flags: uint32(syscall.O_RDONLY)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 16)
+		n, err := r1.Handle.Read(ctx, 0, buf)
+		if err != nil || string(buf[:n]) != "v1" {
+			t.Fatalf("first read = (%q, %v), want v1", string(buf[:n]), err)
+		}
+		// Now w1 writes newer unflushed bytes; r1 must see them immediately!
+		if err := w1.Handle.Write(ctx, 0, []byte("v2-fresh")); err != nil {
+			t.Fatal(err)
+		}
+		n, err = r1.Handle.Read(ctx, 0, buf)
+		if err != nil || string(buf[:n]) != "v2-fresh" {
+			t.Fatalf("second read after sibling write = (%q, %v), want v2-fresh", string(buf[:n]), err)
+		}
+		_ = r1.Handle.Release(ctx)
+		_ = w1.Handle.Release(ctx)
+	})
+
+	t.Run("reopen-bypass-size-without-ledger-does-not-put-on-open", func(t *testing.T) {
+		b := testbackend.NewBackend()
+		var puts atomic.Int64
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPut || r.Method == http.MethodPost {
+				puts.Add(1)
+			}
+			b.ServeHTTP(w, r)
+		}))
+		t.Cleanup(ts.Close)
+		cl := client.New(ts.URL, "")
+		wbcache, _ := staging.NewWriteBackCache(t.TempDir())
+		wb, _ := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCache: wbcache})
+		wb.wbCacheMaxBytes = 32 << 10
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+		terminal, _ := core.New(cl, core.Options{})
+		ch, _ := fs.NewChain(wb, terminal)
+
+		h1, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/oversize-no-ledger",
+			Flags: uint32(syscall.O_CREAT | syscall.O_WRONLY), Mode: 0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := bytes.Repeat([]byte("Z"), 64<<10)
+		if err := h1.Handle.Write(ctx, 0, want); err != nil {
+			t.Fatal(err)
+		}
+		puts.Store(0)
+		h2, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/oversize-no-ledger", Flags: uint32(syscall.O_RDONLY),
+		})
+		if err != nil {
+			t.Fatalf("reopen without ledger: %v", err)
+		}
+		if got := puts.Load(); got != 0 {
+			t.Fatalf("reopen without ledger issued %d remote PUTs during open(2), want 0", got)
+		}
+		gotBuf := make([]byte, len(want))
+		if n, rerr := h2.Handle.Read(ctx, 0, gotBuf); rerr != nil || !bytes.Equal(gotBuf[:n], want) {
+			t.Fatalf("read from unlanded oversize sibling = (%d, %v)", n, rerr)
+		}
+		_ = h2.Handle.Release(ctx)
+		_ = h1.Handle.Release(ctx)
+	})
+
+	t.Run("retried-spill-preserves-part0-bytes", func(t *testing.T) {
+		// 18 MiB shadow quota: 8 MiB occupied by /other.bin leaves 10 MiB free.
+		// A 12 MiB (8 MiB Part 0 + 4 MiB Part 1) zero-base spill with
+		// retainBuffer=false writes Part 0 (8+8=16 <= 18 MiB) and fails Part 1
+		// with ENOSPC (16+4=20 > 18 MiB). Freeing /other.bin and retrying
+		// spillToShadow must preserve Part 0's 'P' bytes instead of truncating
+		// and skipping them as zeros.
+		ledger, err := staging.NewStagingWithQuota(t.TempDir(), 0, 18)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(ledger.Close)
+		if err := ledger.Shadow.WriteFull("/other.bin", bytes.Repeat([]byte("O"), 8<<20), 0); err != nil {
+			t.Fatal(err)
+		}
+		b := testbackend.NewBackend()
+		ts := httptest.NewServer(b)
+		t.Cleanup(ts.Close)
+		cl := client.New(ts.URL, "")
+		wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, Staging: ledger})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+		terminal, _ := core.New(cl, core.Options{})
+		ch, _ := fs.NewChain(wb, terminal)
+
+		multi, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/multi12m.bin",
+			Flags: uint32(syscall.O_CREAT | syscall.O_WRONLY), Mode: 0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		part0 := bytes.Repeat([]byte("P"), 8<<20)
+		part1 := bytes.Repeat([]byte("Q"), 4<<20)
+		want := append(append([]byte(nil), part0...), part1...)
+		if err := multi.Handle.Write(ctx, 0, want); err != nil {
+			t.Fatal(err)
+		}
+		bh := writebackHandleOf(multi.Handle)
+		bh.mu.Lock()
+		firstErr := bh.spillToShadow(ledger, "/multi12m.bin", bh.buf, 0, true, false)
+		bh.mu.Unlock()
+		if !errors.Is(firstErr, syscall.ENOSPC) {
+			t.Fatalf("first spillToShadow err = %v, want ENOSPC on Part 1", firstErr)
+		}
+
+		// Free /other.bin so quota becomes available, then retry spillToShadow.
+		ledger.Shadow.Remove("/other.bin")
+		bh.mu.Lock()
+		retryErr := bh.spillToShadow(ledger, "/multi12m.bin", bh.buf, 0, true, false)
+		bh.mu.Unlock()
+		if retryErr != nil {
+			t.Fatalf("retry spillToShadow err = %v, want nil", retryErr)
+		}
+		spilled, err := ledger.Shadow.ReadAll("/multi12m.bin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(spilled) != len(want) || !bytes.Equal(spilled[:64], part0[:64]) || !bytes.Equal(spilled[8<<20:8<<20+64], part1[:64]) {
+			t.Fatalf("spilled image corrupted after retry: len=%d head=%q part1=%q", len(spilled), spilled[:8], spilled[8<<20:8<<20+8])
+		}
+		ledger.Shadow.Remove("/multi12m.bin")
+		bh.mu.Lock()
+		bh.dirty = false
+		bh.landed = true
+		bh.mu.Unlock()
+		_ = multi.Handle.Release(ctx)
+	})
 }

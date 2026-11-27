@@ -4,6 +4,7 @@ import (
 	"context"
 	"path"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -92,11 +93,22 @@ func TestRmdirWaitsForFlushedClosingSentinel(t *testing.T) {
 		t.Fatalf("expected 1 active sentinel before async Release, got %v", got)
 	}
 
-	// Deliver async FUSE_RELEASE shortly after Rmdir begins waiting.
+	waitEntered := make(chan struct{})
+	var waitOnce sync.Once
+	h.onSentinelWait = func() {
+		waitOnce.Do(func() { close(waitEntered) })
+	}
+
+	releaseDone := make(chan struct{})
 	go func() {
-		time.Sleep(30 * time.Millisecond)
+		defer close(releaseDone)
+		<-waitEntered
 		_ = eh.Release(ctx)
 	}()
+	t.Cleanup(func() {
+		waitOnce.Do(func() { close(waitEntered) })
+		<-releaseDone
+	})
 
 	if _, err := h.Do(ctx, &fs.Op{Kind: fs.OpRmdir, Path: "/tmpdir"}, func(ctx context.Context, op *fs.Op) (fs.Result, error) {
 		if rem := hiddenNames(f); len(rem) > 0 {
@@ -106,7 +118,34 @@ func TestRmdirWaitsForFlushedClosingSentinel(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("OpRmdir raced closing sentinel: %v (want nil)", err)
 	}
+	<-releaseDone
 	if rem := hiddenNames(f); len(rem) != 0 {
 		t.Fatalf("leftover sentinels after Release+Rmdir = %v, want empty", rem)
+	}
+
+	// Also verify a duplicated descriptor that flushed >25ms ago without
+	// starting Release does NOT stall OpRmdir for 2 seconds.
+	f.seedExtent(t, "/dupdir/keep.txt", "still-open")
+	ehDup := claimOpen(t, h, "/dupdir/keep.txt")
+	defer func() { _ = ehDup.Release(ctx) }()
+	if err := ehDup.Flush(ctx); err != nil {
+		t.Fatalf("Flush dup: %v", err)
+	}
+	if _, err := h.Do(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/dupdir/keep.txt"}, func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		return fs.Result{}, nil
+	}); err != nil {
+		t.Fatalf("OpUnlink dup: %v", err)
+	}
+	// Backdate flush past the 25ms kernel-dispatch grace window.
+	ehDup.flushedAtNano.Store(time.Now().Add(-100 * time.Millisecond).UnixNano())
+	start := time.Now()
+	_, err := h.Do(ctx, &fs.Op{Kind: fs.OpRmdir, Path: "/dupdir"}, func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		return fs.Result{}, syscall.ENOTEMPTY
+	})
+	if err != syscall.ENOTEMPTY {
+		t.Fatalf("OpRmdir with still-open dup fd = %v, want ENOTEMPTY", err)
+	}
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("OpRmdir with non-releasing flushed handle stalled for %v", elapsed)
 	}
 }

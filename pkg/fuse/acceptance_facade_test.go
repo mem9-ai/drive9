@@ -14,6 +14,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/extensions/specials"
 	"github.com/mem9-ai/drive9/pkg/extensions/writeback"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/httperr"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 )
 
@@ -281,6 +282,32 @@ func TestFacadeRejectsInvalidNamespaceNamesWithoutPollutingDrain(t *testing.T) {
 				if _, exists := f.inodes.GetInode("/" + bad); exists {
 					t.Fatalf("invalid path /%q allocated an inode", bad)
 				}
+			}
+
+			// Decomposed Unicode (NFD) must be canonicalized to NFC across inode and
+			// staging keys rather than creating a distinct non-canonical local entry.
+			var nfdOut gofuse.CreateOut
+			if st := f.Create(nil, &gofuse.CreateIn{
+				InHeader: gofuse.InHeader{NodeId: 1},
+				Flags:    uint32(syscall.O_CREAT | syscall.O_WRONLY),
+				Mode:     0o644,
+			}, "cafe\u0301.txt", &nfdOut); st != gofuse.OK {
+				t.Fatalf("Create NFD name: %v", st)
+			}
+			_ = f.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: nfdOut.NodeId}, Fh: nfdOut.Fh})
+			f.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: nfdOut.NodeId}, Fh: nfdOut.Fh})
+			if _, ok := f.inodes.GetInode("/caf\u00e9.txt"); !ok {
+				t.Fatal("expected NFC canonical inode path /café.txt")
+			}
+			if _, ok := f.inodes.GetInode("/cafe\u0301.txt"); ok {
+				t.Fatal("unexpected un-normalized NFD inode key /cafe\\u0301.txt")
+			}
+
+			// Sentinel-based client.ErrInvalidPath classification must return EINVAL
+			// even when the invalid path text contains words like "not found".
+			_, invalidErr := client.New("http://127.0.0.1:1", "").StatCtx(context.Background(), `/not found\bad`)
+			if got := httperr.HTTPStatusOf(invalidErr); got != wantEINVAL {
+				t.Fatalf("HTTPStatusOf(%v) = %v, want EINVAL", invalidErr, got)
 			}
 
 			if err := wb.Drain(context.Background()); err != nil {

@@ -1099,10 +1099,12 @@ type fileHandle struct {
 	// bypass the kernel page cache, so pages a KEEP_CACHE sibling of the
 	// inode holds must be dropped by the facade (see Write).
 	direct bool
-	// flushed records that FUSE_FLUSH completed on this descriptor (close(2)
-	// has returned or is returning to userspace while FUSE_RELEASE is in
-	// flight asynchronously from the kernel).
-	flushed atomic.Bool
+	// flushedAtNano records the UnixNano timestamp of the most recent
+	// FUSE_FLUSH on this descriptor; releasing records that FUSE_RELEASE has
+	// started. Keeping the two distinct lets Rmdir avoid stalling on a dup'd
+	// descriptor where one reference flushed/closed while another remains open.
+	flushedAtNano atomic.Int64
+	releasing     atomic.Bool
 }
 
 type handleTable struct {
@@ -1984,7 +1986,7 @@ func (f *FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name string, o
 	if st != gofuse.OK {
 		return st
 	}
-	if st := validateNamespaceTarget(child, false); st != gofuse.OK {
+	if child, st = canonicalizeNamespaceTarget(child, false); st != gofuse.OK {
 		return st
 	}
 	if err := f.flushDeferredUnlink(child); err != nil {
@@ -2023,7 +2025,7 @@ func (f *FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, o
 	if st != gofuse.OK {
 		return st
 	}
-	if st := validateNamespaceTarget(child, true); st != gofuse.OK {
+	if child, st = canonicalizeNamespaceTarget(child, true); st != gofuse.OK {
 		return st
 	}
 	if err := f.flushDeferredUnlink(child); err != nil {
@@ -2212,7 +2214,7 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 	if st != gofuse.OK {
 		return st
 	}
-	if st := validateNamespaceTarget(newPath, false); st != gofuse.OK {
+	if newPath, st = canonicalizeNamespaceTarget(newPath, false); st != gofuse.OK {
 		return st
 	}
 	// v1: rename onto the same path is an immediate success — no remote
@@ -2324,7 +2326,7 @@ func (f *FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, filename string,
 	if st != gofuse.OK {
 		return st
 	}
-	if st := validateNamespaceTarget(newPath, false); st != gofuse.OK {
+	if newPath, st = canonicalizeNamespaceTarget(newPath, false); st != gofuse.OK {
 		return st
 	}
 	if err := f.flushDeferredUnlink(newPath); err != nil {
@@ -2383,7 +2385,7 @@ func (f *FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, pointedTo 
 	if st != gofuse.OK {
 		return st
 	}
-	if st := validateNamespaceTarget(child, false); st != gofuse.OK {
+	if child, st = canonicalizeNamespaceTarget(child, false); st != gofuse.OK {
 		return st
 	}
 	if err := f.flushDeferredUnlink(child); err != nil {
@@ -2680,7 +2682,7 @@ func (f *FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name string,
 	if st != gofuse.OK {
 		return st
 	}
-	if st := validateNamespaceTarget(child, false); st != gofuse.OK {
+	if child, st = canonicalizeNamespaceTarget(child, false); st != gofuse.OK {
 		return st
 	}
 	if err := f.flushDeferredUnlink(child); err != nil {
@@ -3033,7 +3035,7 @@ func (f *FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.Status 
 		// descriptor), not whoever opened the handle.
 		start := time.Now()
 		err := h.Flush(fs.WithFlushOwner(ctx, input.LockOwner))
-		fhEntry.flushed.Store(true)
+		fhEntry.flushedAtNano.Store(time.Now().UnixNano())
 		unlock()
 		f.recordHandleOp(fs.OpFlush, start, err, 0)
 		return fs.StatusOf(err)
@@ -3066,6 +3068,7 @@ func (f *FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		f.locks.release(input.NodeId, lockOwner)
 	}
 	if h, ok := f.handles.drop(input.Fh); ok {
+		h.releasing.Store(true)
 		var rerr error
 		start := time.Now()
 		if h.h != nil {
@@ -3682,23 +3685,27 @@ func (f *FS) childOf(parentIno uint64, name string) (string, gofuse.Status) {
 	return parent + "/" + name, gofuse.OK
 }
 
-// validateNamespaceTarget enforces drive9 path canonicalization rules
+// canonicalizeNamespaceTarget enforces drive9 path canonicalization rules
 // synchronously at namespace creation / destination entrypoints (Create,
-// Mkdir, Mknod, Symlink link path, Link destination, Rename destination) so
-// control characters, backslashes, "."/".." segments, and invalid UTF-8 are
-// rejected with EINVAL before any local inode, bufferingHandle, wbCache, or
-// ShadowStore state is created.
-func validateNamespaceTarget(path string, isDir bool) gofuse.Status {
+// Mkdir, Mknod, Symlink link path, Link destination, Rename destination),
+// returning the NFC-normalized mount path so inode and staging keys always use
+// canonical spellings and invalid paths fail immediately with EINVAL.
+func canonicalizeNamespaceTarget(path string, isDir bool) (string, gofuse.Status) {
 	if isDir {
-		if _, err := pathutil.CanonicalizeDir(path); err != nil {
-			return gofuse.Status(syscall.EINVAL)
+		canon, err := pathutil.CanonicalizeDir(path)
+		if err != nil {
+			return "", gofuse.Status(syscall.EINVAL)
 		}
-		return gofuse.OK
+		if canon != "/" {
+			canon = strings.TrimSuffix(canon, "/")
+		}
+		return canon, gofuse.OK
 	}
-	if _, err := pathutil.Canonicalize(path); err != nil {
-		return gofuse.Status(syscall.EINVAL)
+	canon, err := pathutil.Canonicalize(path)
+	if err != nil {
+		return "", gofuse.Status(syscall.EINVAL)
 	}
-	return gofuse.OK
+	return canon, gofuse.OK
 }
 
 func (f *FS) notifyReleaseCompleted() {
@@ -3720,11 +3727,13 @@ func (f *FS) releaseChanged() <-chan struct{} {
 	return ch
 }
 
-// waitFlushedDeferredUnlinksUnder waits briefly before Rmdir when deferred
-// unlinks under dir/ belong solely to handles that have ALREADY completed
-// FUSE_FLUSH (close(2) returned to userspace while asynchronous FUSE_RELEASE
-// is still in flight). Letting FUSE_RELEASE finish avoids silly-renaming the
-// closing extent file into a transient .d9open-* sentinel right as Rmdir runs.
+const deferredUnlinkFlushDispatchGrace = 25 * time.Millisecond
+
+// waitFlushedDeferredUnlinksUnder waits before Rmdir when deferred unlinks
+// under dir/ belong to handles with an in-flight FUSE_RELEASE (up to 500ms) or
+// within the brief kernel dispatch grace after FUSE_FLUSH (up to 25ms). A
+// dup'd descriptor that flushed one reference while another reference stays
+// open exits after the short dispatch grace instead of stalling Rmdir.
 func (f *FS) waitFlushedDeferredUnlinksUnder(ctx context.Context, dir string) {
 	prefix := strings.TrimSuffix(dir, "/") + "/"
 	deadline := time.Now().Add(500 * time.Millisecond)
@@ -3740,25 +3749,38 @@ func (f *FS) waitFlushedDeferredUnlinksUnder(ctx context.Context, dir string) {
 		if len(inos) == 0 {
 			return
 		}
-		anyInFlightClose := false
+		now := time.Now()
+		hasConfirmedRelease := false
+		hasFlushGraceOnly := false
 		for _, ino := range inos {
 			openHandles := f.openIdx.SnapshotInode(ino)
 			if len(openHandles) == 0 {
-				anyInFlightClose = true
+				hasConfirmedRelease = true
 				continue
 			}
-			allFlushed := true
+			allClosingOrFlushed := true
+			inodeReleasing := false
 			for _, oh := range openHandles {
-				if !oh.flushed.Load() {
-					allFlushed = false
-					break
+				if oh.releasing.Load() {
+					inodeReleasing = true
+					continue
+				}
+				flushedAt := oh.flushedAtNano.Load()
+				if flushedAt != 0 && now.Sub(time.Unix(0, flushedAt)) <= deferredUnlinkFlushDispatchGrace {
+					continue
+				}
+				allClosingOrFlushed = false
+				break
+			}
+			if allClosingOrFlushed {
+				if inodeReleasing {
+					hasConfirmedRelease = true
+				} else {
+					hasFlushGraceOnly = true
 				}
 			}
-			if allFlushed {
-				anyInFlightClose = true
-			}
 		}
-		if !anyInFlightClose || time.Now().After(deadline) || ctx.Err() != nil {
+		if (!hasConfirmedRelease && !hasFlushGraceOnly) || now.After(deadline) || ctx.Err() != nil {
 			return
 		}
 		waitCh := f.releaseChanged()

@@ -1,12 +1,17 @@
 package client
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
 
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
+
+// ErrInvalidPath is returned (wrapped) when a client call rejects a pathname
+// that violates drive9 path canonicalization rules.
+var ErrInvalidPath = errors.New("invalid drive9 path")
 
 // windowsDriveSegment matches a Windows drive-letter prefix ("C:\" or "D:/")
 // at the start of the path or at the start of any path segment. The segment
@@ -20,7 +25,7 @@ var windowsDriveSegment = regexp.MustCompile(`(?:^|/)[A-Za-z]:[\\/]`)
 // and the original path is sent unchanged when valid.
 func validateFSPath(path string) error {
 	if _, err := pathutil.Canonicalize(path); err != nil {
-		return fmt.Errorf("invalid drive9 path %q: %w%s", path, err, windowsPathHint(path))
+		return fmt.Errorf("%w %q: %w%s", ErrInvalidPath, path, err, windowsPathHint(path))
 	}
 	return nil
 }

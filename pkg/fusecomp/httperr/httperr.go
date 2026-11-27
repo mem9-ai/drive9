@@ -33,6 +33,9 @@ func HTTPStatusOf(err error) gofuse.Status {
 	if err == nil {
 		return gofuse.OK
 	}
+	if errors.Is(err, client.ErrInvalidPath) {
+		return gofuse.Status(syscall.EINVAL)
+	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return gofuse.Status(syscall.EAGAIN)
 	}
