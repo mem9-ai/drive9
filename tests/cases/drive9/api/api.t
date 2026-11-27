@@ -699,11 +699,15 @@ def step_uploads_v2_and_extent():
     )
     assert st == 200 and ecv.get("status") == "completed", (st, ecv)
 
-    # HEAD extent headers + GET without plan header -> 422 + GET with plan header -> 206
+    # HEAD extent headers + plain GET returns the bytes (no plan opt-in) +
+    # opt-in GET returns the 206 block plan. Extent layout is an internal
+    # storage choice: a client that cannot parse a plan still reads the file.
     st, eh, _ = req("HEAD", f"/v1/fs{ext_path}")
     assert st == 200 and eh.get("x-dat9-content-layout") == "extent", eh
-    st, eh422, _ = req("GET", f"/v1/fs{ext_path}")
-    assert st == 422 and eh422.get("x-dat9-extent-length") == str(len(ext_data)), (st, eh422)
+    st, eh, ebody = req("GET", f"/v1/fs{ext_path}")
+    assert st == 200 and hashlib.sha256(ebody).hexdigest() == ext_sha, (st, eh)
+    assert eh.get("x-dat9-content-layout") == "extent", eh
+    assert eh.get("x-dat9-extent-length") == str(len(ext_data)), eh
 
     st, _, plan = req_json("GET", f"/v1/fs{ext_path}", headers={"X-Dat9-Extent-Read-Plan": "1"})
     assert st == 206 and plan["size"] == len(ext_data) and len(plan["blocks"]) == 1, (st, plan)
