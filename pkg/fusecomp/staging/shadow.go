@@ -1198,6 +1198,15 @@ func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 
 	sf, ok := s.files[oldPath]
 	if !ok {
+		oldHashKey := "__hash:" + HashPath(oldPath)
+		if recovered, rOK := s.files[oldHashKey]; rOK {
+			sf = recovered
+			delete(s.files, oldHashKey)
+			s.files[oldPath] = sf
+			ok = true
+		}
+	}
+	if !ok {
 		s.mu.Unlock()
 		return false
 	}
@@ -1214,6 +1223,18 @@ func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 	}
 
 	replacedSF := s.files[newPath]
+	newHashKey := "__hash:" + HashPath(newPath)
+	if replacedSF == nil {
+		if recoveredDst, rOK := s.files[newHashKey]; rOK {
+			replacedSF = recoveredDst
+			delete(s.files, newHashKey)
+		}
+	} else if staleHashSF, rOK := s.files[newHashKey]; rOK {
+		if staleHashSF != nil && staleHashSF != replacedSF && staleHashSF.fd != nil {
+			_ = staleHashSF.fd.Close()
+		}
+		delete(s.files, newHashKey)
+	}
 	replacedGen := s.active[newPath]
 	replacedSize := s.recoveredSizes[newSP]
 	delete(s.recoveredSizes, oldSP)
@@ -1681,6 +1702,19 @@ func (s *ShadowStore) removeCoreLocked(remotePath string, expectedGen ContentGen
 	diskPath := s.shadowPath(remotePath)
 	cleanup.removedSize = s.recoveredSizes[diskPath]
 	delete(s.recoveredSizes, diskPath)
+
+	hashKey := "__hash:" + HashPath(remotePath)
+	if _, ok := s.files[remotePath]; !ok {
+		if recovered, rOK := s.files[hashKey]; rOK {
+			delete(s.files, hashKey)
+			s.files[remotePath] = recovered
+		}
+	} else if staleHashSF, rOK := s.files[hashKey]; rOK {
+		if staleHashSF != nil && staleHashSF != s.files[remotePath] && staleHashSF.fd != nil {
+			_ = staleHashSF.fd.Close()
+		}
+		delete(s.files, hashKey)
+	}
 
 	gen := s.active[remotePath]
 	if gen != 0 && s.refs[gen] > 0 {
@@ -2335,23 +2369,37 @@ func (s *ShadowStore) DiscardTransferBackup(remotePath string) {
 	_ = os.Remove(s.shadowTransferBackupPath(remotePath))
 }
 
-// AdoptRecoveredHashFile registers <dir>/<hash>.shadow under __hash:<hash> if
-// ShadowStore.RecoverFromDisk already ran before PendingIndex reconciled a
-// mid-transfer .unlinkbak backup.
-func (s *ShadowStore) AdoptRecoveredHashFile(hash string) error {
-	if s == nil || hash == "" {
+// AdoptRecoveredPath registers <dir>/<hash>.shadow directly under remotePath,
+// migrating or closing any "__hash:"+hash placeholder loaded by RecoverFromDisk
+// before PendingIndex reconciled a mid-transfer .unlinkbak backup.
+func (s *ShadowStore) AdoptRecoveredPath(remotePath string) error {
+	if s == nil || remotePath == "" {
 		return nil
 	}
-	sp := filepath.Join(s.dir, hash+".shadow")
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
+
+	sp := s.shadowPath(remotePath)
+	hashKey := "__hash:" + HashPath(remotePath)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, exists := s.files["__hash:"+hash]; exists {
+
+	if existing, exists := s.files[remotePath]; exists && existing != nil {
+		if staleHashSF, hOK := s.files[hashKey]; hOK {
+			if staleHashSF != nil && staleHashSF != existing && staleHashSF.fd != nil {
+				_ = staleHashSF.fd.Close()
+			}
+			delete(s.files, hashKey)
+		}
+		delete(s.recoveredSizes, sp)
 		return nil
 	}
-	for p := range s.files {
-		if !strings.HasPrefix(p, "__hash:") && HashPath(p) == hash {
-			return nil
-		}
+	if recovered, rOK := s.files[hashKey]; rOK && recovered != nil {
+		delete(s.files, hashKey)
+		s.files[remotePath] = recovered
+		delete(s.recoveredSizes, sp)
+		return nil
 	}
 	fd, err := os.OpenFile(sp, os.O_RDWR, 0o644)
 	if err != nil {
@@ -2362,7 +2410,8 @@ func (s *ShadowStore) AdoptRecoveredHashFile(hash string) error {
 		_ = fd.Close()
 		return serr
 	}
-	s.files["__hash:"+hash] = &ShadowFile{fd: fd, size: fi.Size()}
+	s.files[remotePath] = &ShadowFile{fd: fd, size: fi.Size()}
+	delete(s.recoveredSizes, sp)
 	return nil
 }
 

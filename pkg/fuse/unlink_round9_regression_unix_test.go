@@ -1612,9 +1612,6 @@ func TestRound10MornyxReviewRegressions(t *testing.T) {
 	t.Run("unrelated_commits_during_open_unlink_never_cause_spurious_eagain", func(t *testing.T) {
 		b := testbackend.NewBackend()
 		b.Seed("/target", []byte("target-bytes"))
-		for i := 0; i < 8; i++ {
-			b.Seed(fmt.Sprintf("/unrelated_%d", i), []byte("init"))
-		}
 		var pauseTargetGet atomic.Bool
 		targetGetEntered := make(chan struct{})
 		releaseTargetGet := make(chan struct{})
@@ -1651,6 +1648,19 @@ func TestRound10MornyxReviewRegressions(t *testing.T) {
 		f, err := New(Options{Extensions: []fs.Handler{wb, terminal}, DefaultPermissions: true})
 		require.NoError(t, err)
 
+		// Select 8 unrelated names that do not collide with "/target" on f.openNameStripe
+		// so f.Open(uName) never blocks on f.openNameLock("/target") held by f.Unlink("target").
+		targetStripe := f.openNameStripe("/target")
+		unrelatedNames := make([]string, 0, 8)
+		for candIdx := 0; len(unrelatedNames) < 8; candIdx++ {
+			uName := fmt.Sprintf("unrelated_%d", candIdx)
+			if f.openNameStripe("/"+uName) == targetStripe {
+				continue
+			}
+			unrelatedNames = append(unrelatedNames, uName)
+			b.Seed("/"+uName, []byte("init"))
+		}
+
 		tIno := lookupFacade(t, f, "target")
 		tHdr := gofuse.InHeader{NodeId: tIno}
 		var rOut gofuse.OpenOut
@@ -1662,8 +1672,7 @@ func TestRound10MornyxReviewRegressions(t *testing.T) {
 
 		<-targetGetEntered
 		// Commit 8 unrelated files while PrepareOpenUnlink("/target") is capturing its snapshot!
-		for i := 0; i < 8; i++ {
-			uName := fmt.Sprintf("unrelated_%d", i)
+		for i, uName := range unrelatedNames {
 			uIno := lookupFacade(t, f, uName)
 			uHdr := gofuse.InHeader{NodeId: uIno}
 			var uOut gofuse.OpenOut
@@ -1709,8 +1718,30 @@ func TestRound10MornyxReviewRegressions(t *testing.T) {
 		f, err := New(Options{Extensions: []fs.Handler{wb, terminal}, DefaultPermissions: true})
 		require.NoError(t, err)
 
-		// 1. Open unwritten O_CREAT handle at /reuse, unlink /reuse (pin == 0), then create
-		// a new file at /reuse with staged Shadow + wbCache bytes; old fd must NEVER read replacement bytes!
+		// 1. Open existing seeded file /live_iso (O_RDONLY) and unwritten O_CREAT handle at /reuse,
+		// unlink them, then create replacements with dirty live buffers, wbCache, and Shadow bytes;
+		// neither anonymous fd may read the replacement writer's dirty buffer or staged bytes!
+		b.Seed("/live_iso", []byte("orig-live"))
+		liveIno := lookupFacade(t, f, "live_iso")
+		liveHdr := gofuse.InHeader{NodeId: liveIno}
+		var liveOpen gofuse.OpenOut
+		require.Equal(t, gofuse.OK, f.Open(nil, &gofuse.OpenIn{InHeader: liveHdr, Flags: syscall.O_RDONLY}, &liveOpen))
+		require.Equal(t, gofuse.OK, f.Unlink(nil, rootHeader(), "live_iso"))
+
+		var liveRep gofuse.CreateOut
+		require.Equal(t, gofuse.OK, f.Create(nil, &gofuse.CreateIn{InHeader: *rootHeader(), Flags: syscall.O_CREAT | syscall.O_RDWR, Mode: 0o644}, "live_iso", &liveRep))
+		liveRepHdr := gofuse.InHeader{NodeId: liveRep.NodeId}
+		_, lwst := f.Write(nil, &gofuse.WriteIn{InHeader: liveRepHdr, Fh: liveRep.Fh}, []byte("DIRTY-LIVE-REPLACEMENT"))
+		require.Equal(t, gofuse.OK, lwst)
+		// Unflushed dirty replacement buffer is live in h.w.live["/live_iso"], yet old fd must still read "orig-live"!
+		liveBuf := make([]byte, 32)
+		lrr, lrst := f.Read(nil, &gofuse.ReadIn{InHeader: liveHdr, Fh: liveOpen.Fh, Offset: 0, Size: 32}, liveBuf)
+		require.Equal(t, gofuse.OK, lrst)
+		gotLive, _ := lrr.Bytes(liveBuf)
+		require.Equal(t, "orig-live", string(gotLive))
+		f.Release(nil, &gofuse.ReleaseIn{InHeader: liveHdr, Fh: liveOpen.Fh})
+		f.Release(nil, &gofuse.ReleaseIn{InHeader: liveRepHdr, Fh: liveRep.Fh})
+
 		var cEntry gofuse.EntryOut
 		var cOut gofuse.CreateOut
 		require.Equal(t, gofuse.OK, f.Create(nil, &gofuse.CreateIn{InHeader: *rootHeader(), Flags: syscall.O_CREAT | syscall.O_RDWR, Mode: 0o644}, "reuse", &cOut))
@@ -1742,6 +1773,29 @@ func TestRound10MornyxReviewRegressions(t *testing.T) {
 		f.Release(nil, &gofuse.ReleaseIn{InHeader: oldHdr, Fh: cOut.Fh})
 		f.Release(nil, &gofuse.ReleaseIn{InHeader: repHdr, Fh: repOut.Fh})
 		ledger.Shadow.Remove("/reuse")
+
+		// 2. Crash-recovered PendingConflict shadow (writeGen == 0, loaded into __hash:<hash>
+		// before EnsureActiveGeneration) must clean up its FD and decrement PendingBytes() to 0 on Remove!
+		recDir := filepath.Join(t.TempDir(), "rec-conflict")
+		stSeed, err := staging.NewStaging(recDir)
+		require.NoError(t, err)
+		require.NoError(t, stSeed.Shadow.WriteFull("/conflict-rec", []byte("conflict-payload"), 1))
+		cGen, err := stSeed.Pending.Put("/conflict-rec", int64(len("conflict-payload")), staging.PendingOverwrite)
+		require.NoError(t, err)
+		marked, err := stSeed.Pending.MarkConflictIfGeneration("/conflict-rec", cGen)
+		require.NoError(t, err)
+		require.True(t, marked)
+		stSeed.Close()
+
+		stBoot, err := staging.NewStaging(recDir)
+		require.NoError(t, err)
+		t.Cleanup(stBoot.Close)
+		require.NoError(t, stBoot.Shadow.RecoverFromDisk())
+		require.NoError(t, stBoot.Recover())
+		stBoot.Shadow.RecoverPendingBytes()
+		require.EqualValues(t, len("conflict-payload"), stBoot.Shadow.PendingBytes())
+		stBoot.Shadow.Remove("/conflict-rec")
+		require.Zero(t, stBoot.Shadow.PendingBytes(), "removing crash-recovered PendingConflict shadow must decrement PendingBytes() to 0")
 	})
 
 	t.Run("wbcache_deferred_until_staging_succeeds_and_link_serializes_with_unlink", func(t *testing.T) {
@@ -1942,7 +1996,10 @@ func TestRound10MornyxReviewRegressions(t *testing.T) {
 		stRecovered2, err := staging.NewStaging(baseDir2)
 		require.NoError(t, err)
 		t.Cleanup(stRecovered2.Close)
+		require.NoError(t, stRecovered2.Shadow.RecoverFromDisk())
 		require.NoError(t, stRecovered2.Recover())
+		stRecovered2.Shadow.RecoverPendingBytes()
+		require.EqualValues(t, len("dst-orig-bytes")+len("src-newer-bytes"), stRecovered2.Shadow.PendingBytes())
 		meta2, ok := stRecovered2.Pending.GetMeta("/dst")
 		require.True(t, ok)
 		require.Equal(t, staging.PendingOverwrite, meta2.Kind)
@@ -1950,5 +2007,32 @@ func TestRound10MornyxReviewRegressions(t *testing.T) {
 		gotBytes2, err := stRecovered2.Shadow.ReadAll("/dst")
 		require.NoError(t, err)
 		require.Equal(t, "dst-orig-bytes", string(gotBytes2))
+		// Verify AdoptRecoveredPath registered /dst directly under s.files["/dst"] (not "__hash:"):
+		// Shadow.Rename and Shadow.Remove must succeed and decrement PendingBytes() to 0!
+		require.True(t, stRecovered2.Shadow.Rename("/dst", "/dst-moved"))
+		stRecovered2.Shadow.Remove("/dst-moved")
+		stRecovered2.Shadow.Remove("/src")
+		require.Zero(t, stRecovered2.Shadow.PendingBytes(), "restored backup shadow must decrement PendingBytes() cleanly after Rename + Remove")
+
+		// Case 3: curErr == nil witness recovery (crash after Shadow.Rename(/src -> /dst) before
+		// CommitReversible removes .meta.unlinkbak): witness /dst.meta is PendingConflict, and
+		// RecoverPendingBytes() + Remove("/dst") must decrement PendingBytes() to 0 without leaking!
+		baseDir3, pendingDir3, shadowDir3, dstHash3 := seedMidMoveCrash(t)
+		require.NoError(t, os.WriteFile(filepath.Join(shadowDir3, dstHash3+".shadow"), []byte("src-newer-bytes"), 0o600))
+		_ = os.Remove(filepath.Join(shadowDir3, staging.HashPath("/src")+".shadow"))
+
+		stRecovered3, err := staging.NewStaging(baseDir3)
+		require.NoError(t, err)
+		t.Cleanup(stRecovered3.Close)
+		require.NoError(t, stRecovered3.Shadow.RecoverFromDisk())
+		require.NoError(t, stRecovered3.Recover())
+		stRecovered3.Shadow.RecoverPendingBytes()
+		require.EqualValues(t, len("src-newer-bytes"), stRecovered3.Shadow.PendingBytes())
+		_, err = os.Stat(filepath.Join(pendingDir3, dstHash3+".meta.unlinkbak"))
+		require.ErrorIs(t, err, os.ErrNotExist)
+		_, err = os.Stat(filepath.Join(shadowDir3, dstHash3+".shadow.unlinkbak"))
+		require.ErrorIs(t, err, os.ErrNotExist)
+		stRecovered3.Shadow.Remove("/dst")
+		require.Zero(t, stRecovered3.Shadow.PendingBytes(), "curErr == nil witness recovery must register /dst path and decrement PendingBytes() to 0")
 	})
 }

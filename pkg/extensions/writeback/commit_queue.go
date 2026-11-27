@@ -3644,16 +3644,20 @@ type CommitSeqWindow struct {
 }
 
 // covers reports whether path belongs to the window's obligation universe:
-// one of the renamed endpoints, or any path under either rename prefix.
+// one of the renamed endpoints, or any path under either non-empty endpoint prefix.
 func (win *CommitSeqWindow) covers(path string) bool {
-	return path == win.oldPath || path == win.newPath ||
-		strings.HasPrefix(path, win.oldPrefix) || strings.HasPrefix(path, win.newPrefix)
+	if path == "" {
+		return false
+	}
+	return (win.oldPath != "" && path == win.oldPath) ||
+		(win.newPath != "" && path == win.newPath) ||
+		(win.oldPrefix != "" && strings.HasPrefix(path, win.oldPrefix)) ||
+		(win.newPrefix != "" && strings.HasPrefix(path, win.newPrefix))
 }
 
-// BeginCommitSeqWindow opens a rename's commit-stamp obligation window for
-// the renamed endpoints. The caller MUST End the window once its last stamp
-// comparison ran; ending trims immediately, so an idle mount does not retain
-// the window's growth past its obligations.
+// BeginCommitSeqWindow opens a rename or single-endpoint commit-stamp obligation
+// window. Empty endpoints are omitted so single-path callers (newPath == "") do
+// not synthesize a "/" prefix that would pin unrelated mount commits.
 func (cq *CommitQueue) BeginCommitSeqWindow(oldPath, newPath string) *CommitSeqWindow {
 	if cq == nil {
 		return nil
@@ -3664,19 +3668,29 @@ func (cq *CommitQueue) BeginCommitSeqWindow(oldPath, newPath string) *CommitSeqW
 	if cq.commitSeqWindows == nil {
 		cq.commitSeqWindows = make(map[uint64]*CommitSeqWindow)
 	}
+	var oldPrefix, newPrefix string
+	if oldPath != "" {
+		oldPrefix = strings.TrimSuffix(oldPath, "/") + "/"
+	}
+	if newPath != "" {
+		newPrefix = strings.TrimSuffix(newPath, "/") + "/"
+	}
 	win := &CommitSeqWindow{
 		cq:        cq,
 		id:        cq.commitSeqWindowSeq,
 		oldPath:   oldPath,
 		newPath:   newPath,
-		oldPrefix: strings.TrimSuffix(oldPath, "/") + "/",
-		newPrefix: strings.TrimSuffix(newPath, "/") + "/",
+		oldPrefix: oldPrefix,
+		newPrefix: newPrefix,
 		pins:      make(map[string]struct{}),
 	}
 	cq.commitSeqWindows[win.id] = win
 	// The endpoints' PRE-EXISTING stamps feed the flow's delta baselines and
 	// must stay readable for the window's lifetime.
 	for _, p := range []string{oldPath, newPath} {
+		if p == "" {
+			continue
+		}
 		if _, ok := cq.commitSeq[p]; ok {
 			cq.pinCommitSeqToLocked(win, p)
 		}

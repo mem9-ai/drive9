@@ -128,15 +128,18 @@ func TestExecOptionalSchemaStatementsRetriesTransientInformationSchemaError(t *t
 func TestExecSchemaStatementStopsWhenRetryWaitIsCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	var attempts atomic.Int32
 	transient := &mysql.MySQLError{Number: 8028, Message: "Information schema is changed during the execution of the statement [try again later]"}
 	db := newTestRepairDB(t, func(string) testRepairQueryResult {
 		return testRepairQueryResult{}
 	}, func(string) error {
+		attempts.Add(1)
 		cancel()
 		return transient
 	})
 	err := execSchemaStatement(ctx, db, `ALTER TABLE uploads ADD COLUMN mode INT UNSIGNED NOT NULL DEFAULT 420`, 1, 1)
 	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, int32(1), attempts.Load())
 }
 
 func TestSchemaRetryDelayCaps(t *testing.T) {

@@ -731,6 +731,17 @@ func (idx *PendingIndex) reconcileTransferBackups() error {
 		hash := strings.TrimSuffix(name, ".meta.unlinkbak")
 		metaBakPath := filepath.Join(idx.dir, name)
 		metaPath := filepath.Join(idx.dir, hash+".meta")
+		raw, rerr := os.ReadFile(metaBakPath)
+		if rerr != nil {
+			return fmt.Errorf("pending index read backup meta %s: %w", metaBakPath, rerr)
+		}
+		var bakMeta WriteBackMeta
+		if uerr := json.Unmarshal(raw, &bakMeta); uerr != nil || bakMeta.Path == "" || HashPath(bakMeta.Path) != hash {
+			if uerr != nil {
+				return fmt.Errorf("pending index decode backup meta %s: %w", metaBakPath, uerr)
+			}
+			return fmt.Errorf("pending index invalid backup meta %s for hash %s", metaBakPath, hash)
+		}
 		if idx.shadows != nil && idx.shadows.Dir() != "" {
 			shadowDir := idx.shadows.Dir()
 			shadowPath := filepath.Join(shadowDir, hash+".shadow")
@@ -744,37 +755,32 @@ func (idx *PendingIndex) reconcileTransferBackups() error {
 				return fmt.Errorf("pending index stat shadow %s: %w", shadowPath, curErr)
 			}
 			if bakErr == nil && errors.Is(curErr, os.ErrNotExist) {
-				raw, rerr := os.ReadFile(metaBakPath)
-				if rerr != nil {
-					return fmt.Errorf("pending index read backup meta %s: %w", metaBakPath, rerr)
-				}
-				var bakMeta WriteBackMeta
-				if uerr := json.Unmarshal(raw, &bakMeta); uerr != nil || bakMeta.Path == "" || HashPath(bakMeta.Path) != hash {
-					if uerr != nil {
-						return fmt.Errorf("pending index decode backup meta %s: %w", metaBakPath, uerr)
-					}
-					return fmt.Errorf("pending index invalid backup meta %s for hash %s", metaBakPath, hash)
-				}
 				// Persist original destination .meta BEFORE restoring .shadow.unlinkbak
 				// so a crash or I/O error never pairs restored bytes with a prepared
-				// witness .meta, and keep both backups intact on any failure for retry.
+				// witness .meta, and fsync shadowDir BEFORE removing .meta.unlinkbak.
 				if werr := idx.writeFile(metaPath, raw); werr != nil {
 					return fmt.Errorf("pending index restore backup meta %s: %w", metaPath, werr)
 				}
 				if rerr := os.Rename(shadowBakPath, shadowPath); rerr != nil {
 					return fmt.Errorf("pending index restore shadow backup %s: %w", shadowBakPath, rerr)
 				}
-				if aerr := idx.shadows.AdoptRecoveredHashFile(hash); aerr != nil {
+				if ferr := fsyncDir(shadowDir); ferr != nil {
+					return fmt.Errorf("pending index fsync shadow backup restore %s: %w", shadowDir, ferr)
+				}
+				if aerr := idx.shadows.AdoptRecoveredPath(bakMeta.Path); aerr != nil {
 					return fmt.Errorf("pending index adopt restored shadow %s: %w", shadowPath, aerr)
 				}
 			} else if curErr == nil {
-				if aerr := idx.shadows.AdoptRecoveredHashFile(hash); aerr != nil {
+				if aerr := idx.shadows.AdoptRecoveredPath(bakMeta.Path); aerr != nil {
 					return fmt.Errorf("pending index adopt existing shadow %s: %w", shadowPath, aerr)
 				}
 				if bakErr == nil {
 					if rmErr := os.Remove(shadowBakPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
 						return fmt.Errorf("pending index remove superseded shadow backup %s: %w", shadowBakPath, rmErr)
 					}
+				}
+				if ferr := fsyncDir(shadowDir); ferr != nil {
+					return fmt.Errorf("pending index fsync shadow backup cleanup %s: %w", shadowDir, ferr)
 				}
 			}
 		}
@@ -784,10 +790,12 @@ func (idx *PendingIndex) reconcileTransferBackups() error {
 		mutatedDir = true
 	}
 	if idx.shadows != nil && idx.shadows.Dir() != "" {
-		sEntries, serr := os.ReadDir(idx.shadows.Dir())
+		shadowDir := idx.shadows.Dir()
+		sEntries, serr := os.ReadDir(shadowDir)
 		if serr != nil {
 			return fmt.Errorf("pending index shadow backup scan: %w", serr)
 		}
+		mutatedShadowDir := false
 		for _, se := range sEntries {
 			if !strings.HasSuffix(se.Name(), ".shadow.unlinkbak") {
 				continue
@@ -798,8 +806,14 @@ func (idx *PendingIndex) reconcileTransferBackups() error {
 			} else if !errors.Is(mErr, os.ErrNotExist) {
 				return fmt.Errorf("pending index stat paired backup meta for %s: %w", se.Name(), mErr)
 			}
-			if rmErr := os.Remove(filepath.Join(idx.shadows.Dir(), se.Name())); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			if rmErr := os.Remove(filepath.Join(shadowDir, se.Name())); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
 				return fmt.Errorf("pending index remove orphan shadow backup %s: %w", se.Name(), rmErr)
+			}
+			mutatedShadowDir = true
+		}
+		if mutatedShadowDir {
+			if ferr := fsyncDir(shadowDir); ferr != nil {
+				return fmt.Errorf("pending index fsync orphan shadow backup cleanup %s: %w", shadowDir, ferr)
 			}
 		}
 	}

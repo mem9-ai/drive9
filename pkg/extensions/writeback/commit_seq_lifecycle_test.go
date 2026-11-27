@@ -120,4 +120,18 @@ func TestCommitSeqLifecycleBounded(t *testing.T) {
 	if n := stampCount(); n > limit {
 		t.Fatalf("commitSeq holds %d stamps after every window ended, want <= %d", n, limit)
 	}
+
+	// Single-endpoint window (newPath == "", e.g. PrepareOpenUnlink) must NOT
+	// synthesize a "/" prefix that pins unrelated mount commits past the bound.
+	cq.recordCommitSeq("/unlink/target.txt")
+	wantUnlink := cq.CommitSeq("/unlink/target.txt")
+	single := cq.BeginCommitSeqWindow("/unlink/target.txt", "")
+	churn(4, 3*limit)
+	if n := stampCount(); n > limit {
+		t.Fatalf("commitSeq holds %d stamps while single-endpoint window is open, want <= %d", n, limit)
+	}
+	if got := cq.CommitSeq("/unlink/target.txt"); got != wantUnlink {
+		t.Fatalf("single-endpoint pinned stamp = %d, want %d", got, wantUnlink)
+	}
+	single.End()
 }

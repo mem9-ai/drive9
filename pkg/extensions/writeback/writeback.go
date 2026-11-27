@@ -840,6 +840,7 @@ func New(opts Options) (*Writeback, error) {
 			if meta.Kind == staging.PendingChmod {
 				return
 			}
+			w.bumpUnlinkWatchSeq(meta.Path)
 			// meta.Path is ALREADY the write-back cache's local key (the
 			// uploader maps to the remote name only at the HTTP boundary).
 			// Running it through the remote→local translation again
@@ -1242,16 +1243,16 @@ func (w *Writeback) WaitPathUnlinkUploads(p string) { w.waitUploaderPath(p) }
 //     holding the FUSE name gate + path lock(s), BEFORE mutating openIdx,
 //     inodes, or deferredUnlinks):
 //     - For survivor == "": runs FinishCancelPathLocked first; if that fails,
-//       releases locks and leaves all in-memory state untouched. Only after
-//       durable WAL persistence succeeds does it mark open handles anonymous,
-//       wake stage-name waiters, install clean-reader snapshots (never
-//       clobbering a newer staged shadow, and falling back to in-memory
-//       pendingImage if best-effort Shadow.WriteFull fails), pin the shadow
-//       linearized under regMu against Release, and remove wbCache[p].
+//     releases locks and leaves all in-memory state untouched. Only after
+//     durable WAL persistence succeeds does it mark open handles anonymous,
+//     wake stage-name waiters, install clean-reader snapshots (never
+//     clobbering a newer staged shadow, and falling back to in-memory
+//     pendingImage if best-effort Shadow.WriteFull fails), pin the shadow
+//     linearized under regMu against Release, and remove wbCache[p].
 //     - For survivor != "": migrates Pending/Shadow/CommitQueue and wbCache
-//       state from p onto survivor under lockRenamePaths(p, survivor) without
-//       marking handles anonymous or pinning unlinkedShadow[p], keeping both
-//       path locks held across RetargetPath until finalize.
+//     state from p onto survivor under lockRenamePaths(p, survivor) without
+//     marking handles anonymous or pinning unlinkedShadow[p], keeping both
+//     path locks held across RetargetPath until finalize.
 //  3. finalize (runs after FUSE updates openIdx/inodes and invokes
 //     RetargetPath/MarkPathUnlinked): rebinds stagedCacheGen on migrated
 //     handles, releases path lock(s), and submits migrated wbCache if no open
@@ -4220,7 +4221,8 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 	}
 	if h.buf == nil {
 		isNew := h.isNew
-		if !isNew && !h.unlinked {
+		unlinked := h.unlinked
+		if !isNew && !unlinked {
 			// OpenWritable preload: the first touch materializes the staged
 			// .dat/.meta image (newer than the remote) instead of serving the
 			// remote's stale bytes.
@@ -4248,6 +4250,26 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 		if isNew {
 			return 0, nil // nothing written yet
 		}
+		// An ANONYMOUS fd (its name was unlinked or overwritten) reads its
+		// own unlink snapshot FIRST: live/sibling/pending/shadow tiers below
+		// now describe a REPLACEMENT object that may have reused the name, and
+		// consulting them first would serve the new file's bytes on the old fd.
+		if unlinked {
+			if h.w.opts.Staging != nil && h.w.unlinkedShadowServed(h.path) {
+				if pin := h.w.unlinkedShadowPinFor(h.path); pin != 0 {
+					n, rerr := h.w.opts.Staging.Shadow.ReadAtGen(pin, off, dest)
+					if rerr == nil || rerr == io.EOF {
+						return n, nil
+					}
+					return 0, fs.ErrNotFound
+				}
+				return 0, fs.ErrNotFound
+			}
+			if h.inner == nil {
+				return 0, fs.ErrNotFound
+			}
+			return h.inner.Read(ctx, off, dest)
+		}
 		// Read-your-writes across fds (v1 readSamePathDirtyHandleVisibleRange):
 		// an unflushed dirty buffer is POSIX-visible to every fd of the
 		// file — the second open reads what the first wrote, not the stale
@@ -4266,43 +4288,6 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 			return 0, err
 		} else if ok {
 			return n, nil
-		}
-		// An ANONYMOUS fd (its name was unlinked or overwritten) reads its
-		// own unlink snapshot FIRST: the pending/shadow tiers below now
-		// describe the REPLACEMENT object that reused the name, and serving
-		// them handed the old fd the new file's bytes.
-		if h.unlinked {
-			if h.w.opts.Staging != nil && h.w.unlinkedShadowServed(h.path) {
-				// The snapshot is GENERATION-bound: a replacement that
-				// reused the name wrote a newer generation at the same
-				// path key, and reading the current one served its bytes.
-				// The saved id is a CONTENT generation (that is what
-				// recordUnlinkedSnapshot stores), so it must be read
-				// through the content-generation API.
-				// The snapshot outlives the name through its PIN, not
-				// through its content generation: a replacement that reuses
-				// the pathname advances the active content generation and
-				// RETIRES the old backing, but the pin keeps that retired
-				// descriptor readable until dropUnlinkedShadow releases it.
-				// Reading by content generation would therefore miss the
-				// very snapshot the pin was taken to preserve.
-				if pin := h.w.unlinkedShadowPinFor(h.path); pin != 0 {
-					n, rerr := h.w.opts.Staging.Shadow.ReadAtGen(pin, off, dest)
-					if rerr == nil || rerr == io.EOF {
-						return n, nil
-					}
-					return 0, fs.ErrNotFound
-				}
-				// No lifecycle pin was recorded for this anonymous handle (e.g.
-				// an unwritten handle unlinked before any shadow snapshot existed).
-				// Never fall back to unpinned Shadow.ReadAll(h.path), which would
-				// serve a same-name replacement file's bytes across objects.
-				return 0, fs.ErrNotFound
-			}
-			if h.inner == nil {
-				return 0, fs.ErrNotFound
-			}
-			return h.inner.Read(ctx, off, dest)
 		}
 		// Read-your-staged-writes (v1 pendingIndex overlay): a released handle's
 		// image lives in the shadow store until the queue lands it — the remote
