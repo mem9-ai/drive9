@@ -3,6 +3,7 @@ import { Drive9Error, StatusError, checkError } from "./error.js";
 import { appendExtentImpl, isExtentLayoutMismatchError } from "./extent.js";
 import type { PatchPartURL, PatchPlan, StatResult, WriteOptions } from "./models.js";
 import { uploadPatchPart } from "./patch.js";
+import { UnsupportedInLayerViewError, hasActiveLayerView } from "./view.js";
 
 const DEFAULT_APPEND_PART_SIZE = 8 * 1024 * 1024;
 const MAX_REWRITE_APPEND_BYTES = 8 * 1024 * 1024;
@@ -18,6 +19,9 @@ export async function appendStreamImpl(
   size: number,
   options?: WriteOptions
 ): Promise<void> {
+  if (hasActiveLayerView(client)) {
+    throw new UnsupportedInLayerViewError("append is unsupported in layer view");
+  }
   if (size < 0) {
     throw new Drive9Error("append size must be non-negative");
   }

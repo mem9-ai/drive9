@@ -169,8 +169,8 @@ func NewEngine(cfg EngineConfig) *Engine {
 		OSCache:        true,
 		Readahead:      8 * blockSize,
 		Prefetch:       1,
-		MaxUpload:              chunkMaxUpload,
-		MaxDownload:            defaultMaxDownload,
+		MaxUpload:      chunkMaxUpload,
+		MaxDownload:    defaultMaxDownload,
 		// BufferSize is JuiceFS's TOTAL read/write buffering budget, and it
 		// is not just a soft throttle: the data reader derives its global
 		// read-ahead budget from it (80% of this value gates every read
@@ -223,6 +223,17 @@ func NewEngine(cfg EngineConfig) *Engine {
 	}
 	v := vfs.NewVFS(conf, b, store, nil, nil)
 	return &Engine{Bridge: b, Store: store, VFS: v}
+}
+
+// ResetForGeneration stops any background retry loop, clears all per-generation
+// bridge and registry state, and rebinds the engine to cl while reusing the
+// long-lived JuiceFS ChunkStore and VFS workers. Call only after the previous
+// runtime has drained and stopped all handles.
+func (e *Engine) ResetForGeneration(cl *client.Client) {
+	if e == nil || e.Bridge == nil {
+		return
+	}
+	e.Bridge.ResetForGeneration(cl)
 }
 
 // FlushFile commits any slice still pending on the engine's asynchronous

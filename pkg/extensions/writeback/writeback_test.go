@@ -4,15 +4,18 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/mem9-ai/drive9/internal/testbackend"
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/extensions/cache"
 	"github.com/mem9-ai/drive9/pkg/extensions/core"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 )
 
 func newStack(t *testing.T, policy Policy, b *testbackend.Backend) (*fs.Chain, *Writeback) {
@@ -539,5 +542,319 @@ func TestCleanPathTruncateMissingPathFallsThrough(t *testing.T) {
 	_, err := ch.Dispatch(context.Background(), &fs.Op{Kind: fs.OpSetAttr, Path: "/none", Size: 64 * 1024})
 	if !errors.Is(err, fs.ErrNotFound) {
 		t.Fatalf("missing-path truncate = %v, want ErrNotFound", err)
+	}
+}
+
+func TestFenceRejectsBufferedMutationsAndPreservesReads(t *testing.T) {
+	for _, policy := range []Policy{PolicyCloseSync, PolicyWriteBack} {
+		t.Run(policy.String(), func(t *testing.T) {
+			chain, wb := newStack(t, policy, testbackend.NewBackend())
+			h := open(t, chain, "/kept")
+			ctx := context.Background()
+			if err := h.Write(ctx, 0, []byte("before")); err != nil {
+				t.Fatal(err)
+			}
+			wb.AbandonLayerForRollback()
+			if err := h.Write(ctx, 0, []byte("after")); !errors.Is(err, errLayerRolledBack) {
+				t.Fatalf("write after lease loss: %v", err)
+			}
+			for _, op := range []*fs.Op{
+				{Kind: fs.OpSetAttr, Path: "/kept", Handle: h, HasSize: true, Size: 0},
+				{Kind: fs.OpCreate, Path: "/kept", Flags: syscall.O_TRUNC | syscall.O_RDWR},
+				{Kind: fs.OpCreate, Path: "/new", Flags: syscall.O_CREAT | syscall.O_RDWR},
+			} {
+				if _, err := chain.Dispatch(ctx, op); !errors.Is(err, errLayerRolledBack) {
+					t.Fatalf("op %v after lease loss: %v", op.Kind, err)
+				}
+			}
+			buf := make([]byte, 8)
+			n, err := h.Read(ctx, 0, buf)
+			if err != nil || string(buf[:n]) != "before" {
+				t.Fatalf("buffer after fence: %q, %v", buf[:n], err)
+			}
+		})
+	}
+}
+
+func TestFenceWhileAppendRefreshIsWaiting(t *testing.T) {
+	chain, wb := newStack(t, PolicyCloseSync, testbackend.NewBackend())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	opened, err := chain.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/log", Flags: syscall.O_CREAT | syscall.O_RDWR | syscall.O_APPEND, Mode: 0644})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := opened.Handle
+	if err = h.Write(ctx, 0, []byte("prior")); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	resume := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		select {
+		case <-resume:
+		case <-r.Context().Done():
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	wb.opts.Client = client.New(srv.URL, "")
+	wb.landedAt("/log", 2, 5, 0, nil)
+	done := make(chan error, 1)
+	go func() { done <- h.Write(ctx, 0, []byte("late")) }()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("append did not reach the refresh request")
+	}
+	wb.AbandonLayerForRollback()
+	close(resume)
+	if err := <-done; !errors.Is(err, errLayerRolledBack) {
+		t.Fatalf("append crossing fence: %v", err)
+	}
+	buf := make([]byte, 12)
+	n, err := h.Read(ctx, 0, buf)
+	if err != nil || string(buf[:n]) != "prior" {
+		t.Fatalf("retained image: %q, %v", buf[:n], err)
+	}
+}
+
+func TestFenceDuringMutationDispatch(t *testing.T) {
+	w := &Writeback{}
+	_, err := w.Do(context.Background(), &fs.Op{Kind: fs.OpMkdir, Path: "/dir"}, func(context.Context, *fs.Op) (fs.Result, error) {
+		w.AbandonLayerForRollback()
+		return fs.Result{}, nil
+	})
+	if !errors.Is(err, errLayerRolledBack) {
+		t.Fatalf("mkdir crossing fence: %v", err)
+	}
+}
+
+func TestFencedWritebackCloseRetainsRecoveryImage(t *testing.T) {
+	backend := testbackend.NewBackend()
+	chain, wb, cache := newWriteCacheStack(t, PolicyWriteBack, backend)
+	h := open(t, chain, "/recover")
+	ctx := context.Background()
+	if err := h.Write(ctx, 0, []byte("accepted")); err != nil {
+		t.Fatal(err)
+	}
+	wb.AbandonLayerForRollback()
+	if err := h.Flush(ctx); !errors.Is(err, errLayerRolledBack) {
+		t.Fatalf("flush: %v", err)
+	}
+	if err := h.Release(ctx); !errors.Is(err, errLayerRolledBack) {
+		t.Fatalf("release: %v", err)
+	}
+	data, ok := cache.Get("/recover")
+	if !ok || string(data) != "accepted" {
+		t.Fatalf("recovery cache: %q, %v", data, ok)
+	}
+	if _, ok := backend.Node("/recover"); ok {
+		t.Fatal("fenced image was uploaded")
+	}
+}
+
+func TestFencedInteractiveSyncReturnsError(t *testing.T) {
+	backend := testbackend.NewBackend()
+	chain, wb := newStagedStack(t, PolicyWriteBack, backend)
+	wb.interactive = true
+	h := open(t, chain, "/pending")
+	ctx := context.Background()
+	if err := h.Write(ctx, 0, []byte("accepted")); err != nil {
+		t.Fatal(err)
+	}
+	wb.AbandonLayerForRollback()
+	if err := h.Sync(ctx); err == nil {
+		t.Fatal("fenced fsync returned success")
+	}
+	if _, ok := backend.Node("/pending"); ok {
+		t.Fatal("fenced image was uploaded")
+	}
+}
+
+type rejectedOpenHandle struct {
+	fs.Handle
+	discarded bool
+}
+
+func (h *rejectedOpenHandle) Release(ctx context.Context) error {
+	h.discarded = fs.IsRejectedOpen(ctx)
+	return nil
+}
+
+func TestRejectedTruncateKeepsPreviousRecovery(t *testing.T) {
+	_, wb, cache := newWriteCacheStack(t, PolicyWriteBack, testbackend.NewBackend())
+	inner := &rejectedOpenHandle{}
+	const path = "/held"
+	_, err := wb.Do(context.Background(), &fs.Op{Kind: fs.OpCreate, Path: path, Flags: syscall.O_TRUNC | syscall.O_RDWR},
+		func(context.Context, *fs.Op) (fs.Result, error) {
+			if err := cache.Put(path, []byte("prior"), 5, staging.PendingOverwrite); err != nil {
+				t.Fatal(err)
+			}
+			wb.AbandonLayerForRollback()
+			return fs.Result{Attr: &fs.Attr{Size: 5, Rev: 1}, Handle: inner}, nil
+		})
+	if !errors.Is(err, errLayerRolledBack) || !inner.discarded || wb.handleFor(path) != nil {
+		t.Fatalf("rejected truncate: err %v, discarded %v, tracked %v", err, inner.discarded, wb.handleFor(path) != nil)
+	}
+	if data, ok := cache.Get(path); !ok || string(data) != "prior" {
+		t.Fatalf("rejected truncate replaced recovery: %q, present %v", data, ok)
+	}
+}
+
+func TestDeferredUnlinkLosingLeasePreservesStagedImage(t *testing.T) {
+	ctx := context.Background()
+	chain, wb, cache := newWriteCacheStack(t, PolicyWriteBack, testbackend.NewBackend())
+	h := open(t, chain, "/held").(*bufferingHandle)
+	if err := h.Write(ctx, 0, []byte("prior")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	h.mu.Lock()
+	h.submitDone = release
+	h.mu.Unlock()
+	done := make(chan error, 1)
+	go func() {
+		finish := wb.PreparePathUnlink("/held", false)
+		done <- finish(false)
+	}()
+	close(release)
+	if err := <-done; !errors.Is(err, errLayerRolledBack) {
+		t.Fatalf("unlink: %v", err)
+	}
+	h.mu.Lock()
+	unlinked := h.unlinked
+	h.submitDone = nil
+	h.mu.Unlock()
+	if data, ok := cache.Get("/held"); !ok || string(data) != "prior" || unlinked {
+		t.Fatalf("after rejected unlink: %q present %v anonymous %v", data, ok, unlinked)
+	}
+}
+
+func TestReadOnlyReopenAfterLeaseLoss(t *testing.T) {
+	ctx := context.Background()
+	b := testbackend.NewBackend()
+	b.Seed("/held", []byte("prior"))
+	chain, wb := newStack(t, PolicyCloseSync, b)
+	opened, err := chain.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/held", Flags: syscall.O_RDWR})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb.AbandonLayerForRollback()
+	res, err := chain.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/held", Flags: syscall.O_RDONLY})
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 5)
+	n, err := res.Handle.Read(ctx, 0, buf)
+	if err != nil || string(buf[:n]) != "prior" {
+		t.Fatalf("held read %q, %v", buf[:n], err)
+	}
+	if err := res.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Handle.Flush(ctx); !errors.Is(err, errLayerRolledBack) {
+		t.Fatalf("writer flush: %v", err)
+	}
+}
+
+func TestFencedReopenRetainsAcceptedNewFileAfterWriterRelease(t *testing.T) {
+	for _, policy := range []Policy{PolicyCloseSync, PolicyWriteBack} {
+		t.Run(policy.String(), func(t *testing.T) {
+			ctx := context.Background()
+			b := testbackend.NewBackend()
+			chain, wb := newStack(t, policy, b)
+			writer := open(t, chain, "/fresh")
+			if err := writer.Write(ctx, 0, []byte("first")); err != nil {
+				t.Fatal(err)
+			}
+			wb.AbandonLayerForRollback()
+			reader, err := chain.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/fresh", Flags: syscall.O_RDONLY})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := writer.Release(ctx); !errors.Is(err, errLayerRolledBack) {
+				t.Fatalf("writer close: %v", err)
+			}
+			buf := make([]byte, 5)
+			n, err := reader.Handle.Read(ctx, 0, buf)
+			if err != nil || string(buf[:n]) != "first" {
+				t.Fatalf("reader retained %q, %v", buf[:n], err)
+			}
+			if _, ok := b.Node("/fresh"); ok {
+				t.Fatal("read-only reopen published a file")
+			}
+			if err := reader.Handle.Release(ctx); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestFencedReaderOfReopenedPendingCreate(t *testing.T) {
+	ctx := context.Background()
+	b := testbackend.NewBackend()
+	chain, wb, cached := newWriteCacheStack(t, PolicyWriteBack, b)
+	const path = "/pending"
+	// The prior close staged a create. The terminal can resolve the name
+	// for the writable open, then loses remote visibility before the read.
+	if err := cached.Put(path, []byte("first"), 5, staging.PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	b.Seed(path, []byte("other"))
+	writer, err := chain.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: path, Flags: syscall.O_RDWR})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Handle.Write(ctx, 0, []byte("saved")); err != nil {
+		t.Fatal(err)
+	}
+	b.Remove(path)
+	wb.AbandonLayerForRollback()
+	heads := b.Requests()["HEAD /v1/fs/pending"]
+	reader, err := chain.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: path, Flags: syscall.O_RDONLY})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := reader.Handle.Release(ctx); err != nil {
+			t.Errorf("reader close: %v", err)
+		}
+	})
+	if err := writer.Handle.Release(ctx); !errors.Is(err, errLayerRolledBack) {
+		t.Fatalf("writer close: %v", err)
+	}
+	buf := make([]byte, 5)
+	n, err := reader.Handle.Read(ctx, 0, buf)
+	if err != nil || string(buf[:n]) != "saved" || reader.Attr.Size != 5 {
+		t.Fatalf("reader returned %q, size %d, error %v", buf[:n], reader.Attr.Size, err)
+	}
+	if b.Requests()["HEAD /v1/fs/pending"] != heads {
+		t.Fatal("read-only reopen probed the remote for a locally staged create")
+	}
+	if _, ok := b.Node(path); ok {
+		t.Fatal("fenced reopen published the staged create")
+	}
+}
+
+func TestRejectedLazyCreateDoesNotPublish(t *testing.T) {
+	ctx := context.Background()
+	b := testbackend.NewBackend()
+	chain, wb, cache := newWriteCacheStack(t, PolicyWriteBack, b)
+	res, err := chain.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/new", Flags: syscall.O_CREAT | syscall.O_RDWR})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The facade rejects before the writeback abandonment callback has run.
+	fs.ReleaseRejectedOpen(ctx, res.Handle)
+	if _, ok := b.Node("/new"); ok {
+		t.Fatal("rejected create published a remote file")
+	}
+	if _, ok := cache.GetMeta("/new"); ok || wb.handleFor("/new") != nil {
+		t.Fatal("rejected create retained staged or live ownership")
 	}
 }

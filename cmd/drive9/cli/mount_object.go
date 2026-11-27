@@ -73,7 +73,7 @@ func sessionFromMinted(m *client.ObjectCredentials) objectfs.SessionCredentials 
 	}
 }
 
-func validateObjectMount(goos, mode, layerRef, checkpointRef, profile string) error {
+func validateObjectMount(goos, mode, layerRef, profile string) error {
 	if goos == "windows" {
 		return fmt.Errorf("drive9 mount: object-store sources are not supported on Windows")
 	}
@@ -91,8 +91,8 @@ func validateObjectMount(goos, mode, layerRef, checkpointRef, profile string) er
 	if goos == "darwin" && parsed == MountModeAuto {
 		return fmt.Errorf("drive9 mount: object-store sources on darwin require --mode=fuse (macFUSE or FUSE-T)")
 	}
-	if strings.TrimSpace(layerRef) != "" || strings.TrimSpace(checkpointRef) != "" {
-		return fmt.Errorf("drive9 mount: --layer/--checkpoint are drive9-only")
+	if strings.TrimSpace(layerRef) != "" {
+		return fmt.Errorf("drive9 mount: --layer is drive9-only")
 	}
 	if profile != "" && profile != "none" {
 		return fmt.Errorf("drive9 mount: object-store sources require --profile=none")

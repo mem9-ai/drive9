@@ -131,19 +131,6 @@ func committedRevisionFromExpectedRevision(expectedRevision int64) (int64, bool)
 	return expectedRevision + 1, true
 }
 
-// layerCacheIdentity extracts the layer incarnation an entry was staged
-// against.
-func layerCacheIdentity(entry *client.FSLayerEntry, fallbackLayer string) staging.LayerCacheIdentity {
-	if entry == nil {
-		return staging.LayerCacheIdentity{}
-	}
-	id := entry.LayerID
-	if id == "" {
-		id = fallbackLayer
-	}
-	return staging.LayerCacheIdentity{LayerID: id, EntrySeq: entry.EntrySeq}
-}
-
 func retryPostUploadMode(ctx context.Context, apply func() error) error {
 	var lastErr error
 	for attempt := 0; attempt < postUploadModeAttempts; attempt++ {

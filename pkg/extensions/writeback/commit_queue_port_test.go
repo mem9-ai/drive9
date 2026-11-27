@@ -500,20 +500,29 @@ func TestCommitQueueBatchWriteFallsBackPerItemConflict(t *testing.T) {
 	}
 }
 
-func TestCommitQueueBatchWriteSkipsLayerRef(t *testing.T) {
+func TestCommitQueueViewBoundBatchWriteAndCapsAt100(t *testing.T) {
+	const layerID = "layer_01j8z6kh2m9q7w3r5t6y8v0p1a"
 	var batchCalls atomic.Int32
-	var layerCalls atomic.Int32
+	var gotFence string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/status":
 			_ = json.NewEncoder(w).Encode(map[string]any{"inline_threshold": 50000})
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-write":
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/views/"+layerID+"/v1/fs:batch-write":
 			batchCalls.Add(1)
-			http.Error(w, "unexpected batch", http.StatusInternalServerError)
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/layers/lyr_123/entries":
-			layerCalls.Add(1)
+			gotFence = r.Header.Get("X-FS-Layer-Fence")
+			var req struct {
+				Items []struct {
+					Path string `json:"path"`
+				} `json:"items"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			results := make([]map[string]any, 0, len(req.Items))
+			for i, it := range req.Items {
+				results = append(results, map[string]any{"path": it.Path, "status": 200, "revision": int64(i + 1)})
+			}
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(client.FSLayerEntry{LayerID: "lyr_123", EntrySeq: int64(layerCalls.Load())})
+			_ = json.NewEncoder(w).Encode(map[string]any{"results": results})
 		default:
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
 			w.WriteHeader(http.StatusInternalServerError)
@@ -521,7 +530,7 @@ func TestCommitQueueBatchWriteSkipsLayerRef(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	shadow, err := staging.NewShadowStore(t.TempDir())
+	shadow, err := staging.NewShadowStoreWithQuota(t.TempDir(), 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -530,90 +539,38 @@ func TestCommitQueueBatchWriteSkipsLayerRef(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{"/a.txt", "/b.txt"} {
-		if err := shadow.WriteFull(path, []byte("x"), 0); err != nil {
+	for _, p := range []string{"/a.txt", "/b.txt"} {
+		if err := shadow.WriteFull(p, []byte("x"), 0); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := pending.PutWithBaseRev(path, 1, staging.PendingNew, 0); err != nil {
+		if _, err := pending.PutWithBaseRev(p, 1, staging.PendingNew, 0); err != nil {
 			t.Fatal(err)
 		}
 	}
-	c := newTestClient(ts.URL)
-	c.Warm(context.Background())
-	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
-	cq.SetLayerRef("lyr_123")
-	cq.ConfigureBatchWrite(10*time.Millisecond, 64, client.MaxBatchWriteBytes)
-	if err := cq.Enqueue(&CommitEntry{Path: "/a.txt", Size: 1, Kind: staging.PendingNew}); err != nil {
+	baseClient := newTestClient(ts.URL)
+	baseClient.Warm(context.Background())
+	viewClient, err := baseClient.WithView(client.ViewBinding{LayerID: layerID, Fence: 3})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cq.Enqueue(&CommitEntry{Path: "/b.txt", Size: 1, Kind: staging.PendingNew}); err != nil {
+	cq := NewCommitQueue(viewClient, shadow, pending, nil, 1, 8)
+	cq.ConfigureBatchWrite(10*time.Millisecond, 128, client.MaxBatchWriteBytes)
+	if cq.batchMaxItems != client.MaxLayerViewBatchWriteItems {
+		t.Fatalf("batchMaxItems = %d, want %d", cq.batchMaxItems, client.MaxLayerViewBatchWriteItems)
+	}
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{Path: "/a.txt", Size: 1, Kind: staging.PendingNew})); err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{Path: "/b.txt", Size: 1, Kind: staging.PendingNew})); err != nil {
 		t.Fatal(err)
 	}
 	cq.DrainAll()
 
-	if got := batchCalls.Load(); got != 0 {
-		t.Fatalf("batch calls = %d, want 0", got)
+	if got := batchCalls.Load(); got != 1 {
+		t.Fatalf("view batch calls = %d, want 1", got)
 	}
-	if got := layerCalls.Load(); got != 2 {
-		t.Fatalf("layer calls = %d, want 2", got)
-	}
-}
-
-func TestCommitQueueLayerEntryShadowSpillUploadsObject(t *testing.T) {
-	payload := bytes.Repeat([]byte("z"), 1024)
-	var gotPath, gotSize, gotBaseRevision, gotMode string
-	var gotBody []byte
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/layer-1/objects" {
-			http.NotFound(w, r)
-			return
-		}
-		gotPath = r.URL.Query().Get("path")
-		gotSize = r.URL.Query().Get("size")
-		gotBaseRevision = r.URL.Query().Get("base_revision")
-		gotMode = r.URL.Query().Get("mode")
-		var err error
-		gotBody, err = io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatalf("ReadAll request body: %v", err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"layer_id":   "layer-1",
-			"path":       "/remote/spill.bin",
-			"op":         "upsert",
-			"kind":       "file",
-			"size_bytes": len(payload),
-		})
-	}))
-	defer ts.Close()
-
-	shadow, err := staging.NewShadowStore(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer shadow.Close()
-	if err := shadow.WriteFull("/spill.bin", payload, 7); err != nil {
-		t.Fatal(err)
-	}
-	cq := NewCommitQueue(newTestClient(ts.URL), shadow, nil, nil, 1, 8)
-	_, err = cq.uploadLayerEntry(context.Background(), "layer-1", &CommitEntry{
-		Path:        "/spill.bin",
-		BaseRev:     7,
-		Size:        int64(len(payload)),
-		Kind:        staging.PendingOverwrite,
-		ShadowSpill: true,
-		Mode:        0o640,
-		HasMode:     true,
-	}, "/remote/spill.bin")
-	if err != nil {
-		t.Fatalf("uploadLayerEntry: %v", err)
-	}
-	if gotPath != "/remote/spill.bin" || gotSize != "1024" || gotBaseRevision != "7" || gotMode != "640" {
-		t.Fatalf("query path=%q size=%q base=%q mode=%q", gotPath, gotSize, gotBaseRevision, gotMode)
-	}
-	if !bytes.Equal(gotBody, payload) {
-		t.Fatalf("body mismatch: got %d bytes want %d", len(gotBody), len(payload))
+	if gotFence != "3" {
+		t.Fatalf("X-FS-Layer-Fence = %q, want 3", gotFence)
 	}
 }
 
@@ -833,190 +790,6 @@ func TestCommitQueueAppliesModeAfterUpload(t *testing.T) {
 	if !bytes.Contains(chmodBody, []byte("493")) {
 		t.Fatalf("chmod body = %s, want decimal mode 493", chmodBody)
 	}
-}
-
-func TestCommitQueueLayerUploadWritesEntryAndKeepsPending(t *testing.T) {
-	var gotReq clientLayerEntryRequest
-	var gotPath string
-	var putCalls atomic.Int32
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPut {
-			putCalls.Add(1)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/layer-1/entries" {
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		gotPath = r.URL.Path
-		if err := json.NewDecoder(r.Body).Decode(&gotReq); err != nil {
-			t.Errorf("decode request: %v", err)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"layer_id":      "layer-1",
-			"path":          gotReq.Path,
-			"op":            gotReq.Op,
-			"kind":          gotReq.Kind,
-			"base_revision": gotReq.BaseRevision,
-			"size_bytes":    gotReq.SizeBytes,
-			"mode":          gotReq.Mode,
-			"entry_seq":     1,
-		})
-	}))
-	defer ts.Close()
-
-	shadow, err := staging.NewShadowStore(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer shadow.Close()
-	pending, err := staging.NewPendingIndex(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := shadow.WriteFull("/ok.txt", []byte("data"), 7); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pending.PutWithBaseRevAndMode("/ok.txt", 4, staging.PendingOverwrite, 7, 0o600, true); err != nil {
-		t.Fatal(err)
-	}
-
-	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8, "/remote")
-	cq.SetLayerRef("layer-1")
-	if err := cq.Enqueue(&CommitEntry{
-		Path:    "/ok.txt",
-		BaseRev: 7,
-		Size:    4,
-		Kind:    staging.PendingOverwrite,
-		Mode:    0o600,
-		HasMode: true,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	cq.DrainAll()
-
-	if got := putCalls.Load(); got != 0 {
-		t.Fatalf("base PUT calls = %d, want 0", got)
-	}
-	if gotPath != "/v1/layers/layer-1/entries" {
-		t.Fatalf("layer path = %q", gotPath)
-	}
-	if gotReq.Path != "/remote/ok.txt" || gotReq.Op != "upsert" || gotReq.Kind != "file" {
-		t.Fatalf("layer request = %+v", gotReq)
-	}
-	if gotReq.BaseRevision != 7 || gotReq.SizeBytes != 4 || gotReq.Mode != 0o600 {
-		t.Fatalf("layer request metadata = %+v", gotReq)
-	}
-	if !bytes.Equal(gotReq.Content, []byte("data")) {
-		t.Fatalf("layer content = %q, want data", gotReq.Content)
-	}
-	if !pending.HasPending("/ok.txt") {
-		t.Fatal("pending entry should remain after successful layer upload")
-	}
-	if !shadow.Has("/ok.txt") {
-		t.Fatal("shadow should remain after successful layer upload")
-	}
-}
-
-func TestCommitQueueLayerUploadAcceptsShadowSpillWithoutBaseWrite(t *testing.T) {
-	var gotPath, gotSize, gotMode string
-	var gotBody []byte
-	var putCalls atomic.Int32
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost && r.URL.Path == "/v1/layers/layer-1/uploads/initiate" {
-			http.NotFound(w, r)
-			return
-		}
-		if r.Method == http.MethodPut {
-			putCalls.Add(1)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/layer-1/objects" {
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		gotPath = r.URL.Query().Get("path")
-		gotSize = r.URL.Query().Get("size")
-		gotMode = r.URL.Query().Get("mode")
-		var err error
-		gotBody, err = io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("read request: %v", err)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"layer_id":   "layer-1",
-			"path":       gotPath,
-			"op":         "upsert",
-			"kind":       "file",
-			"size_bytes": 10,
-			"entry_seq":  1,
-		})
-	}))
-	defer ts.Close()
-
-	shadow, err := staging.NewShadowStore(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer shadow.Close()
-	pending, err := staging.NewPendingIndex(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := shadow.WriteFull("/spill.bin", []byte("spill-data"), 0); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pending.PutShadowSpillWithMode("/spill.bin", 10, staging.PendingNew, 0, 0o644, true); err != nil {
-		t.Fatal(err)
-	}
-
-	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8, "/remote")
-	cq.SetLayerRef("layer-1")
-	if err := cq.Enqueue(&CommitEntry{
-		Path:        "/spill.bin",
-		Size:        10,
-		Kind:        staging.PendingNew,
-		ShadowSpill: true,
-		Mode:        0o644,
-		HasMode:     true,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	cq.DrainAll()
-
-	if got := putCalls.Load(); got != 0 {
-		t.Fatalf("base PUT calls = %d, want 0", got)
-	}
-	if gotPath != "/remote/spill.bin" || gotSize != "10" || gotMode != "644" {
-		t.Fatalf("layer object query path=%q size=%q mode=%q", gotPath, gotSize, gotMode)
-	}
-	if !bytes.Equal(gotBody, []byte("spill-data")) {
-		t.Fatalf("layer content = %q, want spill-data", gotBody)
-	}
-	if !pending.HasPending("/spill.bin") {
-		t.Fatal("pending entry should remain after successful layer upload")
-	}
-}
-
-type clientLayerEntryRequest struct {
-	Path         string `json:"path"`
-	Op           string `json:"op"`
-	Kind         string `json:"kind"`
-	BaseRevision int64  `json:"base_revision"`
-	Content      []byte `json:"content"`
-	ContentText  string `json:"content_text"`
-	SizeBytes    int64  `json:"size_bytes"`
-	Mode         uint32 `json:"mode"`
 }
 
 func TestCommitQueueSkipsDefaultModeForPendingNew(t *testing.T) {
@@ -1499,128 +1272,6 @@ func TestCommitQueueDirectPutRouting(t *testing.T) {
 			t.Fatal("shadow should be removed after commit")
 		}
 	})
-}
-
-func TestCommitQueueLayerModeRetainsShadowAndPendingAfterUpload(t *testing.T) {
-	var gotContent []byte
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/layer-1/entries" {
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		var req struct {
-			Path    string `json:"path"`
-			Content []byte `json:"content"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Errorf("decode request: %v", err)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		if req.Path != "/layered.bin" {
-			t.Errorf("request path = %q, want /layered.bin", req.Path)
-		}
-		gotContent = append([]byte(nil), req.Content...)
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"layer_id":  "layer-1",
-			"path":      req.Path,
-			"op":        "upsert",
-			"kind":      "file",
-			"entry_seq": 1,
-		})
-	}))
-	defer ts.Close()
-
-	shadow, err := staging.NewShadowStore(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer shadow.Close()
-	pending, err := staging.NewPendingIndex(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	data := []byte("layer data")
-	if err := shadow.WriteFull("/layered.bin", data, 0); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pending.PutWithBaseRev("/layered.bin", int64(len(data)), staging.PendingNew, 0); err != nil {
-		t.Fatal(err)
-	}
-
-	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
-	cq.SetLayerRef("layer-1")
-	if err := cq.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
-		Path:    "/layered.bin",
-		BaseRev: 0,
-		Size:    int64(len(data)),
-		Kind:    staging.PendingNew,
-	})); err != nil {
-		t.Fatal(err)
-	}
-	cq.DrainAll()
-
-	if !bytes.Equal(gotContent, data) {
-		t.Fatalf("uploaded content = %q, want %q", gotContent, data)
-	}
-	if !shadow.Has("/layered.bin") {
-		t.Fatal("layer shadow should be retained after upload")
-	}
-	if !pending.HasPending("/layered.bin") {
-		t.Fatal("layer pending metadata should be retained after upload")
-	}
-	meta, ok := pending.GetMeta("/layered.bin")
-	if !ok || meta.Kind != staging.PendingOverwrite || !meta.LayerClean {
-		t.Fatalf("layer pending metadata after upload = %+v, want staging.PendingOverwrite", meta)
-	}
-	data2 := []byte("layer data v2")
-	if err := shadow.WriteFull("/layered.bin", data2, 0); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pending.PutWithBaseRev("/layered.bin", int64(len(data2)), staging.PendingOverwrite, 0); err != nil {
-		t.Fatal(err)
-	}
-	cq2 := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
-	cq2.SetLayerRef("layer-1")
-	if err := cq2.Enqueue(attachTestStagingGens(shadow, pending, &CommitEntry{
-		Path:    "/layered.bin",
-		BaseRev: 0,
-		Size:    int64(len(data2)),
-		Kind:    staging.PendingOverwrite,
-	})); err != nil {
-		t.Fatal(err)
-	}
-	cq2.DrainAll()
-	if !bytes.Equal(gotContent, data2) {
-		t.Fatalf("second uploaded content = %q, want %q", gotContent, data2)
-	}
-}
-
-func TestCommitQueueLayerUploadRejectsSizeMismatch(t *testing.T) {
-	shadow, err := staging.NewShadowStore(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer shadow.Close()
-	if err := shadow.WriteFull("/mismatch.bin", []byte("data"), 0); err != nil {
-		t.Fatal(err)
-	}
-	pending, err := staging.NewPendingIndex(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	cq := NewCommitQueue(newTestClient("http://127.0.0.1"), shadow, pending, nil, 1, 8)
-	_, err = cq.uploadLayerEntry(context.Background(), "layer-1", &CommitEntry{
-		Path: "/mismatch.bin",
-		Size: 99,
-		Kind: staging.PendingNew,
-	}, "/mismatch.bin")
-	if err == nil || !strings.Contains(err.Error(), "size mismatch") {
-		t.Fatalf("uploadLayerEntry err=%v, want size mismatch", err)
-	}
-	cq.DrainAll()
 }
 
 // --- Auto-resolve tests (LWW MVP) ---

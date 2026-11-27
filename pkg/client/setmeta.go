@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+
+	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 // SetMetadataOptions selects which file metadata fields to update. A nil
@@ -36,6 +38,9 @@ func (c *Client) SetMetadata(path string, opts SetMetadataOptions) error {
 func (c *Client) SetMetadataCtx(ctx context.Context, path string, opts SetMetadataOptions) error {
 	if opts.Tags == nil && opts.Description == nil {
 		return fmt.Errorf("setmeta: nothing to update")
+	}
+	if c.view.LayerID != "" && opts.Description != nil {
+		return viewprotocol.ErrUnsupportedInLayerView
 	}
 	if err := validateTags(opts.Tags); err != nil {
 		return err

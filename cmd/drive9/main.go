@@ -335,12 +335,49 @@ func startCPUProfileFromEnv() (func(), error) {
 	}, nil
 }
 
+func peelLeadingFSLayerFlags(args []string) (layerRef string, fence int64, rest []string, err error) {
+	i := 0
+	var prefix []string
+	for i < len(args) {
+		a := args[i]
+		switch {
+		case a == "--layer" || a == "--fence":
+			if i+1 >= len(args) {
+				return "", 0, nil, fmt.Errorf("%s requires argument", a)
+			}
+			prefix = append(prefix, a, args[i+1])
+			i += 2
+		case strings.HasPrefix(a, "--layer=") || strings.HasPrefix(a, "--fence="):
+			prefix = append(prefix, a)
+			i++
+		default:
+			goto done
+		}
+	}
+done:
+	if len(prefix) == 0 {
+		return "", 0, args, nil
+	}
+	layerRef, fence, _, err = cli.ParseLayerViewFlags(prefix)
+	if err != nil {
+		return "", 0, nil, err
+	}
+	return layerRef, fence, args[i:], nil
+}
+
 func runFS(args []string) {
+	topLayerRef, topFence, args, flagErr := peelLeadingFSLayerFlags(args)
+	if flagErr != nil {
+		fatal("fs", flagErr)
+	}
 	if len(args) < 1 {
 		fsUsage(2)
 	}
 	sub := args[0]
 	rest := args[1:]
+	if topLayerRef != "" && sub == "layer" {
+		fatal("fs layer", fmt.Errorf("--layer cannot be combined with 'drive9 fs layer' control commands"))
+	}
 
 	// Only commands that may upload pay the /v1/status warm RTT. Read-only
 	// commands (cat/ls/stat/tasks/rm/grep/find) and namespace-only writes (mv,
@@ -353,6 +390,13 @@ func runFS(args []string) {
 		c = cli.NewFromEnvWithWarm()
 	default:
 		c = cli.NewFromEnv()
+	}
+	if topLayerRef != "" {
+		var berr error
+		c, berr = cli.BindCLIViewClient(context.Background(), c, topLayerRef, topFence)
+		if berr != nil {
+			fatal("fs "+sub, berr)
+		}
 	}
 
 	var err error
@@ -565,12 +609,11 @@ commands:
     --output <path>      output file path
   layer <command>      manage filesystem layers
     create [flags] <base-root>
-    list [--json]
-    status [--json] <layer>
-    diff [--json] <layer>
-    checkpoint [flags] <layer>
-    rollback <layer>
-    commit <layer>
+    ls [--after ID] [--limit N] [--json]
+    inspect [--json] <layer>
+    fork [flags] <parent-layer>
+    merge [--json] <layer>
+    rm [--force] [--json] <layer>
 
 global:
   -h, --help, help       show this help

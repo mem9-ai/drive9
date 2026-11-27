@@ -19,7 +19,6 @@ import (
 )
 
 const (
-	maxInlineLayerEntryBytes     = client.DefaultFSLayerInlineEntryBytes
 	zeroTruncateCommitQueueDelay = 50 * time.Millisecond
 	defaultCommitBatchMaxItems   = 64
 	defaultCommitBatchMaxBytes   = client.MaxBatchWriteBytes
@@ -44,7 +43,6 @@ type CommitEntry struct {
 	ShadowSpill          bool // true when data is only in shadow file (auto-resolve would OOM)
 	Mode                 uint32
 	HasMode              bool
-	LayerEntry           staging.LayerCacheIdentity // server identity returned by this Layer upload
 	CoalesceZeroTruncate bool
 	// PayloadBaseRev is the revision that the local bytes were derived from.
 	// It is intentionally separate from BaseRev (the CAS revision sent to the
@@ -181,7 +179,6 @@ type CommitQueue struct {
 	maxPending       int
 	client           *client.Client
 	remoteRoot       string
-	layerRef         string
 	shadows          *staging.ShadowStore
 	// retainedShadows marks a path whose landed entry must NOT have its
 	// shadow reclaimed: the staging handle refused certification (its
@@ -384,8 +381,12 @@ func (cq *CommitQueue) ConfigureBatchWrite(window time.Duration, maxItems int, m
 	if maxItems <= 0 {
 		maxItems = defaultCommitBatchMaxItems
 	}
-	if maxItems > client.MaxBatchWriteItems {
-		maxItems = client.MaxBatchWriteItems
+	maxAllowed := client.MaxBatchWriteItems
+	if cq.client != nil && cq.client.ViewBinding().LayerID != "" {
+		maxAllowed = client.MaxLayerViewBatchWriteItems
+	}
+	if maxItems > maxAllowed {
+		maxItems = maxAllowed
 	}
 	if maxBytes <= 0 {
 		maxBytes = defaultCommitBatchMaxBytes
@@ -404,16 +405,6 @@ func (cq *CommitQueue) ConfigureBatchWrite(window time.Duration, maxItems int, m
 	cq.batchWindow = window
 	cq.batchMaxItems = maxItems
 	cq.batchMaxBytes = maxBytes
-}
-
-// SetLayerRef pins the layer every entry commits into.
-func (cq *CommitQueue) SetLayerRef(layerRef string) {
-	if cq == nil {
-		return
-	}
-	cq.mu.Lock()
-	cq.layerRef = strings.TrimSpace(layerRef)
-	cq.mu.Unlock()
 }
 
 // Enqueue adds a commit entry to the queue. Returns an error if the queue
@@ -548,42 +539,40 @@ func (cq *CommitQueue) IsFull() bool {
 	return len(cq.queue) >= cq.maxPending
 }
 
-// AbandonLayer halts the commit queue because the mounted layer was rolled
-// back. New Enqueue calls return errLayerRolledBack. Queued (not-yet-
-// dispatched) entries are canceled so workers remove them; their pending
-// state is preserved on disk. In-flight uploads are left to finish — they
-// will fail with 409 and fall to onCommitTerminalFailure, which marks them
-// staging.PendingConflict. Unlike DrainAll this does NOT block (no wg.Wait()) so the
-// caller is not stalled waiting on uploads to a now-dead layer.
+// AbandonLayer preserves queued generations for recovery. In-flight writes
+// settle from their own publication result, which may already be committed.
 func (cq *CommitQueue) AbandonLayer() {
 	if cq == nil {
 		return
 	}
 	cq.mu.Lock()
-	if cq.stopped {
-		// Already stopped (e.g. DrainAll ran first); just mark abandoned so
-		// Enqueue returns the rolled-back sentinel instead of the generic
-		// "commit queue stopped" message.
-		cq.abandoned = true
+	if cq.abandoned {
 		cq.mu.Unlock()
 		return
 	}
 	cq.abandoned = true
-	cq.stopped = true
-	close(cq.workCh)
-	// Cancel all queued (not-yet-dispatched) entries so the worker loop
-	// removes them; their pending state is preserved on disk.
+	if !cq.stopped {
+		cq.stopped = true
+		close(cq.workCh)
+	}
+	var dropped []*CommitEntry
 	for _, entry := range cq.queue {
-		if entry != nil {
+		if entry != nil && !entry.canceled && cq.inFlight[entry.Path] != entry {
 			entry.canceled = true
+			dropped = append(dropped, entry)
 		}
 	}
 	cq.forceAllDelayedLocked()
 	cq.queue = nil
 	cq.queuedByPath = make(map[string]map[*CommitEntry]struct{})
 	cq.mu.Unlock()
-	// Do NOT wg.Wait() — let in-flight workers finish their current upload
-	// (they will 409 → onCommitTerminalFailure → MarkConflict on their own).
+	for _, entry := range dropped {
+		if cq.index != nil && entry.PendingIndexGen != 0 {
+			if _, err := cq.index.MarkConflictIfGeneration(entry.Path, entry.PendingIndexGen); err != nil {
+				safeLogPrintf("commit queue: preserving fenced write for %s: %v", entry.Path, err)
+			}
+		}
+	}
 }
 
 // DrainAll stops accepting new entries and waits for all workers to finish.
@@ -723,6 +712,40 @@ func (cq *CommitQueue) HasPath(path string) bool {
 	return cq.hasQueuedPathLocked(path) || cq.hasImmediatePathLocked(path)
 }
 
+// HasUncanceledPath reports whether path has at least one non-canceled entry in
+// flight, immediate execution, or the pending queue. Callers that re-enqueue
+// staged data after canceling an entry use HasUncanceledPath so a dying worker
+// between unlockPath() and endInFlight() cannot suppress re-enqueueing.
+func (cq *CommitQueue) HasUncanceledPath(path string) bool {
+	if cq == nil || path == "" {
+		return false
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	if cur := cq.inFlight[path]; cur != nil && !cur.canceled {
+		return true
+	}
+	for entry := range cq.immediate {
+		if entry != nil && entry.Path == path && !entry.canceled {
+			return true
+		}
+	}
+	if cq.queuedByPath != nil {
+		for entry := range cq.queuedByPath[path] {
+			if entry != nil && !entry.canceled {
+				return true
+			}
+		}
+		return false
+	}
+	for _, entry := range cq.queue {
+		if entry != nil && entry.Path == path && !entry.canceled {
+			return true
+		}
+	}
+	return false
+}
+
 // WaitPrefix blocks until all in-flight or queued commits under the given
 // prefix complete. Used by Rename to wait for descendant commits.
 func (cq *CommitQueue) WaitPrefix(prefix string) {
@@ -809,6 +832,106 @@ func (cq *CommitQueue) CancelPath(path string) error {
 // gone) so a crash before that close cannot replay the staged frames.
 func (cq *CommitQueue) CancelPathPreserveLocal(path string) error {
 	return cq.cancelPath(path, true)
+}
+
+// isAbandoned reports whether layer lease loss abandoned queued commits.
+func (cq *CommitQueue) isAbandoned() bool {
+	if cq == nil {
+		return false
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	return cq.abandoned
+}
+
+// PreserveAbortedUnlinkLocked marks any live non-conflict PendingIndex entry
+// on path as PendingConflict while the caller holds cq.lockPath(path). Used
+// when AcquireCancelPathLock stripped queued entries before lease loss aborted
+// an unlink: AbandonLayer() no longer sees those stripped entries in cq.queue,
+// so the caller must preserve the generation as a conflict to prevent restart
+// recovery from auto-uploading an abandoned generation.
+func (cq *CommitQueue) PreserveAbortedUnlinkLocked(path string) {
+	if cq == nil || cq.index == nil {
+		return
+	}
+	meta, ok := cq.index.GetMeta(path)
+	if !ok || meta == nil || meta.Generation == 0 || meta.Kind == staging.PendingConflict {
+		return
+	}
+	if _, err := cq.index.MarkConflictIfGeneration(path, meta.Generation); err != nil {
+		safeLogPrintf("commit queue: preserving fenced write for %s: %v", path, err)
+	}
+}
+
+// AcquireCancelPathLock cancels queued or in-flight uploads for path and
+// acquires the per-path lock WITHOUT writing any WAL marker or mutating local
+// shadow/index state. Callers then decide (e.g. under a fast lease fence)
+// whether to proceed to FinishCancelPathLocked or release the lock and abort
+// with zero WAL/local side effects.
+func (cq *CommitQueue) AcquireCancelPathLock(path string, aborted func() bool) (func(), error) {
+	isAborted := func() bool {
+		return cq.isAbandoned() || (aborted != nil && aborted())
+	}
+	if isAborted() {
+		return nil, errLayerRolledBack
+	}
+	// First pass without the path lock: an in-flight upload holds that lock
+	// for its whole transfer, and aborting it here is what releases it.
+	for _, cancel := range cq.cancelPathEntries(path) {
+		cancel()
+	}
+	unlock := cq.lockPath(path)
+	if isAborted() {
+		cq.PreserveAbortedUnlinkLocked(path)
+		unlock()
+		return nil, errLayerRolledBack
+	}
+	for _, cancel := range cq.cancelPathEntries(path) {
+		cancel()
+	}
+	if isAborted() {
+		cq.PreserveAbortedUnlinkLocked(path)
+		unlock()
+		return nil, errLayerRolledBack
+	}
+	return unlock, nil
+}
+
+// FinishCancelPathLocked journals the unlink fence (and removes local state
+// when !preserveLocal) while the caller holds the per-path lock returned by
+// AcquireCancelPathLock.
+func (cq *CommitQueue) FinishCancelPathLocked(path string, preserveLocal bool) error {
+	_, err := cq.finishCancelPathLocked(path, preserveLocal, nil)
+	return err
+}
+
+// FinishCancelPathLockedWithAbort is FinishCancelPathLocked with an external
+// lease-loss predicate checked before any WAL or disk mutation. It reports
+// whether a durable WAL marker or durable shadow removal was committed.
+func (cq *CommitQueue) FinishCancelPathLockedWithAbort(path string, preserveLocal bool, aborted func() bool) (bool, error) {
+	return cq.finishCancelPathLocked(path, preserveLocal, aborted)
+}
+
+// JournalRenameMarkerLocked cancels any remaining queue entries for path and
+// appends a durable JournalUnlink marker while the caller already holds the
+// path lock. Returns (false, nil) when no WAL journal is configured.
+func (cq *CommitQueue) JournalRenameMarkerLocked(path string, aborted func() bool) (bool, error) {
+	if cq == nil {
+		return false, nil
+	}
+	if cq.isAbandoned() || (aborted != nil && aborted()) {
+		return false, errLayerRolledBack
+	}
+	for _, cancel := range cq.cancelPathEntries(path) {
+		cancel()
+	}
+	if cq.journal == nil {
+		return false, nil
+	}
+	if err := cq.journal.AppendSync(staging.JournalEntry{Op: staging.JournalUnlink, Path: path}); err != nil {
+		return false, fmt.Errorf("journal rename marker for %s: %w", path, err)
+	}
+	return true, nil
 }
 
 // CancelEntryInFlight cancels EXACTLY the given entry — the targeted
@@ -1170,15 +1293,6 @@ func classifyCommitTerminalReason(lastErr error) string {
 	}
 }
 
-func (cq *CommitQueue) layerRefSnapshot() string {
-	if cq == nil {
-		return ""
-	}
-	cq.mu.Lock()
-	defer cq.mu.Unlock()
-	return cq.layerRef
-}
-
 func (cq *CommitQueue) remotePath(localPath string) string {
 	root := "/"
 	if cq != nil && cq.remoteRoot != "" {
@@ -1381,7 +1495,7 @@ func (cq *CommitQueue) recoveredEntry(path string) *CommitEntry {
 		return nil
 	}
 	shadowGen := cq.index.RecoverShadowSource(path, meta.Generation, cq.shadows)
-	if meta.Kind == staging.PendingOverwrite && meta.BaseRev <= 0 && cq.layerRefSnapshot() == "" {
+	if meta.Kind == staging.PendingOverwrite && meta.BaseRev <= 0 {
 		safeLogPrintf("commit queue: skip legacy pending overwrite without base revision for %s", path)
 		return nil
 	}
@@ -1516,21 +1630,19 @@ func (cq *CommitQueue) cancelPathEntries(path string) []context.CancelFunc {
 // for data the recreator never wrote. The failure-free error return keeps the
 // record — the name survived, and so did its unlanded data.
 func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
-	// First pass without the path lock: an in-flight upload holds that lock
-	// for its whole transfer, and aborting it here is what releases it.
-	for _, cancel := range cq.cancelPathEntries(path) {
-		cancel()
+	unlock, err := cq.AcquireCancelPathLock(path, nil)
+	if err != nil {
+		return err
 	}
-	// Second pass under the same-path lock the staging path holds across
-	// its shadow/pending publication and Enqueue: an entry that slipped in
-	// between the two passes is canceled too, and the marker below lands at
-	// a higher Seq than every frame published before it. A staging that
-	// takes the lock after this returns sees the handle's unlink marking and
-	// publishes nothing (stageAndEnqueueOpt).
-	unlock := cq.lockPath(path)
 	defer unlock()
-	for _, cancel := range cq.cancelPathEntries(path) {
-		cancel()
+	_, err = cq.finishCancelPathLocked(path, preserveLocal, nil)
+	return err
+}
+
+func (cq *CommitQueue) finishCancelPathLocked(path string, preserveLocal bool, aborted func() bool) (bool, error) {
+	if cq.isAbandoned() || (aborted != nil && aborted()) {
+		cq.PreserveAbortedUnlinkLocked(path)
+		return false, errLayerRolledBack
 	}
 	hadLocal := false
 	var removalErr error
@@ -1580,7 +1692,7 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 		}
 		dropPending()
 		cq.clearTerminalFailure(path)
-		return nil
+		return false, nil
 	}
 	// AppendSync, not Append: the marker is what fences the frames of this
 	// name after a power loss, so it has to be on disk before the local state
@@ -1598,7 +1710,7 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 		}
 		dropPending()
 		cq.clearTerminalFailure(path)
-		return nil
+		return true, nil
 	}
 	safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", path, appendErr)
 	// A marker that could not be fsynced fences nothing, so BOTH policies must
@@ -1627,7 +1739,7 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 			cq.index.Remove(path)
 		}
 		cq.clearTerminalFailure(path)
-		return nil
+		return true, nil
 	}
 	// The recovery source survived or its absence cannot be proven. Keep the
 	// pending entry (the overlay stays discoverable), re-drive the upload
@@ -1641,7 +1753,7 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 			}
 		}
 	}
-	return fmt.Errorf("commit queue: unlink of %s is not crash-durable: WAL marker failed (%v) and the staged image could not be confirmed removed", path, appendErr)
+	return false, fmt.Errorf("commit queue: unlink of %s is not crash-durable: WAL marker failed (%v) and the staged image could not be confirmed removed", path, appendErr)
 }
 
 // isEntryCanceled checks whether this specific entry was canceled by
@@ -1864,6 +1976,10 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 			}
 		}
 
+		if err := cq.rejectAbandonedLayer(); err != nil {
+			cq.onCommitTerminalFailure(entry, err)
+			return
+		}
 		timeout := uploadTimeout
 		if entry.ShadowSpill {
 			timeout = releaseTimeout(entry.Size)
@@ -1933,20 +2049,12 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 			unlockPath()
 			return
 		}
+		if fenceErr := cq.rejectAbandonedLayer(); fenceErr != nil {
+			cq.onCommitTerminalFailure(entry, fenceErr)
+			unlockPath()
+			return
+		}
 		if errors.Is(err, client.ErrConflict) {
-			// When the layer was rolled back, the 409 is a state conflict
-			// (not a revision conflict); skip the Stat/HEAD auto-resolve
-			// round-trip and go straight to terminal failure so the entry
-			// is preserved as staging.PendingConflict.
-			cq.mu.Lock()
-			abandoned := cq.abandoned
-			cq.mu.Unlock()
-			if abandoned {
-				safeLogPrintf("commit queue: layer abandoned, terminal failure for %s", entry.Path)
-				cq.onCommitTerminalFailure(entry, fmt.Errorf("%w: %v", errLayerRolledBack, err))
-				unlockPath()
-				return
-			}
 			if entry.DisableAutoResolveLWW {
 				safeLogPrintf("commit queue: fenced conflict for %s at base revision %d, keeping terminal", entry.Path, entry.BaseRev)
 				cq.onCommitTerminalFailure(entry, err)
@@ -2058,9 +2166,6 @@ func (cq *CommitQueue) batchWriteEligible(entry *CommitEntry) bool {
 	if cq == nil || entry == nil || entry.canceled || entry.ShadowSpill || cq.shadows == nil || cq.client == nil {
 		return false
 	}
-	if cq.layerRefSnapshot() != "" {
-		return false
-	}
 	if entry.Kind == staging.PendingOverwrite && entry.BaseRev <= 0 {
 		return false
 	}
@@ -2168,7 +2273,11 @@ func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
 	}
 
 	start := time.Now()
-	results, err := cq.client.BatchWriteCtx(ctx, remoteItems)
+	var results []client.BatchWriteResult
+	err = cq.rejectAbandonedLayer()
+	if err == nil {
+		results, err = cq.client.BatchWriteCtx(ctx, remoteItems)
+	}
 	if cq.perf != nil {
 		var bytes uint64
 		for _, item := range remoteItems {
@@ -2548,11 +2657,7 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 		return 0, fmt.Errorf("no shadow store")
 	}
 
-	layerRef := cq.layerRefSnapshot()
 	apiPath := cq.remotePath(entry.Path)
-	if layerRef != "" {
-		return cq.uploadLayerEntry(ctx, layerRef, entry, apiPath)
-	}
 	if err := cq.validateEntryPayloadFreshCtx(ctx, entry); err != nil {
 		return 0, err
 	}
@@ -2629,75 +2734,6 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 	return 0, err
 }
 
-func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, entry *CommitEntry, apiPath string) (int64, error) {
-	// The queue may have captured this generation before replay observed an
-	// external tip. Recheck under the upload fence, not only during recovery.
-	if cq.index != nil {
-		if meta, ok := cq.index.GetMeta(entry.Path); ok && meta.Kind == staging.PendingConflict {
-			entry.DisableAutoResolveLWW = true
-			return 0, &client.StatusError{StatusCode: http.StatusConflict, Message: "local Layer publication conflicts with an observed remote tip"}
-		}
-	}
-	if err := cq.validateEntryPayloadFreshCtx(ctx, entry); err != nil {
-		return 0, err
-	}
-	// Read the main-namespace claim only after validation. Overlay upserts
-	// themselves do not advance main revisions or produce landed proofs.
-	// Layer entries use zero, not the base write API's -1 sentinel, for no claim.
-	expectedRevision := max(entry.BaseRev, 0)
-	if entry.Size > maxInlineLayerEntryBytes || entry.ShadowSpill {
-		fd, actualSize, release, err := cq.shadows.OpenIfGeneration(entry.Path, entry.ShadowGen)
-		if err != nil {
-			return 0, fmt.Errorf("open shadow stream: %w", err)
-		}
-		defer release()
-		defer func() { _ = fd.Close() }()
-		if entry.Size != actualSize {
-			return 0, fmt.Errorf("layer entry %s size mismatch: metadata=%d actual=%d", entry.Path, entry.Size, actualSize)
-		}
-		start := time.Now()
-		uploaded, err := cq.client.UploadFSLayerFile(ctx, layerRef, apiPath, fd, actualSize, expectedRevision, entry.Mode, entry.HasMode)
-		if err == nil {
-			entry.LayerEntry = layerCacheIdentity(uploaded, layerRef)
-		}
-		if cq.perf != nil {
-			cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(start), uint64(actualSize))
-		}
-		return 0, err
-	}
-	data, err := cq.readEntryPayloadCtx(ctx, entry)
-	if err != nil {
-		return 0, fmt.Errorf("read shadow: %w", err)
-	}
-	if int64(len(data)) > maxInlineLayerEntryBytes {
-		return 0, fmt.Errorf("layer entry %s is %d bytes; inline layer uploads are limited to %d bytes", entry.Path, len(data), maxInlineLayerEntryBytes)
-	}
-	actualSize := int64(len(data))
-	if entry.Size != actualSize {
-		return 0, fmt.Errorf("layer entry %s size mismatch: metadata=%d actual=%d", entry.Path, entry.Size, actualSize)
-	}
-	req := client.FSLayerEntryRequest{
-		Path:         apiPath,
-		Op:           "upsert",
-		Kind:         "file",
-		BaseRevision: expectedRevision,
-		Content:      data,
-		SizeBytes:    actualSize,
-	}
-	if entry.HasMode {
-		req.Mode = entry.Mode & 0o777
-	}
-	start := time.Now()
-	uploaded, err := cq.client.UpsertFSLayerEntry(ctx, layerRef, req)
-	if err == nil {
-		entry.LayerEntry = layerCacheIdentity(uploaded, layerRef)
-	}
-	if cq.perf != nil {
-		cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(start), uint64(len(data)))
-	}
-	return 0, err
-}
-
 func (cq *CommitQueue) removeFromQueue(entry *CommitEntry) {
 	cq.mu.Lock()
 	defer cq.mu.Unlock()
@@ -2765,10 +2801,7 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, expectedRevision, com
 }
 
 func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRevision, committedRev int64, remoteModeAlreadyApplied bool) error {
-	layerRef := cq.layerRefSnapshot()
-	if layerRef == "" {
-		committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
-	}
+	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	cq.rememberLanded(entry.Path, committedRev, entry.Size, cq.checksumLandedPayload(entry), entry.SnapshotID, entry.liveAncestors...)
 	cq.recordCommitSeq(entry.Path)
 	// The image landed remotely: a previously recorded terminal failure for
@@ -2789,7 +2822,7 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 			applyMode, applyHasMode = meta.Mode, true
 		}
 	}
-	if layerRef == "" && !remoteModeAlreadyApplied && shouldApplyRemoteMode(entry.Kind, applyHasMode, applyMode) {
+	if !remoteModeAlreadyApplied && shouldApplyRemoteMode(entry.Kind, applyHasMode, applyMode) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		var err error
 		mode := applyMode & posixPermissionModeMask
@@ -2830,7 +2863,7 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 	// Write durable commit record BEFORE cleaning up local state so that
 	// crash recovery never re-uploads an already committed entry.
 	var markerErr error
-	if cq.journal != nil && layerRef == "" {
+	if cq.journal != nil {
 		// Durable before cleanup: recovery reads the WAL as written, and a
 		// marker still in the page cache after a power loss is not there —
 		// the pending frames it was meant to override would replay and
@@ -2854,19 +2887,14 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 		cq.OnSuccess(entry, committedRev)
 	}
 
-	// Clean up shadow and pending index. Layer mounts intentionally retain
-	// both until the layer is committed or rolled back: pendingIndex remains
-	// the local metadata source, and shadowStore remains the local data source
-	// for large files that are not admitted to readCache.
-	//
-	// The cleanup is only safe when the local image can no longer be a replay
+	// Clean up shadow and pending index. The cleanup is only safe when the local image can no longer be a replay
 	// source. Two cases keep it: a staging handle that retained newer bytes,
 	// and a removal that failed while the commit marker is not durable. Both
 	// must be detected BEFORE the pending entry is deleted, because that
 	// deletion is what makes a later landed fence a silent no-op.
 	retained := false
 	removalFailed := false
-	if cq.shadows != nil && cq.layerRefSnapshot() == "" {
+	if cq.shadows != nil {
 		if keep, ok := cq.retainedShadows.LoadAndDelete(entry.Path); ok && keep == entry.ShadowGen {
 			// The staging handle kept newer local bytes: the shadow stays as
 			// the restore source for this landing's evicted parts.
@@ -2922,14 +2950,9 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 			safeLogPrintf("commit queue: shadow survived the cleanup for %s after a non-durable commit marker; replay fenced as committed", entry.Path)
 		}
 	}
-	if cq.index != nil && cq.layerRefSnapshot() == "" && !keepPending {
+	if cq.index != nil && !keepPending {
 		if entry.PendingIndexGen != 0 {
 			cq.index.RemoveIfGeneration(entry.Path, entry.PendingIndexGen)
-		}
-	}
-	if cq.index != nil && cq.layerRefSnapshot() != "" {
-		if err := cq.index.MarkLayerCommittedIfGeneration(entry.Path, entry.PendingIndexGen, committedRev, entry.Mode, entry.HasMode, entry.LayerEntry); err != nil {
-			return err
 		}
 	}
 	if cq.OnCleanup != nil {
@@ -2963,15 +2986,6 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 	if cq.isEntryCanceled(entry) || entryCtx.Err() != nil {
 		cq.removeFromQueue(entry)
 		safeLogPrintf("commit queue: auto-resolve skipped for %s (canceled)", entry.Path)
-		return
-	}
-
-	// Layer mounts upload through layer endpoints; Stat/Read here would
-	// compare against the base FS namespace, so neither the idempotent
-	// check nor LWW can be trusted. Keep layer conflicts terminal.
-	if cq.layerRefSnapshot() != "" {
-		safeLogPrintf("commit queue: auto-resolve unsupported for layer mount, terminal failure for %s", entry.Path)
-		cq.finishResolveFailure(entryCtx, entry, nil)
 		return
 	}
 
@@ -3555,6 +3569,9 @@ func (cq *CommitQueue) CancelQueuedForRename(path string) error {
 	if cq == nil {
 		return nil
 	}
+	if cq.isAbandoned() {
+		return errLayerRolledBack
+	}
 	for _, cancel := range cq.cancelPathEntries(path) {
 		cancel()
 	}
@@ -3661,16 +3678,20 @@ type CommitSeqWindow struct {
 }
 
 // covers reports whether path belongs to the window's obligation universe:
-// one of the renamed endpoints, or any path under either rename prefix.
+// one of the renamed endpoints, or any path under either non-empty endpoint prefix.
 func (win *CommitSeqWindow) covers(path string) bool {
-	return path == win.oldPath || path == win.newPath ||
-		strings.HasPrefix(path, win.oldPrefix) || strings.HasPrefix(path, win.newPrefix)
+	if path == "" {
+		return false
+	}
+	return (win.oldPath != "" && path == win.oldPath) ||
+		(win.newPath != "" && path == win.newPath) ||
+		(win.oldPrefix != "" && strings.HasPrefix(path, win.oldPrefix)) ||
+		(win.newPrefix != "" && strings.HasPrefix(path, win.newPrefix))
 }
 
-// BeginCommitSeqWindow opens a rename's commit-stamp obligation window for
-// the renamed endpoints. The caller MUST End the window once its last stamp
-// comparison ran; ending trims immediately, so an idle mount does not retain
-// the window's growth past its obligations.
+// BeginCommitSeqWindow opens a rename or single-endpoint commit-stamp obligation
+// window. Empty endpoints are omitted so single-path callers (newPath == "") do
+// not synthesize a "/" prefix that would pin unrelated mount commits.
 func (cq *CommitQueue) BeginCommitSeqWindow(oldPath, newPath string) *CommitSeqWindow {
 	if cq == nil {
 		return nil
@@ -3681,19 +3702,29 @@ func (cq *CommitQueue) BeginCommitSeqWindow(oldPath, newPath string) *CommitSeqW
 	if cq.commitSeqWindows == nil {
 		cq.commitSeqWindows = make(map[uint64]*CommitSeqWindow)
 	}
+	var oldPrefix, newPrefix string
+	if oldPath != "" {
+		oldPrefix = strings.TrimSuffix(oldPath, "/") + "/"
+	}
+	if newPath != "" {
+		newPrefix = strings.TrimSuffix(newPath, "/") + "/"
+	}
 	win := &CommitSeqWindow{
 		cq:        cq,
 		id:        cq.commitSeqWindowSeq,
 		oldPath:   oldPath,
 		newPath:   newPath,
-		oldPrefix: strings.TrimSuffix(oldPath, "/") + "/",
-		newPrefix: strings.TrimSuffix(newPath, "/") + "/",
+		oldPrefix: oldPrefix,
+		newPrefix: newPrefix,
 		pins:      make(map[string]struct{}),
 	}
 	cq.commitSeqWindows[win.id] = win
 	// The endpoints' PRE-EXISTING stamps feed the flow's delta baselines and
 	// must stay readable for the window's lifetime.
 	for _, p := range []string{oldPath, newPath} {
+		if p == "" {
+			continue
+		}
 		if _, ok := cq.commitSeq[p]; ok {
 			cq.pinCommitSeqToLocked(win, p)
 		}

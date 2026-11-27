@@ -85,14 +85,54 @@ type workspace struct {
 	overlay    map[string]overlayEntry // rel path (no leading slash) → entry
 	tree       map[string]client.GitTreeNode
 	treeLoaded string // head commit the tree was loaded for
-	// stateRestoreMu serializes the lazy local .git restore. An attempt
-	// that fails (or finds the checkpoint not uploaded yet) leaves the
-	// gate open — the next entry point retries — while restoreLatched
-	// makes every later call a no-op once a restore has succeeded. A
-	// sync.Once here consumed the attempt on failure and never retried
-	// (review).
-	stateRestoreMu sync.Mutex
+	// restoreWait serializes the lazy local .git restore while remaining
+	// cancelable by caller/Stop contexts. An attempt that fails (or finds
+	// the checkpoint not uploaded yet) leaves restoreLatched false so the
+	// next entry point retries; once latched, later calls no-op.
+	restoreWait    chan struct{}
 	restoreLatched bool
+	// Accessed under Git.ckptMu. Only a successful pack + state upload sets it.
+	lastCheckpoint string
+}
+
+func (w *workspace) isRestoreLatched() bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.restoreLatched
+}
+
+func (w *workspace) markRestoreLatched() {
+	w.mu.Lock()
+	w.restoreLatched = true
+	w.mu.Unlock()
+}
+
+func (w *workspace) acquireRestore(ctx context.Context) bool {
+	for {
+		w.mu.Lock()
+		if w.restoreWait == nil {
+			w.restoreWait = make(chan struct{})
+			w.mu.Unlock()
+			return true
+		}
+		wait := w.restoreWait
+		w.mu.Unlock()
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			return false
+		}
+	}
+}
+
+func (w *workspace) releaseRestore() {
+	w.mu.Lock()
+	wait := w.restoreWait
+	w.restoreWait = nil
+	w.mu.Unlock()
+	if wait != nil {
+		close(wait)
+	}
 }
 
 // noteTreeSize records a blob size learned by materializing it (v1
@@ -100,13 +140,13 @@ type workspace struct {
 // the first read resolves one, getattr answers a placeholder that git
 // status flags as phantom-modified. Recording the size lets the next
 // stat pass the index comparison and the status converge.
-func (w *workspace) noteTreeSize(rel string, size int64) {
+func (w *workspace) noteTreeSize(rel, sha string, size int64) {
 	if size < 0 {
 		return
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if n, ok := w.tree[rel]; ok && n.SizeBytes < 0 {
+	if n, ok := w.tree[rel]; ok && n.ObjectSHA == sha && n.SizeBytes < 0 {
 		// map values are copies: write the updated node back or every
 		// lookup re-resolves via cat-file and a later failure re-exposes
 		// the placeholder (review).
@@ -395,8 +435,14 @@ type Git struct {
 	// server-side after this mount started (git clone --fast) is
 	// discovered on the next overlay miss, not only at mount start.
 	lastListAt time.Time
-	// rescanCancel stops the periodic workspace rescan (Start arms it).
-	rescanCancel context.CancelFunc
+	// backgroundMu serializes task admission with Stop. Once stopping, no
+	// discovery or restore may start against this runtime's local directory.
+	backgroundMu sync.Mutex
+	backgroundWG sync.WaitGroup
+	background   map[*gitBackgroundTask]struct{}
+	started      bool
+	stopping     bool
+	stopAttempt  *gitStopAttempt
 
 	// live indexes claimed workspace handles by path (SetAttr
 	// interception, unlink/rename retargeting).
@@ -411,6 +457,15 @@ type Git struct {
 	// workspace's own checkpoint (its staged-object pack). A live local
 	// checkout is never listed here.
 	freshRestored map[string]bool
+
+	// bgRestoreSem bounds concurrent background workspace restores so a
+	// multi-workspace tenant does not fan out unbounded clones/fetches at
+	// mount start while foreground lookups still bypass the queue.
+	bgRestoreSem chan struct{}
+
+	blobReads    singleFlight
+	batchMu      sync.Mutex
+	batchReaders map[string]*catFileBatch
 }
 
 // trackWorkspace maintains the claimed-handle index.
@@ -460,6 +515,16 @@ func (g *Git) ReexecRefusal() (string, int) { return "git_workspace", 1 }
 // the clone (uploading the object database) and flips to an EMPTY overlay
 // on discovery, shadowing the .git the checkpoint is about to read.
 func (g *Git) RoutesLocal(viewPath string) bool {
+	return g.RoutesLocalCtx(context.Background(), viewPath)
+}
+
+// RoutesLocalCtx reports view paths the git plane declares local, ensuring a
+// fresh-LocalRoot mount discovers any indexed workspace and finishes restoring
+// its local .git before the outer overlay stats or opens it.
+func (g *Git) RoutesLocalCtx(ctx context.Context, viewPath string) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// Cheap necessary condition: only a path with a `.git` segment can
 	// match (segment-exact — `.gitignore` must not).
 	if !pathHasGitDirSegment(viewPath) {
@@ -469,17 +534,37 @@ func (g *Git) RoutesLocal(viewPath string) bool {
 	if !ok {
 		return false
 	}
-	if g.localRoot != "" && gitcache.WorkspacePending(context.Background(), g.localRoot, root) {
+	if g.localRoot != "" && gitcache.WorkspacePending(ctx, g.localRoot, root) {
 		return true
 	}
-	// In-memory workspace list only — this must not trigger workspace
-	// routing (a throttled refresh from every `.git` access during a
-	// clone).
+	g.ensureLoadedForGitDir(ctx)
 	w, rel, ok := g.workspaceFor(viewPath)
 	if !ok || w == nil {
 		return false
 	}
-	return rel == ".git" || strings.HasPrefix(rel, ".git/")
+	if rel != ".git" && !strings.HasPrefix(rel, ".git/") {
+		return false
+	}
+	if g.localRoot != "" && !w.isRestoreLatched() {
+		_ = g.ensureWorkspaceState(ctx, w)
+	}
+	return true
+}
+
+// ensureLoadedForGitDir loads indexed workspaces once on a cold mount while
+// keeping dormant roots at zero ListGitWorkspaces refreshes and avoiding
+// repeated refreshes for non-workspace `.git` paths once loaded.
+func (g *Git) ensureLoadedForGitDir(ctx context.Context) {
+	g.tryArmFromLocalSignals()
+	g.mu.RLock()
+	loaded := g.loaded
+	armed := g.armed
+	confirmed := g.dormantConfirmed
+	g.mu.RUnlock()
+	if loaded || (!armed && confirmed) {
+		return
+	}
+	g.ensure(ctx)
 }
 
 // pathHasGitDirSegment reports whether viewPath contains a path segment
@@ -516,8 +601,9 @@ func New(opts Options) (*Git, error) {
 		return nil, fmt.Errorf("git: client is required")
 	}
 	g := &Git{cl: opts.Client, bus: opts.Events, localRoot: opts.LocalRoot, syncPolicy: opts.SyncPolicy,
-		remoteRoot: strings.TrimSuffix(strings.TrimSpace(opts.RemoteRoot), "/"),
-		onRefresh:  opts.OnWorkspaceRefresh}
+		remoteRoot:   strings.TrimSuffix(strings.TrimSpace(opts.RemoteRoot), "/"),
+		onRefresh:    opts.OnWorkspaceRefresh,
+		bgRestoreSem: make(chan struct{}, 2)}
 	if g.localRoot != "" {
 		g.checkpoints = debounce.NewFlushDebouncer(gitCheckpointDebounce)
 	}
@@ -549,35 +635,54 @@ func New(opts Options) (*Git, error) {
 // checkpoint upload (git clone --fast registers the workspace BEFORE the
 // state lands). Sync per workspace, bounded by the hydrate budget.
 func (g *Git) ensureWorkspaceState(ctx context.Context, w *workspace) error {
-	if g.localRoot == "" {
+	if g.localRoot == "" || w == nil || w.isRestoreLatched() {
 		return nil
 	}
-	w.stateRestoreMu.Lock()
-	defer w.stateRestoreMu.Unlock()
-	if w.restoreLatched {
-		return nil
-	}
-	rctx, cancel := context.WithTimeout(context.Background(), gitWorkspaceHydrateTimeout)
-	defer cancel()
-	if err := g.restoreWorkspaceState(rctx, w); err != nil {
-		// Not latched: a transient failure (or a checkpoint the CLI
-		// has not uploaded yet — discovery races the upload) retries
-		// at the next entry point. A not-yet-uploaded checkpoint is
-		// quiet; real failures surface for diagnosis.
-		if !errors.Is(err, errGitStateNotReady) {
-			fmt.Fprintf(os.Stderr, "drive9: git state restore failed for workspace %s: %v\n", w.id, err)
+	return g.runForeground(ctx, func(workCtx context.Context) error {
+		if !w.acquireRestore(workCtx) {
+			return workCtx.Err()
 		}
-		return nil
-	}
-	if w.blobless() {
-		// A blobless restore prefetches the HEAD tree's blobs
-		// before serving.
-		if err := g.MaterializeHeadTree(rctx, g.gitDirFor(w.rootPath())); err != nil {
-			fmt.Fprintf(os.Stderr, "drive9: git head tree materialize failed for workspace %s: %v\n", w.id, err)
+		defer w.releaseRestore()
+		if w.isRestoreLatched() {
+			return nil
 		}
-	}
-	w.restoreLatched = true
-	return nil
+		rctx, cancel := context.WithTimeout(workCtx, gitWorkspaceHydrateTimeout)
+		defer cancel()
+		if err := g.restoreWorkspaceState(rctx, w); err != nil {
+			// Not latched: a transient failure (or a checkpoint the CLI
+			// has not uploaded yet — discovery races the upload) retries
+			// at the next entry point. A not-yet-uploaded checkpoint or
+			// intentional cancellation is quiet; real failures surface.
+			if !errors.Is(err, errGitStateNotReady) && !errors.Is(err, context.Canceled) && !errors.Is(err, errGitRuntimeStopped) {
+				fmt.Fprintf(os.Stderr, "drive9: git state restore failed for workspace %s: %v\n", w.id, err)
+			}
+			return nil
+		}
+		if w.blobless() {
+			// A blobless restore prefetches the HEAD tree's blobs before
+			// serving. Linked worktrees resolve objects through their admin
+			// dir under the common repository rather than the root .git file.
+			// Do not latch restore completion until blob hydration succeeds.
+			gitDir, ok := g.checkpointGitDir(w)
+			if !ok {
+				return errGitStateNotReady
+			}
+			if err := g.MaterializeHeadTree(rctx, gitDir); err != nil {
+				if workCtx.Err() != nil {
+					return workCtx.Err()
+				}
+				if !errors.Is(err, context.Canceled) && !errors.Is(err, errGitRuntimeStopped) {
+					fmt.Fprintf(os.Stderr, "drive9: git head tree materialize failed for workspace %s: %v\n", w.id, err)
+				}
+				return err
+			}
+		}
+		if workCtx.Err() != nil {
+			return workCtx.Err()
+		}
+		w.markRestoreLatched()
+		return nil
+	})
 }
 
 // gitWorkspaceDiscoveryWindow bounds how often a miss re-lists workspaces.
@@ -741,15 +846,23 @@ func (g *Git) ensure(ctx context.Context) {
 	forced := g.forceNext
 	armed := g.armed
 	g.mu.RUnlock()
-	if loaded || !armed {
-		if !armed {
-			// Dormant: no ListGitWorkspaces (v1 G0/AC5). One index probe
-			// decides: entries under this mount's root arm the plane (a
-			// fresh-LocalRoot remount still discovers, G2); an empty or
-			// absent index confirms dormant until a local arm signal.
-			g.maybeArmFromIndex(ctx)
-		}
+	if loaded {
 		return
+	}
+	if !armed {
+		// Dormant: no ListGitWorkspaces (v1 G0/AC5). One index probe
+		// decides: entries under this mount's root arm the plane (a
+		// fresh-LocalRoot remount still discovers, G2); an empty or
+		// absent index confirms dormant until a local arm signal.
+		g.maybeArmFromIndex(ctx)
+		g.mu.RLock()
+		loaded = g.loaded
+		forced = g.forceNext
+		armed = g.armed
+		g.mu.RUnlock()
+		if loaded || !armed {
+			return
+		}
 	}
 	if g.onRefresh != nil {
 		g.onRefresh(forced)
@@ -824,9 +937,17 @@ func (g *Git) ensure(ctx context.Context) {
 		// checkpoint raced the discovery) retries on the next reload —
 		// the success latch makes repeat attempts a no-op.
 		if g.localRoot != "" {
-			go func(w *workspace) {
-				_ = g.ensureWorkspaceState(ctx, w)
-			}(w)
+			g.runBackground(func(restoreCtx context.Context) {
+				if g.bgRestoreSem != nil {
+					select {
+					case g.bgRestoreSem <- struct{}{}:
+						defer func() { <-g.bgRestoreSem }()
+					case <-restoreCtx.Done():
+						return
+					}
+				}
+				_ = g.ensureWorkspaceState(restoreCtx, w)
+			})
 		}
 	}
 }
@@ -847,12 +968,7 @@ func (g *Git) refreshTree(ctx context.Context, w *workspace) {
 	// Latch only after a SUCCESSFUL install: a transient 503 used to mark
 	// the commit loaded forever, so every rescan skipped the retry and the
 	// fast-clone view kept missing (or serving the old) tree files.
-	if !g.loadTree(ctx, w) {
-		return
-	}
-	w.mu.Lock()
-	w.treeLoaded = head
-	w.mu.Unlock()
+	g.loadTree(ctx, w, head)
 }
 
 // workspaceFor returns the workspace whose root is the longest prefix of
@@ -889,7 +1005,18 @@ func (g *Git) workspaceFor(path string) (*workspace, string, bool) {
 // gitWorkspaceIndexRescanInterval) arms workspaces registered after the
 // mount without a remount.
 func (g *Git) Start(ctx context.Context) error {
-	go func() {
+	g.backgroundMu.Lock()
+	if g.stopping {
+		g.backgroundMu.Unlock()
+		return errGitRuntimeStopped
+	}
+	if g.started {
+		g.backgroundMu.Unlock()
+		return nil
+	}
+	g.started = true
+	g.backgroundMu.Unlock()
+	g.runBackground(func(startCtx context.Context) {
 		// v1 starts DORMANT: no initial ListGitWorkspaces. Local arm
 		// signals or a non-empty remote index arm the first list; an
 		// armed mount's checkpointed workspaces then restore.
@@ -898,7 +1025,7 @@ func (g *Git) Start(ctx context.Context) error {
 		armed := g.armed
 		g.mu.RUnlock()
 		if !armed {
-			probeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			probeCtx, cancel := context.WithTimeout(startCtx, 15*time.Second)
 			g.maybeArmFromIndex(probeCtx)
 			cancel()
 			g.mu.RLock()
@@ -906,29 +1033,12 @@ func (g *Git) Start(ctx context.Context) error {
 			g.mu.RUnlock()
 		}
 		if armed {
-			reloadCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			g.Reload(reloadCtx)
+			reloadCtx, cancel := context.WithTimeout(startCtx, 15*time.Second)
+			g.ensure(reloadCtx)
 			cancel()
 		}
-		if g.localRoot != "" {
-			g.mu.RLock()
-			workspaces := make([]*workspace, len(g.workspaces))
-			copy(workspaces, g.workspaces)
-			g.mu.RUnlock()
-			restoreCtx, restoreCancel := context.WithTimeout(context.Background(), gitWorkspaceHydrateTimeout)
-			defer restoreCancel()
-			for _, w := range workspaces {
-				// All restore entry points (mount start, discovery, lazy
-				// blob reads) serialize on the workspace's restore gate:
-				// two concurrent restores race their RemoveAll+Rename
-				// swap and can leave a half-deleted .git behind.
-				_ = g.ensureWorkspaceState(restoreCtx, w)
-			}
-		}
-	}()
-	rescanCtx, rescanCancel := context.WithCancel(context.Background())
-	g.rescanCancel = rescanCancel
-	go func() {
+	})
+	g.runBackground(func(rescanCtx context.Context) {
 		ticker := time.NewTicker(gitWorkspaceRescanInterval)
 		defer ticker.Stop()
 		for {
@@ -936,7 +1046,7 @@ func (g *Git) Start(ctx context.Context) error {
 			case <-rescanCtx.Done():
 				return
 			case <-ticker.C:
-				rescanCtx2, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				rescanCtx2, cancel := context.WithTimeout(rescanCtx, 15*time.Second)
 				g.tryArmFromLocalSignals()
 				g.maybeRescanRemoteIndex(rescanCtx2)
 				g.mu.RLock()
@@ -948,23 +1058,14 @@ func (g *Git) Start(ctx context.Context) error {
 				cancel()
 			}
 		}
-	}()
+	})
 	return nil
 }
 
-// Drain flushes pending debounced checkpoints.
+// Drain finishes pending uploads and confirms the on-disk Git state has been saved.
 func (g *Git) Drain(ctx context.Context) error {
 	if g.checkpoints != nil {
 		g.checkpoints.FlushAll()
 	}
-	return nil
-}
-
-// Stop checkpoints every workspace's state at shutdown.
-func (g *Git) Stop(ctx context.Context) error {
-	if g.rescanCancel != nil {
-		g.rescanCancel()
-	}
-	g.checkpointAllGitWorkspaces()
-	return nil
+	return g.checkpointAllGitWorkspaces(ctx)
 }

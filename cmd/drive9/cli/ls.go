@@ -22,6 +22,10 @@ func Ls(c *client.Client, args []string) error {
 		return err
 	}
 	defer withObjectAuthLocal(authLocal)()
+	layerRef, fence, args, err := ParseLayerViewFlags(args)
+	if err != nil {
+		return err
+	}
 	long := false
 	path := "/"
 
@@ -34,7 +38,7 @@ func Ls(c *client.Client, args []string) error {
 		}
 	}
 
-	h, err := fsHandleForArg(c, path)
+	h, err := fsHandleForLayerArg(c, path, layerRef, fence)
 	if err != nil {
 		return err
 	}

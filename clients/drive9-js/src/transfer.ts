@@ -26,6 +26,14 @@ import type {
   UploadSummary,
 } from "./models.js";
 import { Semaphore } from "./utils.js";
+import {
+  UnsupportedInLayerViewError,
+  clientFetch,
+  fetchViewObjectRedirect,
+  getClientViewBinding,
+  rewriteRequestForView,
+  hasActiveLayerView,
+} from "./view.js";
 
 const PART_SIZE = 8 * 1024 * 1024;
 const UPLOAD_MAX_CONCURRENCY = 16;
@@ -82,22 +90,24 @@ async function streamToUint8Array(stream: ReadableStream<Uint8Array>, size: numb
   return result.slice(0, offset);
 }
 
-export async function readStreamImpl(client: Client, path: string): Promise<ReadableStream<Uint8Array>> {
-  const baseUrl = client.fsUrl(path);
-  const resp = await fetch(baseUrl, {
+async function fetchReadPlan(client: Client, path: string, range?: string) {
+  const headers = client["authHeaders"]({ "X-Dat9-Extent-Read-Plan": "1", ...(range && { Range: range }) });
+  const req = rewriteRequestForView(getClientViewBinding(client), client.fsUrl(path), {
     method: "GET",
-    headers: client["authHeaders"]({ "X-Dat9-Extent-Read-Plan": "1" }),
+    headers,
     redirect: "manual",
   });
+  const resp = await fetch(req.url, req.init);
+  return { resp, sourceUrl: resp.url || req.url };
+}
+
+export async function readStreamImpl(client: Client, path: string): Promise<ReadableStream<Uint8Array>> {
+  const { resp, sourceUrl } = await fetchReadPlan(client, path);
   const status = resp.status;
   if (status === 302 || status === 307) {
     const location = resp.headers.get("location") || resp.headers.get("Location");
     if (!location) throw new Drive9Error("302 without Location header");
-    // The server may return a relative Location (e.g. the local S3 mock's
-    // /s3/... path). fetch requires an absolute URL, so resolve it against
-    // the original request URL.
-    const absLocation = new URL(location, baseUrl).toString();
-    const resp2 = await fetch(absLocation, { method: "GET" });
+    const resp2 = await fetchViewObjectRedirect(client, sourceUrl, location);
     await checkError(resp2);
     if (!resp2.body) throw new Drive9Error("empty response body");
     return resp2.body;
@@ -130,25 +140,13 @@ export async function readStreamRangeImpl(
       },
     });
   }
-  const baseUrl = client.fsUrl(path);
   const rangeHeader = `bytes=${offset}-${offset + length - 1}`;
-  const resp = await fetch(baseUrl, {
-    method: "GET",
-    headers: client["authHeaders"]({
-      "X-Dat9-Extent-Read-Plan": "1",
-      Range: rangeHeader,
-    }),
-    redirect: "manual",
-  });
+  const { resp, sourceUrl } = await fetchReadPlan(client, path, rangeHeader);
   const status = resp.status;
   if (status === 302 || status === 307) {
     const location = resp.headers.get("location") || resp.headers.get("Location");
     if (!location) throw new Drive9Error("302 without Location header");
-    const absLocation = new URL(location, baseUrl).toString();
-    const resp2 = await fetch(absLocation, {
-      method: "GET",
-      headers: { Range: rangeHeader },
-    });
+    const resp2 = await fetchViewObjectRedirect(client, sourceUrl, location, { Range: rangeHeader });
     if (resp2.status === 416) {
       await resp2.text().catch(() => "");
       return new ReadableStream({ start(c) { c.close(); } });
@@ -232,6 +230,9 @@ export async function writeStreamWithSummaryImpl(
   options?: number | InternalWriteOptions
 ): Promise<UploadSummary> {
   const opts = normalizeWriteOptions(options);
+  if (hasActiveLayerView(client) && opts.description) {
+    throw new UnsupportedInLayerViewError("description metadata is unsupported in layer view");
+  }
   validateRequestedWriteLayout(opts.layout);
   const started = new Date();
   const threshold = client["smallFileThreshold"];
@@ -488,7 +489,7 @@ async function initiateUploadByBody(
   expectedRevision: number,
   description: string
 ): Promise<UploadPlan> {
-  const resp = await fetch(`${client.baseUrl}/v1/uploads/initiate`, {
+  const resp = await clientFetch(client, `${client.baseUrl}/v1/uploads/initiate`, {
     method: "POST",
     headers: client["authHeaders"]({ "Content-Type": "application/json" }),
     body: JSON.stringify({ path, total_size: size, part_checksums: checksums, ...expectedRevisionPayload(expectedRevision), description }),
@@ -513,7 +514,7 @@ async function initiateUploadLegacy(
   if (checksums.length) headers["X-Dat9-Part-Checksums"] = checksums.join(",");
   if (expectedRevision >= 0) headers["X-Dat9-Expected-Revision"] = String(expectedRevision);
   if (description) headers["X-Dat9-Description"] = description;
-  const resp = await fetch(client.fsUrl(path), { method: "PUT", headers });
+  const resp = await clientFetch(client, client.fsUrl(path), { method: "PUT", headers });
   await checkError(resp);
   return (await resp.json()) as UploadPlan;
 }
@@ -574,7 +575,7 @@ async function uploadOnePart(
 
 async function completeUpload(client: Client, uploadId: string, tags?: Record<string, string>): Promise<void> {
   const body = tags != null ? JSON.stringify({ tags }) : undefined;
-  const resp = await fetch(`${client.baseUrl}/v1/uploads/${uploadId}/complete`, {
+  const resp = await clientFetch(client, `${client.baseUrl}/v1/uploads/${uploadId}/complete`, {
     method: "POST",
     headers: client["authHeaders"](tags != null ? { "Content-Type": "application/json" } : undefined),
     body,
@@ -614,7 +615,7 @@ async function uploadPartsV2(client: Client, plan: UploadPlanV2, data: Uint8Arra
 }
 
 async function presignOnePart(client: Client, uploadId: string, partNumber: number): Promise<PresignedPart> {
-  const resp = await fetch(`${client.baseUrl}/v2/uploads/${uploadId}/presign`, {
+  const resp = await clientFetch(client, `${client.baseUrl}/v2/uploads/${uploadId}/presign`, {
     method: "POST",
     headers: client["authHeaders"]({ "Content-Type": "application/json" }),
     body: JSON.stringify({ part_number: partNumber }),
@@ -650,7 +651,7 @@ function presignedHeaders(part: PresignedPart): Record<string, string> {
 }
 
 async function completeUploadV2(client: Client, uploadId: string, parts: CompletePart[], tags?: Record<string, string>): Promise<void> {
-  const resp = await fetch(`${client.baseUrl}/v2/uploads/${uploadId}/complete`, {
+  const resp = await clientFetch(client, `${client.baseUrl}/v2/uploads/${uploadId}/complete`, {
     method: "POST",
     headers: client["authHeaders"]({ "Content-Type": "application/json" }),
     body: JSON.stringify({ parts, tags }),
@@ -659,7 +660,7 @@ async function completeUploadV2(client: Client, uploadId: string, parts: Complet
 }
 
 async function abortUploadV2(client: Client, uploadId: string): Promise<void> {
-  await fetch(`${client.baseUrl}/v2/uploads/${uploadId}/abort`, {
+  await clientFetch(client, `${client.baseUrl}/v2/uploads/${uploadId}/abort`, {
     method: "POST",
     headers: client["authHeaders"](),
   });
@@ -682,7 +683,7 @@ export async function resumeUploadImpl(
 }
 
 async function queryUpload(client: Client, path: string): Promise<UploadMeta> {
-  const resp = await fetch(`${client.baseUrl}/v1/uploads?path=${encodeURIComponent(path)}&status=UPLOADING`, {
+  const resp = await clientFetch(client, `${client.baseUrl}/v1/uploads?path=${encodeURIComponent(path)}&status=UPLOADING`, {
     headers: client["authHeaders"](),
   });
   await checkError(resp);
@@ -707,7 +708,7 @@ async function requestResume(client: Client, uploadId: string, checksums: string
 }
 
 async function requestResumeByBody(client: Client, uploadId: string, checksums: string[]): Promise<UploadPlan> {
-  const resp = await fetch(`${client.baseUrl}/v1/uploads/${uploadId}/resume`, {
+  const resp = await clientFetch(client, `${client.baseUrl}/v1/uploads/${uploadId}/resume`, {
     method: "POST",
     headers: client["authHeaders"]({ "Content-Type": "application/json" }),
     body: JSON.stringify({ part_checksums: checksums }),
@@ -723,7 +724,7 @@ async function requestResumeByBody(client: Client, uploadId: string, checksums: 
 async function requestResumeLegacy(client: Client, uploadId: string, checksums: string[]): Promise<UploadPlan> {
   const headers = client["authHeaders"]({ "Content-Type": "application/octet-stream" });
   if (checksums.length) headers["X-Dat9-Part-Checksums"] = checksums.join(",");
-  const resp = await fetch(`${client.baseUrl}/v1/uploads/${uploadId}/resume`, {
+  const resp = await clientFetch(client, `${client.baseUrl}/v1/uploads/${uploadId}/resume`, {
     method: "POST",
     headers,
   });

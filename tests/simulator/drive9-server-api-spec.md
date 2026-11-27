@@ -45,7 +45,7 @@ Every endpoint in this specification carries one of two contract tags:
 
 ### 2.2 Path/Permission-Scoped Tokens `[prod-ext]`
 - Issued via `POST /v1/tokens` or `POST /v1/tokens/generate` with `scopes: [{prefix, ops[]}]` (empty `scopes` rejected with `400`).
-- Admitted only on `/v1/fs*`, `/v1/uploads*`, `/v2/uploads*`, `/v1/layers*`, and `POST /v1/tokens/refresh`.
+- Admitted only on `/v1/fs*`, `/v1/uploads*`, `/v2/uploads*`, `/v1/layers*`, `/v1/views*`, and `POST /v1/tokens/refresh`.
 - Permanently denied (`403`) on `/v1/sql`, `/v1/fork`, `/v1/events`, `/v1/journals*`, `/v1/vault*`, `/v1/object-credentials`, `/v1/runtime*`, `POST /v1/fs/{path}?chmod`, `batch-write` items with `hasMode: true`, and `checksum_sha256` on upload completion.
 - Pseudoroot projection: ancestor directories above a granted `prefix` allow projected `stat`/`list` showing only authorized descendants, hiding sibling entries (`404`/`403`).
 
@@ -408,7 +408,7 @@ All batch endpoints accept `POST` only; any other HTTP method returns `405 Metho
 
 ## 8. Extended Production Surfaces `[prod-ext]`
 
-1. **LayerFS (`/v1/layers*`, `/v1/layer-checkpoints/{id}`)**: CoW overlay layers (`POST|GET /v1/layers`, `GET|DELETE /v1/layers/{ref}?cascade=`, `.../fork`, `.../chain`, `.../diff?max_seq=&replay=&mode=log`, `.../checkpoints`, `.../rollback`, `.../commit` -> `200 committed` or `409 conflicted`, `.../entries`, `.../objects`, `.../uploads/*`, `.../events`).
+1. **LayerFS**. The built-in server returns `501 LAYER_REQUIRES_TIDB_SERVER` for authenticated Layer management (`/v1/layers*`) and view requests (`/v1/views*`). Run the LayerFS integration cases against the TiDB-backed server.
 2. **Tokens (`/v1/tokens*`)**: scoped token issuance (`POST /v1/tokens`), listing (`GET /v1/tokens`), rotation (`POST /v1/tokens/refresh`), revocation (`POST /v1/tokens/revoke`, `DELETE /v1/tokens/{id}`), activation/deactivation, and control-plane generation (`POST /v1/tokens/generate`).
 3. **Quota (`/v1/quota`)**: `GET /v1/quota` (Drive9 key or control-plane + `tenant_id` / `X-Drive9-Tenant-ID`) & `POST /v1/quota` (control-plane).
 4. **Vault (`/v1/vault/*`)**: secret CRUD (`/v1/vault/secrets*`), capability/grant token issuance (`/v1/vault/tokens*`, `/v1/vault/grants*`), audit (`/v1/vault/audit`), and capability-authenticated secret reads (`/v1/vault/read*`).

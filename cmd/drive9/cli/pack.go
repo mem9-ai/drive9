@@ -15,11 +15,13 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/mountcontrol"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 	"github.com/mem9-ai/drive9/pkg/pathutil"
@@ -85,12 +87,34 @@ type packItem struct {
 }
 
 type mountedPackTarget struct {
-	MountPoint string
-	MountRel   string
-	RemoteRoot string
-	Profile    string
-	LocalRoot  string
-	PackPaths  []string
+	LayerID       string
+	LayerReadOnly bool
+	Server        string
+	MountPoint    string
+	MountRel      string
+	RemoteRoot    string
+	Profile       string
+	LocalRoot     string
+	PackPaths     []string
+}
+
+func (target mountedPackTarget) viewClient(c *client.Client) (*client.Client, error) {
+	if target.LayerID == "" {
+		if c.ViewBinding().LayerID != "" {
+			return nil, fmt.Errorf("selected mount and client refer to different views")
+		}
+		return c, nil
+	}
+	if c == nil || strings.TrimRight(c.BaseURL(), "/") != strings.TrimRight(target.Server, "/") {
+		return nil, fmt.Errorf("selected layer mount and client refer to different servers")
+	}
+	if current := c.ViewBinding().LayerID; current != "" {
+		if current != target.LayerID {
+			return nil, fmt.Errorf("selected mount and client refer to different layers")
+		}
+		return c, nil
+	}
+	return c.WithView(client.ViewBinding{LayerID: target.LayerID})
 }
 
 // PackCommand is the top-level `drive9 pack` entry point.
@@ -133,6 +157,16 @@ func Pack(c *client.Client, args []string) error {
 		resolved, err := resolveMountedPackTarget(*mountTarget)
 		if err != nil {
 			return err
+		}
+		if resolved.LayerReadOnly {
+			return fmt.Errorf("drive9 pack: selected layer mount is read-only")
+		}
+		c, err = resolved.viewClient(c)
+		if err != nil {
+			return err
+		}
+		if resolved.LayerID != "" && c.ViewBinding().Fence == 0 {
+			return fmt.Errorf("drive9 pack: writing through a mounted Layer requires the worker's active fence. Use drive9 umount --pack to archive the overlay")
 		}
 		if strings.TrimSpace(*localRoot) == "" {
 			*localRoot = resolved.LocalRoot
@@ -210,6 +244,10 @@ func Unpack(c *client.Client, args []string) error {
 	}
 	if strings.TrimSpace(*mountTarget) != "" {
 		resolved, err := resolveMountedPackTarget(*mountTarget)
+		if err != nil {
+			return err
+		}
+		c, err = resolved.viewClient(c)
 		if err != nil {
 			return err
 		}
@@ -1666,6 +1704,9 @@ func clientForRemoteArchiveArg(defaultClient *client.Client, raw string) (*clien
 	if rp.Path == "/" || strings.HasSuffix(rp.Path, "/") {
 		return nil, "", fmt.Errorf("remote archive path must be a file, got %q", raw)
 	}
+	if err := requireNoLayerWithRemoteContext("", defaultClient, rp, raw); err != nil {
+		return nil, "", err
+	}
 	c := defaultClient
 	if rp.Context != "" {
 		var err error
@@ -1684,11 +1725,19 @@ func clientForPackArchiveArg(defaultClient *client.Client, raw string, remoteRoo
 	if strings.TrimSpace(profile) == noneMountProfile {
 		return nil, "", fmt.Errorf("default pack archive requires an overlay profile or an explicit remote archive path")
 	}
-	archivePath, err := defaultPackArchivePath(remoteRoot, profile)
+	archivePath, err := mountPackArchivePath(remoteRoot, profile, defaultClient.ViewBinding().LayerID)
 	if err != nil {
 		return nil, "", err
 	}
 	return defaultClient, archivePath, nil
+}
+
+func mountPackArchivePath(remoteRoot, profile, layerID string) (string, error) {
+	archive, err := defaultPackArchivePath(remoteRoot, profile)
+	if err != nil || layerID == "" {
+		return archive, err
+	}
+	return mountpath.ToRemote(remoteRoot, archive), nil
 }
 
 func defaultPackArchivePath(remoteRoot string, profile string) (string, error) {
@@ -1745,6 +1794,11 @@ func resolveMountedPackTarget(target string) (mountedPackTarget, error) {
 	for {
 		state, _, err := mountstate.ReadProcessState(candidate)
 		if err == nil {
+			if runtime.GOOS != "windows" {
+				if err := refreshMountedView(&state, mountcontrol.RequestStatus, time.Second); err != nil {
+					return mountedPackTarget{}, err
+				}
+			}
 			if strings.TrimSpace(state.LocalRoot) == "" {
 				return mountedPackTarget{}, fmt.Errorf("drive9 mount metadata for %q does not include local_root; remount with an overlay profile", candidate)
 			}
@@ -1768,13 +1822,20 @@ func resolveMountedPackTarget(target string) (mountedPackTarget, error) {
 			if err != nil {
 				return mountedPackTarget{}, err
 			}
+			localRoot, err := mountstate.LayerLocalRoot(state.LocalRoot, state.LayerID)
+			if err != nil {
+				return mountedPackTarget{}, err
+			}
 			return mountedPackTarget{
-				MountPoint: absMount,
-				MountRel:   rel,
-				RemoteRoot: remoteRoot,
-				Profile:    state.Profile,
-				LocalRoot:  state.LocalRoot,
-				PackPaths:  append([]string(nil), state.PackPaths...),
+				LayerID:       state.LayerID,
+				LayerReadOnly: state.LayerReadOnly,
+				Server:        state.Server,
+				MountPoint:    absMount,
+				MountRel:      rel,
+				RemoteRoot:    remoteRoot,
+				Profile:       state.Profile,
+				LocalRoot:     localRoot,
+				PackPaths:     append([]string(nil), state.PackPaths...),
 			}, nil
 		}
 		if !errors.Is(err, os.ErrNotExist) {

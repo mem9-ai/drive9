@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,9 +8,12 @@ import { http, HttpResponse } from "msw";
 import {
   Client,
   ConflictError,
-  FSLayerCommitConflictError,
+  InvalidLayerViewRequestError,
+  LAYER_FENCE_HEADER,
   MaxBatchReadSmallPaths,
   MaxBatchStatPaths,
+  MaxLayerViewBatchWriteItems,
+  UnsupportedInLayerViewError,
 } from "../src/index.js";
 
 const server = setupServer();
@@ -22,6 +25,55 @@ afterAll(() => server.close());
 const text = new TextEncoder();
 
 describe("TypeScript SDK parity surface", () => {
+  it("batch writes preserve explicit modes and reject unsupported tags", async () => {
+    const c = new Client("http://localhost:9009", "key");
+    server.use(http.post("http://localhost:9009/v1/fs\\:batch-write", async ({ request }) => {
+      const body = await request.json() as { items: Array<{ path: string; hasMode?: boolean; mode?: number }> };
+      expect(body.items.map(({ mode, hasMode }) => [mode, hasMode])).toEqual([[0, true], [0o600, true], [undefined, undefined]]);
+      return HttpResponse.json({ results: body.items.map(({ path }) => ({ path, status: 200 })) });
+    }));
+    const data = new Uint8Array(1);
+    expect(await c.batchWrite([
+      { path: "/zero", data, mode: 0 },
+      { path: "/private", data, mode: 0o600 },
+      { path: "/inherit", data },
+    ])).toHaveLength(3);
+    const tagged = { path: "/tagged", data, tags: { env: "test" } };
+    await expect(c.batchWrite([tagged])).rejects.toThrow(/does not support tags/);
+  });
+
+  it("resolves relative object locations from the view URL under a deployment prefix", async () => {
+    const layerId = "layer_01j8z6kh2m9q7w3r5t6y8v0p1a";
+    const c = new Client("http://localhost:9009/deploy", "key").withView({ layerId });
+    server.use(
+      http.get(`http://localhost:9009/deploy/v1/views/${layerId}/v1/fs/blob`, () =>
+        new HttpResponse(null, { status: 307, headers: { Location: "../../../../../s3/blob" } })),
+      http.get("http://localhost:9009/deploy/s3/blob", ({ request }) => request.headers.has("range")
+        ? new HttpResponse("b", { status: 206 }) : new HttpResponse("abc"))
+    );
+    expect(new TextDecoder().decode(await c.read("/blob"))).toBe("abc");
+    expect(await new Response(await c.readStreamRange("/blob", 1, 1)).text()).toBe("b");
+  });
+
+  it.each([false, true])("resolves redirects with an empty Response.url (range=%s)", async ranged => {
+    const layerId = "layer_01j8z6kh2m9q7w3r5t6y8v0p1a";
+    const base = "https://example.test/deploy";
+    const c = new Client(base, "key").withView({ layerId });
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(null, { status: 307, headers: { Location: "../../../../../objects/blob" } }))
+      .mockResolvedValueOnce(new Response("b", { status: ranged ? 206 : 200 }));
+    try {
+      const body = ranged ? await c.readStreamRange("/blob", 1, 1) : await c.readStream("/blob");
+      expect(await new Response(body).text()).toBe("b");
+      expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+        base + "/v1/views/" + layerId + "/v1/fs/blob",
+        base + "/objects/blob",
+      ]);
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
   it("loads the current context from DRIVE9_CONFIG and treats missing type as owner", () => {
     const dir = mkdtempSync(join(tmpdir(), "drive9-js-config-"));
     const configPath = join(dir, "config.json");
@@ -380,119 +432,214 @@ describe("TypeScript SDK parity surface", () => {
     expect(await client.readVaultSecretFieldAsOwner("aws", "key")).toBe("value");
   });
 
-  it("covers layer API endpoint shapes", async () => {
-    server.use(
-      http.post("http://localhost:9009/v1/layers", () =>
-        HttpResponse.json({ layer_id: "layer_1", base_root_path: "/", name: "test", state: "open", durability_mode: "async", actor_id: "a", durable_seq: 0, created_at: "now", updated_at: "now" })
-      ),
-      http.get("http://localhost:9009/v1/layers/layer_1/diff", ({ request }) => {
-        expect(new URL(request.url).searchParams.get("replay")).toBe("1");
-        return HttpResponse.json({ entries: [{ layer_id: "layer_1", path: "/a.txt", parent_path: "/", name: "a.txt", op: "upsert", kind: "file", base_inode_id: "", base_revision: 1, storage_type: "inline", storage_ref: "", storage_ref_hash: "", storage_encryption_mode: "", storage_encryption_key_id: "", checksum_sha256: "", size_bytes: 1, mode: 420, entry_seq: 1, created_at: "now", updated_at: "now" }] });
-      }),
-      http.post("http://localhost:9009/v1/layers/layer_1/entries", async ({ request }) => {
-        const body = (await request.json()) as { content: string };
-        expect(body.content).toBe(Buffer.from("x").toString("base64"));
-        return HttpResponse.json({ layer_id: "layer_1", path: "/a.txt", parent_path: "/", name: "a.txt", op: "upsert", kind: "file", base_inode_id: "", base_revision: 1, storage_type: "inline", storage_ref: "", storage_ref_hash: "", storage_encryption_mode: "", storage_encryption_key_id: "", checksum_sha256: "", size_bytes: 1, mode: 420, entry_seq: 1, created_at: "now", updated_at: "now" });
-      }),
-      http.post("http://localhost:9009/v1/layers/layer_1/commit", () => HttpResponse.json({ status: "committed", layer_id: "layer_1", applied: 1 }))
-    );
+  it("covers v36 LayerFS control-plane and mount-lease endpoint shapes", async () => {
+    const layerId = "layer_01j8z6kh2m9q7w3r5t6y8v0p1a";
+    const childId = "layer_01j8z6kh2m9q7w3r5t6y8v0p1b";
 
-    const client = new Client("http://localhost:9009", "key");
-    expect((await client.createFSLayer({ base_root_path: "/" })).layer_id).toBe("layer_1");
-    expect((await client.replayFSLayer("layer_1")).length).toBe(1);
-    expect((await client.upsertFSLayerEntry("layer_1", { path: "/a.txt", content: text.encode("x") })).path).toBe("/a.txt");
-    expect((await client.commitFSLayer("layer_1")).applied).toBe(1);
-  });
-
-  it("covers LayerFS fork and delete endpoint shapes", async () => {
     server.use(
-      http.post("http://localhost:9009/v1/layers/parent-ref/fork", async ({ request }) => {
-        expect(request.headers.get("authorization")).toBe("Bearer key");
-        expect(await request.json()).toEqual({
-          layer_id: "child_1",
-          name: "child",
-          actor_id: "agent-1",
-          checkpoint_id: "checkpoint_1",
+      http.post("http://localhost:9009/v1/layers", async ({ request }) => {
+        expect(await request.json()).toEqual({ base_root_path: "/workspace", name: "work-a", ttl_seconds: 3600 });
+        return HttpResponse.json({
+          layer_id: layerId,
+          base_root_path: "/workspace",
+          name: "work-a",
+          parent_layer_id: "",
+          actor_id: "a",
+          state: "active",
+          snap_gen: 3,
+          fence: 0,
+          exclusive_mount_id: "",
+          mount_lease_ttl_ms: 0,
+          mount_expired: false,
+          created_at: "now",
+          updated_at: "now",
         });
-        return HttpResponse.json(
-          {
-            layer_id: "child_1",
-            base_root_path: "/",
-            name: "child",
-            state: "active",
-            durability_mode: "restore-safe",
-            actor_id: "agent-1",
-            durable_seq: 0,
-            parent_layer_id: "parent_1",
-            origin_seq: 7,
-            origin_checkpoint_id: "checkpoint_1",
-            root_layer_id: "parent_1",
-            depth: 1,
-            origin: "fork",
-            created_at: "now",
-            updated_at: "now",
-          },
-          { status: 201 }
-        );
       }),
-      http.delete("http://localhost:9009/v1/layers/child_1", ({ request }) => {
-        expect(new URL(request.url).searchParams.get("cascade")).toBe("true");
-        return HttpResponse.json({ status: "abandoned", layer_id: "child_1" });
+      http.get("http://localhost:9009/v1/layers", ({ request }) => {
+        const after = new URL(request.url).searchParams.get("after");
+        if (!after) {
+          return HttpResponse.json({
+            layers: [{ layer_id: layerId, base_root_path: "/workspace", name: "work-a", parent_layer_id: "", actor_id: "a", state: "active", snap_gen: 3, fence: 0, exclusive_mount_id: "", mount_lease_ttl_ms: 0, mount_expired: false, created_at: "now", updated_at: "now" }],
+            next_after: layerId,
+          });
+        }
+        return HttpResponse.json({ layers: [] });
+      }),
+      http.get("http://localhost:9009/v1/layers/tag%3Aenv%3Dci", () =>
+        HttpResponse.json({
+          layer_id: layerId,
+          base_root_path: "/workspace",
+          name: "work-a",
+          parent_layer_id: "",
+          actor_id: "a",
+          state: "active",
+          snap_gen: 3,
+          fence: 0,
+          exclusive_mount_id: "",
+          mount_lease_ttl_ms: 0,
+          mount_expired: false,
+          created_at: "now",
+          updated_at: "now",
+        })
+      ),
+      http.post(`http://localhost:9009/v1/layers/${layerId}/fork`, async ({ request }) => {
+        expect(request.headers.get("authorization")).toBe("Bearer key");
+        expect(await request.json()).toEqual({ name: "child", actor_id: "agent-1" });
+        return HttpResponse.json({
+          layer_id: childId,
+          base_root_path: "/workspace",
+          name: "child",
+          parent_layer_id: layerId,
+          actor_id: "agent-1",
+          state: "active",
+          snap_gen: 3,
+          fence: 0,
+          exclusive_mount_id: "",
+          mount_lease_ttl_ms: 0,
+          mount_expired: false,
+          created_at: "now",
+          updated_at: "now",
+        });
+      }),
+      http.post(`http://localhost:9009/v1/layers/${layerId}/bind-mount`, async ({ request }) => {
+        expect(await request.json()).toEqual({ mount_id: "m1", operation_id: "op1", expected_fence: 0 });
+        return HttpResponse.json({ layer_id: layerId, mount_id: "m1", operation_id: "op1", fence: 1, mount_lease_until: "soon", mount_lease_ttl_ms: 60000 });
+      }),
+      http.post(`http://localhost:9009/v1/layers/${layerId}/renew-mount`, async ({ request }) => {
+        expect(await request.json()).toEqual({ mount_id: "m1", fence: 1 });
+        return HttpResponse.json({ layer_id: layerId, mount_id: "m1", operation_id: "op1", fence: 1, mount_lease_until: "later", mount_lease_ttl_ms: 60000 });
+      }),
+      http.post(`http://localhost:9009/v1/layers/${layerId}/unbind-mount`, async ({ request }) => {
+        expect(await request.json()).toEqual({ mount_id: "m1", kind: "fence", fence: 1 });
+        return HttpResponse.json({ layer_id: layerId, fence: 2, unbound: true });
+      }),
+      http.post(`http://localhost:9009/v1/layers/${layerId}/merge`, () =>
+        HttpResponse.json({ layer_id: layerId, status: "merged", applied_paths: 4 })
+      ),
+      http.delete(`http://localhost:9009/v1/layers/${childId}`, ({ request }) => {
+        expect(new URL(request.url).searchParams.get("force")).toBe("true");
+        return HttpResponse.json({ layer_id: childId, status: "deleted" });
       })
     );
 
     const client = new Client("http://localhost:9009", "key");
-    const child = await client.forkFSLayer("parent-ref", {
-      layer_id: "child_1",
-      name: "child",
-      actor_id: "agent-1",
-      checkpoint_id: "checkpoint_1",
-    });
-    expect(child.parent_layer_id).toBe("parent_1");
-    expect(child.origin_checkpoint_id).toBe("checkpoint_1");
-    expect(child.depth).toBe(1);
-    await client.deleteFSLayer(child.layer_id, { cascade: true });
+    expect((await client.createLayer({ base_root_path: "/workspace", name: "work-a", ttl_seconds: 3600 })).layer_id).toBe(layerId);
+    expect((await client.listAllLayers()).map((l) => l.layer_id)).toEqual([layerId]);
+    expect((await client.getLayer("tag:env=ci")).layer_id).toBe(layerId);
+    const child = await client.forkLayer(layerId, { name: "child", actor_id: "agent-1" });
+    expect(child.parent_layer_id).toBe(layerId);
+    expect((await client.bindLayerMount(layerId, { mount_id: "m1", operation_id: "op1", expected_fence: 0 })).fence).toBe(1);
+    expect((await client.renewLayerMount(layerId, { mount_id: "m1", fence: 1 })).fence).toBe(1);
+    expect((await client.unbindLayerMount(layerId, { mount_id: "m1", kind: "fence", fence: 1 })).unbound).toBe(true);
+    expect((await client.mergeLayer(layerId)).applied_paths).toBe(4);
+    expect((await client.deleteLayer(childId, { force: true })).status).toBe("deleted");
   });
 
-  it("maps LayerFS delete conflicts through the shared error contract", async () => {
+  it("routes view-bound data plane via /v1/views/{layer_id}, enforces fence/Set D/batchWrite cap, and strips redirect credentials", async () => {
+    const layerId = "layer_01j8z6kh2m9q7w3r5t6y8v0p1a";
+    let s3SawAuth: string | null = null;
+    let s3SawFence: string | null = null;
+    let fencedLocally = false;
+
     server.use(
-      http.delete("http://localhost:9009/v1/layers/parent_1", () =>
-        HttpResponse.json({ error: "fs layer has children" }, { status: 409 })
+      http.get("http://localhost:9009/v1/status", ({ request }) => {
+        expect(request.headers.get(LAYER_FENCE_HEADER)).toBeNull();
+        return HttpResponse.json({ status: "ok", inline_threshold: 50000 });
+      }),
+      http.put(`http://localhost:9009/v1/views/${layerId}/v1/fs/workspace/a.txt`, ({ request }) => {
+        expect(request.headers.get(LAYER_FENCE_HEADER)).toBe("5");
+        return HttpResponse.json({ revision: 2 });
+      }),
+      http.get(`http://localhost:9009/v1/views/${layerId}/v1/fs/workspace`, ({ request }) => {
+        expect(request.headers.get(LAYER_FENCE_HEADER)).toBe("5");
+        const cursor = new URL(request.url).searchParams.get("cursor");
+        if (!cursor) {
+          return HttpResponse.json({ entries: [{ name: "a.txt", size: 2, isDir: false }], next_cursor: "c2" });
+        }
+        expect(cursor).toBe("c2");
+        return HttpResponse.json({ entries: [{ name: "b.txt", size: 3, isDir: false }] });
+      }),
+      http.get(`http://localhost:9009/v1/views/${layerId}/v1/fs/workspace/s3.bin`, () =>
+        new HttpResponse(null, { status: 302, headers: { Location: "http://s3.mock.local:9009/obj/1?sig=abc" } })
+      ),
+      http.get("http://s3.mock.local:9009/obj/1", ({ request }) => {
+        s3SawAuth = request.headers.get("authorization");
+        s3SawFence = request.headers.get(LAYER_FENCE_HEADER);
+        return new HttpResponse(text.encode("from-s3"), { status: 200 });
+      }),
+      http.get(`http://localhost:9009/v1/views/${layerId}/v1/fs/workspace/evil.bin`, () =>
+        new HttpResponse(null, { status: 302, headers: { Location: "http://localhost:9009/v1/status" } })
+      ),
+      http.delete(`http://localhost:9009/v1/layers/${layerId}`, () =>
+        HttpResponse.json({ error: "fs layer is mounted", code: "LAYER_MOUNTED_BUSY" }, { status: 409 })
       )
     );
 
-    const client = new Client("http://localhost:9009", "key");
-    await expect(client.deleteFSLayer("parent_1")).rejects.toMatchObject({
+    const base = new Client("http://localhost:9009", "secret-token");
+    expect(() => base.withView({ layerId: "not-canonical" })).toThrow(InvalidLayerViewRequestError);
+    expect(() => base.withView({ layerId, fence: 2 })).toThrow(InvalidLayerViewRequestError);
+
+    const vc = base.withView({
+      layerId,
+      fence: 5,
+      writeGuard: () => {
+        if (fencedLocally) throw new Error("self-fenced");
+      },
+    });
+    expect(vc.viewBinding()).toEqual({ layerId, fence: 5 });
+
+    // Set A passes through without X-FS-Layer-Fence.
+    await vc.status();
+
+    // Set C mutating request carries X-FS-Layer-Fence: 5.
+    expect(await vc.writeWithRevision("/workspace/a.txt", text.encode("hi"))).toBe(2);
+
+    // Cursor pagination in list().
+    expect((await vc.list("/workspace")).map((e) => e.name)).toEqual(["a.txt", "b.txt"]);
+
+    // Redirected object download strips Authorization and X-FS-Layer-Fence, and blocks redirects to /v1/*.
+    expect(new TextDecoder().decode(await vc.read("/workspace/s3.bin"))).toBe("from-s3");
+    expect(s3SawAuth).toBeNull();
+    expect(s3SawFence).toBeNull();
+    await expect(vc.read("/workspace/evil.bin")).rejects.toBeInstanceOf(InvalidLayerViewRequestError);
+
+    await expect(vc.exec({ argv: ["pwd"] })).rejects.toBeInstanceOf(UnsupportedInLayerViewError);
+    await expect(vc.runtimeCapabilities()).rejects.toBeInstanceOf(UnsupportedInLayerViewError);
+    await expect(vc.listGitWorkspaces()).rejects.toBeInstanceOf(UnsupportedInLayerViewError);
+    await expect(vc.createJournal({ title: "test" })).rejects.toBeInstanceOf(UnsupportedInLayerViewError);
+    await expect(vc.revokeScopedToken("token")).rejects.toBeInstanceOf(UnsupportedInLayerViewError);
+    await expect(vc.listVaultSecrets()).rejects.toBeInstanceOf(UnsupportedInLayerViewError);
+
+    // Set D & local caps reject before hitting network.
+    await expect(vc.grep("q", "/workspace")).rejects.toBeInstanceOf(UnsupportedInLayerViewError);
+    await expect(vc.find("/workspace")).rejects.toBeInstanceOf(UnsupportedInLayerViewError);
+    await expect(vc.sql("SELECT 1")).rejects.toBeInstanceOf(UnsupportedInLayerViewError);
+    await expect(vc.append("/workspace/a.txt", text.encode("!"))).rejects.toBeInstanceOf(UnsupportedInLayerViewError);
+    await expect(vc.write("/workspace/a.txt", text.encode("hi"), { description: "nope" })).rejects.toBeInstanceOf(UnsupportedInLayerViewError);
+
+    const tooMany = Array.from({ length: MaxLayerViewBatchWriteItems + 1 }, (_, i) => ({
+      path: `/workspace/${i}.txt`,
+      data: text.encode("x"),
+    }));
+    await expect(vc.batchWrite(tooMany)).rejects.toThrow(/exceeds limit of 100/);
+
+    // Local self-fence halts mutating requests while leaving reads intact.
+    fencedLocally = true;
+    server.use(...["batch-stat", "batch-read-small"].map((action) =>
+      http.post(`http://localhost:9009/v1/views/${layerId}/v1/fs\\:${action}`, () =>
+        HttpResponse.json({ results: [{ path: "/file", status: 200 }] }))
+    ));
+    expect(await vc.batchStat(["/file"])).toHaveLength(1);
+    expect(await vc.batchReadSmall(["/file"])).toHaveLength(1);
+
+    await expect(vc.write("/workspace/a.txt", text.encode("blocked"))).rejects.toThrow("self-fenced");
+    expect((await vc.list("/workspace")).length).toBe(2);
+
+    await expect(base.deleteLayer(layerId)).rejects.toMatchObject({
       name: "ConflictError",
-      message: "fs layer has children",
+      message: "fs layer is mounted",
       statusCode: 409,
     } satisfies Partial<ConflictError>);
-  });
-
-  it("preserves LayerFS commit conflict details on 409", async () => {
-    server.use(
-      http.post("http://localhost:9009/v1/layers/layer_1/commit", () =>
-        HttpResponse.json(
-          {
-            status: "conflicted",
-            layer_id: "layer_1",
-            conflicts: [{ path: "/a.txt", reason: "revision mismatch", base_revision: 1, want_revision: 2 }],
-          },
-          { status: 409 }
-        )
-      )
-    );
-
-    const client = new Client("http://localhost:9009", "key");
-    try {
-      await client.commitFSLayer("layer_1");
-      throw new Error("commit should have failed");
-    } catch (err) {
-      expect(err).toBeInstanceOf(FSLayerCommitConflictError);
-      const conflict = err as FSLayerCommitConflictError;
-      expect(conflict.commit.status).toBe("conflicted");
-      expect(conflict.commit.conflicts?.[0].path).toBe("/a.txt");
-    }
   });
 
   it("covers git workspace API endpoint shapes", async () => {

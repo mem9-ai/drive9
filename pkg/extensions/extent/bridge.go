@@ -40,6 +40,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
@@ -82,8 +83,9 @@ const (
 type Bridge struct {
 	meta.Meta // nil embed: satisfies unexported interface members; never called
 
-	cfg    Config
-	format meta.Format
+	cfg       Config
+	clientPtr atomic.Pointer[client.Client]
+	format    meta.Format
 
 	mu           sync.Mutex
 	nextID       uint64 // provisional slice-id allocator (high bit set)
@@ -96,7 +98,9 @@ type Bridge struct {
 	// flush/close boundary (FlushFile) surfaces it — Bridge.Write itself
 	// returns success to keep the community writer clean (its sticky
 	// fileWriter.err otherwise stranded the handle after recovery).
-	commitErr map[meta.Ino]error
+	commitErr      map[meta.Ino]error
+	closedRetained map[meta.Ino]struct{}
+	onRetireClosed func(localPath string, ino meta.Ino) bool
 
 	layoutPending map[meta.Ino]bool
 	// freshCreate marks inodes this bridge CREATED locally: their first
@@ -142,13 +146,15 @@ type Bridge struct {
 	// read legitimately disagree with the server (replica lag); a revision
 	// recorded from someone else's write, or a publication minutes ago, gives
 	// a read nothing to wait for.
-	revAt    map[meta.Ino]time.Time
-	pending  map[meta.Ino][]pendingWrite
-	truncs   map[meta.Ino]int64  // truncate-only growth awaiting the next commit
-	truncSeq map[meta.Ino]uint64 // monotonic counter fencing b.truncs cleanup
+	revAt        map[meta.Ino]time.Time
+	pending      map[meta.Ino][]pendingWrite
+	truncs       map[meta.Ino]int64  // truncate-only growth awaiting the next commit
+	truncSeq     map[meta.Ino]uint64 // monotonic counter fencing b.truncs cleanup
 	retryRunning bool
 	retryStop    chan struct{}
 	retryOnce    sync.Once
+	retryWg      sync.WaitGroup
+	fetchWg      sync.WaitGroup
 	// modes and mtimes remember local-only create/setattr values until the
 	// first remote publication applies them server-side.
 	modes  map[meta.Ino]uint32
@@ -231,9 +237,11 @@ func NewBridge(cfg Config) *Bridge {
 		layoutPendingID:   make(map[meta.Ino]string),
 		freshCreate:       make(map[meta.Ino]bool),
 		commitErr:         make(map[meta.Ino]error),
+		closedRetained:    make(map[meta.Ino]struct{}),
 		verifyBase:        make(map[meta.Ino]verifyBase),
 		emptyPlaceholders: make(map[string]verifyBase),
 	}
+	br.clientPtr.Store(cfg.Client)
 	br.blocks.cacheDir = cfg.CacheDir
 	br.blocks.diskBudget = cfg.SpoolBudget
 	br.blocks.freeRatio = cfg.FreeSpaceRatio
@@ -248,6 +256,65 @@ func NewBridge(cfg Config) *Bridge {
 		return p, ok
 	}
 	return br
+}
+
+func (b *Bridge) client() *client.Client {
+	return b.clientPtr.Load()
+}
+
+// ResetForGeneration stops any background retry loop and in-flight block
+// fetches, then resets all mutable bridge state before binding the shared
+// engine to a new main generation.
+func (b *Bridge) ResetForGeneration(cl *client.Client) {
+	if b == nil {
+		return
+	}
+	_ = b.ShutdownCtx(context.Background())
+
+	b.commitMu.Lock()
+	b.commitLocks = make(map[meta.Ino]*sync.Mutex)
+	b.commitMu.Unlock()
+
+	root := strings.TrimSuffix(b.cfg.RemoteRoot, "/")
+	if root == "" {
+		root = "/"
+	}
+
+	b.clientPtr.Store(cl)
+
+	b.mu.Lock()
+	b.stagedSlices = make(map[uint64]*stagedSlice)
+	b.paths = map[meta.Ino]string{rootIno: root}
+	b.sizes = make(map[meta.Ino]int64)
+	b.revs = make(map[meta.Ino]int64)
+	b.pubSizes = make(map[meta.Ino]int64)
+	b.revAt = make(map[meta.Ino]time.Time)
+	b.buffered = make(map[meta.Ino]int64)
+	b.pending = make(map[meta.Ino][]pendingWrite)
+	b.truncs = make(map[meta.Ino]int64)
+	b.truncSeq = make(map[meta.Ino]uint64)
+	b.modes = make(map[meta.Ino]uint32)
+	b.mtimes = make(map[meta.Ino]time.Time)
+	b.sentinels = make(map[string]meta.Ino)
+	b.nextHeldIno = heldInoBase
+	b.moved = make(map[meta.Ino]string)
+	b.replacements = make(map[string]meta.Ino)
+	b.locks = newLockTable()
+	b.layoutPending = make(map[meta.Ino]bool)
+	b.layoutPendingID = make(map[meta.Ino]string)
+	b.freshCreate = make(map[meta.Ino]bool)
+	b.commitErr = make(map[meta.Ino]error)
+	b.closedRetained = make(map[meta.Ino]struct{})
+	b.onRetireClosed = nil
+	b.verifyBase = make(map[meta.Ino]verifyBase)
+	b.emptyPlaceholders = make(map[string]verifyBase)
+	b.emptyPlaceholderOrd = nil
+	b.retryRunning = false
+	b.retryStop = make(chan struct{})
+	b.retryOnce = sync.Once{}
+	b.mu.Unlock()
+
+	b.blocks.resetForGeneration()
 }
 
 // verifyBase is an identity-verified recovery's publication constraint.
@@ -398,6 +465,25 @@ func newBlockRegistry() *blockRegistry {
 		sliceUsed:     make(map[uint64]int64),
 		budgetCh:      make(chan struct{}),
 	}
+}
+
+func (r *blockRegistry) resetForGeneration() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.m = make(map[uint64]*blockEntry)
+	r.pins = make(map[string]int)
+	r.pinSizes = make(map[string]int64)
+	r.pinnedBytes = 0
+	r.stagedMemBytes = 0
+	r.waitingSlices = make(map[uint64]int)
+	r.sliceTarget = make(map[uint64]int64)
+	r.sliceUsed = make(map[uint64]int64)
+	r.stagedDiskBytes = 0
+	close(r.budgetCh)
+	r.budgetCh = make(chan struct{})
+	r.mu.Unlock()
 }
 
 // ctxOf adapts a meta.Context to a context.Context (meta.Context embeds

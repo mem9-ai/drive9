@@ -106,6 +106,9 @@ func Archive(c *client.Client, args []string) error {
 	if !isRemote {
 		return fmt.Errorf("archive source must be a remote path (got %q); use drive9 pack for local→remote archiving", srcArg)
 	}
+	if err := requireNoLayerWithRemoteContext("", c, srcRP, srcArg); err != nil {
+		return err
+	}
 	if srcRP.Path == "" {
 		srcRP.Path = "/"
 	}

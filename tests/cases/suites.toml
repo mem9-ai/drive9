@@ -496,6 +496,18 @@ timeout = "15m"
 
 # ---- Daily / Staging `[prod-ext]` cases (skip cleanly when cloud credentials absent) ----
 [[case]]
+name = "drive9/fuse/git-workspace-checkpoint"
+tier = "daily-prod-ext"
+no_mount = true
+timeout = "60m"
+
+[[case]]
+name = "drive9/fuse/layer-fs"
+tier = "daily-prod-ext"
+no_mount = true
+timeout = "20m"
+
+[[case]]
 name = "drive9/api/tokens"
 tier = "daily-prod-ext"
 no_mount = true

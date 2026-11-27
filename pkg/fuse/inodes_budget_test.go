@@ -16,9 +16,8 @@ func TestInodeTableChargesAndReleasesBudget(t *testing.T) {
 	for i := 0; i < paths; i++ {
 		m.Lookup("/dir/file"+string(rune('a'+i)), false, 1, time.Now())
 	}
-	// The root inode was charged at construction time? No: the table is
-	// built before the budget is wired, so only the new entries count.
-	want := int64(paths) * inodeTableEntryBytes
+	// Attaching the budget charges the pre-existing root as well.
+	want := int64(paths+1) * inodeTableEntryBytes
 	if got := budget.UsedBy(membudget.ClassInodeTable); got != want {
 		t.Fatalf("inode charge = %d, want %d", got, want)
 	}
@@ -59,7 +58,7 @@ func TestInodeTableBudgetIsForced(t *testing.T) {
 	if snap.Overruns == 0 {
 		t.Fatal("overruns not counted")
 	}
-	if got := snap.Classes[membudget.ClassInodeTable]; got != 5*inodeTableEntryBytes {
+	if got := snap.Classes[membudget.ClassInodeTable]; got != 6*inodeTableEntryBytes {
 		t.Fatalf("inode class charge = %d", got)
 	}
 }

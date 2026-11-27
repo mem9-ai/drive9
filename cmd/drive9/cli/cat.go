@@ -25,6 +25,10 @@ func catWithWriter(c *client.Client, args []string, out io.Writer) error {
 		return err
 	}
 	defer withObjectAuthLocal(authLocal)()
+	layerRef, fence, args, err := ParseLayerViewFlags(args)
+	if err != nil {
+		return err
+	}
 	fs := flag.NewFlagSet("fs cat", flag.ContinueOnError)
 	offset := fs.Int64("offset", 0, "byte offset for a positional read; requires --length")
 	length := fs.Int64("length", 0, "byte length for a positional read; requires --offset")
@@ -55,7 +59,7 @@ func catWithWriter(c *client.Client, args []string, out io.Writer) error {
 		return fmt.Errorf("--length must be >= 0")
 	}
 	path := fs.Arg(0)
-	h, err := fsHandleForArg(c, path)
+	h, err := fsHandleForLayerArg(c, path, layerRef, fence)
 	if err != nil {
 		return err
 	}

@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	pathpkg "path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -799,6 +800,14 @@ func resolveMountedGitTarget(target string) (mountedGitTarget, error) {
 	for {
 		state, _, err := mountstate.ReadProcessState(candidate)
 		if err == nil {
+			if runtime.GOOS != "windows" {
+				if err := refreshMountedView(&state, nil, time.Second); err != nil {
+					return mountedGitTarget{}, fmt.Errorf("drive9 git: %w", err)
+				}
+			}
+			if state.LayerID != "" {
+				return mountedGitTarget{}, fmt.Errorf("drive9 git requires a main-view mount; %q is mounted on a Layer", candidate)
+			}
 			if strings.TrimSpace(state.RemoteRoot) == "" {
 				return mountedGitTarget{}, fmt.Errorf("drive9 mount metadata for %q does not include remote_root; remount with a newer drive9 CLI", candidate)
 			}

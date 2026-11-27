@@ -169,11 +169,21 @@ func NewShadowStoreWithQuota(dir string, freeRatio float64, maxBytes int64) (*Sh
 	}
 	// Sweep retired shadows leaked by a previous process that died while
 	// pinned readers still held them — pins cannot survive a restart, and
-	// nothing else ever deletes these files.
+	// nothing else ever deletes these files. Also sweep orphaned .shadow.unlinkbak
+	// files that have no paired .meta.unlinkbak recovery record in ../pending.
+	pendingSiblingDir := filepath.Join(filepath.Dir(dir), "pending")
 	if entries, err := os.ReadDir(dir); err == nil {
 		for _, e := range entries {
-			if strings.Contains(e.Name(), ".shadow.retired.") || strings.HasSuffix(e.Name(), ".shadow.tmp") {
-				_ = os.Remove(filepath.Join(dir, e.Name()))
+			name := e.Name()
+			if strings.Contains(name, ".shadow.retired.") || strings.HasSuffix(name, ".shadow.tmp") {
+				_ = os.Remove(filepath.Join(dir, name))
+				continue
+			}
+			if strings.HasSuffix(name, ".shadow.unlinkbak") {
+				hash := strings.TrimSuffix(name, ".shadow.unlinkbak")
+				if _, merr := os.Stat(filepath.Join(pendingSiblingDir, hash+".meta.unlinkbak")); errors.Is(merr, os.ErrNotExist) {
+					_ = os.Remove(filepath.Join(dir, name))
+				}
 			}
 		}
 	}
@@ -1186,7 +1196,21 @@ func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 
 	s.mu.Lock()
 
+	oldHashKey := "__hash:" + HashPath(oldPath)
 	sf, ok := s.files[oldPath]
+	if !ok {
+		if recovered, rOK := s.files[oldHashKey]; rOK {
+			sf = recovered
+			delete(s.files, oldHashKey)
+			s.files[oldPath] = sf
+			ok = true
+		}
+	} else if staleOldHashSF, rOK := s.files[oldHashKey]; rOK {
+		if staleOldHashSF != nil && staleOldHashSF != sf && staleOldHashSF.fd != nil {
+			_ = staleOldHashSF.fd.Close()
+		}
+		delete(s.files, oldHashKey)
+	}
 	if !ok {
 		s.mu.Unlock()
 		return false
@@ -1204,6 +1228,18 @@ func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 	}
 
 	replacedSF := s.files[newPath]
+	newHashKey := "__hash:" + HashPath(newPath)
+	if replacedSF == nil {
+		if recoveredDst, rOK := s.files[newHashKey]; rOK {
+			replacedSF = recoveredDst
+			delete(s.files, newHashKey)
+		}
+	} else if staleHashSF, rOK := s.files[newHashKey]; rOK {
+		if staleHashSF != nil && staleHashSF != replacedSF && staleHashSF.fd != nil {
+			_ = staleHashSF.fd.Close()
+		}
+		delete(s.files, newHashKey)
+	}
 	replacedGen := s.active[newPath]
 	replacedSize := s.recoveredSizes[newSP]
 	delete(s.recoveredSizes, oldSP)
@@ -1671,6 +1707,19 @@ func (s *ShadowStore) removeCoreLocked(remotePath string, expectedGen ContentGen
 	diskPath := s.shadowPath(remotePath)
 	cleanup.removedSize = s.recoveredSizes[diskPath]
 	delete(s.recoveredSizes, diskPath)
+
+	hashKey := "__hash:" + HashPath(remotePath)
+	if _, ok := s.files[remotePath]; !ok {
+		if recovered, rOK := s.files[hashKey]; rOK {
+			delete(s.files, hashKey)
+			s.files[remotePath] = recovered
+		}
+	} else if staleHashSF, rOK := s.files[hashKey]; rOK {
+		if staleHashSF != nil && staleHashSF != s.files[remotePath] && staleHashSF.fd != nil {
+			_ = staleHashSF.fd.Close()
+		}
+		delete(s.files, hashKey)
+	}
 
 	gen := s.active[remotePath]
 	if gen != 0 && s.refs[gen] > 0 {
@@ -2169,6 +2218,206 @@ func (s *ShadowStore) bumpWriteGenLocked(remotePath string) ContentGen {
 		sf.contentGen = ContentGen(g)
 	}
 	return ContentGen(g)
+}
+
+func (s *ShadowStore) shadowTransferBackupPath(remotePath string) string {
+	return s.shadowPath(remotePath) + ".unlinkbak"
+}
+
+// BackupForTransfer stashes remotePath's active shadow under a non-.shadow
+// backup file (<hash>.shadow.unlinkbak) and removes remotePath from active
+// accounting so MovePayloadReversible can reversibly replace a live destination
+// without leaving orphan .shadow bytes in PendingBytes() across crashes.
+func (s *ShadowStore) BackupForTransfer(remotePath string) (bool, error) {
+	if s == nil || remotePath == "" {
+		return false, nil
+	}
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
+
+	s.mu.Lock()
+	sf, ok := s.files[remotePath]
+	if !ok {
+		hashKey := "__hash:" + HashPath(remotePath)
+		if recovered, recoveredOK := s.files[hashKey]; recoveredOK {
+			sf = recovered
+			delete(s.files, hashKey)
+			s.files[remotePath] = sf
+			ok = true
+		} else {
+			fd, err := os.OpenFile(s.shadowPath(remotePath), os.O_RDWR, 0o644)
+			if err != nil {
+				s.mu.Unlock()
+				if errors.Is(err, os.ErrNotExist) {
+					return false, nil
+				}
+				return false, err
+			}
+			fi, serr := fd.Stat()
+			if serr != nil {
+				_ = fd.Close()
+				s.mu.Unlock()
+				return false, serr
+			}
+			sf = &ShadowFile{fd: fd, size: fi.Size()}
+			s.files[remotePath] = sf
+			ok = true
+		}
+	}
+	if !ok || sf == nil {
+		s.mu.Unlock()
+		return false, nil
+	}
+	diskPath := s.shadowPath(remotePath)
+	backupPath := s.shadowTransferBackupPath(remotePath)
+	_ = os.Remove(backupPath)
+
+	gen := s.active[remotePath]
+	if gen != 0 && s.refs[gen] > 0 {
+		oldFD := sf.fd
+		oldSize := sf.size
+		s.mu.Unlock()
+		if err := copyShadowFile(backupPath, oldFD, oldSize); err != nil {
+			_ = os.Remove(backupPath)
+			return false, err
+		}
+		s.mu.Lock()
+		cleanup, removed := s.removeCoreLocked(remotePath, 0, shadowRetiredSnapshot)
+		s.mu.Unlock()
+		if removed {
+			if _, rerr := s.runRemoveCleanupChecked(cleanup); rerr != nil {
+				_ = os.Remove(backupPath)
+				return false, rerr
+			}
+		}
+		return true, nil
+	}
+
+	if err := os.Rename(diskPath, backupPath); err != nil {
+		s.mu.Unlock()
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	removedSize := sf.size
+	if rec, hadRec := s.recoveredSizes[diskPath]; hadRec && removedSize == 0 {
+		removedSize = rec
+	}
+	delete(s.recoveredSizes, diskPath)
+	s.resizeWrittenLocked(sf, 0)
+	_ = sf.fd.Close()
+	delete(s.files, remotePath)
+	if gen != 0 {
+		delete(s.active, remotePath)
+		delete(s.genFile, gen)
+		delete(s.refs, gen)
+	}
+	delete(s.writeGen, remotePath)
+	s.mu.Unlock()
+
+	if removedSize > 0 {
+		s.pendingBytes.Add(-removedSize)
+	}
+	return true, nil
+}
+
+// RestoreTransferBackup restores <hash>.shadow.unlinkbak back to <hash>.shadow
+// when remotePath has no active shadow payload.
+func (s *ShadowStore) RestoreTransferBackup(remotePath string) error {
+	if s == nil || remotePath == "" {
+		return nil
+	}
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
+
+	diskPath := s.shadowPath(remotePath)
+	backupPath := s.shadowTransferBackupPath(remotePath)
+	if err := os.Rename(backupPath, diskPath); err != nil {
+		return err
+	}
+	fd, err := os.OpenFile(diskPath, os.O_RDWR, 0o644)
+	if err != nil {
+		_ = os.Rename(diskPath, backupPath)
+		return err
+	}
+	fi, serr := fd.Stat()
+	if serr != nil {
+		_ = fd.Close()
+		_ = os.Rename(diskPath, backupPath)
+		return serr
+	}
+
+	s.mu.Lock()
+	if old, ok := s.files[remotePath]; ok && old != nil {
+		s.resizeWrittenLocked(old, 0)
+		_ = old.fd.Close()
+	}
+	delete(s.recoveredSizes, diskPath)
+	s.files[remotePath] = &ShadowFile{fd: fd, size: fi.Size()}
+	s.bumpWriteGenLocked(remotePath)
+	s.mu.Unlock()
+
+	if fi.Size() > 0 {
+		s.pendingBytes.Add(fi.Size())
+	}
+	return nil
+}
+
+// DiscardTransferBackup removes any stashed <hash>.shadow.unlinkbak for remotePath.
+func (s *ShadowStore) DiscardTransferBackup(remotePath string) {
+	if s == nil || remotePath == "" {
+		return
+	}
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
+	_ = os.Remove(s.shadowTransferBackupPath(remotePath))
+}
+
+// AdoptRecoveredPath registers <dir>/<hash>.shadow directly under remotePath,
+// migrating or closing any "__hash:"+hash placeholder loaded by RecoverFromDisk
+// before PendingIndex reconciled a mid-transfer .unlinkbak backup.
+func (s *ShadowStore) AdoptRecoveredPath(remotePath string) error {
+	if s == nil || remotePath == "" {
+		return nil
+	}
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
+
+	sp := s.shadowPath(remotePath)
+	hashKey := "__hash:" + HashPath(remotePath)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if existing, exists := s.files[remotePath]; exists && existing != nil {
+		if staleHashSF, hOK := s.files[hashKey]; hOK {
+			if staleHashSF != nil && staleHashSF != existing && staleHashSF.fd != nil {
+				_ = staleHashSF.fd.Close()
+			}
+			delete(s.files, hashKey)
+		}
+		delete(s.recoveredSizes, sp)
+		return nil
+	}
+	if recovered, rOK := s.files[hashKey]; rOK && recovered != nil {
+		delete(s.files, hashKey)
+		s.files[remotePath] = recovered
+		delete(s.recoveredSizes, sp)
+		return nil
+	}
+	fd, err := os.OpenFile(sp, os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	fi, serr := fd.Stat()
+	if serr != nil {
+		_ = fd.Close()
+		return serr
+	}
+	s.files[remotePath] = &ShadowFile{fd: fd, size: fi.Size()}
+	delete(s.recoveredSizes, sp)
+	return nil
 }
 
 func isRegular(e os.DirEntry) bool {

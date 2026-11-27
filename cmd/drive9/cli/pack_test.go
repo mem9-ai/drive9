@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,7 +18,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/mountcontrol"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
 
@@ -735,12 +740,13 @@ func TestPackMountProfileOverrideUsesEffectiveProfilePackPaths(t *testing.T) {
 	mustWriteFile(t, filepath.Join(localRoot, "overlay", ".git", "config"), []byte("git\n"), 0o644)
 	mustWriteFile(t, filepath.Join(localRoot, "overlay", "dist", "app.js"), []byte("bundle\n"), 0o644)
 	_, err := mountstate.WriteProcessState(mountPoint, mountstate.ProcessState{
-		PID:        os.Getpid(),
-		MountPoint: mountPoint,
-		RemoteRoot: "/remote",
-		Profile:    "coding-agent",
-		LocalRoot:  localRoot,
-		PackPaths:  []string{".git"},
+		ControlSocket: fixedArchiveSocket(t, ""),
+		PID:           os.Getpid(),
+		MountPoint:    mountPoint,
+		RemoteRoot:    "/remote",
+		Profile:       "coding-agent",
+		LocalRoot:     localRoot,
+		PackPaths:     []string{".git"},
 	})
 	if err != nil {
 		t.Fatalf("WriteProcessState: %v", err)
@@ -792,12 +798,13 @@ func TestPackMountProfileNoneDoesNotUseMountPackPaths(t *testing.T) {
 	localRoot := t.TempDir()
 	mustWriteFile(t, filepath.Join(localRoot, "overlay", ".git", "config"), []byte("git\n"), 0o644)
 	_, err := mountstate.WriteProcessState(mountPoint, mountstate.ProcessState{
-		PID:        os.Getpid(),
-		MountPoint: mountPoint,
-		RemoteRoot: "/remote",
-		Profile:    "coding-agent",
-		LocalRoot:  localRoot,
-		PackPaths:  []string{".git"},
+		ControlSocket: fixedArchiveSocket(t, ""),
+		PID:           os.Getpid(),
+		MountPoint:    mountPoint,
+		RemoteRoot:    "/remote",
+		Profile:       "coding-agent",
+		LocalRoot:     localRoot,
+		PackPaths:     []string{".git"},
 	})
 	if err != nil {
 		t.Fatalf("WriteProcessState: %v", err)
@@ -825,18 +832,20 @@ func TestPackMountProfileNoneDoesNotUseMountPackPaths(t *testing.T) {
 
 func TestRunUmountPacksAfterUnmount(t *testing.T) {
 	state := mountstate.ProcessState{
-		PID:        1234,
-		MountPoint: "/mnt/drive9",
-		RemoteRoot: "/remote",
-		Profile:    "coding-agent",
-		LocalRoot:  filepath.Join(t.TempDir(), "local"),
-		PackPaths:  []string{".git"},
+		ControlSocket: "fixture.sock",
+		PID:           1234,
+		MountPoint:    "/mnt/drive9",
+		RemoteRoot:    "/remote",
+		Profile:       "coding-agent",
+		LocalRoot:     filepath.Join(t.TempDir(), "local"),
+		PackPaths:     []string{".git"},
 	}
 	var calls []string
 	var gotPaths []string
 	deps := umountDeps{
-		goos:     "linux",
-		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
+		requestStatus: fixedArchiveStatus(""),
+		goos:          "linux",
+		lookPath:      fakeLookPath(map[string]bool{"fusermount3": true}),
 		run: func(argv []string) error {
 			calls = append(calls, "run")
 			return nil
@@ -890,17 +899,21 @@ func TestRunUmountPacksAfterUnmount(t *testing.T) {
 	}
 }
 
-func TestRunUmountAutoPacksCodingAgentMount(t *testing.T) {
+func TestRunUmountAutoPacksLegacyMainMount(t *testing.T) {
 	state := mountstate.ProcessState{
-		PID:        1234,
-		MountPoint: "/mnt/drive9",
-		RemoteRoot: "/remote",
-		Profile:    "coding-agent",
-		LocalRoot:  filepath.Join(t.TempDir(), "local"),
-		PackPaths:  []string{".git"},
+		ControlSocket: "fixture.sock",
+		PID:           1234,
+		MountPoint:    "/mnt/drive9",
+		RemoteRoot:    "/remote",
+		Profile:       "coding-agent",
+		LocalRoot:     filepath.Join(t.TempDir(), "local"),
+		PackPaths:     []string{".git"},
 	}
 	var gotArchives []string
 	deps := umountDeps{
+		requestStatus: func(context.Context, string, time.Duration) (*mountcontrol.StatusResponse, error) {
+			return &mountcontrol.StatusResponse{OK: true, MountPoint: state.MountPoint, PID: state.PID}, nil
+		},
 		goos:     "linux",
 		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
 		run:      func(argv []string) error { return nil },
@@ -1596,5 +1609,259 @@ func TestPackPathWithinUsesFilesystemIdentity(t *testing.T) {
 	}
 	if !packPathUnder(filepath.Join(installed, "child"), installed) {
 		t.Fatal("descendant of a scope entry was not matched")
+	}
+}
+
+func TestLayerMountUnpacksIntoSelectedOverlay(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
+	oldMount := mountFuse
+	t.Cleanup(func() { mountFuse = oldMount })
+	writeTestProfile(t, "layer-pack", "[pack]\n.git\n")
+	const id = "layer_01j8z6kh2m9q7w3r5t6y8v0p1a"
+	const base = "/repo"
+	const file = ".git/config"
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "overlay", file), []byte("layer data"), 0600)
+	var archive bytes.Buffer
+	if _, err := writePackArchive(context.Background(), &archive, packOptions{LocalRoot: src, RemoteRoot: base, Paths: []string{".git"}}); err != nil {
+		t.Fatal(err)
+	}
+	defaultPath, err := defaultPackArchivePath(base, "layer-pack")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		name, archivePath string
+		args              []string
+	}{
+		{"automatic", base + defaultPath, nil},
+		{"explicit", base + "/packs/explicit.tar.gz", []string{"--no-auto-unpack", "--unpack", ":/repo/packs/explicit.tar.gz"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/v1/layers/task=auth":
+					_, _ = io.WriteString(w, `{"layer_id":"`+id+`","base_root_path":"/repo"}`)
+				case "/v1/views/" + id + "/v1/fs" + tt.archivePath:
+					_, _ = w.Write(archive.Bytes())
+				default:
+					if strings.HasPrefix(r.URL.Path, "/v1/fs/") {
+						t.Errorf("unexpected main read %s", r.URL.Path)
+					}
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+			local := t.TempDir()
+			mustWriteFile(t, filepath.Join(local, "overlay", file), []byte("main data"), 0600)
+			mounted := false
+			mountFuse = func(opts *mountFuseOptions) error {
+				mounted = true
+				if opts.LayerRef != id || opts.RemoteRoot != base || opts.LocalRoot != local {
+					t.Errorf("unexpected mount roots or identity")
+				}
+				return nil
+			}
+			args := []string{"--foreground", "--mode=fuse", "--server", srv.URL, "--api-key", "test", "--layer=task=auth", "--profile=layer-pack", "--local-root", local}
+			args = append(args, tt.args...)
+			if err := MountCmd(append(args, t.TempDir())); err != nil {
+				t.Fatal(err)
+			}
+			if !mounted {
+				t.Fatal("mount not reached")
+			}
+			assertFileContent(t, filepath.Join(local, "overlay", file), "main data")
+			viewLocal, err := mountstate.LayerLocalRoot(local, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertFileContent(t, filepath.Join(viewLocal, "overlay", file), "layer data")
+			mountPoint := t.TempDir()
+			state := mountstate.ProcessState{PID: os.Getpid(), MountPoint: mountPoint, Server: srv.URL, LocalRoot: local, RemoteRoot: base, Profile: "layer-pack", LayerID: id, LayerReadOnly: true}
+			state.ControlSocket = fixedArchiveSocket(t, id)
+			pidFile, err := mountstate.WriteProcessState(mountPoint, state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Remove(pidFile) })
+			if err := os.Remove(filepath.Join(viewLocal, "overlay", file)); err != nil {
+				t.Fatal(err)
+			}
+			c := client.New(srv.URL, "test")
+			if err := Unpack(c, []string{"--mount", mountPoint, ":" + tt.archivePath}); err != nil {
+				t.Fatal(err)
+			}
+			assertFileContent(t, filepath.Join(viewLocal, "overlay", file), "layer data")
+			if err := Pack(c, []string{"--mount", mountPoint, ":" + tt.archivePath}); err == nil || !strings.Contains(err.Error(), "read-only") {
+				t.Fatalf("pack into read-only layer: %v", err)
+			}
+			if err := Unpack(client.New("https://example.invalid", ""), []string{"--mount", mountPoint, ":" + tt.archivePath}); err == nil || !strings.Contains(err.Error(), "different servers") {
+				t.Fatalf("foreign server selected: %v", err)
+			}
+		})
+	}
+}
+
+func TestLayerUnmountPacksOnlyTheLayerOverlay(t *testing.T) {
+	const id = "layer_01j8z6kh2m9q7w3r5t6y8v0p1a"
+	const file = "dist/file"
+	uploaded := make(chan []byte, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/status" {
+			_, _ = io.WriteString(w, `{"inline_threshold":1048576,"max_upload_bytes":10485760}`)
+			return
+		}
+		if r.Method == http.MethodPut && r.URL.Path == "/v1/views/"+id+"/v1/fs/repo/archive" {
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Error(err)
+			}
+			uploaded <- data
+			_, _ = io.WriteString(w, `{"revision":1}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	base := t.TempDir()
+	viewRoot, err := mountstate.LayerLocalRoot(base, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, filepath.Join(base, "overlay", file), []byte("main file"), 0600)
+	mustWriteFile(t, filepath.Join(viewRoot, "overlay", file), []byte("layer file"), 0600)
+	state := mountstate.ProcessState{Server: srv.URL, CredentialKind: mountstate.CredentialKindAPIKey, APIKey: "test", LocalRoot: base, RemoteRoot: "/repo", Profile: "coding-agent", LayerID: id}
+	if err := defaultPackAfterUnmount(context.Background(), state, []string{":/repo/archive"}, []string{"dist"}); err != nil {
+		t.Fatal(err)
+	}
+	dst := t.TempDir()
+	select {
+	case data := <-uploaded:
+		if _, err := extractPackArchive(context.Background(), bytes.NewReader(data), unpackOptions{LocalRoot: dst}); err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatal("layer upload missing")
+	}
+	assertFileContent(t, filepath.Join(dst, "overlay", file), "layer file")
+}
+
+func TestSupervisedLayerPinsResolvedArchiveIdentity(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
+	const id = "layer_01j8z6kh2m9q7w3r5t6y8v0p1a"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/layers/task=auth" {
+			_, _ = io.WriteString(w, `{"layer_id":"`+id+`","base_root_path":"/repo"}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	old := runSuperviseForeground
+	t.Cleanup(func() { runSuperviseForeground = old })
+	base := t.TempDir()
+	for _, flags := range [][]string{{"--layer", "task=auth"}, {"--layer=task=auth"}} {
+		t.Setenv(EnvMountLocalOnlyPatterns, "**/.agent-cache/**")
+		t.Setenv(EnvMountRemoteOnlyPatterns, "**/results/**")
+		var got mountSuperviseStartRequest
+		runSuperviseForeground = func(req mountSuperviseStartRequest) error { got = req; return nil }
+		args := []string{"--supervise-foreground", "--mode=fuse", "--auth", "local", "--read-only", "--profile=coding-agent", "--local-root", base, "--server", srv.URL, "--api-key", "test"}
+		args = append(args, flags...)
+		if err := MountCmd(append(args, t.TempDir())); err != nil {
+			t.Fatal(err)
+		}
+		if got.LayerID != id || !got.LayerReadOnly || got.LocalRoot != base || got.RemoteRoot != "/repo" {
+			t.Fatalf("incorrect supervisor layer metadata")
+		}
+		worker := workerArgsForSupervise(got.OriginalArgs)
+		wantLayer := []string{"--layer", id}
+		if len(flags) == 1 {
+			wantLayer = []string{"--layer=" + id}
+		}
+		wantFlags := []string{"--foreground", "--supervised", "--local-only=**/.agent-cache/**", "--remote-only=**/results/**", "--auth=local", "--mode=fuse", "--read-only", "--profile=coding-agent", "--local-root", base, "--server", srv.URL}
+		// sanitize drops credentials; the target mountpoint remains the last argument.
+		want := append([]string{"mount"}, wantFlags...)
+		want = append(want, wantLayer...)
+		want = append(want, got.MountPoint)
+		if !reflect.DeepEqual(worker, want) {
+			t.Errorf("worker args differ: got %q, want %q", worker, want)
+		}
+	}
+}
+
+func TestLayerDefaultRootUsesResolvedRemoteRoot(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
+	const id = "layer_01j8z6kh2m9q7w3r5t6y8v0p1a"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/layers/work" {
+			_, _ = io.WriteString(w, `{"layer_id":"`+id+`","base_root_path":"/repo"}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	old := runSuperviseForeground
+	t.Cleanup(func() { runSuperviseForeground = old })
+	var roots []string
+	runSuperviseForeground = func(req mountSuperviseStartRequest) error {
+		roots = append(roots, req.LocalRoot)
+		if req.RemoteRoot != "/repo" || req.LayerID != id {
+			t.Fatalf("layer metadata %q %q", req.RemoteRoot, req.LayerID)
+		}
+		return nil
+	}
+	for _, remote := range [][]string{nil, {":/repo"}} {
+		args := []string{"--supervise-foreground", "--mode=fuse", "--auth", "server", "--no-auto-unpack", "--profile=coding-agent", "--layer", "work", "--server", srv.URL, "--api-key", "test"}
+		args = append(args, remote...)
+		if err := MountCmd(append(args, t.TempDir())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(roots) != 2 || roots[0] == "" || roots[0] != roots[1] {
+		t.Fatalf("default roots %v", roots)
+	}
+}
+
+func startFakeMountStatusSocket(t *testing.T, getStatus func() mountcontrol.StatusResponse) string {
+	t.Helper()
+	shortDir, err := os.MkdirTemp("/tmp", "d9cli")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(shortDir) })
+	sockPath := filepath.Join(shortDir, "ctrl.sock")
+	ln, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+
+	go func() {
+		for {
+			conn, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				var req mountcontrol.DrainRequest
+				if json.NewDecoder(c).Decode(&req) != nil {
+					return
+				}
+				_ = json.NewEncoder(c).Encode(getStatus())
+			}(conn)
+		}
+	}()
+	return sockPath
+}
+
+func fixedArchiveSocket(t *testing.T, layer string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		return ""
+	}
+	return startFakeMountStatusSocket(t, func() mountcontrol.StatusResponse { return mountcontrol.StatusResponse{OK: true, Layer: &layer} })
+}
+
+func fixedArchiveStatus(layer string) func(context.Context, string, time.Duration) (*mountcontrol.StatusResponse, error) {
+	return func(context.Context, string, time.Duration) (*mountcontrol.StatusResponse, error) {
+		return &mountcontrol.StatusResponse{OK: true, Layer: &layer}, nil
 	}
 }

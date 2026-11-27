@@ -128,7 +128,6 @@ func ExampleClient_filesystemCRUDAndMetadata() {
 
 	_, _ = c.SQL("select path, size_bytes from files limit 10")
 	_, _ = c.Grep("deployment checklist", "/workspace/", 20)
-	_, _ = c.GrepWithLayer("deployment checklist", "/workspace/", 20, "layer-123")
 
 	params := url.Values{}
 	params.Set("name", "*.md")
@@ -587,50 +586,39 @@ func ExampleClient_eventsLayersGitAndJournal() {
 		OnDisconnected: func(err error) {},
 	})
 
-	layer, err := c.CreateFSLayer(ctx, drive9.FSLayerCreateRequest{
+	layer, err := c.CreateLayer(ctx, drive9.LayerCreateRequest{
 		BaseRootPath: "/workspace/",
 		Name:         "agent-a-work",
 		ActorID:      "agent-a",
 	})
 	if err == nil {
-		_, _ = c.ListFSLayers(ctx)
-		_, _ = c.GetFSLayer(ctx, layer.LayerID)
-		_, _ = c.UpsertFSLayerEntry(ctx, layer.LayerID, drive9.FSLayerEntryRequest{
-			Path:        "/workspace/note.txt",
-			Op:          "upsert",
-			Kind:        "file",
-			Content:     []byte("draft"),
-			ContentType: "text/plain",
-			SizeBytes:   int64(len("draft")),
-			Mode:        0o644,
-		})
-		_, _ = c.UploadFSLayerFile(ctx, layer.LayerID, "/workspace/blob.bin", bytes.NewReader([]byte("blob")), int64(len("blob")), 0, 0o644, true)
-		_, _ = c.ReadFSLayerFile(ctx, layer.LayerID, "/workspace/blob.bin", nil)
-		rc, err := c.ReadFSLayerFileStream(ctx, layer.LayerID, "/workspace/blob.bin", nil)
-		if err == nil {
-			_ = rc.Close()
+		_, _ = c.ListLayers(ctx, drive9.LayerListOptions{Limit: 50})
+		_, _ = c.ListAllLayers(ctx)
+		_, _ = c.GetLayer(ctx, layer.LayerID)
+		if viewClient, verr := c.WithView(drive9.ViewBinding{LayerID: layer.LayerID}); verr == nil {
+			_ = viewClient.ViewBinding()
+			_ = viewClient.WriteCtx(ctx, "/workspace/note.txt", []byte("draft"))
+			_, _ = viewClient.ReadCtx(ctx, "/workspace/note.txt")
 		}
-		_, _ = c.GetFSLayerEntry(ctx, layer.LayerID, "/workspace/blob.bin")
-		_, _ = c.GetFSLayerEntryAtSeq(ctx, layer.LayerID, "/workspace/blob.bin", 1)
-		_, _ = c.DiffFSLayer(ctx, layer.LayerID)
-		_, _ = c.DiffFSLayerAtSeq(ctx, layer.LayerID, 1)
-		_, _ = c.ReplayFSLayer(ctx, layer.LayerID)
-		_, _ = c.ReplayFSLayerAtSeq(ctx, layer.LayerID, 1)
-		checkpoint, err := c.CheckpointFSLayer(ctx, layer.LayerID, drive9.FSLayerCheckpointRequest{Label: "before-commit"})
-		if err == nil {
-			_, _ = c.GetFSLayerCheckpoint(ctx, checkpoint.CheckpointID)
-			child, err := c.ForkFSLayer(ctx, layer.LayerID, drive9.FSLayerForkRequest{
-				Name:         "agent-a-child",
-				CheckpointID: checkpoint.CheckpointID,
-			})
-			if err == nil {
-				_, _ = c.ListFSLayerChain(ctx, child.LayerID)
-				_ = c.DeleteFSLayer(ctx, child.LayerID, true)
+		if child, ferr := c.ForkLayer(ctx, layer.LayerID, drive9.LayerForkRequest{Name: "agent-a-child"}); ferr == nil {
+			if lease, berr := c.BindLayerMount(ctx, child.LayerID, drive9.LayerMountBindRequest{
+				MountID:       "mnt-1",
+				OperationID:   "op-1",
+				ExpectedFence: child.Fence,
+			}); berr == nil {
+				_, _ = c.RenewLayerMount(ctx, child.LayerID, drive9.LayerMountRenewRequest{
+					MountID: "mnt-1",
+					Fence:   lease.Fence,
+				})
+				_, _ = c.UnbindLayerMount(ctx, child.LayerID, drive9.LayerMountUnbindRequest{
+					MountID: "mnt-1",
+					Kind:    "fence",
+					Fence:   lease.Fence,
+				})
 			}
+			_, _ = c.DeleteLayer(ctx, child.LayerID, true)
 		}
-		_, _ = c.ListFSLayerEvents(ctx, layer.LayerID, 0)
-		_ = c.RollbackFSLayer(ctx, layer.LayerID)
-		_, _ = c.CommitFSLayer(ctx, layer.LayerID)
+		_, _ = c.MergeLayer(ctx, layer.LayerID)
 	}
 
 	ws, err := c.UpsertGitWorkspace(ctx, drive9.GitWorkspaceRequest{
@@ -857,14 +845,13 @@ var coveredClientMethods = map[string]bool{
 	"BatchReadSmallCtx":                      true,
 	"BatchStatCtx":                           true,
 	"BatchWriteCtx":                          true,
+	"BindLayerMount":                         true,
 	"CachedAppendLogSupported":               true,
 	"CachedBatchWriteModeSupported":          true,
 	"CachedSmallFileThreshold":               true,
 	"CancelRuntimeExecution":                 true,
-	"CheckpointFSLayer":                      true,
 	"Chmod":                                  true,
 	"ChmodCtx":                               true,
-	"CommitFSLayer":                          true,
 	"Copy":                                   true,
 	"CopyCtx":                                true,
 	"CreateFile":                             true,
@@ -872,8 +859,8 @@ var coveredClientMethods = map[string]bool{
 	"CreateFileCreatedCtx":                   true,
 	"CachedCompletionIdentitySupported":      true,
 	"WarmCompletionIdentity":                 true,
-	"CreateFSLayer":                          true,
-	"DeleteFSLayer":                          true,
+	"CreateLayer":                            true,
+	"DeleteLayer":                            true,
 	"CreateJournal":                          true,
 	"CreateExtentFileCreatedCtx":             true,
 	"CreateVaultSecret":                      true,
@@ -884,7 +871,6 @@ var coveredClientMethods = map[string]bool{
 	"DeleteFileCtx":                          true,
 	"DeleteGitWorkspace":                     true,
 	"DeleteVaultSecret":                      true,
-	"DiffFSLayer":                            true,
 	"CommitExtentPatch":                      true,
 	"CommitExtentPatchExpectedResource":      true,
 	"InitiateExtentPatchExpectedResource":    true,
@@ -892,8 +878,7 @@ var coveredClientMethods = map[string]bool{
 	"StatResourceID":                         true,
 	"Exec":                                   true,
 	"FetchExtentBlockRange":                  true,
-	"ForkFSLayer":                            true,
-	"DiffFSLayerAtSeq":                       true,
+	"ForkLayer":                              true,
 	"DownloadDir":                            true,
 	"DownloadDirCtx":                         true,
 	"DownloadToFile":                         true,
@@ -901,10 +886,7 @@ var coveredClientMethods = map[string]bool{
 	"Find":                                   true,
 	"FileTasks":                              true,
 	"FileTasksCtx":                           true,
-	"GetFSLayer":                             true,
-	"GetFSLayerCheckpoint":                   true,
-	"GetFSLayerEntry":                        true,
-	"GetFSLayerEntryAtSeq":                   true,
+	"GetLayer":                               true,
 	"GetExtentReadPlan":                      true,
 	"GetGitObjectPack":                       true,
 	"GetGitOverlayEntry":                     true,
@@ -914,7 +896,6 @@ var coveredClientMethods = map[string]bool{
 	"GetQuota":                               true,
 	"GetRuntimeCapabilities":                 true,
 	"Grep":                                   true,
-	"GrepWithLayer":                          true,
 	"Hardlink":                               true,
 	"HardlinkCtx":                            true,
 	"IssueScopedToken":                       true,
@@ -923,9 +904,8 @@ var coveredClientMethods = map[string]bool{
 	"List":                                   true,
 	"ListCtx":                                true,
 	"ListWithOptionsCtx":                     true,
-	"ListFSLayerChain":                       true,
-	"ListFSLayerEvents":                      true,
-	"ListFSLayers":                           true,
+	"ListAllLayers":                          true,
+	"ListLayers":                             true,
 	"ListGitObjectPacks":                     true,
 	"ListGitOverlayEntries":                  true,
 	"ListGitTree":                            true,
@@ -933,6 +913,7 @@ var coveredClientMethods = map[string]bool{
 	"ListReadableVaultSecrets":               true,
 	"ListVaultSecrets":                       true,
 	"MaxUploadBytes":                         true,
+	"MergeLayer":                             true,
 	"MintObjectCredentials":                  true,
 	"Mkdir":                                  true,
 	"MkdirCtx":                               true,
@@ -951,8 +932,6 @@ var coveredClientMethods = map[string]bool{
 	"ReadAt":                                 true,
 	"ReadAtCtx":                              true,
 	"ReadCtx":                                true,
-	"ReadFSLayerFile":                        true,
-	"ReadFSLayerFileStream":                  true,
 	"ReadJournalEntries":                     true,
 	"ReadObjectRange":                        true,
 	"ReadStream":                             true,
@@ -961,14 +940,13 @@ var coveredClientMethods = map[string]bool{
 	"ReadVaultSecretAsOwner":                 true,
 	"ReadVaultSecretField":                   true,
 	"ReadVaultSecretFieldAsOwner":            true,
+	"RenewLayerMount":                        true,
 	"ReplaceGitTree":                         true,
 	"RemoveAll":                              true,
 	"RemoveAllCtx":                           true,
 	"RemoveGitWorkspaceIndexEntry":           true,
 	"Rename":                                 true,
 	"RenameCtx":                              true,
-	"ReplayFSLayer":                          true,
-	"ReplayFSLayerAtSeq":                     true,
 	"ResolveReadTarget":                      true,
 	"ResumeUpload":                           true,
 	"ResumeUploadWithSummary":                true,
@@ -978,7 +956,6 @@ var coveredClientMethods = map[string]bool{
 	"RevokeScopedTokenByAPIKey":              true,
 	"RevokeVaultGrant":                       true,
 	"RevokeVaultToken":                       true,
-	"RollbackFSLayer":                        true,
 	"SQL":                                    true,
 	"SearchJournal":                          true,
 	"SetActor":                               true,
@@ -997,16 +974,17 @@ var coveredClientMethods = map[string]bool{
 	"Symlink":                                true,
 	"SymlinkCtx":                             true,
 	"TruncateExtentConditional":              true,
+	"UnbindLayerMount":                       true,
 	"UpdateVaultSecret":                      true,
-	"UploadFSLayerFile":                      true,
-	"UpsertFSLayerEntry":                     true,
 	"UpsertGitState":                         true,
 	"UpsertGitWorkspace":                     true,
 	"UpsertGitWorkspaceIndexEntry":           true,
 	"VerifyJournal":                          true,
+	"ViewBinding":                            true,
 	"Warm":                                   true,
 	"WatchEvents":                            true,
 	"WatchEventsWithLifecycle":               true,
+	"WithView":                               true,
 	"Write":                                  true,
 	"WriteCtx":                               true,
 	"WriteCtxConditional":                    true,

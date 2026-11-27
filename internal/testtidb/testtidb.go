@@ -176,11 +176,6 @@ func ResetMetaDB(t *testing.T, db *sql.DB) {
 }
 
 var resetDeleteQueries = []string{
-	"DELETE FROM fs_layer_checkpoints",
-	"DELETE FROM fs_layer_events",
-	"DELETE FROM fs_layer_tags",
-	"DELETE FROM fs_layer_entries",
-	"DELETE FROM fs_layers",
 	"DELETE FROM quota_outbox",
 	"DELETE FROM quota_admission_locks",
 	"DELETE FROM file_gc_tasks",

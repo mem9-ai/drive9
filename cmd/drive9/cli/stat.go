@@ -22,11 +22,15 @@ func Stat(c *client.Client, args []string) error {
 		return err
 	}
 	defer withObjectAuthLocal(authLocal)()
+	layerRef, fence, args, err := ParseLayerViewFlags(args)
+	if err != nil {
+		return err
+	}
 	outputFormat, path, err := parseOutputFormatAndPath(args, "drive9 fs stat [-o text|json] [--auth=local|server] <path>")
 	if err != nil {
 		return err
 	}
-	h, err := fsHandleForArg(c, path)
+	h, err := fsHandleForLayerArg(c, path, layerRef, fence)
 	if err != nil {
 		return err
 	}

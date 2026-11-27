@@ -3,14 +3,23 @@
 package cli
 
 import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
+	"os/signal"
+	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/mountstate"
+	"github.com/mem9-ai/drive9/pkg/mountsupervisor"
 )
 
 func TestPeelSystemdUnitFlagsPassesMountFlags(t *testing.T) {
@@ -167,7 +176,10 @@ func TestProcessMatchesIdentitySelf(t *testing.T) {
 }
 
 func TestAdoptSupervisorCommandArgsIncludesMountKind(t *testing.T) {
-	args := adoptSupervisorCommandArgs("/mnt/obj", "/tmp/obj.log", "https://s", `["s3://b/","/mnt/obj"]`, 42, 7, mountstate.MountKindObject)
+	args, err := adoptSupervisorCommandArgs("/mnt/obj", "/tmp/obj.log", "https://s", `["s3://b/","/mnt/obj"]`, 42, 7, mountstate.MountKindObject, mountstate.ProcessState{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	kind := ""
 	for i := 0; i < len(args)-1; i++ {
 		if args[i] == "--mount-kind" {
@@ -515,11 +527,223 @@ func TestWaitForSupervisedMountReadyIgnoresStaleState(t *testing.T) {
 	}
 
 	waitCh := make(chan error) // never closes
-	err = waitForSupervisedMountReady(mp, foreignPID, waitCh, "/dev/null", 300*time.Millisecond)
+	err = waitForSupervisedMountReady(mp, cmd.Process, waitCh, "/dev/null", 300*time.Millisecond)
 	if err == nil {
 		t.Fatal("stale healthy state must not satisfy ready for a different supervisor PID")
 	}
 	if !strings.Contains(err.Error(), "timed out waiting") {
 		t.Fatalf("error = %v, want ready timeout", err)
+	}
+}
+
+func TestSupervisorLayerMetadataRoundTrip(t *testing.T) {
+	mp := t.TempDir()
+	for _, readOnly := range []bool{false, true} {
+		st := mountstate.ProcessState{LayerID: "layer-42", LayerReadOnly: readOnly, LocalRoot: "/base", RemoteRoot: "/repo", Profile: "work", PackPaths: []string{"build"}}
+		fresh, err := superviseCommandArgs(mountSuperviseStartRequest{MountPoint: mp, OriginalArgs: []string{"--layer", st.LayerID, mp}, LayerID: st.LayerID, LayerReadOnly: readOnly, LocalRoot: st.LocalRoot, RemoteRoot: st.RemoteRoot, Profile: st.Profile, PackPaths: st.PackPaths}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		adopted, err := adoptSupervisorCommandArgs(mp, "", "", `["--layer","layer-42","/mnt"]`, 42, 7, mountstate.MountKindFUSE, st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, cmd := range [][]string{fresh, adopted} {
+			err := runMountSuperviseWith(cmd[2:], func(cfg mountsupervisor.Config) error {
+				if cfg.LayerID != st.LayerID || cfg.LayerReadOnly != readOnly || cfg.LocalRoot != st.LocalRoot || cfg.RemoteRoot != st.RemoteRoot || cfg.Profile != st.Profile || !reflect.DeepEqual(cfg.PackPaths, st.PackPaths) {
+					t.Errorf("layer pack metadata changed during supervisor startup (adopt=%v, readOnly=%v)", cfg.Adopt, readOnly)
+				}
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+func TestReadOnlyLayerUmountPack(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	for _, flag := range []string{"--pack", "--pack-path", ""} {
+		t.Run("pack"+flag, func(t *testing.T) {
+			mp := t.TempDir()
+			detached := false
+			deps := umountDeps{
+				requestStatus: fixedArchiveStatus("layer-42"),
+				goos:          "linux", lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
+				run: func([]string) error { detached = true; return nil },
+				readProcessState: func(string) (mountstate.ProcessState, string, error) {
+					return mountstate.ProcessState{ControlSocket: "fixture.sock", LayerID: "layer-42", LayerReadOnly: true, PackPaths: []string{"build"}}, "", nil
+				},
+				packAfterUnmount: func(context.Context, mountstate.ProcessState, []string, []string) error {
+					t.Fatal("packed read-only layer")
+					return nil
+				},
+				now: time.Now, sleep: time.Sleep, printErrf: func(string, ...any) {},
+			}
+			args := []string{"--timeout", "0"}
+			if flag != "" {
+				args = append(args, flag, "archive")
+			}
+			err := runUmount(append(args, mp), deps)
+			if flag != "" {
+				if detached || err == nil || !strings.Contains(err.Error(), "read-only layer") {
+					t.Fatalf("detached=%v error=%v", detached, err)
+				}
+			} else if !detached || err != nil {
+				t.Fatalf("auto-pack detached=%v error=%v", detached, err)
+			}
+		})
+	}
+}
+
+func TestSupervisedLayerDefaultRootLookupExit(t *testing.T) {
+	stubMountProfileAppendLogProbe(t)
+	for _, tc := range []struct{ status, exit int }{{401, 5}, {403, 5}, {404, 5}, {503, 6}} {
+		t.Run(strconv.Itoa(tc.status), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v1/layers/task=auth" {
+					http.Error(w, "layer lookup failed", tc.status)
+					return
+				}
+				http.NotFound(w, r)
+			}))
+			defer srv.Close()
+			err := MountCmd([]string{"--supervised", "--foreground", "--mode=fuse", "--server", srv.URL, "--api-key", "test-key", "--profile=coding-agent", "--no-auto-unpack", "--layer", "task=auth", t.TempDir()})
+			var coded interface{ ExitCode() int }
+			if !errors.As(err, &coded) || coded.ExitCode() != tc.exit {
+				t.Fatalf("lookup returned %v, want exit %d", err, tc.exit)
+			}
+		})
+	}
+}
+
+func TestParentWaitsForLeaseAfterWorkerReadyTimeout(t *testing.T) {
+	const childEnv = "DRIVE9_TEST_LEASE_READY_DIR"
+	if dir := os.Getenv(childEnv); dir != "" {
+		start := time.Now()
+		cfg := mountsupervisor.Config{MountPoint: filepath.Join(dir, "mount"), LayerID: "layer-test",
+			Executable: filepath.Join(dir, "worker"), WorkerArgs: []string{dir}, StopTimeout: time.Second, RestartWindow: time.Minute,
+			Now:   func() time.Time { return start.Add(20 * time.Since(start)) },
+			Sleep: func(d time.Duration) { time.Sleep(d / 20) },
+		}
+		err := mountsupervisor.Run(cfg)
+		// The fake worker eventually stops with a permanent error. All three
+		// attempts below must be observable before the parent's timeout.
+		if err == nil {
+			t.Fatal("expected permanent worker failure")
+		}
+		return
+	}
+	dir := t.TempDir()
+	mp := filepath.Join(dir, "mount")
+	if err := os.Mkdir(mp, 0700); err != nil {
+		t.Fatal(err)
+	}
+	const worker = `#!/bin/sh
+if mkdir "$1/bound" 2>/dev/null; then exec sleep 10; fi
+if mkdir "$1/busy" 2>/dev/null; then exit 8; fi
+touch "$1/retried"
+exit 5
+`
+	if err := os.WriteFile(filepath.Join(dir, "worker"), []byte(worker), 0700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestParentWaitsForLeaseAfterWorkerReadyTimeout$")
+	cmd.Env = append(os.Environ(), childEnv+"="+dir)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- cmd.Wait() }()
+	err := waitForSupervisedMountReady(mp, cmd.Process, waitCh, "/dev/null", 800*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "before becoming ready") || ctx.Err() != nil {
+		t.Fatalf("parent result %v (context %v)", err, ctx.Err())
+	}
+	for _, stage := range []string{"bound", "busy", "retried"} {
+		if _, err := os.Stat(filepath.Join(dir, stage)); err != nil {
+			t.Errorf("missing worker stage %s: %v", stage, err)
+		}
+	}
+}
+
+func TestParentReturnsTerminalSupervisorStateDuringLeaseWait(t *testing.T) {
+	const childEnv = "DRIVE9_TEST_TERMINAL_SUPERVISOR"
+	if mp := os.Getenv(childEnv); mp != "" {
+		state := os.Getenv("DRIVE9_TEST_SUPERVISOR_STATE")
+		id, err := mountstate.ProcessCreationTime(os.Getpid())
+		if err != nil {
+			t.Fatal(err)
+		}
+		held, err := mountsupervisor.TryExclusive(mp, func() error {
+			stopping := make(chan os.Signal, 1)
+			if state == mountstate.SupervisorStateCircuitOpen {
+				signal.Notify(stopping, syscall.SIGTERM)
+				defer signal.Stop(stopping)
+			}
+			err := mountstate.WriteSupervisorState(mp, mountstate.SupervisorState{
+				PID: os.Getpid(), CreationTime: id, MountPoint: mp, State: state,
+				LayerLeaseRecoveryUntil: time.Now().Add(time.Hour),
+			})
+			if err != nil {
+				return err
+			}
+			if state == mountstate.SupervisorStateFailed && os.Getenv("DRIVE9_TEST_SUPERVISOR_STUCK") == "" {
+				time.Sleep(750 * time.Millisecond)
+				return os.WriteFile(filepath.Join(mp, "finished-cleanup"), nil, 0600)
+			}
+			if state == mountstate.SupervisorStateCircuitOpen {
+				<-stopping
+				return os.WriteFile(filepath.Join(mp, "finished-cleanup"), nil, 0600)
+			}
+			time.Sleep(time.Minute)
+			return nil
+		})
+		if err != nil || !held {
+			t.Fatalf("child lock: held=%t, err=%v", held, err)
+		}
+		return
+	}
+	for _, tc := range []struct {
+		name, state string
+		stuck       bool
+	}{
+		{"failed", mountstate.SupervisorStateFailed, false},
+		{"circuit-open", mountstate.SupervisorStateCircuitOpen, false},
+		{"stuck-failed", mountstate.SupervisorStateFailed, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mp := t.TempDir()
+			t.Cleanup(func() { _ = mountstate.ClearSupervisorState(mp) })
+			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestParentReturnsTerminalSupervisorStateDuringLeaseWait$")
+			cmd.Env = append(os.Environ(), childEnv+"="+mp, "DRIVE9_TEST_SUPERVISOR_STATE="+tc.state)
+			if tc.stuck {
+				cmd.Env = append(cmd.Env, "DRIVE9_TEST_SUPERVISOR_STUCK=1")
+			}
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			wait := make(chan error, 1)
+			go func() { wait <- cmd.Wait() }()
+			err := waitForSupervisedMountReady(mp, cmd.Process, wait, "/dev/null", 10*time.Second)
+			if err == nil || !strings.Contains(err.Error(), tc.state) || ctx.Err() != nil {
+				t.Fatalf("parent result %v (context %v)", err, ctx.Err())
+			}
+			if processAliveImpl(cmd.Process.Pid) {
+				t.Error("child still alive after startup failure")
+			}
+			if held, err := mountsupervisor.TryExclusive(mp, nil); err != nil || !held {
+				t.Errorf("retry cannot acquire supervisor lock: held=%t, err=%v", held, err)
+			}
+			if !tc.stuck {
+				if _, err := os.Stat(filepath.Join(mp, "finished-cleanup")); err != nil {
+					t.Error(err)
+				}
+			}
+		})
 	}
 }

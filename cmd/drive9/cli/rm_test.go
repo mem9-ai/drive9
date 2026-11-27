@@ -168,3 +168,30 @@ func TestRmInvalidArgs(t *testing.T) {
 		})
 	}
 }
+
+func TestRmRejectsEmptyViewFlags(t *testing.T) {
+	for _, args := range [][]string{
+		{"--layer=", "/a.txt"}, {"--layer", " ", "/a.txt"},
+		{"--fence=", "/a.txt"}, {"--fence", " ", "/a.txt"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Errorf("invalid view flag sent %s %s", r.Method, r.URL.Path)
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer srv.Close()
+			if err := Rm(client.New(srv.URL, ""), args); err == nil {
+				t.Fatal("expected the empty view flag to be rejected")
+			}
+		})
+	}
+}
+
+func TestMountAndExecRejectEmptyLayer(t *testing.T) {
+	if err := MountCmd([]string{"--layer= "}); err == nil || !strings.Contains(err.Error(), "--layer") {
+		t.Fatalf("mount with blank layer: %v", err)
+	}
+	if _, err := parseExecArgs([]string{"--layer", "", "--", "pwd"}); err == nil || !strings.Contains(err.Error(), "--layer") {
+		t.Fatalf("exec with blank layer: %v", err)
+	}
+}

@@ -11,6 +11,7 @@ import {
 } from "./extent.js";
 import type { CompletePart, PresignedPart, UploadPlanV2, WriteOptions } from "./models.js";
 import { Semaphore } from "./utils.js";
+import { UnsupportedInLayerViewError, clientFetch, hasActiveLayerView } from "./view.js";
 
 const UPLOAD_MAX_CONCURRENCY = 16;
 
@@ -71,6 +72,9 @@ export class StreamWriter {
   async writePart(partNum: number, data: Uint8Array): Promise<void> {
     if (partNum < 1) {
       throw new Drive9Error("part number must be >= 1");
+    }
+    if (hasActiveLayerView(this.client) && this.description) {
+      throw new UnsupportedInLayerViewError("description metadata is unsupported in layer view");
     }
     if (!this.state.started) {
       try {
@@ -232,7 +236,7 @@ export class StreamWriter {
 }
 
 async function presignOnePart(client: Client, uploadId: string, partNumber: number): Promise<PresignedPart> {
-  const resp = await fetch(`${client.baseUrl}/v2/uploads/${uploadId}/presign`, {
+  const resp = await clientFetch(client, `${client.baseUrl}/v2/uploads/${uploadId}/presign`, {
     method: "POST",
     headers: client["authHeaders"]({ "Content-Type": "application/json" }),
     body: JSON.stringify({ part_number: partNumber }),
@@ -268,7 +272,7 @@ function presignedHeaders(part: PresignedPart): Record<string, string> {
 }
 
 async function completeUploadV2(client: Client, uploadId: string, parts: CompletePart[], tags?: Record<string, string>): Promise<void> {
-  const resp = await fetch(`${client.baseUrl}/v2/uploads/${uploadId}/complete`, {
+  const resp = await clientFetch(client, `${client.baseUrl}/v2/uploads/${uploadId}/complete`, {
     method: "POST",
     headers: client["authHeaders"]({ "Content-Type": "application/json" }),
     body: JSON.stringify({ parts, tags }),
@@ -277,7 +281,7 @@ async function completeUploadV2(client: Client, uploadId: string, parts: Complet
 }
 
 async function abortUploadV2(client: Client, uploadId: string): Promise<void> {
-  await fetch(`${client.baseUrl}/v2/uploads/${uploadId}/abort`, {
+  await clientFetch(client, `${client.baseUrl}/v2/uploads/${uploadId}/abort`, {
     method: "POST",
     headers: client["authHeaders"](),
   });

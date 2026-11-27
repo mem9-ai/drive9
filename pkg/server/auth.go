@@ -47,6 +47,8 @@ type TenantScope struct {
 
 const chmodOwnerOnlyMessage = "chmod is owner-only"
 
+var errChmodForbidden = errors.New(chmodOwnerOnlyMessage)
+
 // CanChmod is the policy for explicit chmod and for the mode bits a batch write item
 // carries: only an owner token may change permission bits. A missing scope denies here;
 // handlers report missing authentication separately. Creation-time mkdir modes and layer

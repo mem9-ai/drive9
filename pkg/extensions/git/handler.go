@@ -4,6 +4,7 @@ package git
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -13,6 +14,12 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
 )
+
+// An unavailable clean object may fall back to the base filesystem. Once
+// this read is cancelled, no other provider should start work on its behalf.
+func gitReadInterrupted(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errGitRuntimeStopped)
+}
 
 func kindOf(e overlayEntry) fs.Kind {
 	switch e.Kind {
@@ -45,6 +52,9 @@ func (g *Git) emit(path string) {
 
 func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
 	g.ensure(ctx)
+	if err := ctx.Err(); err != nil {
+		return fs.Result{}, err
+	}
 	w, rel, ok := g.workspaceFor(op.Path)
 	if !ok {
 		// A workspace registered after this mount started (git clone
@@ -77,11 +87,17 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 
 	switch op.Kind {
 	case fs.OpLookup, fs.OpGetAttr:
+		if (rel == ".git" || strings.HasPrefix(rel, ".git/")) && g.localRoot != "" && !w.isRestoreLatched() {
+			_ = g.ensureWorkspaceState(ctx, w)
+			if err := ctx.Err(); err != nil {
+				return fs.Result{}, err
+			}
+		}
 		e, hit := w.lookup(rel)
 		if !hit {
 			// Fast-clone view (v1 gitEntry): clean files resolve from the
 			// HEAD tree before the base view.
-			if n, tok := w.treeLookup(rel); tok {
+			if n, head, tok := w.treeLookup(rel); tok {
 				if n.Kind == "dir" || n.Kind == "symlink" || n.ObjectSHA != "" {
 					attr := treeAttr(n, w.cleanTreeMtime())
 					// An unknown size resolves once via cat-file and is
@@ -89,8 +105,14 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 					// single failed exec flap the served size and pin git
 					// status entries as modified.
 					if n.SizeBytes < 0 && (n.Kind == "file" || n.Kind == "symlink") && n.ObjectSHA != "" {
-						attr.Size = g.blobSize(w, n.ObjectSHA)
-						w.noteTreeSize(rel, attr.Size)
+						size := g.resolveTreeNodeSize(ctx, w, head, rel, n.ObjectSHA)
+						if err := ctx.Err(); err != nil {
+							return fs.Result{}, err
+						}
+						if size >= 0 {
+							attr.Size = size
+							w.noteTreeSize(rel, n.ObjectSHA, size)
+						}
 					}
 					return fs.Result{Attr: &attr}, nil
 				}
@@ -125,9 +147,11 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 			if e.Kind == "symlink" {
 				return fs.Result{Data: e.Content}, nil
 			}
-		} else if n, tok := w.treeLookup(rel); tok && n.Kind == "symlink" {
-			if data, err := g.materializeBlob(w, n.ObjectSHA); err == nil {
+		} else if n, head, tok := w.treeLookup(rel); tok && n.Kind == "symlink" {
+			if data, err := g.materializeTreeEntry(ctx, w, head, rel, n.ObjectSHA); err == nil {
 				return fs.Result{Data: data}, nil
+			} else if gitReadInterrupted(err) {
+				return fs.Result{}, err
 			}
 		}
 		return next(ctx, op)
@@ -164,8 +188,8 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 		}
 		// Fast-clone view: materialize the blob from the restored local
 		// .git (v1 materializeGitBlob).
-		if n, tok := w.treeLookup(rel); tok && n.Kind == "file" && n.ObjectSHA != "" {
-			if data, err := g.materializeBlob(w, n.ObjectSHA); err == nil {
+		if n, head, tok := w.treeLookup(rel); tok && n.Kind == "file" && n.ObjectSHA != "" {
+			if data, err := g.materializeTreeEntry(ctx, w, head, rel, n.ObjectSHA); err == nil {
 				if op.Offset > 0 || op.Limit > 0 {
 					off := op.Offset
 					if off < 0 {
@@ -181,6 +205,8 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 					data = data[off:end]
 				}
 				return fs.Result{Data: data}, nil
+			} else if gitReadInterrupted(err) {
+				return fs.Result{}, err
 			}
 		}
 		return next(ctx, op)
@@ -232,8 +258,11 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 					h.dirty = true
 					h.mu.Unlock()
 				}
+				attr := h.attr(ctx)
+				if err := ctx.Err(); err != nil {
+					return fs.Result{}, err
+				}
 				g.trackWorkspace(op.Path, h)
-				attr := h.Attr()
 				return fs.Result{Handle: h, Attr: &attr}, nil
 			}
 		}
@@ -256,14 +285,17 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 			// A clean tree file has no base-plane entry: a read-only
 			// open that fell through would wrap a 404 remote handle and
 			// every read EIOs. Claim it and serve the materialized blob.
-			if n, tok := w.treeLookup(rel); tok && n.Kind == "file" && n.ObjectSHA != "" {
+			if n, head, tok := w.treeLookup(rel); tok && n.Kind == "file" && n.ObjectSHA != "" {
 				h := &gitHandle{g: g, w: w, path: op.Path, rel: rel, flags: op.Flags,
-					treeSHA: n.ObjectSHA, mode: parseMode(n.Mode)}
+					treeSHA: n.ObjectSHA, treeHead: head, treeRel: rel, mode: parseMode(n.Mode)}
 				if h.mode == 0 {
 					h.mode = 0o644
 				}
+				attr := h.attr(ctx)
+				if err := ctx.Err(); err != nil {
+					return fs.Result{}, err
+				}
 				g.trackWorkspace(op.Path, h)
-				attr := h.Attr()
 				return fs.Result{Handle: h, Attr: &attr}, nil
 			}
 			return next(ctx, op)
@@ -364,11 +396,14 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 				h.SetMode(op.Mode)
 			}
 			if op.Size >= 0 {
-				if err := h.Truncate(op.Size); err != nil {
+				if err := h.truncate(ctx, op.Size); err != nil {
 					return fs.Result{}, err
 				}
 			}
-			attr := h.Attr()
+			attr := h.attr(ctx)
+			if err := ctx.Err(); err != nil {
+				return fs.Result{}, err
+			}
 			return fs.Result{Attr: &attr}, nil
 		}
 		handled := false
@@ -379,8 +414,8 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 		// kernel's O_TRUNC pre-step included.
 		if op.HasMode || op.Size >= 0 {
 			if _, hit := w.lookup(rel); !hit {
-				if n, tok := w.treeLookup(rel); tok && n.Kind == "file" && n.ObjectSHA != "" {
-					if data, merr := g.materializeBlob(w, n.ObjectSHA); merr == nil {
+				if n, head, tok := w.treeLookup(rel); tok && n.Kind == "file" && n.ObjectSHA != "" {
+					if data, merr := g.materializeTreeEntry(ctx, w, head, rel, n.ObjectSHA); merr == nil {
 						mode := strings.TrimSpace(n.Mode)
 						if mode == "" {
 							mode = "100644"
@@ -389,6 +424,8 @@ func (g *Git) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error
 						if err := g.putOverlay(ctx, w, rel, e); err != nil {
 							return fs.Result{}, err
 						}
+					} else if gitReadInterrupted(merr) {
+						return fs.Result{}, merr
 					}
 				}
 			}
@@ -513,8 +550,8 @@ func (g *Git) renameOverlay(ctx context.Context, oldPath, newPath string) error 
 	// Clean-tree source (no overlay entry, no ordinary remote file):
 	// materialize the blob through the Git content path — a plain
 	// namespace stat/read 404s for fast-clone files (v1 copyGitFileOverlay).
-	if n, tok := wOld.treeLookup(relOld); tok && n.Kind == "file" && n.ObjectSHA != "" {
-		if data, merr := g.materializeBlob(wOld, n.ObjectSHA); merr == nil {
+	if n, head, tok := wOld.treeLookup(relOld); tok && n.Kind == "file" && n.ObjectSHA != "" {
+		if data, merr := g.materializeTreeEntry(ctx, wOld, head, relOld, n.ObjectSHA); merr == nil {
 			mode := strings.TrimSpace(n.Mode)
 			if mode == "" {
 				mode = "100644"
@@ -523,6 +560,8 @@ func (g *Git) renameOverlay(ctx context.Context, oldPath, newPath string) error 
 				return err
 			}
 			return g.putOverlay(ctx, wOld, relOld, overlayEntry{Op: "whiteout", Kind: "file"})
+		} else if gitReadInterrupted(merr) {
+			return merr
 		}
 	}
 	// base content moves through one fetch + upsert
@@ -549,6 +588,12 @@ func (g *Git) renameOverlay(ctx context.Context, oldPath, newPath string) error 
 
 // listMerged overlays the workspace's children on the base listing.
 func (g *Git) listMerged(ctx context.Context, w *workspace, dir string, next fs.Next) (fs.Result, error) {
+	if dir == w.rootPath() && g.localRoot != "" && !w.isRestoreLatched() {
+		_ = g.ensureWorkspaceState(ctx, w)
+		if err := ctx.Err(); err != nil {
+			return fs.Result{}, err
+		}
+	}
 	res, err := next(ctx, &fs.Op{Kind: fs.OpList, Path: dir})
 	if err != nil && !fs.IsNotFound(err) {
 		return res, err
@@ -610,6 +655,7 @@ func (g *Git) listMerged(ctx context.Context, w *workspace, dir string, next fs.
 		sha  string
 		name string
 	}
+	head := w.treeLoaded
 	var pending []unresolved
 	for rel, n := range w.tree {
 		if prefixRel != "" && !strings.HasPrefix(rel, prefixRel+"/") {
@@ -638,8 +684,11 @@ func (g *Git) listMerged(ctx context.Context, w *workspace, dir string, next fs.
 	}
 	w.mu.RUnlock()
 	for _, u := range pending {
-		size := g.blobSize(w, u.sha)
-		w.noteTreeSize(u.rel, size)
+		size := g.resolveTreeNodeSize(ctx, w, head, u.rel, u.sha)
+		if err := ctx.Err(); err != nil {
+			return fs.Result{}, err
+		}
+		w.noteTreeSize(u.rel, u.sha, size)
 		if e, ok := out[u.name]; ok && size > 0 {
 			e.Attr.Size = size
 			out[u.name] = e

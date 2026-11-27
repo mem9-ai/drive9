@@ -15,7 +15,12 @@ import (
 	"go.uber.org/zap"
 )
 
-const maxParallelSchemaStatementGroups = 8
+const (
+	maxParallelSchemaStatementGroups = 8
+	maxSchemaStatementAttempts       = 8
+	schemaStatementRetryBase         = 50 * time.Millisecond
+	schemaStatementRetryMax          = 500 * time.Millisecond
+)
 
 // CloneStatements returns a copy of the given schema statements so callers can
 // format or extend them without mutating the init-schema source of truth.
@@ -171,7 +176,7 @@ func execSchemaStatement(ctx context.Context, db *sql.DB, stmt string, index, co
 		zap.Int("statement_index", index),
 		zap.Int("statement_count", count),
 		zap.String("statement", snippet))
-	if _, err := db.ExecContext(ctx, stmt); err != nil {
+	if err := execSchemaSQL(ctx, db, stmt); err != nil {
 		if isIgnorableSchemaError(err) {
 			logger.Info(ctx, "schema_statement_exec_skipped_existing",
 				zap.Int("statement_index", index),
@@ -180,15 +185,6 @@ func execSchemaStatement(ctx context.Context, db *sql.DB, stmt string, index, co
 				zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
 				zap.String("skip_reason", err.Error()))
 			return nil
-		}
-		if IsTransientSchemaError(err) {
-			logger.Warn(ctx, "schema_statement_exec_retryable_failed",
-				zap.Int("statement_index", index),
-				zap.Int("statement_count", count),
-				zap.String("statement", snippet),
-				zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
-				zap.String("reason", err.Error()))
-			return fmt.Errorf("exec %q: %w", snippet, err)
 		}
 		logger.Error(ctx, "schema_statement_exec_failed",
 			zap.Int("statement_index", index),
@@ -206,6 +202,61 @@ func execSchemaStatement(ctx context.Context, db *sql.DB, stmt string, index, co
 	return nil
 }
 
+func execSchemaSQL(ctx context.Context, db *sql.DB, stmt string) error {
+	var lastErr error
+	for attempt := 1; attempt <= maxSchemaStatementAttempts; attempt++ {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			if !IsTransientSchemaError(err) {
+				return err
+			}
+			lastErr = err
+			logger.Warn(ctx, "schema_statement_exec_retryable_failed",
+				zap.Int("attempt", attempt),
+				zap.Int("max_attempts", maxSchemaStatementAttempts),
+				zap.String("statement", schemaStatementSnippet(stmt)),
+				zap.String("reason", err.Error()))
+			if attempt == maxSchemaStatementAttempts {
+				break
+			}
+			if waitErr := waitSchemaRetry(ctx, schemaRetryDelay(attempt)); waitErr != nil {
+				return waitErr
+			}
+			continue
+		}
+		return nil
+	}
+	return lastErr
+}
+
+func schemaRetryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	shift := attempt - 1
+	if shift > 30 {
+		shift = 30
+	}
+	d := schemaStatementRetryBase * time.Duration(1<<uint(shift))
+	if d > schemaStatementRetryMax || d < schemaStatementRetryBase {
+		return schemaStatementRetryMax
+	}
+	return d
+}
+
+func waitSchemaRetry(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 // ExecOptionalSchemaStatements executes optional DDL statements and skips
 // feature-specific failures that can happen on TiDB deployments without FTS,
 // vector indexing, or columnar replica support. It returns the number of
@@ -219,7 +270,7 @@ func ExecOptionalSchemaStatements(ctx context.Context, db *sql.DB, stmts []strin
 			zap.Int("statement_index", i+1),
 			zap.Int("statement_count", len(stmts)),
 			zap.String("statement", snippet))
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
+		if err := execSchemaSQL(ctx, db, stmt); err != nil {
 			if isIgnorableSchemaError(err) {
 				logger.Info(ctx, "optional_schema_statement_exec_skipped_existing",
 					zap.Int("statement_index", i+1),
@@ -238,15 +289,6 @@ func ExecOptionalSchemaStatements(ctx context.Context, db *sql.DB, stmts []strin
 					zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
 					zap.String("skip_reason", err.Error()))
 				continue
-			}
-			if IsTransientSchemaError(err) {
-				logger.Warn(ctx, "optional_schema_statement_exec_retryable_failed",
-					zap.Int("statement_index", i+1),
-					zap.Int("statement_count", len(stmts)),
-					zap.String("statement", snippet),
-					zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
-					zap.String("reason", err.Error()))
-				return skipped, fmt.Errorf("exec optional %q: %w", snippet, err)
 			}
 			logger.Error(ctx, "optional_schema_statement_exec_failed",
 				zap.Int("statement_index", i+1),

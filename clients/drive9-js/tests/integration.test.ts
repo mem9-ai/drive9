@@ -260,11 +260,9 @@ describeIntegration("TypeScript SDK integration", () => {
     const rows = (await c.sql("SELECT path FROM file_nodes LIMIT 5")) as unknown[];
     expect(Array.isArray(rows)).toBe(true);
 
-    // grep / grepWithLayer / find
+    // grep / find
     const results = await c.grep("aaa", prefix, 10);
     expect(Array.isArray(results)).toBe(true);
-    const results2 = await c.grepWithLayer("aaa", prefix, 10, "");
-    expect(Array.isArray(results2)).toBe(true);
     const found = await c.find(prefix, { name: "a.txt" });
     expect(Array.isArray(found)).toBe(true);
   });
@@ -383,7 +381,7 @@ describeIntegration("TypeScript SDK integration", () => {
     const c = makeClient();
     let layer;
     try {
-      layer = await c.createFSLayer({ base_root_path: prefix, name: "it-ts-layer" });
+      layer = await c.createLayer({ base_root_path: prefix, name: `it-ts-layer-${Date.now()}` });
     } catch (err) {
       if (
         process.env.DRIVE9_ALLOW_CORE_ONLY_SERVER === "1" &&
@@ -396,71 +394,21 @@ describeIntegration("TypeScript SDK integration", () => {
     }
     expect(layer.layer_id).toBeTruthy();
 
-    expect(await c.listFSLayers()).toBeTruthy();
-    expect(await c.getFSLayer(layer.layer_id)).toBeTruthy();
+    expect((await c.listLayers({ limit: 10 })).layers).toBeTruthy();
+    expect(await c.getLayer(layer.layer_id)).toBeTruthy();
 
+    const vc = c.withView({ layerId: layer.layer_id });
     const entryPath = prefix + "layer-file.txt";
-    await c.upsertFSLayerEntry(layer.layer_id, {
-      path: entryPath,
-      op: "upsert",
-      kind: "file",
-      content_text: "layer content",
-      size_bytes: 13,
-      mode: 0o644,
+    await vc.write(entryPath, new TextEncoder().encode("layer content"));
+    const data = await vc.read(entryPath);
+    expect(new TextDecoder().decode(data)).toBe("layer content");
+
+    const child = await c.forkLayer(layer.layer_id, {
+      name: `it-ts-layer-child-${Date.now()}`,
     });
-    await c.getFSLayerEntry(layer.layer_id, entryPath);
-
-    // uploadFSLayerFile + readFSLayerFile + readFSLayerFileStream
-    const objPath = prefix + "layer-obj.bin";
-    await c.uploadFSLayerFile(layer.layer_id, objPath, new TextEncoder().encode("obj"), { mode: 0o644 });
-    const data = await c.readFSLayerFile(layer.layer_id, objPath);
-    expect(new TextDecoder().decode(data)).toBe("obj");
-    const rc = await c.readFSLayerFileStream(layer.layer_id, objPath);
-    await new Response(rc).arrayBuffer();
-
-    // diff / replay
-    expect(await c.diffFSLayer(layer.layer_id)).toBeTruthy();
-    expect(await c.diffFSLayer(layer.layer_id, 1 << 30)).toBeTruthy();
-    expect(await c.replayFSLayer(layer.layer_id)).toBeTruthy();
-    expect(await c.replayFSLayer(layer.layer_id, 1 << 30)).toBeTruthy();
-
-    // events
-    expect(await c.listFSLayerEvents(layer.layer_id, 0)).toBeTruthy();
-
-    // checkpoint + get
-    const ch = await c.checkpointFSLayer(layer.layer_id, { label: "it-ts-cp" });
-    expect(ch.checkpoint_id).toBeTruthy();
-    await c.getFSLayerCheckpoint(ch.checkpoint_id);
-
-    // fork from the exact checkpoint, then delete the child generation
-    const child = await c.forkFSLayer(layer.layer_id, {
-      layer_id: `it-ts-child-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
-      name: "it-ts-layer-child",
-      checkpoint_id: ch.checkpoint_id,
-    });
-    let childDeleted = false;
-    try {
-      expect(child.parent_layer_id).toBe(layer.layer_id);
-      expect(child.origin_checkpoint_id).toBe(ch.checkpoint_id);
-      await c.deleteFSLayer(child.layer_id, { cascade: true });
-      childDeleted = true;
-    } finally {
-      if (!childDeleted) {
-        await c.deleteFSLayer(child.layer_id, { cascade: true }).catch(() => {});
-      }
-    }
-
-    // rollback + commit (best-effort)
-    try {
-      await c.rollbackFSLayer(layer.layer_id);
-    } catch {
-      // non-fatal
-    }
-    try {
-      await c.commitFSLayer(layer.layer_id);
-    } catch {
-      // non-fatal
-    }
+    expect(child.parent_layer_id).toBe(layer.layer_id);
+    await c.deleteLayer(child.layer_id, { force: true });
+    await c.mergeLayer(layer.layer_id);
   });
 
   // ---------------------------------------------------------------------------

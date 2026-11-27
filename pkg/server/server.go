@@ -15,7 +15,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	pathpkg "path"
 	"strconv"
 	"strings"
 	"sync"
@@ -547,7 +546,8 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/git-workspaces/", business)
 	mux.Handle("/v1/layers", business)
 	mux.Handle("/v1/layers/", business)
-	mux.Handle("/v1/layer-checkpoints/", business)
+	mux.Handle("/v1/views", business)
+	mux.Handle("/v1/views/", business)
 	mux.Handle("/v1/object-credentials", business)
 	// Vault management API goes through tenant auth.
 	// Vault mutations are audited (including refusals); the read surface is not.
@@ -1727,8 +1727,9 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleJournal(w, r)
 	case r.URL.Path == "/v1/git-workspaces" || strings.HasPrefix(r.URL.Path, "/v1/git-workspaces/"):
 		s.handleGitWorkspaces(w, r)
-	case r.URL.Path == "/v1/layers" || strings.HasPrefix(r.URL.Path, "/v1/layers/") || strings.HasPrefix(r.URL.Path, "/v1/layer-checkpoints/"):
-		s.handleFSLayers(w, r)
+	case r.URL.Path == "/v1/layers" || strings.HasPrefix(r.URL.Path, "/v1/layers/") ||
+		r.URL.Path == "/v1/views" || strings.HasPrefix(r.URL.Path, "/v1/views/"):
+		s.handleLayerUnsupported(w, r)
 	case r.URL.Path == "/v1/object-credentials":
 		s.handleObjectCredentials(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/vault/secrets"), strings.HasPrefix(r.URL.Path, "/v1/vault/tokens"), strings.HasPrefix(r.URL.Path, "/v1/vault/grants"), strings.HasPrefix(r.URL.Path, "/v1/vault/audit"):
@@ -1754,8 +1755,7 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 //     chmod stays owner-only)
 //   - /v1/uploads* + /v2/uploads/* (action-aware, mirrors actual upload
 //     dispatch table; see isScopedV{1,2}UploadRouteAllowed)
-//   - /v1/layers* + /v1/layer-checkpoints/* (route-aware, with per-layer
-//     base root and per-entry path authorization in fs_layer.go)
+//   - /v1/layers* and /v1/views* return the built-in LayerFS capability error.
 //
 // chmod (POST /v1/fs/<path>?chmod=1) is explicitly NOT and never will be in
 // the scoped allowlist — chmod escalates ACLs and is owner-token-only.
@@ -1827,65 +1827,13 @@ func isScopedBusinessRequestAllowed(r *http.Request) bool {
 		return isScopedV2UploadRouteAllowed(r.Method, path)
 	}
 
-	if path == "/v1/layers" || strings.HasPrefix(path, "/v1/layers/") || strings.HasPrefix(path, "/v1/layer-checkpoints/") {
-		return isScopedFSLayerRouteAllowed(r.Method, path, r.URL.Query())
+	if path == "/v1/layers" || strings.HasPrefix(path, "/v1/layers/") ||
+		path == "/v1/views" || strings.HasPrefix(path, "/v1/views/") {
+		return true
 	}
 
 	// SQL, fork, events, journals, vault, status, etc.: still default-deny.
 	return false
-}
-
-func isScopedFSLayerRouteAllowed(method, path string, query url.Values) bool {
-	if path == "/v1/layers" {
-		return (method == http.MethodGet || method == http.MethodPost) && len(query) == 0
-	}
-	if strings.HasPrefix(path, "/v1/layer-checkpoints/") {
-		return method == http.MethodGet && len(query) == 0
-	}
-	if !strings.HasPrefix(path, "/v1/layers/") {
-		return false
-	}
-	rest := strings.TrimPrefix(path, "/v1/layers/")
-	if rest == "" {
-		return false
-	}
-	parts := strings.Split(rest, "/")
-	switch len(parts) {
-	case 1:
-		// GET status or DELETE (logical abandon; cascade query optional)
-		if method == http.MethodGet {
-			return len(query) == 0
-		}
-		if method == http.MethodDelete {
-			return queryKeysSubsetOf(query, []string{"cascade"})
-		}
-		return false
-	case 2:
-		switch parts[1] {
-		case "diff":
-			return method == http.MethodGet && queryKeysSubsetOf(query, []string{"max_seq", "replay", "mode"})
-		case "chain":
-			return method == http.MethodGet && len(query) == 0
-		case "fork", "checkpoints", "rollback", "commit":
-			return method == http.MethodPost && len(query) == 0
-		case "entries":
-			if method == http.MethodGet {
-				return queryKeysSubsetOf(query, []string{"path", "max_seq"})
-			}
-			return (method == http.MethodPost || method == http.MethodPut) && len(query) == 0
-		case "objects":
-			if method == http.MethodGet {
-				return queryKeysSubsetOf(query, []string{"path", "max_seq"})
-			}
-			return (method == http.MethodPost || method == http.MethodPut) && queryKeysSubsetOf(query, []string{"path", "size", "base_revision", "mode"})
-		case "events":
-			return method == http.MethodGet && queryKeysSubsetOf(query, []string{"since"})
-		default:
-			return false
-		}
-	default:
-		return false
-	}
 }
 
 // isScopedV1UploadRouteAllowed mirrors handleUploads (server.go ~1872) and
@@ -6627,20 +6575,16 @@ func (s *Server) handleGrep(w http.ResponseWriter, r *http.Request, path string)
 		}
 		limit = n
 	}
+	if r.URL.Query().Has("layer") {
+		writeUnsupportedLayerQuery(w)
+		return
+	}
 	results, err := b.Grep(r.Context(), query, path, limit)
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "grep_failed", "path", path, "query_len", len(query), "limit", limit, "error", err)...)
 		metricEvent(r.Context(), "userdb_query", "api", "grep", "result", "error")
 		writeBackendError(w, r, err)
 		return
-	}
-	if layerRef := strings.TrimSpace(r.URL.Query().Get("layer")); layerRef != "" {
-		results, err = s.overlayFSLayerGrep(r.Context(), b, ScopeFromContext(r.Context()), layerRef, query, path, limit, results)
-		if err != nil {
-			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "grep_layer_failed", "path", path, "query_len", len(query), "limit", limit, "layer", layerRef, "error", err)...)
-			writeBackendError(w, r, err)
-			return
-		}
 	}
 	metricEvent(r.Context(), "userdb_query", "api", "grep", "result", "ok")
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "grep_ok", "path", path, "query_len", len(query), "limit", limit, "results", len(results))...)
@@ -6659,6 +6603,10 @@ func (s *Server) handleFind(w http.ResponseWriter, r *http.Request, path string)
 		return
 	}
 	q := r.URL.Query()
+	if q.Has("layer") {
+		writeUnsupportedLayerQuery(w)
+		return
+	}
 	f := &datastore.FindFilter{PathPrefix: path}
 	f.NameGlob = q.Get("name")
 	if tag := q.Get("tag"); tag != "" {
@@ -6718,279 +6666,8 @@ func (s *Server) handleFind(w http.ResponseWriter, r *http.Request, path string)
 		writeBackendError(w, r, err)
 		return
 	}
-	if layerRef := strings.TrimSpace(q.Get("layer")); layerRef != "" {
-		results, err = overlayFSLayerFind(r.Context(), b, layerRef, f, results)
-		if err != nil {
-			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "find_layer_failed", "path", path, "layer", layerRef, "error", err)...)
-			writeBackendError(w, r, err)
-			return
-		}
-	}
 	metricEvent(r.Context(), "userdb_query", "api", "find", "result", "ok")
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "find_ok", "path", path, "results", len(results), "name", f.NameGlob, "tag_key", f.TagKey)...)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(results)
-}
-
-func (s *Server) overlayFSLayerGrep(ctx context.Context, b *backend.Dat9Backend, scope *TenantScope, layerRef, query, pathPrefix string, limit int, base []datastore.SearchResult) ([]datastore.SearchResult, error) {
-	layer, entries, err := resolveSearchLayerEntries(ctx, b, layerRef)
-	if err != nil {
-		return nil, err
-	}
-	if layer == nil {
-		return base, nil
-	}
-	hiddenExact, hiddenDirs := fsLayerHiddenPaths(entries)
-	out := filterLayerHiddenResults(base, hiddenExact, hiddenDirs)
-	seen := make(map[string]struct{}, len(out))
-	for _, r := range out {
-		seen[r.Path] = struct{}{}
-	}
-	queryFold := strings.ToLower(query)
-	// Several entries can alias the same blob; resolve each ref once per request.
-	decisions := &fsLayerStorageRefDecisions{}
-	for i := range entries {
-		entry := &entries[i]
-		if _, ok := seen[entry.Path]; ok {
-			continue
-		}
-		if entry.Op != datastore.FSLayerEntryOpUpsert && entry.Op != datastore.FSLayerEntryOpSymlink {
-			continue
-		}
-		if !fsLayerSearchPathMatches(entry.Path, pathPrefix) {
-			continue
-		}
-		// The bytes behind this entry may live outside the caller's scope. Skip
-		// the entry rather than answer: returning a match/no-match verdict here
-		// would leak content the object-read endpoint refuses to serve.
-		if err := s.authorizeFSLayerStorageRefWith(ctx, b.Store(), scope, entry, decisions); err != nil {
-			var denied *fsLayerStorageRefDenied
-			if errors.As(err, &denied) {
-				continue
-			}
-			return nil, err
-		}
-		matched, err := fsLayerEntryContains(ctx, b, entry, queryFold)
-		if err != nil {
-			return nil, err
-		}
-		if !matched {
-			continue
-		}
-		out = append(out, datastore.SearchResult{
-			Path:      entry.Path,
-			Name:      pathutil.BaseName(entry.Path),
-			SizeBytes: entry.SizeBytes,
-		})
-		seen[entry.Path] = struct{}{}
-		if limit > 0 && len(out) >= limit {
-			return out[:limit], nil
-		}
-	}
-	if limit > 0 && len(out) > limit {
-		return out[:limit], nil
-	}
-	return out, nil
-}
-
-func fsLayerEntryContains(ctx context.Context, b *backend.Dat9Backend, entry *datastore.FSLayerEntry, queryFold string) (bool, error) {
-	if queryFold == "" {
-		return true, nil
-	}
-	if entry.Op == datastore.FSLayerEntryOpSymlink {
-		data := []byte(entry.ContentText)
-		if len(data) == 0 {
-			data = entry.ContentBlob
-		}
-		return strings.Contains(strings.ToLower(string(data)), queryFold), nil
-	}
-	rc, err := b.OpenFSLayerEntryData(ctx, entry)
-	if err != nil {
-		return false, err
-	}
-	defer func() { _ = rc.Close() }()
-	buf := make([]byte, 64*1024)
-	overlap := ""
-	overlapBytes := len(queryFold)*4 + 8
-	for {
-		n, readErr := rc.Read(buf)
-		if n > 0 {
-			raw := overlap + string(buf[:n])
-			if strings.Contains(strings.ToLower(raw), queryFold) {
-				return true, nil
-			}
-			if len(raw) > overlapBytes {
-				overlap = raw[len(raw)-overlapBytes:]
-			} else {
-				overlap = raw
-			}
-		}
-		if errors.Is(readErr, io.EOF) {
-			return false, nil
-		}
-		if readErr != nil {
-			return false, readErr
-		}
-	}
-}
-
-func overlayFSLayerFind(ctx context.Context, b *backend.Dat9Backend, layerRef string, filter *datastore.FindFilter, base []datastore.SearchResult) ([]datastore.SearchResult, error) {
-	layer, entries, err := resolveSearchLayerEntries(ctx, b, layerRef)
-	if err != nil {
-		return nil, err
-	}
-	if layer == nil {
-		return base, nil
-	}
-	hiddenExact, hiddenDirs := fsLayerHiddenPaths(entries)
-	out := filterLayerHiddenResults(base, hiddenExact, hiddenDirs)
-	seen := make(map[string]struct{}, len(out))
-	for _, r := range out {
-		seen[r.Path] = struct{}{}
-	}
-	for i := range entries {
-		entry := &entries[i]
-		if entry.Op == datastore.FSLayerEntryOpWhiteout || entry.Op == datastore.FSLayerEntryOpChmod || entry.Op == datastore.FSLayerEntryOpRename {
-			continue
-		}
-		if _, ok := seen[entry.Path]; ok {
-			continue
-		}
-		if !fsLayerFindEntryMatches(entry, filter) {
-			continue
-		}
-		out = append(out, datastore.SearchResult{
-			Path:      entry.Path,
-			Name:      pathutil.BaseName(entry.Path),
-			SizeBytes: entry.SizeBytes,
-		})
-		seen[entry.Path] = struct{}{}
-		if filter != nil && filter.Limit > 0 && len(out) >= filter.Limit {
-			return out[:filter.Limit], nil
-		}
-	}
-	if filter != nil && filter.Limit > 0 && len(out) > filter.Limit {
-		return out[:filter.Limit], nil
-	}
-	return out, nil
-}
-
-func resolveSearchLayerEntries(ctx context.Context, b *backend.Dat9Backend, layerRef string) (*datastore.FSLayer, []datastore.FSLayerEntry, error) {
-	if b == nil || b.Store() == nil {
-		return nil, nil, fmt.Errorf("missing backend store")
-	}
-	layer, err := b.Store().ResolveFSLayerRef(ctx, layerRef)
-	if err != nil {
-		return nil, nil, err
-	}
-	switch layer.State {
-	case datastore.FSLayerStateActive, datastore.FSLayerStateSealed, datastore.FSLayerStateCommitting:
-	default:
-		return nil, nil, fmt.Errorf("fs layer %s is %s", layer.LayerID, layer.State)
-	}
-	var entries []datastore.FSLayerEntry
-	if layer.HasParent() {
-		entries, err = b.Store().ListFSLayerChainMergedEntries(ctx, layer.LayerID)
-	} else {
-		entries, err = b.Store().ListFSLayerEntries(ctx, layer.LayerID)
-	}
-	if err != nil {
-		return nil, nil, err
-	}
-	return layer, entries, nil
-}
-
-func fsLayerHiddenPaths(entries []datastore.FSLayerEntry) (map[string]struct{}, []string) {
-	exact := make(map[string]struct{})
-	var dirs []string
-	for i := range entries {
-		entry := &entries[i]
-		switch entry.Op {
-		case datastore.FSLayerEntryOpUpsert, datastore.FSLayerEntryOpSymlink, datastore.FSLayerEntryOpMkdir:
-			exact[entry.Path] = struct{}{}
-		case datastore.FSLayerEntryOpWhiteout:
-			exact[entry.Path] = struct{}{}
-			if entry.Kind == datastore.FSLayerEntryKindDir || strings.HasSuffix(entry.Path, "/") {
-				dir := entry.Path
-				if !strings.HasSuffix(dir, "/") {
-					dir += "/"
-				}
-				dirs = append(dirs, dir)
-			}
-		case datastore.FSLayerEntryOpRename:
-			exact[entry.Path] = struct{}{}
-			target := strings.TrimSpace(entry.ContentText)
-			if target == "" && len(entry.ContentBlob) > 0 {
-				target = strings.TrimSpace(string(entry.ContentBlob))
-			}
-			if target != "" {
-				exact[target] = struct{}{}
-			}
-		}
-	}
-	return exact, dirs
-}
-
-func filterLayerHiddenResults(base []datastore.SearchResult, exact map[string]struct{}, dirs []string) []datastore.SearchResult {
-	out := make([]datastore.SearchResult, 0, len(base))
-	for _, result := range base {
-		if _, hidden := exact[result.Path]; hidden {
-			continue
-		}
-		hidden := false
-		for _, dir := range dirs {
-			if strings.HasPrefix(result.Path, dir) {
-				hidden = true
-				break
-			}
-		}
-		if !hidden {
-			out = append(out, result)
-		}
-	}
-	return out
-}
-
-func fsLayerSearchPathMatches(path, prefix string) bool {
-	prefix = strings.TrimSpace(prefix)
-	if prefix == "" || prefix == "/" {
-		return strings.HasPrefix(path, "/")
-	}
-	if strings.HasSuffix(prefix, "/") {
-		return path == prefix || strings.HasPrefix(path, prefix)
-	}
-	return path == prefix || strings.HasPrefix(path, prefix+"/")
-}
-
-func fsLayerFindEntryMatches(entry *datastore.FSLayerEntry, filter *datastore.FindFilter) bool {
-	if entry == nil {
-		return false
-	}
-	if filter != nil {
-		if !fsLayerSearchPathMatches(entry.Path, filter.PathPrefix) {
-			return false
-		}
-		if filter.TagKey != "" {
-			return false
-		}
-		if filter.NameGlob != "" {
-			matched, err := pathpkg.Match(filter.NameGlob, pathutil.BaseName(entry.Path))
-			if err != nil || !matched {
-				return false
-			}
-		}
-		if filter.After != nil && !entry.UpdatedAt.After(*filter.After) {
-			return false
-		}
-		if filter.Before != nil && !entry.UpdatedAt.Before(*filter.Before) {
-			return false
-		}
-		if filter.MinSize > 0 && entry.SizeBytes < filter.MinSize {
-			return false
-		}
-		if filter.MaxSize > 0 && entry.SizeBytes > filter.MaxSize {
-			return false
-		}
-	}
-	return true
 }

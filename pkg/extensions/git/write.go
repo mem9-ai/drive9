@@ -29,9 +29,11 @@ type gitHandle struct {
 	rel   string
 	flags uint32
 	mode  uint32
-	// treeSHA set on a clean-tree read handle: reads materialize the
-	// blob instead of falling to the (absent) base-plane entry.
-	treeSHA string
+	// Capture the clean base at open. A rename may change rel, and a refresh
+	// may replace the tree before the first read or buffered write.
+	treeSHA  string
+	treeHead string
+	treeRel  string
 
 	mu       sync.Mutex
 	buf      *writebuffer.WriteBuffer
@@ -70,14 +72,12 @@ func (g *Git) claimWorkspaceOpen(w *workspace, path, rel string, flags uint32, m
 	if h.mode == 0 {
 		h.mode = mode & 0o777
 	}
-	if h.mode == 0 {
-		// An in-place modify of a clean tree file carries no create mode
-		// (append opens, O_TRUNC rewrites of existing names): the file
-		// keeps the tree node's mode — a stash/checkout restore that
-		// rewrites content in place must not regress an 0755 fixture
-		// file to 0644 in the published overlay entry.
-		if n, tok := w.treeLookup(rel); tok {
+	if n, head, ok := w.treeLookup(rel); ok {
+		if h.mode == 0 {
 			h.mode = parseMode(n.Mode)
+		}
+		if !hit && !fresh && n.Kind == "file" {
+			h.treeSHA, h.treeHead, h.treeRel = n.ObjectSHA, head, rel
 		}
 	}
 	if h.mode == 0 {
@@ -86,12 +86,15 @@ func (g *Git) claimWorkspaceOpen(w *workspace, path, rel string, flags uint32, m
 	return h, nil
 }
 
-func (h *gitHandle) Attr() fs.Attr {
+func (h *gitHandle) Attr() fs.Attr { return h.attr(context.Background()) }
+
+func (h *gitHandle) attr(ctx context.Context) fs.Attr {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	size := int64(0)
 	mtime := h.w.cleanTreeMtime()
-	if e, hit := h.w.lookup(h.rel); hit && e.Op == "upsert" {
+	e, hit := h.w.lookup(h.rel)
+	if hit && e.Op == "upsert" {
 		size = int64(len(e.Content))
 		if !e.mtime.IsZero() {
 			mtime = e.mtime
@@ -99,17 +102,26 @@ func (h *gitHandle) Attr() fs.Attr {
 	}
 	if h.buf != nil {
 		size = h.buf.Size()
-	}
-	if size == 0 && h.treeSHA != "" {
-		if n, tok := h.w.treeLookup(h.rel); tok {
+	} else if !hit && h.treeSHA != "" {
+		if n, _, ok := h.w.treeLookup(h.rel); ok && n.ObjectSHA == h.treeSHA && n.SizeBytes >= 0 {
 			size = n.SizeBytes
-			if size < 0 {
-				size = h.g.blobSize(h.w, h.treeSHA)
-				h.w.noteTreeSize(h.rel, size)
-			}
+		} else {
+			size = h.g.resolveTreeNodeSize(ctx, h.w, h.treeHead, h.treeRel, h.treeSHA)
+			h.w.noteTreeSize(h.rel, h.treeSHA, size)
 		}
 	}
-	return fs.Attr{Kind: fs.KindFile, Mode: h.mode, Size: size, Mtime: mtime}
+	return fs.Attr{Kind: fs.KindFile, Mode: h.mode, Size: max(0, size), Mtime: mtime}
+}
+
+// A cold workspace may acquire its object database after the first attempt.
+func (h *gitHandle) loadTreeBlob(ctx context.Context, head, rel, sha string) ([]byte, error) {
+	data, err := h.g.materializeTreeEntry(ctx, h.w, head, rel, sha)
+	if err != nil && !gitReadInterrupted(err) {
+		if restoreErr := h.g.ensureWorkspaceState(ctx, h.w); restoreErr == nil {
+			return h.g.materializeTreeEntry(ctx, h.w, head, rel, sha)
+		}
+	}
+	return data, err
 }
 
 func (h *gitHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
@@ -117,19 +129,11 @@ func (h *gitHandle) Read(ctx context.Context, off int64, dest []byte) (int, erro
 	defer h.mu.Unlock()
 	if h.buf == nil && h.treeSHA != "" {
 		if _, hit := h.w.lookup(h.rel); !hit {
-			data, err := h.g.materializeBlob(h.w, h.treeSHA)
-			if err != nil {
-				// The blob's local .git may simply not be here yet: the
-				// discovery-time restore ran before the CLI uploaded its
-				// checkpoint. Pull the state once, then retry.
-				if rerr := h.g.ensureWorkspaceState(ctx, h.w); rerr == nil {
-					data, err = h.g.materializeBlob(h.w, h.treeSHA)
-				}
-			}
+			data, err := h.loadTreeBlob(ctx, h.treeHead, h.treeRel, h.treeSHA)
 			if err != nil {
 				return 0, err
 			}
-			h.w.noteTreeSize(h.rel, int64(len(data)))
+			h.w.noteTreeSize(h.rel, h.treeSHA, int64(len(data)))
 			if off >= int64(len(data)) {
 				return 0, nil
 			}
@@ -210,7 +214,7 @@ func (h *gitHandle) Release(ctx context.Context) error {
 	// commit (which reads the buffer) and on every early return.
 	defer h.releaseBuffer()
 	h.g.untrackHandle(h)
-	if h.unlinked {
+	if fs.IsRejectedOpen(ctx) || h.unlinked {
 		return nil
 	}
 	return h.commit(ctx)
@@ -224,11 +228,11 @@ func (h *gitHandle) releaseBuffer() {
 	writebuffer.Discard(&h.buf)
 }
 
-// Truncate applies a local truncation; the image lands at the boundary.
-func (h *gitHandle) Truncate(size int64) error {
+// truncate applies a local truncation; the image lands at the boundary.
+func (h *gitHandle) truncate(ctx context.Context, size int64) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if err := h.ensureBufferLocked(context.Background()); err != nil {
+	if err := h.ensureBufferLocked(ctx); err != nil {
 		return err
 	}
 	if err := h.buf.Truncate(size); err != nil {
@@ -374,19 +378,23 @@ func (h *gitHandle) ensureBufferLocked(ctx context.Context) (err error) {
 		buf.ClearDirty()
 		return nil
 	}
-	if n, ok := h.w.treeLookup(h.rel); ok && n.Kind == "file" && n.ObjectSHA != "" {
-		data, err := h.g.materializeBlob(h.w, n.ObjectSHA)
-		if err != nil {
-			if rerr := h.g.ensureWorkspaceState(ctx, h.w); rerr == nil {
-				data, err = h.g.materializeBlob(h.w, n.ObjectSHA)
-			}
+	head, rel, sha := h.treeHead, h.treeRel, h.treeSHA
+	if sha == "" {
+		if n, current, ok := h.w.treeLookup(h.rel); ok && n.Kind == "file" {
+			head, rel, sha = current, h.rel, n.ObjectSHA
 		}
+	}
+	if sha != "" {
+		data, err := h.loadTreeBlob(ctx, head, rel, sha)
 		if err == nil {
 			if _, werr := buf.Write(0, data); werr != nil {
 				return werr
 			}
 			buf.ClearDirty()
 			return nil
+		}
+		if h.treeSHA != "" || gitReadInterrupted(err) {
+			return err
 		}
 		// Fall through to the remote base: the blob may be materializable
 		// there even though the local git dir cannot serve it.

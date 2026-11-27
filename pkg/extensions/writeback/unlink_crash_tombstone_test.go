@@ -20,6 +20,7 @@ package writeback
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -210,7 +211,7 @@ func TestUnlinkOfOpenFileInsideFsyncWindowDoesNotResurrectAfterCrash(t *testing.
 
 	// close(2) returned; RELEASE is still in flight, so unlink(2) takes the
 	// unlink-of-open-file branch: the queued upload is canceled mid-flight.
-	if err := s.wb.MarkPathUnlinked(path); err != nil {
+	if err := s.wb.PreparePathUnlink(path, false)(true); err != nil {
 		t.Fatalf("unlink-of-open-file marking: %v", err)
 	}
 
@@ -307,7 +308,7 @@ func TestFsyncRacingUnlinkOfOpenFileStagesNothing(t *testing.T) {
 	// check-to-enqueue window — the post-enqueue recheck that cancels the
 	// just-enqueued entry. Mark BEFORE the fsync runs: its guard must bar
 	// the staging outright.
-	if err := s.wb.MarkPathUnlinked(path); err != nil {
+	if err := s.wb.PreparePathUnlink(path, false)(true); err != nil {
 		t.Fatalf("racing unlink marking: %v", err)
 	}
 	if err := h.Sync(ctx); err != nil {
@@ -350,7 +351,7 @@ func TestUnlinkMarkerFailureDropsPreservedState(t *testing.T) {
 	if err := s.ledger.Journal.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.wb.MarkPathUnlinked(path); err != nil {
+	if err := s.wb.PreparePathUnlink(path, false)(true); err != nil {
 		t.Fatalf("marker failure with a working cleanup must not fail the unlink: %v", err)
 	}
 
@@ -443,7 +444,7 @@ func TestUnlinkMarkerAndCleanupFailureFailsUnlink(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = os.Chmod(shadowDir, 0o700) })
 
-			err := s.wb.MarkPathUnlinked(path)
+			err := s.wb.PreparePathUnlink(path, false)(true)
 			if err == nil {
 				t.Fatal("marker + cleanup both failing must fail the unlink instead of acknowledging it")
 			}
@@ -539,7 +540,7 @@ func TestFsyncMarkedDuringStagingWindowSelfCancelsWithoutDeadlock(t *testing.T) 
 	// The staging parks on the held upload with the queue's path lock
 	// held; the marking (which takes no lock) lands in the window.
 	time.Sleep(100 * time.Millisecond)
-	if err := s.wb.MarkPathUnlinked(path); err != nil {
+	if err := s.wb.PreparePathUnlink(path, false)(true); err != nil {
 		t.Fatalf("window marking: %v", err)
 	}
 	s.hold.Store(false)
@@ -559,5 +560,38 @@ func TestFsyncMarkedDuringStagingWindowSelfCancelsWithoutDeadlock(t *testing.T) 
 	}
 	if _, ok := s.backend.Node(path); ok {
 		t.Fatal("the windowed fsync published the unlinked name")
+	}
+}
+
+func TestAbortedPreparedUnlinkKeepsQueuedWrite(t *testing.T) {
+	const path = "/held"
+	s := newUnlinkWindowStack(t, path)
+	s.hold.Store(true)
+	ctx := context.Background()
+	h := open(t, s.ch, path).(*bufferingHandle)
+	if err := h.Write(ctx, 0, []byte("accepted")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s.waitPutStarted(t)
+	frames := journalFramesFor(t, s.ledger.Journal, path)
+	finish := s.wb.PreparePathUnlink(path, false)
+	if err := finish(false); !errors.Is(err, errLayerRolledBack) {
+		t.Fatalf("aborted unlink: %v", err)
+	}
+	h.mu.Lock()
+	anonymous := h.unlinked
+	h.mu.Unlock()
+	if anonymous || !s.ledger.Pending.HasPending(path) || !s.ledger.Shadow.Has(path) || frames != journalFramesFor(t, s.ledger.Journal, path) {
+		t.Fatal("preparation retired a live handle or replayable queued write")
+	}
+	s.hold.Store(false)
+	if err := s.wb.WaitCommitQueueIdle(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if node, ok := s.backend.Node(path); !ok || string(node.Data) != "accepted" {
+		t.Fatal("aborted unlink cancelled previously accepted upload")
 	}
 }

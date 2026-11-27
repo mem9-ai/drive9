@@ -90,23 +90,16 @@ func TestGrepTextOutputWithoutJSON(t *testing.T) {
 	}
 }
 
-func TestGrepJSONWithLayer(t *testing.T) {
+func TestGrepRejectsLayerFlag(t *testing.T) {
 	var capturedLayer string
 	srv := newGrepTestServer(t, `[]`, &capturedLayer)
 	defer srv.Close()
 
 	c := client.New(srv.URL, "")
-	out, err := captureStdoutE(t, func() error {
+	_, err := captureStdoutE(t, func() error {
 		return Grep(c, []string{"--json", "--layer", "task=search", "needle", ":/repo/"})
 	})
-	if err != nil {
-		t.Fatalf("Grep --json --layer: %v", err)
-	}
-
-	if capturedLayer != "task=search" {
-		t.Fatalf("layer param = %q, want task=search", capturedLayer)
-	}
-	if got := strings.TrimSpace(out); got != "[]" {
-		t.Fatalf("got %q, want []", got)
+	if err == nil || !strings.Contains(err.Error(), "unsupported in layer view") {
+		t.Fatalf("Grep --layer err = %v, want unsupported in layer view", err)
 	}
 }

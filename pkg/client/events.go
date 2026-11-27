@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 // ChangeEvent represents a server-sent filesystem change event.
@@ -60,6 +62,12 @@ func (c *Client) WatchEvents(ctx context.Context, actor string, handler EventHan
 
 // WatchEventsWithLifecycle is WatchEvents with optional lifecycle callbacks.
 func (c *Client) WatchEventsWithLifecycle(ctx context.Context, actor string, handler EventHandler, lifecycle EventLifecycle) {
+	if c.view.LayerID != "" {
+		if lifecycle.OnDisconnected != nil {
+			lifecycle.OnDisconnected(viewprotocol.ErrUnsupportedInLayerView)
+		}
+		return
+	}
 	var lastSeq uint64
 	backoff := sseInitialBackoff
 
@@ -108,6 +116,9 @@ func (c *Client) WatchEventsWithLifecycle(ctx context.Context, actor string, han
 }
 
 func (c *Client) streamEvents(ctx context.Context, since uint64, actor string, handler EventHandler, onCurrent func(seq uint64)) error {
+	if c.view.LayerID != "" {
+		return viewprotocol.ErrUnsupportedInLayerView
+	}
 	url := fmt.Sprintf("%s/v1/events?since=%d", c.baseURL, since)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {

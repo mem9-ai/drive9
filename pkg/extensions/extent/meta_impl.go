@@ -53,21 +53,6 @@ func (b *Bridge) GetFormat() meta.Format {
 	return b.format
 }
 
-func (b *Bridge) Shutdown() error {
-	b.retryOnce.Do(func() { close(b.retryStop) })
-	b.mu.Lock()
-	var spooled int64
-	for id, sl := range b.stagedSlices {
-		spooled += sl.closeAndSpoolBytes()
-		delete(b.stagedSlices, id)
-	}
-	b.mu.Unlock()
-	if spooled > 0 {
-		b.blocks.releaseDiskSpool(spooled)
-	}
-	return nil
-}
-
 func (b *Bridge) OnReload(cb func(*meta.Format)) {}
 
 func (b *Bridge) NewSession(record bool) error {
@@ -130,25 +115,49 @@ func isRangeNotSatisfiable(err error) bool {
 
 // ---- namespace ----
 
+func (b *Bridge) peekIncarnationIno(full string) (meta.Ino, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if rep, hasRep := b.replacements[full]; hasRep {
+		return rep, false
+	}
+	ino := inoFor(full)
+	if held, isHeld := b.heldInoForLocked(full); isHeld && held == ino {
+		return 0, true
+	}
+	return ino, false
+}
+
+func (b *Bridge) resolveOrCreateIncarnationIno(full string) meta.Ino {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if rep, hasRep := b.replacements[full]; hasRep {
+		return rep
+	}
+	ino := inoFor(full)
+	if held, isHeld := b.heldInoForLocked(full); isHeld && held == ino {
+		rep := b.allocateHeldReplacementInoLocked()
+		b.replacements[full] = rep
+		return rep
+	}
+	return ino
+}
+
 func (b *Bridge) Lookup(ctx meta.Context, parent meta.Ino, name string, inode *meta.Ino, attr *meta.Attr, checkPerm bool) syscall.Errno {
 	pp, ok := b.remotePath(parent)
 	if !ok {
 		return syscall.ESTALE
 	}
 	path := childPath(pp, name)
-	// The live incarnation's key: a replacement's synthetic inode when one
-	// owns this pathname, else the path hash.
-	b.mu.Lock()
-	ino := b.liveInoLocked(path)
-	b.mu.Unlock()
-	st, err := b.cfg.Client.StatCtx(ctxOf(ctx), path)
+	ino, deferredReplacement := b.peekIncarnationIno(path)
+	st, err := b.client().StatCtx(ctxOf(ctx), path)
 	if err != nil {
-		// Fresh files exist only locally until their first commit.
-		if client.IsNotFound(err) {
+		if client.IsNotFound(err) && !deferredReplacement {
 			b.mu.Lock()
 			size, fresh := b.sizes[ino]
+			mappedPath := b.paths[ino]
 			b.mu.Unlock()
-			if fresh {
+			if fresh && mappedPath == path {
 				if inode != nil {
 					*inode = ino
 				}
@@ -159,6 +168,9 @@ func (b *Bridge) Lookup(ctx meta.Context, parent meta.Ino, name string, inode *m
 			}
 		}
 		return errnoOf(err)
+	}
+	if deferredReplacement {
+		ino = b.resolveOrCreateIncarnationIno(path)
 	}
 	b.remember(ino, path)
 	b.observeRevisionWithSize(ino, st.Revision, st.Size)
@@ -181,7 +193,7 @@ func (b *Bridge) GetAttr(ctx meta.Context, ino meta.Ino, attr *meta.Attr) syscal
 	if !ok {
 		return syscall.ESTALE
 	}
-	st, err := b.cfg.Client.StatCtx(ctxOf(ctx), path)
+	st, err := b.client().StatCtx(ctxOf(ctx), path)
 	if err != nil {
 		if client.IsNotFound(err) {
 			b.mu.Lock()
@@ -233,7 +245,7 @@ func (b *Bridge) Resolve(ctx meta.Context, parent meta.Ino, path string, inode *
 		return syscall.ESTALE
 	}
 	full := childPath(pp, path)
-	st, err := b.cfg.Client.StatCtx(ctxOf(ctx), full)
+	st, err := b.client().StatCtx(ctxOf(ctx), full)
 	if err != nil {
 		return errnoOf(err)
 	}
@@ -288,7 +300,7 @@ func (b *Bridge) Mkdir(ctx meta.Context, parent meta.Ino, name string, mode uint
 		return syscall.ESTALE
 	}
 	path := childPath(pp, name)
-	if err := b.cfg.Client.MkdirCtx(ctxOf(ctx), path, uint32(mode & ^cumask)); err != nil {
+	if err := b.client().MkdirCtx(ctxOf(ctx), path, uint32(mode & ^cumask)); err != nil {
 		return errnoOf(err)
 	}
 	ino := inoFor(path)
@@ -313,18 +325,7 @@ func (b *Bridge) Mknod(ctx meta.Context, parent meta.Ino, name string, _type uin
 		return syscall.ESTALE
 	}
 	full := childPath(pp, name)
-	ino := inoFor(full)
-	// A held path hash (live deleted-open or renamed-away descriptor) means
-	// this create is a NEW incarnation: allocate its synthetic key and
-	// publish it in the same critical section, so the same incarnation's
-	// later resolutions (Create's mandatory ResolvePath, repeated opens)
-	// land on THIS inode and no concurrent resolution can publish another.
-	b.mu.Lock()
-	if held, isHeld := b.heldInoForLocked(full); isHeld && held == ino {
-		ino = b.allocateHeldReplacementInoLocked()
-		b.replacements[full] = ino
-	}
-	b.mu.Unlock()
+	ino := b.resolveOrCreateIncarnationIno(full)
 	b.remember(ino, full)
 	b.mu.Lock()
 	if _, has := b.sizes[ino]; !has {
@@ -361,9 +362,9 @@ func (b *Bridge) removeEntry(ctx meta.Context, parent meta.Ino, name string) sys
 	}
 	path := childPath(pp, name)
 	// Fresh, never-committed files have no server-side name yet.
-	st, err := b.cfg.Client.StatCtx(ctxOf(ctx), path)
+	st, err := b.client().StatCtx(ctxOf(ctx), path)
 	if err == nil || !client.IsNotFound(err) {
-		if err := b.cfg.Client.RemoveAllCtx(ctxOf(ctx), path); err != nil {
+		if err := b.client().RemoveAllCtx(ctxOf(ctx), path); err != nil {
 			return errnoOf(err)
 		}
 	}
@@ -400,8 +401,8 @@ func (b *Bridge) Rename(ctx meta.Context, parentSrc meta.Ino, nameSrc string, pa
 	}
 	src := childPath(sp, nameSrc)
 	dst := childPath(dp, nameDst)
-	if _, err := b.cfg.Client.StatCtx(ctxOf(ctx), src); err == nil {
-		if err := b.cfg.Client.RenameCtx(ctxOf(ctx), src, dst); err != nil {
+	if _, err := b.client().StatCtx(ctxOf(ctx), src); err == nil {
+		if err := b.client().RenameCtx(ctxOf(ctx), src, dst); err != nil {
 			return errnoOf(err)
 		}
 	}
@@ -437,7 +438,7 @@ func (b *Bridge) Readdir(ctx meta.Context, ino meta.Ino, wantattr uint8, entries
 	if !ok {
 		return syscall.ESTALE
 	}
-	infos, err := b.cfg.Client.ListCtx(ctxOf(ctx), path)
+	infos, err := b.client().ListCtx(ctxOf(ctx), path)
 	if err != nil {
 		return errnoOf(err)
 	}
@@ -522,7 +523,7 @@ func (b *Bridge) fetchFreshReadPlan(ctx context.Context, ino meta.Ino, path stri
 			case <-time.After(delay):
 			}
 		}
-		last, err = b.cfg.Client.GetExtentReadPlan(ctx, path, start, end)
+		last, err = b.client().GetExtentReadPlan(ctx, path, start, end)
 		if err != nil {
 			if known > 0 && start < pubSize && (client.IsNotFound(err) || isRangeNotSatisfiable(err)) {
 				continue
@@ -550,7 +551,7 @@ func (b *Bridge) fetchFreshReadPlan(ctx context.Context, ino meta.Ino, path stri
 // (avoiding EIO / mmap SIGBUS without any persistent classic-ownership state).
 func (b *Bridge) synthesizeUnconvertedReadPlan(ctx context.Context, ino meta.Ino, path string, start int64) (*client.ExtentReadPlan, error) {
 	known, pubSize := b.publishedState(ino)
-	rc, err := b.cfg.Client.ReadStreamRange(ctx, path, start, meta.ChunkSize)
+	rc, err := b.client().ReadStreamRange(ctx, path, start, meta.ChunkSize)
 	if err != nil {
 		if client.IsNotFound(err) || isRangeNotSatisfiable(err) {
 			if known > 0 && start < pubSize {
@@ -606,7 +607,7 @@ func (b *Bridge) Read(ctx meta.Context, ino meta.Ino, indx uint32, slices *[]met
 			truncFloor, truncating := b.truncs[ino]
 			b.mu.Unlock()
 			if known > 0 && start < pubSize && (!truncating || start < truncFloor) {
-				if st, serr := b.cfg.Client.StatCtx(ctxOf(ctx), path); serr == nil && st.Revision >= known && st.Size <= start {
+				if st, serr := b.client().StatCtx(ctxOf(ctx), path); serr == nil && st.Revision >= known && st.Size <= start {
 					b.observeRevisionWithSize(ino, st.Revision, st.Size)
 				} else {
 					return syscall.EIO
@@ -858,13 +859,16 @@ func (b *Bridge) Read(ctx meta.Context, ino meta.Ino, indx uint32, slices *[]met
 }
 
 func (b *Bridge) withShutdownCtx(parent context.Context) (context.Context, context.CancelFunc) {
-	if b.retryStop == nil {
+	b.mu.Lock()
+	stopCh := b.retryStop
+	b.mu.Unlock()
+	if stopCh == nil {
 		return context.WithCancel(parent)
 	}
 	ctx, cancel := context.WithCancel(parent)
 	go func() {
 		select {
-		case <-b.retryStop:
+		case <-stopCh:
 			cancel()
 		case <-ctx.Done():
 		}
@@ -893,26 +897,50 @@ func (b *Bridge) NewSlice(ctx meta.Context, id *uint64) syscall.Errno {
 	return 0
 }
 
+func (b *Bridge) recordCommitErr(ino meta.Ino, err error) {
+	if err == nil {
+		return
+	}
+	b.mu.Lock()
+	b.commitErr[ino] = err
+	b.mu.Unlock()
+	b.kickPendingFlush()
+}
+
 func (b *Bridge) flushAnyPending(ctx context.Context) {
 	b.mu.Lock()
-	seen := make(map[meta.Ino]struct{}, len(b.pending)+len(b.commitErr))
-	inos := make([]meta.Ino, 0, len(b.pending)+len(b.commitErr))
-	for ino, list := range b.pending {
-		if len(list) > 0 {
-			seen[ino] = struct{}{}
-			inos = append(inos, ino)
-		}
-	}
-	for ino := range b.commitErr {
+	seen := make(map[meta.Ino]struct{}, len(b.pending)+len(b.commitErr)+len(b.truncs)+len(b.closedRetained))
+	inos := make([]meta.Ino, 0, len(b.pending)+len(b.commitErr)+len(b.truncs)+len(b.closedRetained))
+	add := func(ino meta.Ino) {
 		if _, ok := seen[ino]; !ok {
 			seen[ino] = struct{}{}
 			inos = append(inos, ino)
 		}
 	}
+	for ino, list := range b.pending {
+		if len(list) > 0 {
+			add(ino)
+		}
+	}
+	for ino := range b.truncs {
+		add(ino)
+	}
+	for ino := range b.commitErr {
+		add(ino)
+	}
+	for ino := range b.closedRetained {
+		add(ino)
+	}
 	b.mu.Unlock()
 	for _, ino := range inos {
 		if ctx.Err() != nil {
 			return
+		}
+		if b.isClosedRetained(ino) {
+			if err := b.FlushFileFinal(ctx, ino); err == nil {
+				b.retireClosed(ino)
+			}
+			continue
 		}
 		_ = b.FlushFile(ctx, ino)
 	}
@@ -955,16 +983,21 @@ func (b *Bridge) kickPendingFlush() {
 		b.mu.Unlock()
 		return
 	}
-	select {
-	case <-b.retryStop:
-		b.mu.Unlock()
-		return
-	default:
+	stopCh := b.retryStop
+	if stopCh != nil {
+		select {
+		case <-stopCh:
+			b.mu.Unlock()
+			return
+		default:
+		}
 	}
 	b.retryRunning = true
+	b.retryWg.Add(1)
 	b.mu.Unlock()
 
-	go func() {
+	go func(stopCh <-chan struct{}) {
+		defer b.retryWg.Done()
 		delays := []time.Duration{100 * time.Millisecond, 250 * time.Millisecond, 500 * time.Millisecond, time.Second}
 		step := 0
 		for {
@@ -974,7 +1007,7 @@ func (b *Bridge) kickPendingFlush() {
 			}
 			timer := time.NewTimer(d)
 			select {
-			case <-b.retryStop:
+			case <-stopCh:
 				timer.Stop()
 				b.mu.Lock()
 				b.retryRunning = false
@@ -982,9 +1015,11 @@ func (b *Bridge) kickPendingFlush() {
 				return
 			case <-timer.C:
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			sctx, scancel := b.withShutdownCtx(context.Background())
+			ctx, cancel := context.WithTimeout(sctx, 30*time.Second)
 			b.flushAnyPending(ctx)
 			cancel()
+			scancel()
 
 			b.mu.Lock()
 			if len(b.commitErr) == 0 {
@@ -994,7 +1029,7 @@ func (b *Bridge) kickPendingFlush() {
 			}
 			b.mu.Unlock()
 		}
-	}()
+	}(stopCh)
 }
 
 // Write records one uploaded slice and commits every pending slice of the
@@ -1128,7 +1163,7 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 	if !ok {
 		return fmt.Errorf("no path for inode %d", ino)
 	}
-	st, err := b.cfg.Client.StatCtx(ctx, path)
+	st, err := b.client().StatCtx(ctx, path)
 	fresh := err != nil && client.IsNotFound(err)
 	if err != nil && !fresh {
 		return err
@@ -1153,7 +1188,7 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 	// extent create this descriptor semantically represents. Conditional file
 	// delete fences on revision + resource identity and refuses directories.
 	if !fresh && err == nil && b.matchesEmptyPlaceholderFull(path, st) && (bounded || b.isFreshCreate(ino)) {
-		if rmErr := b.cfg.Client.DeleteFileConditionalCtx(ctx, path, st.Revision, st.ResourceID); rmErr != nil {
+		if rmErr := b.client().DeleteFileConditionalCtx(ctx, path, st.Revision, st.ResourceID); rmErr != nil {
 			return fmt.Errorf("remove empty placeholder %s: %w", path, rmErr)
 		}
 		b.takeEmptyPlaceholderFull(path)
@@ -1177,7 +1212,7 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 	}
 
 	if fresh {
-		if !b.cfg.Client.WarmCompletionIdentity(ctx) {
+		if !b.client().WarmCompletionIdentity(ctx) {
 			return fmt.Errorf("create %s: server does not advertise completion_identity_v1, so the landed object cannot be attributed to this descriptor", path)
 		}
 		landed := ""
@@ -1185,7 +1220,7 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 		upctx := client.WithCompletedResourceSink(ctx, &landed)
 		upctx = client.WithCompletedRevisionSink(upctx, &landedRev)
 		ra := &sparseImageAt{bridge: b, ctx: ctx, path: path, size: size, writes: pending}
-		if err := b.cfg.Client.WriteExtentStreamConditional(upctx, path, ra, size, nil, -1); err != nil {
+		if err := b.client().WriteExtentStreamConditional(upctx, path, ra, size, nil, -1); err != nil {
 			return err
 		}
 		if landed == "" {
@@ -1199,7 +1234,7 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 		b.mu.Unlock()
 		b.recordLandedRevisionWithSize(ino, landedRev, size)
 		if landedRev <= 0 {
-			if nst, serr := b.cfg.Client.StatCtx(ctx, path); serr == nil && nst.ResourceID == landed {
+			if nst, serr := b.client().StatCtx(ctx, path); serr == nil && nst.ResourceID == landed {
 				b.observeRevisionWithSize(ino, nst.Revision, nst.Size)
 			}
 		}
@@ -1216,7 +1251,7 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 			return cerr
 		}
 		if b.publishedRevision(ino) <= revBefore {
-			if nst, serr := b.cfg.Client.StatCtx(ctx, path); serr == nil {
+			if nst, serr := b.client().StatCtx(ctx, path); serr == nil {
 				b.observeRevisionWithSize(ino, nst.Revision, nst.Size)
 			}
 		}
@@ -1236,7 +1271,7 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 	b.releaseCommitted(ino, pending)
 	b.clearBufferedLength(ino, size)
 	if fresh && mode != 0 && mode != 0o644 {
-		_ = b.cfg.Client.ChmodCtx(ctx, path, uint32(mode))
+		_ = b.client().ChmodCtx(ctx, path, uint32(mode))
 	}
 	return nil
 }
@@ -1320,7 +1355,7 @@ func (b *Bridge) commitWithRetry(ctx context.Context, ino meta.Ino, path string,
 	// hand the caller an image OLDER than one this mount already wrote.
 	var landedRev int64
 	pctx := client.WithCompletedRevisionSink(ctx, &landedRev)
-	err := b.cfg.Client.CommitExtentPatchExpectedResource(pctx, path, size, blocks, rev, expRes)
+	err := b.client().CommitExtentPatchExpectedResource(pctx, path, size, blocks, rev, expRes)
 	if err == nil {
 		b.recordLandedRevisionWithSize(ino, landedRev, size)
 		return landedRev, nil
@@ -1333,7 +1368,7 @@ func (b *Bridge) commitWithRetry(ctx context.Context, ino meta.Ino, path string,
 	// content-addressed, nothing is re-uploaded. The re-stat is
 	// IDENTITY-CHECKED when a recovery constraint is active: a conflict
 	// against a replacement must never publish the staged data into it.
-	st, serr := b.cfg.Client.StatCtx(ctx, path)
+	st, serr := b.client().StatCtx(ctx, path)
 	if serr != nil {
 		return 0, err
 	}
@@ -1346,7 +1381,7 @@ func (b *Bridge) commitWithRetry(ctx context.Context, ino meta.Ino, path string,
 		return 0, fmt.Errorf("target %s no longer holds the staged object", path)
 	}
 	landedRev = 0
-	err2 := b.cfg.Client.CommitExtentPatchExpectedResource(client.WithCompletedRevisionSink(ctx, &landedRev), path, size, blocks, st.Revision, id2)
+	err2 := b.client().CommitExtentPatchExpectedResource(client.WithCompletedRevisionSink(ctx, &landedRev), path, size, blocks, st.Revision, id2)
 	if errors.Is(err2, client.ErrResourceMismatch) {
 		b.abandonIno(ino)
 	}
@@ -1369,7 +1404,7 @@ func (b *Bridge) applyTruncateFloor(ctx context.Context, ino meta.Ino, path stri
 		return err
 	}
 	if nextRev <= 0 {
-		nst, serr := b.cfg.Client.StatCtx(ctx, path)
+		nst, serr := b.client().StatCtx(ctx, path)
 		if serr != nil {
 			return serr
 		}
@@ -1518,10 +1553,10 @@ func (b *Bridge) flushPendingLocked(ctx context.Context, ino meta.Ino) error {
 }
 
 func (b *Bridge) publishPureSparseExtent(ctx context.Context, ino meta.Ino, path string, size int64, snapTruncSeq uint64) error {
-	if !b.cfg.Client.WarmCompletionIdentity(ctx) {
+	if !b.client().WarmCompletionIdentity(ctx) {
 		return fmt.Errorf("create %s: server does not advertise completion_identity_v1, so the landed object cannot be attributed to this descriptor", path)
 	}
-	rev, createdID, nativeExtent, err := b.cfg.Client.CreateExtentFileCreatedCtx(ctx, path)
+	rev, createdID, nativeExtent, err := b.client().CreateExtentFileCreatedCtx(ctx, path)
 	if err != nil {
 		return err
 	}
@@ -1539,7 +1574,7 @@ func (b *Bridge) publishPureSparseExtent(ctx context.Context, ino meta.Ino, path
 			}
 		}
 	} else {
-		if rmErr := b.cfg.Client.DeleteFileConditionalCtx(ctx, path, rev, createdID); rmErr != nil {
+		if rmErr := b.client().DeleteFileConditionalCtx(ctx, path, rev, createdID); rmErr != nil {
 			return fmt.Errorf("remove fallback placeholder %s: %w", path, rmErr)
 		}
 		landed := ""
@@ -1547,7 +1582,7 @@ func (b *Bridge) publishPureSparseExtent(ctx context.Context, ino meta.Ino, path
 		upctx := client.WithCompletedResourceSink(ctx, &landed)
 		upctx = client.WithCompletedRevisionSink(upctx, &landedRev)
 		ra := &sparseImageAt{bridge: b, ctx: ctx, path: path, size: size}
-		if err := b.cfg.Client.WriteExtentStreamConditional(upctx, path, ra, size, nil, -1); err != nil {
+		if err := b.client().WriteExtentStreamConditional(upctx, path, ra, size, nil, -1); err != nil {
 			return err
 		}
 		if landed == "" {
@@ -1575,7 +1610,7 @@ func (b *Bridge) publishPureSparseExtent(ctx context.Context, ino meta.Ino, path
 	b.mu.Unlock()
 	b.clearBufferedLength(ino, size)
 	if mode != 0 && mode != 0o644 {
-		_ = b.cfg.Client.ChmodCtx(ctx, path, uint32(mode))
+		_ = b.client().ChmodCtx(ctx, path, uint32(mode))
 	}
 	return nil
 }
@@ -1597,7 +1632,7 @@ func (b *Bridge) flushTruncateOnly(ctx context.Context, ino meta.Ino, size int64
 	if !tracked {
 		return nil
 	}
-	st, err := b.cfg.Client.StatCtx(ctx, path)
+	st, err := b.client().StatCtx(ctx, path)
 	if err != nil {
 		if client.IsNotFound(err) {
 			if size > 0 && b.isFreshCreate(ino) {
@@ -1606,6 +1641,9 @@ func (b *Bridge) flushTruncateOnly(ctx context.Context, ino meta.Ino, size int64
 			b.mu.Lock()
 			if b.truncSeq[ino] == snapTruncSeq {
 				delete(b.truncs, ino)
+				if len(b.pending[ino]) == 0 && !b.needsFreshIdentityLocked(ino) {
+					delete(b.commitErr, ino)
+				}
 			}
 			b.mu.Unlock()
 			return nil
@@ -1632,11 +1670,14 @@ func (b *Bridge) flushTruncateOnly(ctx context.Context, ino meta.Ino, size int64
 				b.mu.Lock()
 				if b.truncSeq[ino] == snapTruncSeq {
 					delete(b.truncs, ino)
+					if len(b.pending[ino]) == 0 && !b.needsFreshIdentityLocked(ino) {
+						delete(b.commitErr, ino)
+					}
 				}
 				b.mu.Unlock()
 				return nil
 			}
-			if rmErr := b.cfg.Client.DeleteFileConditionalCtx(ctx, path, st.Revision, st.ResourceID); rmErr != nil {
+			if rmErr := b.client().DeleteFileConditionalCtx(ctx, path, st.Revision, st.ResourceID); rmErr != nil {
 				return fmt.Errorf("remove empty placeholder %s: %w", path, rmErr)
 			}
 			b.takeEmptyPlaceholderFull(path)
@@ -1688,13 +1729,13 @@ func (b *Bridge) blockBytes(ctx context.Context, p pendingWrite, path string) ([
 		return data, nil
 	}
 	start := int64(p.chunk)*meta.ChunkSize + int64(p.off)
-	plan, err := b.cfg.Client.GetExtentReadPlan(ctx, path, start, start+p.size-1)
+	plan, err := b.client().GetExtentReadPlan(ctx, path, start, start+p.size-1)
 	if err != nil {
 		return nil, err
 	}
 	for _, blk := range plan.Blocks {
 		if blk.BlockKey == p.checksum {
-			rc, err := b.cfg.Client.FetchExtentBlockRange(ctx, blk.URL, blk.BlockOffset, blk.Length)
+			rc, err := b.client().FetchExtentBlockRange(ctx, blk.URL, blk.BlockOffset, blk.Length)
 			if err != nil {
 				return nil, err
 			}
@@ -1815,38 +1856,26 @@ func blockData(b *Bridge, ctx context.Context, path string, w *pendingWrite) []b
 // resolve through the local table.
 func (b *Bridge) ResolveLocal(ctx context.Context, local string) (meta.Ino, syscall.Errno) {
 	full := b.fullPath(local)
-	ino := inoFor(full)
-	// The registered owner of a pathname — a replacement incarnation, or a
-	// renamed file at its new name — IS the live inode: every open of that
-	// name converges on it (JuiceFS keys reader/writer state and write
-	// invalidation by inode; a second key for one object would let a
-	// reader keep stale bytes after a write through the other handle).
-	// Otherwise a held path hash (live deleted-open or renamed-away
-	// descriptor) means this is a NEW incarnation: allocate its synthetic
-	// key and publish it in the same critical section, so concurrent first
-	// resolutions converge and Create's mandatory re-resolve lands on the
-	// key its Mknod allocated.
-	b.mu.Lock()
-	if rep, hasRep := b.replacements[full]; hasRep {
-		ino = rep
-	} else if held, isHeld := b.heldInoForLocked(full); isHeld && held == ino {
-		ino = b.allocateHeldReplacementInoLocked()
-		b.replacements[full] = ino
-	}
-	b.mu.Unlock()
-	st, err := b.cfg.Client.StatCtx(ctx, full)
+	ino, deferredReplacement := b.peekIncarnationIno(full)
+	st, err := b.client().StatCtx(ctx, full)
 	if err != nil {
 		if client.IsNotFound(err) {
-			b.mu.Lock()
-			_, fresh := b.sizes[ino]
-			b.mu.Unlock()
-			if fresh {
-				b.remember(ino, full)
-				return ino, 0
+			if !deferredReplacement {
+				b.mu.Lock()
+				_, fresh := b.sizes[ino]
+				mappedPath := b.paths[ino]
+				b.mu.Unlock()
+				if fresh && mappedPath == full {
+					b.remember(ino, full)
+					return ino, 0
+				}
 			}
 			return 0, syscall.ENOENT
 		}
 		return 0, syscall.EIO
+	}
+	if deferredReplacement {
+		ino = b.resolveOrCreateIncarnationIno(full)
 	}
 	b.remember(ino, full)
 	b.observeRevisionWithSize(ino, st.Revision, st.Size)
@@ -1909,7 +1938,7 @@ func (b *Bridge) clearBufferedLength(ino meta.Ino, published int64) {
 
 // StatLocal stats a mount-local path against RemoteRoot.
 func (b *Bridge) StatLocal(ctx context.Context, local string) (*client.StatResult, error) {
-	return b.cfg.Client.StatCtx(ctx, b.fullPath(local))
+	return b.client().StatCtx(ctx, b.fullPath(local))
 }
 
 // maxEmptyPlaceholderRecords bounds the recency window of empty-placeholder
@@ -2142,11 +2171,12 @@ func (b *Bridge) peekVerifyBase(ino meta.Ino) (verifyBase, bool) {
 func (b *Bridge) abandonIno(ino meta.Ino) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.releaseDroppedPendingLocked(ino)
+	delete(b.closedRetained, ino)
 	delete(b.freshCreate, ino)
 	delete(b.verifyBase, ino)
 	delete(b.layoutPending, ino)
 	delete(b.layoutPendingID, ino)
-	delete(b.pending, ino)
 	delete(b.truncs, ino)
 	delete(b.truncSeq, ino)
 	delete(b.revs, ino)
@@ -2212,12 +2242,16 @@ func (b *Bridge) waitStagedSlice(ctx context.Context, id uint64, size int64) boo
 	}
 }
 
+func (b *Bridge) needsFreshIdentityLocked(ino meta.Ino) bool {
+	return b.freshCreate[ino] && b.verifyBase[ino].resID == "" && b.layoutPendingID[ino] == ""
+}
+
 // needsFreshIdentity reports whether this inode is a locally-created
 // descriptor whose identity was never established.
 func (b *Bridge) needsFreshIdentity(ino meta.Ino) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.freshCreate[ino] && b.verifyBase[ino].resID == "" && b.layoutPendingID[ino] == ""
+	return b.needsFreshIdentityLocked(ino)
 }
 
 // ModeOf reports the mode recorded for the inode locally.
@@ -2250,8 +2284,31 @@ func (b *Bridge) SetMtimeLocal(ino meta.Ino, mtime time.Time) {
 	b.mu.Unlock()
 }
 
+func (b *Bridge) releaseDroppedPendingLocked(ino meta.Ino) {
+	dropped := b.pending[ino]
+	if len(dropped) == 0 {
+		delete(b.pending, ino)
+		return
+	}
+	delete(b.pending, ino)
+	refs := make(map[string]int, len(dropped))
+	for _, list := range b.pending {
+		for _, w := range list {
+			refs[w.checksum]++
+		}
+	}
+	for _, p := range dropped {
+		b.blocks.unpin(p.checksum)
+		if refs[p.checksum] == 0 {
+			b.blocks.release(p.checksum)
+		}
+	}
+}
+
 // forgetInoLocked drops one inode's cached state; the caller holds b.mu.
 func (b *Bridge) forgetInoLocked(ino meta.Ino) {
+	b.releaseDroppedPendingLocked(ino)
+	delete(b.closedRetained, ino)
 	delete(b.layoutPendingID, ino)
 	delete(b.layoutPending, ino)
 	delete(b.freshCreate, ino)
@@ -2263,7 +2320,6 @@ func (b *Bridge) forgetInoLocked(ino meta.Ino) {
 	delete(b.revs, ino)
 	delete(b.pubSizes, ino)
 	delete(b.revAt, ino)
-	delete(b.pending, ino)
 	delete(b.truncs, ino)
 	delete(b.truncSeq, ino)
 	delete(b.modes, ino)
@@ -2398,6 +2454,15 @@ func (b *Bridge) RemapLocal(oldPath, newPath string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	newIno := inoFor(newFull)
+	if displaced := b.liveInoLocked(newFull); b.paths[displaced] == newFull {
+		if _, closedAtDest := b.closedRetained[displaced]; closedAtDest {
+			if b.replacements[newFull] == displaced {
+				delete(b.replacements, newFull)
+			}
+			delete(b.moved, displaced)
+			b.forgetInoLocked(displaced)
+		}
+	}
 	if rep, ok := b.replacements[oldFull]; ok {
 		// A registered owner (replacement incarnation, or a file renamed
 		// before) holds oldPath: follow IT and carry its registration. The
@@ -2507,13 +2572,13 @@ func (b *Bridge) KeepDeletedOpen(local string) (string, error) {
 	live := b.liveInoLocked(full)
 	b.mu.Unlock()
 	sentinel := deletedOpenSentinel(local, live)
-	if _, err := b.cfg.Client.StatCtx(context.Background(), full); err != nil {
+	if _, err := b.client().StatCtx(context.Background(), full); err != nil {
 		if client.IsNotFound(err) {
 			return "", nil // already gone remotely: nothing to keep
 		}
 		return "", err
 	}
-	if err := b.cfg.Client.RenameCtx(context.Background(), full, b.fullPath(sentinel)); err != nil {
+	if err := b.client().RenameCtx(context.Background(), full, b.fullPath(sentinel)); err != nil {
 		return "", err
 	}
 	b.RemapLocal(local, sentinel)
@@ -2543,14 +2608,14 @@ func (b *Bridge) RetainOpenAlias(local string) (string, error) {
 	live := b.liveInoLocked(full)
 	b.mu.Unlock()
 	sentinel := deletedOpenSentinel(local, live)
-	if _, err := b.cfg.Client.StatCtx(context.Background(), full); err != nil {
+	if _, err := b.client().StatCtx(context.Background(), full); err != nil {
 		if client.IsNotFound(err) {
 			return "", nil
 		}
 		return "", err
 	}
 	sentinelFull := b.fullPath(sentinel)
-	if err := b.cfg.Client.HardlinkCtx(context.Background(), full, sentinelFull); err != nil {
+	if err := b.client().HardlinkCtx(context.Background(), full, sentinelFull); err != nil {
 		return "", err
 	}
 	b.mu.Lock()
@@ -2579,7 +2644,7 @@ func (b *Bridge) DropDeletedOpen(sentinel string) {
 	delete(b.moved, heldIno)
 	b.forgetInoLocked(heldIno)
 	b.mu.Unlock()
-	_ = b.cfg.Client.RemoveAllCtx(context.Background(), b.fullPath(sentinel))
+	_ = b.client().RemoveAllCtx(context.Background(), b.fullPath(sentinel))
 }
 
 // heldInoForLocked reports the held (moved or sentinel-bound) path-hash
@@ -2645,18 +2710,39 @@ func (b *Bridge) flushFile(ctx context.Context, ino meta.Ino, finalize bool) err
 	// makes every retry observe the previous commit's result.
 	unlockCommit := b.lockCommit(ino)
 	defer unlockCommit()
-	if err := b.flushPendingLocked(ctx, ino); err != nil {
-		return err
+
+	b.mu.Lock()
+	hasPendingOrTrunc := len(b.pending[ino]) > 0
+	if !hasPendingOrTrunc {
+		_, hasPendingOrTrunc = b.truncs[ino]
 	}
+	b.mu.Unlock()
+
+	if hasPendingOrTrunc {
+		if err := b.flushPendingLocked(ctx, ino); err != nil {
+			b.recordCommitErr(ino, err)
+			return err
+		}
+	}
+
 	b.mu.Lock()
 	size, has := b.sizes[ino]
 	path, mapped := b.paths[ino]
 	mode, hasMode := b.modes[ino]
+	wasFresh := b.freshCreate[ino]
 	b.mu.Unlock()
 	if finalize && has && mapped && size == 0 {
-		if _, err := b.cfg.Client.StatCtx(ctx, path); err != nil && client.IsNotFound(err) {
-			rev, createdID, nativeExtent, err := b.cfg.Client.CreateExtentFileCreatedCtx(ctx, path)
+		_, statErr := b.client().StatCtx(ctx, path)
+		if statErr != nil && !client.IsNotFound(statErr) {
+			if b.needsFreshIdentity(ino) || b.HasUncommitted(ino) {
+				b.recordCommitErr(ino, statErr)
+			}
+			return statErr
+		}
+		if statErr != nil && client.IsNotFound(statErr) {
+			rev, createdID, nativeExtent, err := b.client().CreateExtentFileCreatedCtx(ctx, path)
 			if err != nil {
+				b.recordCommitErr(ino, err)
 				return err
 			}
 			if nativeExtent {
@@ -2665,28 +2751,48 @@ func (b *Bridge) flushFile(ctx context.Context, ino meta.Ino, finalize bool) err
 					b.layoutPendingID[ino] = createdID
 				}
 				delete(b.freshCreate, ino)
+				delete(b.commitErr, ino)
 				delete(b.modes, ino)
 				delete(b.mtimes, ino)
 				b.mu.Unlock()
 				b.recordLandedRevisionWithSize(ino, rev, 0)
 			} else {
 				b.markEmptyPlaceholder(path, rev, createdID)
+				b.mu.Lock()
+				if createdID != "" {
+					b.verifyBase[ino] = verifyBase{rev: rev, resID: createdID}
+				}
+				delete(b.freshCreate, ino)
+				delete(b.commitErr, ino)
+				delete(b.modes, ino)
+				delete(b.mtimes, ino)
+				b.mu.Unlock()
+				b.recordLandedRevisionWithSize(ino, rev, 0)
 			}
 			if hasMode && mode != 0 && mode != 0o644 {
-				_ = b.cfg.Client.ChmodCtx(ctx, path, mode)
+				_ = b.client().ChmodCtx(ctx, path, mode)
 			}
+		} else if wasFresh {
+			b.mu.Lock()
+			delete(b.freshCreate, ino)
+			delete(b.commitErr, ino)
+			b.mu.Unlock()
 		}
 	}
 	if !has {
-		return nil
+		b.mu.Lock()
+		prevErr := b.commitErr[ino]
+		b.mu.Unlock()
+		return prevErr
 	}
 	if err := b.flushTruncateOnly(ctx, ino, size); err != nil {
+		b.recordCommitErr(ino, err)
 		return err
 	}
-	// Everything landed. (A remembered landing failure was cleared by the
-	// successful commit itself — Bridge.Write's sticky memory exists only
-	// until the next successful landing, which just happened.)
-	return nil
+	b.mu.Lock()
+	prevErr := b.commitErr[ino]
+	b.mu.Unlock()
+	return prevErr
 }
 
 // isFreshCreate reports whether this bridge created the inode locally (so its
@@ -2700,7 +2806,7 @@ func (b *Bridge) isFreshCreate(ino meta.Ino) bool {
 // nameMaterialized reports whether the full remote path currently exists
 // server-side (a fresh empty engine file may have none yet).
 func (b *Bridge) nameMaterialized(ctx context.Context, fullPath string) bool {
-	_, err := b.cfg.Client.StatCtx(ctx, fullPath)
+	_, err := b.client().StatCtx(ctx, fullPath)
 	return err == nil
 }
 
@@ -2742,6 +2848,13 @@ func (b *Bridge) MaterializeEmpty(ctx context.Context, ino meta.Ino) error {
 	//     stranger's object, so refuse rather than adopt.
 	if b.nameMaterialized(ctx, path) {
 		if b.publicationIdentity(ino) != "" || !b.isFreshCreate(ino) {
+			b.mu.Lock()
+			if len(b.pending[ino]) == 0 && !b.needsFreshIdentityLocked(ino) {
+				if _, hasTrunc := b.truncs[ino]; !hasTrunc {
+					delete(b.commitErr, ino)
+				}
+			}
+			b.mu.Unlock()
 			return nil
 		}
 		return fmt.Errorf("materialize empty file %s: name occupied by an object this descriptor did not create", path)
@@ -2752,10 +2865,10 @@ func (b *Bridge) MaterializeEmpty(ctx context.Context, ino meta.Ino) error {
 	// leaves a published empty file whose descriptor can never be used.
 	// Check here too — Sync reaches MaterializeEmpty without any pending
 	// slices, so the commit-path preflight never runs for it.
-	if !b.cfg.Client.WarmCompletionIdentity(ctx) {
+	if !b.client().WarmCompletionIdentity(ctx) {
 		return fmt.Errorf("materialize empty file %s: server does not advertise completion_identity_v1, so the created object cannot be attributed to this descriptor", path)
 	}
-	rev, createdID, nativeExtent, err := b.cfg.Client.CreateExtentFileCreatedCtx(ctx, path)
+	rev, createdID, nativeExtent, err := b.client().CreateExtentFileCreatedCtx(ctx, path)
 	if err != nil {
 		return fmt.Errorf("materialize empty file %s: %w", path, err)
 	}
@@ -2772,9 +2885,14 @@ func (b *Bridge) MaterializeEmpty(ctx context.Context, ino meta.Ino) error {
 	if nativeExtent {
 		delete(b.freshCreate, ino)
 	}
+	if len(b.pending[ino]) == 0 && !b.needsFreshIdentityLocked(ino) {
+		if _, hasTrunc := b.truncs[ino]; !hasTrunc {
+			delete(b.commitErr, ino)
+		}
+	}
 	b.mu.Unlock()
 	if hasMode && mode != 0 && mode != 0o644 {
-		_ = b.cfg.Client.ChmodCtx(ctx, path, mode)
+		_ = b.client().ChmodCtx(ctx, path, mode)
 	}
 	return nil
 }
@@ -2920,7 +3038,7 @@ func (b *Bridge) Fallocate(ctx meta.Context, inode meta.Ino, mode uint8, off, si
 	cur, has := b.localLengthLocked(inode)
 	b.mu.Unlock()
 	if !has {
-		st, err := b.cfg.Client.StatCtx(ctxOf(ctx), path)
+		st, err := b.client().StatCtx(ctxOf(ctx), path)
 		if err != nil {
 			if !client.IsNotFound(err) {
 				return errnoOf(err)
@@ -3095,7 +3213,7 @@ func (b *Bridge) Remove(ctx meta.Context, parent meta.Ino, name string, skipTras
 
 // removeTree walks and unlinks depth-first, counting attempted deletions.
 func (b *Bridge) removeTree(ctx context.Context, full string, count *uint64) syscall.Errno {
-	st, err := b.cfg.Client.StatCtx(ctx, full)
+	st, err := b.client().StatCtx(ctx, full)
 	if err != nil {
 		if client.IsNotFound(err) {
 			return syscall.ENOENT
@@ -3103,7 +3221,7 @@ func (b *Bridge) removeTree(ctx context.Context, full string, count *uint64) sys
 		return errnoOf(err)
 	}
 	if st.IsDir {
-		children, err := b.cfg.Client.ListCtx(ctx, full)
+		children, err := b.client().ListCtx(ctx, full)
 		if err != nil {
 			return errnoOf(err)
 		}
@@ -3152,7 +3270,7 @@ func (b *Bridge) GetSummary(ctx meta.Context, inode meta.Ino, summary *meta.Summ
 	}
 	var walk func(p string) syscall.Errno
 	walk = func(p string) syscall.Errno {
-		infos, err := b.cfg.Client.ListCtx(ctxOf(ctx), p)
+		infos, err := b.client().ListCtx(ctxOf(ctx), p)
 		if err != nil {
 			if strict {
 				return errnoOf(err)
@@ -3171,7 +3289,7 @@ func (b *Bridge) GetSummary(ctx meta.Context, inode meta.Ino, summary *meta.Summ
 				continue
 			}
 			summary.Files++
-			if st, serr := b.cfg.Client.StatCtx(ctxOf(ctx), child); serr == nil {
+			if st, serr := b.client().StatCtx(ctxOf(ctx), child); serr == nil {
 				summary.Length += uint64(st.Size)
 				summary.Size += uint64(st.Size)
 			}

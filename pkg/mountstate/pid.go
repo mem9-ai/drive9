@@ -21,6 +21,8 @@ type ProcessState struct {
 	MountKind              string   `json:"mount_kind,omitempty"`
 	MountPoint             string   `json:"mount_point,omitempty"`
 	RemoteRoot             string   `json:"remote_root,omitempty"`
+	LayerID                string   `json:"layer_id,omitempty"`
+	LayerReadOnly          bool     `json:"layer_read_only,omitempty"`
 	Profile                string   `json:"profile,omitempty"`
 	LocalRoot              string   `json:"local_root,omitempty"`
 	Server                 string   `json:"server,omitempty"`

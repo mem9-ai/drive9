@@ -111,6 +111,10 @@ func MountCmd(args []string) error {
 			return vaultMountCmd(args[1:], true)
 		case "drain":
 			return MountDrainCmd(args[1:])
+		case "switch":
+			return mountSwitchCmd(args[1:], false)
+		case "switch-operation":
+			return mountSwitchCmd(args[1:], true)
 		case "status":
 			return runMountStatus(args[1:])
 		case "health":
@@ -153,7 +157,11 @@ func fsMountCmd(args []string) error {
 	return fsMountCmdWithBackground(args, false)
 }
 
-func fsMountCmdWithBackground(args []string, background bool) (resultErr error) {
+func fsMountCmdWithBackground(args []string, background bool) error {
+	return fsMountWithLeaseRecovery(args, background, false)
+}
+
+func fsMountWithLeaseRecovery(args []string, background, recovering bool) (resultErr error) {
 	authLocal, args, err := peelObjectAuth(args)
 	if err != nil {
 		return err
@@ -170,6 +178,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	apiKey := fs.String("api-key", "", "owner API key (overrides $DRIVE9_API_KEY and config)")
 	mode := fs.String("mode", "auto", "mount mode: auto, fuse, or webdav")
 	foreground := fs.Bool("foreground", false, "run in the foreground and block until unmounted")
+	recoverLease := fs.Bool("recover-layer-lease", recovering, "wait for an earlier worker's Layer lease during recovery")
 	superviseForeground := fs.Bool("supervise-foreground", false, "run as in-process supervisor and block until stop (sandbox/systemd friendly)")
 	noSupervise := fs.Bool("no-supervise", false, "legacy fire-and-forget background mount without supervisor")
 	defaultOwner := fs.String("owner", "", "UID:GID to report for files without a stored owner (FUSE; default: the mounting user)")
@@ -214,8 +223,17 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	durability := fs.String("durability", string(fuseDurabilityAuto), "write durability: auto, interactive, fsync, close-sync, or write-sync")
 	extensions := fs.String("extensions", "", "comma-separated fs extensions in build-up order (core first, each entry wrapping the previous ones; chain assembly is the reverse, core the terminal; default: the full set). e.g. --extensions core for a minimal write-sync fs, or --extensions core,sse,cache,writeback for the durability stack")
 	wbSyncWindow := fs.String("writeback-sync-window", "1s", "write-back close staging durability: a duration bounds the power-loss window via a background WAL syncer (default 1s); \"0\"/\"off\" defers all fsyncs to fsync(2)/umount; \"close\" restores fsync-at-close staging (legacy power-loss-safe behavior; see issue #964)")
-	layerRef := fs.String("layer", "", "mount through writable fs layer (layer id, name, or tag ref)")
-	checkpointRef := fs.String("checkpoint", "", "restore fs layer checkpoint before mounting")
+	var layerRef string
+	layerArgIndex := -1
+	duplicateLayer := false
+	fs.Func("layer", "mount through fs layer view (layer id, name, or tag ref)", func(value string) error {
+		if layerArgIndex >= 0 {
+			duplicateLayer = true
+		}
+		layerRef = strings.TrimSpace(value)
+		layerArgIndex = len(originalArgs) - len(fs.Args()) - 1
+		return nil
+	})
 	profile := fs.String("profile", "", "mount profile: coding-agent (default), portable, none, extent, interactive, or a ~/.drive9/profiles/<name> file")
 	localRoot := fs.String("local-root", "", "local-only overlay storage root (auto-generated for overlay profiles)")
 	localizeQuotaMB := fs.Int64("localize-quota-mb", 0, "byte quota in MiB for the local-only overlay on the host disk; local writes past it fail with ENOSPC (0 disables)")
@@ -264,6 +282,12 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if duplicateLayer {
+		return fmt.Errorf("--layer specified multiple times")
+	}
+	if flagProvided(fs, "layer") && layerRef == "" {
+		return fmt.Errorf("--layer requires a non-empty argument")
+	}
 	credentialSecrets := []string{*server, *apiKey}
 	defer func() {
 		if *noPersistCredentials {
@@ -287,10 +311,12 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 
 	// Parse positional args: 1-arg = mountpoint; 2-arg = remote mountpoint.
 	var remoteRoot, mountPoint string
+	var remoteRootDefaulted bool
 	var objectLoc *Location
 	switch fs.NArg() {
 	case 1:
 		remoteRoot = "/"
+		remoteRootDefaulted = true
 		mountPoint = fs.Arg(0)
 	case 2:
 		src := fs.Arg(0)
@@ -346,7 +372,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 		if legacyInterruptibleMutationsGiven && *legacyInterruptibleMutations {
 			return fmt.Errorf("drive9 mount: --legacy-interruptible-mutations is only supported with Drive9 FUSE mounts")
 		}
-		if err := validateObjectMount(runtime.GOOS, *mode, *layerRef, *checkpointRef, *profile); err != nil {
+		if err := validateObjectMount(runtime.GOOS, *mode, layerRef, *profile); err != nil {
 			return err
 		}
 		var serverVal, apiKeyVal, tokenVal string
@@ -426,10 +452,6 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	for _, pattern := range envRemoteOnlyPatterns {
 		policyEnvArgs = append(policyEnvArgs, "--remote-only="+pattern)
 	}
-	// Snapshot environment-derived policy in argv so supervised restarts and
-	// later adoption keep the original mount contract without re-reading env.
-	originalArgs = append(policyEnvArgs, originalArgs...)
-
 	remoteRoot, err = mountpath.NormalizeRoot(remoteRoot)
 	if err != nil {
 		return fmt.Errorf("drive9 mount: %w", err)
@@ -677,18 +699,8 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	if resolved == MountModeWebDAV && perfDirGiven {
 		return fmt.Errorf("--perf-dir is only supported with --mode=fuse")
 	}
-	if resolved == MountModeWebDAV && strings.TrimSpace(*layerRef) != "" {
+	if resolved == MountModeWebDAV && layerRef != "" {
 		return fmt.Errorf("drive9 mount: --layer is only supported with --mode=fuse")
-	}
-	if resolved == MountModeWebDAV && strings.TrimSpace(*checkpointRef) != "" {
-		return fmt.Errorf("drive9 mount: --checkpoint is only supported with --mode=fuse")
-	}
-	if strings.TrimSpace(*checkpointRef) != "" && strings.TrimSpace(*layerRef) == "" {
-		return fmt.Errorf("drive9 mount: --checkpoint requires --layer")
-	}
-	// D10: --checkpoint is a read-only restore view.
-	if strings.TrimSpace(*checkpointRef) != "" {
-		*readOnly = true
 	}
 
 	resolvedCredentials := ResolveCredentials()
@@ -710,15 +722,6 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 			return fmt.Errorf("drive9 mount: --unpack requires an overlay profile")
 		}
 	}
-	if normalizedLocalRoot == "" && overlayProfile && resolved == MountModeFUSE {
-		normalizedLocalRoot, err = defaultMountLocalRoot(*server, remoteRoot, mountCredentialCacheKey(apiKeyVal, tokenVal))
-		if err != nil {
-			return err
-		}
-	}
-	if err := validateMountProfileFlags(profileCfg.Name, normalizedLocalRoot, effectiveLocalOnlyPatterns, effectiveLocalGitignoreAwarePatterns, effectiveRemoteOnlyPatterns, effectivePackPaths); err != nil {
-		return err
-	}
 	if resolved == MountModeFUSE && runtime.GOOS != "windows" && len(profileCfg.AppendLogPatterns) > 0 {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		supported := mountProfileAppendLogSupported(ctx, serverVal, apiKeyVal, tokenVal)
@@ -739,13 +742,65 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	}
 
 	autoUnpack := overlayProfile && len(effectivePackPaths) > 0 && !*noAutoUnpack
+	envSuperviseOff := strings.EqualFold(strings.TrimSpace(os.Getenv("DRIVE9_MOUNT_SUPERVISE")), "off")
+	wantSupervise := !*noSupervise && !envSuperviseOff
+	supervising := *superviseForeground || (background && !*foreground && wantSupervise && runtime.GOOS != "windows")
+	needDefaultRoot := normalizedLocalRoot == "" && overlayProfile && resolved == MountModeFUSE
+	var archiveClient *client.Client
+	if autoUnpack || len(unpackArchives) > 0 || ((supervising || needDefaultRoot) && layerRef != "") {
+		if token != "" {
+			archiveClient = client.NewWithToken(serverVal, token)
+		} else {
+			archiveClient = client.New(serverVal, apiKeyVal)
+		}
+		if layerRef != "" {
+			lookupCtx, cancelLookup := context.WithTimeout(context.Background(), defaultMountBackgroundReadyTimeout)
+			info, err := archiveClient.GetLayer(lookupCtx, layerRef)
+			cancelLookup()
+			if err != nil {
+				return classifyMountLayerLookupError(layerRef, err)
+			}
+			archiveClient, err = archiveClient.WithView(client.ViewBinding{LayerID: info.LayerID})
+			if err != nil {
+				return mountLayerConfigError("invalid layer view", err)
+			}
+			_, remoteRoot, err = mountpath.LayerRoots(info.BaseRootPath, remoteRoot, remoteRootDefaulted)
+			if err != nil {
+				return mountLayerConfigError("invalid layer mount root", err)
+			}
+			// Pin child processes to the same layer as the supervisor and archive.
+			if strings.HasPrefix(originalArgs[layerArgIndex], "-layer=") || strings.HasPrefix(originalArgs[layerArgIndex], "--layer=") {
+				originalArgs[layerArgIndex] = "--layer=" + info.LayerID
+			} else {
+				originalArgs[layerArgIndex] = info.LayerID
+			}
+			layerRef = info.LayerID
+			remoteRootDefaulted = false
+		}
+	}
+	if needDefaultRoot {
+		normalizedLocalRoot, err = defaultMountLocalRoot(*server, remoteRoot, mountCredentialCacheKey(apiKeyVal, tokenVal))
+		if err != nil {
+			return err
+		}
+	}
+	if err := validateMountProfileFlags(profileCfg.Name, normalizedLocalRoot, effectiveLocalOnlyPatterns, effectiveLocalGitignoreAwarePatterns, effectiveRemoteOnlyPatterns, effectivePackPaths); err != nil {
+		return err
+	}
+	packLocalRoot := normalizedLocalRoot
+	if layerRef != "" && archiveClient != nil {
+		packLocalRoot, err = mountstate.LayerLocalRoot(normalizedLocalRoot, layerRef)
+		if err != nil {
+			return err
+		}
+	}
 	if runtime.GOOS == "windows" && resolved == MountModeFUSE && len(unpackArchives) == 0 && !autoUnpack {
 		return mountFuse(&mountFuseOptions{
 			MountPoint:                   mountPoint,
 			RemoteRoot:                   remoteRoot,
+			RemoteRootDefaulted:          remoteRootDefaulted,
 			Profile:                      profileCfg.Name,
-			LayerRef:                     strings.TrimSpace(*layerRef),
-			CheckpointRef:                strings.TrimSpace(*checkpointRef),
+			LayerRef:                     layerRef,
 			LocalRoot:                    normalizedLocalRoot,
 			LocalOnlyPatterns:            append([]string(nil), effectiveLocalOnlyPatterns...),
 			LocalGitignoreAwarePatterns:  append([]string(nil), effectiveLocalGitignoreAwarePatterns...),
@@ -761,17 +816,15 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 		})
 	}
 
-	// Resolve supervision mode from flags + env.
-	// DRIVE9_MOUNT_SUPERVISE=off forces legacy behavior.
-	envSuperviseOff := strings.EqualFold(strings.TrimSpace(os.Getenv("DRIVE9_MOUNT_SUPERVISE")), "off")
-	wantSupervise := !*noSupervise && !envSuperviseOff
 	if *noPersistCredentials && (*superviseForeground || background && !*foreground && wantSupervise) {
 		return fmt.Errorf("drive9 mount: --no-persist-credentials requires --foreground or --no-supervise")
 	}
+	// Add the environment snapshot only after pinning the layer in the parsed arguments.
+	replayArgs := append(policyEnvArgs, originalArgs...)
 	if *superviseForeground {
 		// This process becomes the supervisor (blocks).
 		return runSuperviseForeground(mountSuperviseStartRequest{
-			OriginalArgs:      append([]string(nil), originalArgs...),
+			OriginalArgs:      append([]string(nil), replayArgs...),
 			MountPoint:        mountPoint,
 			Server:            serverVal,
 			APIKey:            apiKeyVal,
@@ -779,6 +832,9 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 			RemoteRoot:        remoteRoot,
 			Profile:           profileCfg.Name,
 			LocalRoot:         normalizedLocalRoot,
+			LayerID:           layerRef,
+			LayerReadOnly:     layerRef != "" && *readOnly,
+			RecoverLayerLease: *recoverLease,
 			PackPaths:         append([]string(nil), effectivePackPaths...),
 			MaxRestarts:       *maxRestarts,
 			RestartWindow:     *restartWindow,
@@ -794,7 +850,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	if background && !*foreground {
 		if wantSupervise && resolved == MountModeFUSE && runtime.GOOS != "windows" {
 			return startMountSupervisedBackground(mountSuperviseStartRequest{
-				OriginalArgs:      append([]string(nil), originalArgs...),
+				OriginalArgs:      append([]string(nil), replayArgs...),
 				MountPoint:        mountPoint,
 				Server:            serverVal,
 				APIKey:            apiKeyVal,
@@ -802,6 +858,9 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 				RemoteRoot:        remoteRoot,
 				Profile:           profileCfg.Name,
 				LocalRoot:         normalizedLocalRoot,
+				LayerID:           layerRef,
+				LayerReadOnly:     layerRef != "" && *readOnly,
+				RecoverLayerLease: *recoverLease,
 				PackPaths:         append([]string(nil), effectivePackPaths...),
 				MaxRestarts:       *maxRestarts,
 				RestartWindow:     *restartWindow,
@@ -815,7 +874,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 			})
 		}
 		return startMountBackground(mountBackgroundRequest{
-			Args:       append([]string(nil), originalArgs...),
+			Args:       append([]string(nil), replayArgs...),
 			MountPoint: mountPoint,
 			Server:     serverVal,
 			APIKey:     apiKeyVal,
@@ -845,31 +904,25 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	}
 
 	if autoUnpack || len(unpackArchives) > 0 {
-		var c *client.Client
-		if token != "" {
-			c = client.NewWithToken(*server, token)
-		} else {
-			c = client.New(*server, *apiKey)
-		}
 		if autoUnpack {
-			archivePath, err := defaultPackArchivePath(remoteRoot, profileCfg.Name)
+			archivePath, err := mountPackArchivePath(remoteRoot, profileCfg.Name, layerRef)
 			if err != nil {
 				return err
 			}
-			if _, err := unpackRemoteArchiveIfExists(context.Background(), c, archivePath, unpackOptions{
-				LocalRoot: normalizedLocalRoot,
+			if _, err := unpackRemoteArchiveIfExists(context.Background(), archiveClient, archivePath, unpackOptions{
+				LocalRoot: packLocalRoot,
 				Replace:   true,
 			}); err != nil {
 				return fmt.Errorf("drive9 mount: auto-unpack :%s: %w", archivePath, err)
 			}
 		}
 		for _, archiveArg := range unpackArchives {
-			archiveClient, archivePath, err := clientForRemoteArchiveArg(c, archiveArg)
+			archiveClient, archivePath, err := clientForRemoteArchiveArg(archiveClient, archiveArg)
 			if err != nil {
 				return err
 			}
 			if err := unpackRemoteArchive(context.Background(), archiveClient, archivePath, unpackOptions{
-				LocalRoot: normalizedLocalRoot,
+				LocalRoot: packLocalRoot,
 				Replace:   true,
 			}); err != nil {
 				return fmt.Errorf("drive9 mount: unpack %s: %w", archiveArg, err)
@@ -881,9 +934,9 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 		return mountFuse(&mountFuseOptions{
 			MountPoint:                   mountPoint,
 			RemoteRoot:                   remoteRoot,
+			RemoteRootDefaulted:          remoteRootDefaulted,
 			Profile:                      profileCfg.Name,
-			LayerRef:                     strings.TrimSpace(*layerRef),
-			CheckpointRef:                strings.TrimSpace(*checkpointRef),
+			LayerRef:                     layerRef,
 			LocalRoot:                    normalizedLocalRoot,
 			LocalOnlyPatterns:            append([]string(nil), effectiveLocalOnlyPatterns...),
 			LocalGitignoreAwarePatterns:  append([]string(nil), effectiveLocalGitignoreAwarePatterns...),
@@ -905,6 +958,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 		Token:                        token,
 		MountPoint:                   mountPoint,
 		RemoteRoot:                   remoteRoot,
+		RemoteRootDefaulted:          remoteRootDefaulted,
 		CacheDir:                     *cacheDir,
 		CacheSize:                    int64(*cacheSize) << 20,
 		ReadCacheMaxFileBytes:        *readCacheMaxFile << 20,
@@ -931,8 +985,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 		WritebackLazyStaging:         wbLazyStaging,
 		WritebackSyncWindow:          wbSyncWindowDur,
 		Profile:                      profileCfg.Name,
-		LayerRef:                     strings.TrimSpace(*layerRef),
-		CheckpointRef:                strings.TrimSpace(*checkpointRef),
+		LayerRef:                     layerRef,
 		LocalRoot:                    normalizedLocalRoot,
 		LocalOnlyPatterns:            append([]string(nil), effectiveLocalOnlyPatterns...),
 		LocalGitignoreAwarePatterns:  append([]string(nil), effectiveLocalGitignoreAwarePatterns...),
@@ -1015,6 +1068,9 @@ func (e mountCommandRedactedError) ExitCode() int {
 }
 
 type mountSuperviseStartRequest struct {
+	LayerID           string
+	LayerReadOnly     bool
+	RecoverLayerLease bool
 	OriginalArgs      []string
 	MountPoint        string
 	Server            string
@@ -1048,10 +1104,10 @@ func workerArgsForSupervise(args []string) []string {
 	for i := 0; i < len(cleaned); i++ {
 		a := cleaned[i]
 		switch {
-		case a == "--foreground" || a == "--supervise-foreground" || a == "--no-supervise" || a == "--supervised":
+		case a == "--foreground" || a == "--supervise-foreground" || a == "--recover-layer-lease" || a == "--no-supervise" || a == "--supervised":
 			continue
 		case strings.HasPrefix(a, "--foreground=") || strings.HasPrefix(a, "--supervise-foreground=") ||
-			strings.HasPrefix(a, "--no-supervise=") || strings.HasPrefix(a, "--supervised="):
+			strings.HasPrefix(a, "--recover-layer-lease=") || strings.HasPrefix(a, "--no-supervise=") || strings.HasPrefix(a, "--supervised="):
 			continue
 		default:
 			out = append(out, a)
@@ -1081,6 +1137,15 @@ func superviseCommandArgs(req mountSuperviseStartRequest, logPath string) ([]str
 		"--profile", req.Profile,
 		"--local-root-meta", req.LocalRoot,
 		"--sanitized-args-json", string(sanitized),
+	}
+	if req.LayerID != "" {
+		out = append(out, "--layer-id-meta", req.LayerID)
+		if req.RecoverLayerLease && !req.LayerReadOnly {
+			out = append(out, "--recover-layer-lease")
+		}
+		if req.LayerReadOnly {
+			out = append(out, "--layer-read-only-meta")
+		}
 	}
 	if req.MountKind != "" {
 		out = append(out, "--mount-kind", req.MountKind)
@@ -1140,7 +1205,7 @@ func startMountSupervisedBackgroundImpl(req mountSuperviseStartRequest) error {
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- cmd.Wait() }()
 
-	if err := waitForSupervisedMountReady(req.MountPoint, cmd.Process.Pid, waitCh, logPath, defaultMountBackgroundReadyTimeout); err != nil {
+	if err := waitForSupervisedMountReady(req.MountPoint, cmd.Process, waitCh, logPath, defaultMountBackgroundReadyTimeout); err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "drive9: mount supervised in background (supervisor pid: %d, log: %s)\n", cmd.Process.Pid, logPath)
@@ -1215,9 +1280,11 @@ func applyScrubbedMountEnv(scrubbed []string) {
 	}
 }
 
-func waitForSupervisedMountReady(mountPoint string, supervisorPID int, waitCh <-chan error, logPath string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
+func waitForSupervisedMountReady(mountPoint string, child *os.Process, waitCh <-chan error, logPath string, timeout time.Duration) error {
+	start := time.Now()
+	deadline := start.Add(timeout)
 	// Capture child identity once (Darwin ProcessCreationTime shells out to ps).
+	supervisorPID := child.Pid
 	supCreation, _ := mountstate.ProcessCreationTime(supervisorPID)
 	for {
 		select {
@@ -1228,22 +1295,58 @@ func waitForSupervisedMountReady(mountPoint string, supervisorPID int, waitCh <-
 			return fmt.Errorf("drive9 mount: supervised mount exited before becoming ready (log: %s)", logPath)
 		default:
 		}
+		// Ready only when SupervisorState matches the child we just spawned
+		// (PID+creation) and its worker is identity-alive — never accept a
+		// stale pidfile from a previous generation.
+		if st, _, err := mountstate.ReadSupervisorState(mountPoint); err == nil {
+			if supervisorStateMatchesGeneration(st, supervisorPID, supCreation) {
+				if st.State == mountstate.SupervisorStateFailed || st.State == mountstate.SupervisorStateCircuitOpen {
+					failure := fmt.Errorf("drive9 mount: supervisor %s before becoming ready after %s (%s; log: %s)", st.State, time.Since(start).Round(time.Millisecond), st.LastExitReason, logPath)
+					return errors.Join(failure, waitForTerminalSupervisor(child, waitCh, st.State))
+				}
+				for _, until := range []time.Time{st.LayerWorkerStartupUntil, st.LayerLeaseRecoveryUntil} {
+					if !until.IsZero() && until.Add(timeout).After(deadline) {
+						deadline = until.Add(timeout)
+					}
+				}
+			}
+			if supervisedReadyStateMatches(st, supervisorPID, supCreation) && probeMountReadyForCLI(mountPoint) {
+				return nil
+			}
+		}
 		if time.Now().After(deadline) {
 			// Stop only the supervisor we just spawned. Worker kill is gated on
 			// SupervisorState matching this generation (PID+creation); never
 			// act on stale state or PID-only liveness (fail closed).
 			cleanupSupervisedReadyTimeout(mountPoint, supervisorPID, supCreation)
-			return fmt.Errorf("drive9 mount: timed out waiting for supervised mount to become ready after %s (log: %s)", timeout, logPath)
-		}
-		// Ready only when SupervisorState matches the child we just spawned
-		// (PID+creation) and its worker is identity-alive — never accept a
-		// stale pidfile from a previous generation.
-		if st, _, err := mountstate.ReadSupervisorState(mountPoint); err == nil {
-			if supervisedReadyStateMatches(st, supervisorPID, supCreation) && probeMountReadyForCLI(mountPoint) {
-				return nil
-			}
+			return fmt.Errorf("drive9 mount: timed out waiting for supervised mount to become ready after %s (log: %s)", time.Since(start).Round(time.Millisecond), logPath)
 		}
 		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// Both terminal states follow worker exit. A failed supervisor is finishing
+// its own cleanup. A circuit-open supervisor stays idle until told to stop.
+func waitForTerminalSupervisor(child *os.Process, waitCh <-chan error, state string) error {
+	if state == mountstate.SupervisorStateCircuitOpen {
+		_ = child.Signal(syscall.SIGTERM)
+	}
+	select {
+	case <-waitCh:
+		return nil
+	case <-time.After(10 * time.Second):
+	}
+
+	// Only act on the spawned process handle; a simultaneous retry can own
+	// the mountpoint as soon as this child exits.
+	if err := child.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return fmt.Errorf("stop supervisor pid %d: %w", child.Pid, err)
+	}
+	select {
+	case <-waitCh:
+		return nil
+	case <-time.After(3 * time.Second):
+		return fmt.Errorf("supervisor pid %d did not exit after kill", child.Pid)
 	}
 }
 
@@ -2032,6 +2135,7 @@ type umountDeps struct {
 	// requestDrain asks a live mount to quiesce its write plane before the
 	// unmount detaches it (nil skips the pre-unmount drain).
 	requestDrain     func(context.Context, string, time.Duration) (*mountcontrol.DrainResponse, error)
+	requestStatus    func(context.Context, string, time.Duration) (*mountcontrol.StatusResponse, error)
 	remove           func(string) error
 	pidAlive         func(int) bool
 	packAfterUnmount func(context.Context, mountstate.ProcessState, []string, []string) error
@@ -2064,6 +2168,7 @@ func defaultUmountDeps() umountDeps {
 		terminate:        terminateProcess,
 		terminateState:   terminateMountProcess,
 		requestDrain:     mountcontrol.RequestDrain,
+		requestStatus:    mountcontrol.RequestStatus,
 		remove:           os.Remove,
 		pidAlive:         processAlive,
 		packAfterUnmount: defaultPackAfterUnmount,
@@ -2128,10 +2233,11 @@ func runUmount(args []string, deps umountDeps) error {
 
 	var packState mountstate.ProcessState
 	packStateOK := false
-	needPackState := len(packArchives) > 0 || len(packPaths) > 0 || !*noAutoPack
+	explicitPack := len(packArchives) > 0 || len(packPaths) > 0
+	needPackState := explicitPack || !*noAutoPack
 	if needPackState {
 		if deps.readProcessState == nil {
-			if len(packArchives) > 0 || len(packPaths) > 0 {
+			if explicitPack {
 				return fmt.Errorf("drive9 umount: pack requires mount process metadata")
 			}
 		} else if deps.goos == "windows" {
@@ -2139,19 +2245,36 @@ func runUmount(args []string, deps umountDeps) error {
 			var err error
 			st, _, err = deps.readProcessState(stateMountPoint)
 			if err != nil {
-				if len(packArchives) > 0 || len(packPaths) > 0 {
+				if explicitPack {
 					return fmt.Errorf("drive9 umount: read mount state for pack: %w", err)
 				}
 			} else {
 				packState, packStateOK = st, true
 			}
 		} else if preStopErr != nil {
-			if len(packArchives) > 0 || len(packPaths) > 0 {
+			if explicitPack {
 				return fmt.Errorf("drive9 umount: read mount state for pack: %w", preStopErr)
 			}
 		} else {
 			packState, packStateOK = preStopState, true
 		}
+	}
+
+	archiveRequested := explicitPack || (!*noAutoPack && len(packState.PackPaths) > 0)
+	if archiveRequested && packStateOK && deps.goos != "windows" {
+		if err := refreshMountedView(&packState, deps.requestStatus, 5*time.Second); err != nil {
+			if explicitPack {
+				return fmt.Errorf("drive9 umount: %w", err)
+			}
+			packStateOK = false
+			if deps.printErrf != nil {
+				deps.printErrf("drive9 umount: warning: skipping automatic pack: %v\n", err)
+			}
+		}
+	}
+
+	if packState.LayerReadOnly && explicitPack {
+		return fmt.Errorf("drive9 umount: cannot pack into a read-only layer")
 	}
 
 	// Drain BEFORE stopping the writer. A mount that is detached with pending
@@ -2246,16 +2369,16 @@ func runUmount(args []string, deps umountDeps) error {
 
 	packArchiveArgs := append([]string(nil), packArchives...)
 	if packStateOK {
-		if len(packArchives) > 0 || len(packPaths) > 0 {
+		if explicitPack {
 			if err := validateUmountPackState(packState); err != nil {
 				return err
 			}
 		}
-		if !*noAutoPack && (len(packState.PackPaths) > 0 || len(packPaths) > 0) {
+		if !packState.LayerReadOnly && !*noAutoPack && (len(packState.PackPaths) > 0 || len(packPaths) > 0) {
 			if err := validateUmountPackState(packState); err != nil {
 				return err
 			}
-			defaultArchive, err := defaultPackArchivePath(packState.RemoteRoot, packState.Profile)
+			defaultArchive, err := mountPackArchivePath(packState.RemoteRoot, packState.Profile, packState.LayerID)
 			if err != nil {
 				return err
 			}
@@ -2598,8 +2721,12 @@ func defaultPackAfterUnmount(ctx context.Context, state mountstate.ProcessState,
 	warmCtx, cancel := context.WithTimeout(ctx, fsClientWarmTimeout)
 	c.Warm(warmCtx)
 	cancel()
+	localRoot, err := mountstate.LayerLocalRoot(state.LocalRoot, state.LayerID)
+	if err != nil {
+		return err
+	}
 	opts := packOptions{
-		LocalRoot:        state.LocalRoot,
+		LocalRoot:        localRoot,
 		RemoteRoot:       state.RemoteRoot,
 		Profile:          state.Profile,
 		Paths:            append([]string(nil), paths...),
@@ -2628,10 +2755,16 @@ func packClientFromMountState(state mountstate.ProcessState) (*client.Client, er
 	if err != nil {
 		return nil, err
 	}
+	var c *client.Client
 	if auth.Token != "" {
-		return client.NewWithToken(auth.Server, auth.Token), nil
+		c = client.NewWithToken(auth.Server, auth.Token)
+	} else {
+		c = client.New(auth.Server, auth.APIKey)
 	}
-	return client.New(auth.Server, auth.APIKey), nil
+	if state.LayerID != "" {
+		return c.WithView(client.ViewBinding{LayerID: state.LayerID})
+	}
+	return c, nil
 }
 
 func packAuthFromMountState(state mountstate.ProcessState) (mountPackAuth, error) {

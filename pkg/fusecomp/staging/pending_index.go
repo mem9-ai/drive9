@@ -22,16 +22,15 @@ import (
 // replacement Put's new .meta must never be deleted by a stale owner's
 // remove that already passed its generation check in memory.
 type PendingIndex struct {
-	layerPublicationMu sync.RWMutex // rollback waits for publishers before dropping caches
-	mu                 sync.RWMutex
-	items              map[string]*WriteBackMeta // path → metadata
-	fences             map[string]CommittedFence // path → landed replay fence (never a pending entry)
-	fenceMask          map[string]struct{}       // hashes of fences that could not be read
-	fencesLoaded       bool
-	fencesErr          error
-	dir                string // directory for .meta persistence
-	nextGen            atomic.Uint64
-	pathLocks          map[string]*pendingPathLock
+	mu           sync.RWMutex
+	items        map[string]*WriteBackMeta // path → metadata
+	fences       map[string]CommittedFence // path → landed replay fence (never a pending entry)
+	fenceMask    map[string]struct{}       // hashes of fences that could not be read
+	fencesLoaded bool
+	fencesErr    error
+	dir          string // directory for .meta persistence
+	nextGen      atomic.Uint64
+	pathLocks    map[string]*pendingPathLock
 	// journal, when set, is the durable publication channel for new pending
 	// entries: one group-committed WAL fsync replaces the per-entry
 	// atomicWrite (tmp fsync + dir fsync). Callers must have made the entry's
@@ -44,7 +43,6 @@ type PendingIndex struct {
 	// background SyncLoop / fsync(2) / umount make it durable.
 	journalSyncOnPut bool
 	shadows          *ShadowStore // wired once before staging/recovery
-	layerAbandoned   bool         // prevents late publications from reviving a rolled-back overlay
 	// writeMu is the leaf lock for every disk write this index performs, and the
 	// guard for closed. Teardown closes the index so a worker that is still
 	// finishing a commit cannot create .meta/.fence/.tmp files in a directory the
@@ -157,6 +155,9 @@ func (idx *PendingIndex) RecoverFromDisk() error {
 	if err := idx.loadCommittedFences(); err != nil {
 		return err
 	}
+	if err := idx.reconcileTransferBackups(); err != nil {
+		return err
+	}
 	entries, err := os.ReadDir(idx.dir)
 	if err != nil {
 		return fmt.Errorf("pending index recovery: %w", err)
@@ -266,15 +267,6 @@ func (idx *PendingIndex) PutWithBaseRev(remotePath string, size int64, kind Pend
 func (idx *PendingIndex) PutWithBaseRevAndMode(remotePath string, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool) (uint64, error) {
 	return idx.PutWithBaseRevAndModeAndLineage(remotePath, size, kind, baseRev, mode, hasMode, "", "", false)
 }
-
-// PutLayerCache publishes content already persisted in a Layer. It remains
-// visible through the overlay index, but does not require another upload.
-func (idx *PendingIndex) PutLayerCache(remotePath string, size int64, baseRev int64, mode uint32, hasMode bool, identity LayerCacheIdentity) (uint64, error) {
-	return idx.putInternal(WriteBackMeta{Path: remotePath, Size: size, Kind: PendingOverwrite, BaseRev: baseRev, Mode: mode, HasMode: hasMode, LayerClean: true, LayerID: identity.LayerID, LayerEntrySeq: identity.EntrySeq})
-}
-
-// putLayerCacheIfAbsent never replaces a publication that arrived while a
-// chmod with no initial metadata was reading or uploading its payload.
 
 // PutWithBaseRevAndModeAndLineage attaches process-local causal identity to
 // the durable metadata. The IDs are intentionally excluded from JSON; empty
@@ -489,6 +481,8 @@ type PendingConflictTransfer struct {
 	// destination: the durable state already describes the committed pairing,
 	// so Abort degenerates into finishing the publication.
 	payloadMoved   bool
+	origDst        *WriteBackMeta
+	hasDstBackup   bool
 	expectedOldGen uint64
 	expectedNewGen uint64
 	closed         bool
@@ -523,7 +517,7 @@ func (idx *PendingIndex) BeginConflictTransfer(oldPath, newPath string, expected
 		}
 	}
 	pla, plb := idx.acquireTwoPathLocks(oldPath, newPath)
-	prepared, ok, destWasLive, err := idx.prepareConflictTransferLocked(oldPath, newPath, expectedOldGen, expectedNewGen, srcKind)
+	prepared, origDst, ok, destWasLive, err := idx.prepareConflictTransferLocked(oldPath, newPath, expectedOldGen, expectedNewGen, srcKind)
 	if err != nil || !ok {
 		idx.releaseTwoPathLocks(oldPath, newPath, pla, plb)
 		return nil, false, err
@@ -535,6 +529,7 @@ func (idx *PendingIndex) BeginConflictTransfer(oldPath, newPath string, expected
 		newPath:           newPath,
 		locks:             [2]*pendingPathLock{pla, plb},
 		prepared:          prepared,
+		origDst:           origDst,
 		destWasLive:       destWasLive,
 		destMetaPersisted: !destWasLive,
 		expectedOldGen:    expectedOldGen,
@@ -543,23 +538,26 @@ func (idx *PendingIndex) BeginConflictTransfer(oldPath, newPath string, expected
 }
 
 // prepareConflictTransferLocked fences both endpoints and builds the prepared
-// meta. The caller holds both path locks. It returns the prepared meta, ok,
-// whether the destination was live, and an error when the prepared file could
-// not be persisted.
-func (idx *PendingIndex) prepareConflictTransferLocked(oldPath, newPath string, expectedOldGen, expectedNewGen uint64, keepKind PendingKind) (*WriteBackMeta, bool, bool, error) {
+// meta. The caller holds both path locks. It returns the prepared meta, any
+// pre-existing destination meta copy, ok, whether the destination was live,
+// and an error when the prepared file could not be persisted.
+func (idx *PendingIndex) prepareConflictTransferLocked(oldPath, newPath string, expectedOldGen, expectedNewGen uint64, keepKind PendingKind) (*WriteBackMeta, *WriteBackMeta, bool, bool, error) {
 	idx.mu.RLock()
 	src, hasSrc := idx.items[oldPath]
 	dst, hasDst := idx.items[newPath]
 	idx.mu.RUnlock()
 	if !hasSrc || src == nil || src.Generation != expectedOldGen {
-		return nil, false, false, nil
+		return nil, nil, false, false, nil
 	}
+	var origDst *WriteBackMeta
 	if hasDst {
 		if dst == nil || dst.Generation != expectedNewGen {
-			return nil, false, false, nil
+			return nil, nil, false, false, nil
 		}
+		dstCopy := cloneWriteBackMeta(dst)
+		origDst = &dstCopy
 	} else if expectedNewGen != 0 {
-		return nil, false, false, nil
+		return nil, nil, false, false, nil
 	}
 	gen := idx.nextGen.Add(1)
 	clone := cloneWriteBackMeta(src)
@@ -580,10 +578,10 @@ func (idx *PendingIndex) prepareConflictTransferLocked(oldPath, newPath string, 
 	prepared := &clone
 	if !hasDst {
 		if err := idx.writePreparedWitness(prepared); err != nil {
-			return nil, false, false, err
+			return nil, nil, false, false, err
 		}
 	}
-	return prepared, true, hasDst, nil
+	return prepared, origDst, true, hasDst, nil
 }
 
 // writePreparedWitness persists the prepared entry at the destination as a
@@ -688,8 +686,372 @@ func (t *PendingConflictTransfer) Commit() (bool, error) {
 	t.idx.mu.Unlock()
 
 	_ = os.Remove(filepath.Join(t.idx.dir, HashPath(t.oldPath)+".meta"))
+	t.discardDstBackupLocked()
 	t.idx.removeFenceFiles(cleared)
 	safeLogPrintf("pending: conflict marker moved %s -> %s (gen %d -> %d)", t.oldPath, t.newPath, t.expectedOldGen, t.prepared.Generation)
+	return true, nil
+}
+
+func (idx *PendingIndex) metaBackupFilePath(remotePath string) string {
+	return filepath.Join(idx.dir, HashPath(remotePath)+".meta.unlinkbak")
+}
+
+func (idx *PendingIndex) writeMetaBackupFile(meta *WriteBackMeta) error {
+	if idx == nil || meta == nil {
+		return nil
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("marshal pending backup meta for %s: %w", meta.Path, err)
+	}
+	if err := idx.writeFile(idx.metaBackupFilePath(meta.Path), raw); err != nil {
+		return fmt.Errorf("persist pending backup meta for %s: %w", meta.Path, err)
+	}
+	return nil
+}
+
+func (idx *PendingIndex) removeMetaBackupFile(remotePath string) {
+	if idx == nil || remotePath == "" {
+		return
+	}
+	_ = os.Remove(idx.metaBackupFilePath(remotePath))
+}
+
+func (idx *PendingIndex) reconcileTransferBackups() error {
+	entries, err := os.ReadDir(idx.dir)
+	if err != nil {
+		return fmt.Errorf("pending index backup scan: %w", err)
+	}
+	mutatedDir := false
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".meta.unlinkbak") {
+			continue
+		}
+		hash := strings.TrimSuffix(name, ".meta.unlinkbak")
+		metaBakPath := filepath.Join(idx.dir, name)
+		metaPath := filepath.Join(idx.dir, hash+".meta")
+		raw, rerr := os.ReadFile(metaBakPath)
+		if rerr != nil {
+			return fmt.Errorf("pending index read backup meta %s: %w", metaBakPath, rerr)
+		}
+		var bakMeta WriteBackMeta
+		if uerr := json.Unmarshal(raw, &bakMeta); uerr != nil || bakMeta.Path == "" || HashPath(bakMeta.Path) != hash {
+			if uerr != nil {
+				return fmt.Errorf("pending index decode backup meta %s: %w", metaBakPath, uerr)
+			}
+			return fmt.Errorf("pending index invalid backup meta %s for hash %s", metaBakPath, hash)
+		}
+		if idx.shadows != nil && idx.shadows.Dir() != "" {
+			shadowDir := idx.shadows.Dir()
+			shadowPath := filepath.Join(shadowDir, hash+".shadow")
+			shadowBakPath := filepath.Join(shadowDir, hash+".shadow.unlinkbak")
+			_, bakErr := os.Stat(shadowBakPath)
+			if bakErr != nil && !errors.Is(bakErr, os.ErrNotExist) {
+				return fmt.Errorf("pending index stat shadow backup %s: %w", shadowBakPath, bakErr)
+			}
+			_, curErr := os.Stat(shadowPath)
+			if curErr != nil && !errors.Is(curErr, os.ErrNotExist) {
+				return fmt.Errorf("pending index stat shadow %s: %w", shadowPath, curErr)
+			}
+			if bakErr == nil && errors.Is(curErr, os.ErrNotExist) {
+				// Persist original destination .meta BEFORE restoring .shadow.unlinkbak
+				// so a crash or I/O error never pairs restored bytes with a prepared
+				// witness .meta, and fsync shadowDir BEFORE removing .meta.unlinkbak.
+				if werr := idx.writeFile(metaPath, raw); werr != nil {
+					return fmt.Errorf("pending index restore backup meta %s: %w", metaPath, werr)
+				}
+				if rerr := os.Rename(shadowBakPath, shadowPath); rerr != nil {
+					return fmt.Errorf("pending index restore shadow backup %s: %w", shadowBakPath, rerr)
+				}
+				if ferr := fsyncDir(shadowDir); ferr != nil {
+					return fmt.Errorf("pending index fsync shadow backup restore %s: %w", shadowDir, ferr)
+				}
+				if aerr := idx.shadows.AdoptRecoveredPath(bakMeta.Path); aerr != nil {
+					return fmt.Errorf("pending index adopt restored shadow %s: %w", shadowPath, aerr)
+				}
+			} else if curErr == nil {
+				if aerr := idx.shadows.AdoptRecoveredPath(bakMeta.Path); aerr != nil {
+					return fmt.Errorf("pending index adopt existing shadow %s: %w", shadowPath, aerr)
+				}
+				if bakErr == nil {
+					if rmErr := os.Remove(shadowBakPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+						return fmt.Errorf("pending index remove superseded shadow backup %s: %w", shadowBakPath, rmErr)
+					}
+				}
+				if ferr := fsyncDir(shadowDir); ferr != nil {
+					return fmt.Errorf("pending index fsync shadow backup cleanup %s: %w", shadowDir, ferr)
+				}
+			}
+		}
+		if rmErr := os.Remove(metaBakPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			return fmt.Errorf("pending index remove backup meta %s: %w", metaBakPath, rmErr)
+		}
+		mutatedDir = true
+	}
+	if idx.shadows != nil && idx.shadows.Dir() != "" {
+		shadowDir := idx.shadows.Dir()
+		sEntries, serr := os.ReadDir(shadowDir)
+		if serr != nil {
+			return fmt.Errorf("pending index shadow backup scan: %w", serr)
+		}
+		mutatedShadowDir := false
+		for _, se := range sEntries {
+			if !strings.HasSuffix(se.Name(), ".shadow.unlinkbak") {
+				continue
+			}
+			hash := strings.TrimSuffix(se.Name(), ".shadow.unlinkbak")
+			if _, mErr := os.Stat(filepath.Join(idx.dir, hash+".meta.unlinkbak")); mErr == nil {
+				continue
+			} else if !errors.Is(mErr, os.ErrNotExist) {
+				return fmt.Errorf("pending index stat paired backup meta for %s: %w", se.Name(), mErr)
+			}
+			if rmErr := os.Remove(filepath.Join(shadowDir, se.Name())); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+				return fmt.Errorf("pending index remove orphan shadow backup %s: %w", se.Name(), rmErr)
+			}
+			mutatedShadowDir = true
+		}
+		if mutatedShadowDir {
+			if ferr := fsyncDir(shadowDir); ferr != nil {
+				return fmt.Errorf("pending index fsync orphan shadow backup cleanup %s: %w", shadowDir, ferr)
+			}
+		}
+	}
+	if mutatedDir {
+		if ferr := fsyncDir(idx.dir); ferr != nil {
+			return fmt.Errorf("pending index fsync backup recovery: %w", ferr)
+		}
+	}
+	return nil
+}
+
+// RestoreKindIfGeneration restores path's Kind when its generation still
+// matches expectedGen. Used to undo pre-publication MarkConflictIfGeneration
+// when BeginConflictTransfer fails before moving any payload.
+func (idx *PendingIndex) RestoreKindIfGeneration(path string, expectedGen uint64, kind PendingKind) {
+	if idx == nil || expectedGen == 0 || kind == PendingConflict {
+		return
+	}
+	pl := idx.acquirePathLock(path)
+	defer idx.releasePathLock(path, pl)
+	var snapshot *WriteBackMeta
+	idx.mu.RLock()
+	if src, ok := idx.items[path]; ok && src != nil && src.Generation == expectedGen {
+		cp := cloneWriteBackMeta(src)
+		cp.Kind = kind
+		snapshot = &cp
+	}
+	idx.mu.RUnlock()
+	if snapshot == nil {
+		return
+	}
+	if err := idx.writeMetaFile(snapshot); err != nil {
+		return
+	}
+	idx.mu.Lock()
+	if src, ok := idx.items[path]; ok && src != nil && src.Generation == expectedGen {
+		src.Kind = kind
+	}
+	idx.mu.Unlock()
+}
+
+// restoreSourceKindLocked restores oldPath's pre-transfer Kind on disk first
+// and then in memory while both endpoint path locks are held.
+func (t *PendingConflictTransfer) restoreSourceKindLocked() {
+	if t == nil || t.prepared == nil || t.prepared.Kind == PendingConflict {
+		return
+	}
+	var snapshot *WriteBackMeta
+	t.idx.mu.RLock()
+	if src, ok := t.idx.items[t.oldPath]; ok && src != nil && src.Generation == t.expectedOldGen {
+		cp := cloneWriteBackMeta(src)
+		cp.Kind = t.prepared.Kind
+		snapshot = &cp
+	}
+	t.idx.mu.RUnlock()
+	if snapshot == nil {
+		return
+	}
+	if err := t.idx.writeMetaFile(snapshot); err != nil {
+		return
+	}
+	t.idx.mu.Lock()
+	if src, ok := t.idx.items[t.oldPath]; ok && src != nil && src.Generation == t.expectedOldGen {
+		src.Kind = t.prepared.Kind
+	}
+	t.idx.mu.Unlock()
+}
+
+func (t *PendingConflictTransfer) discardDstBackupLocked() {
+	if t == nil {
+		return
+	}
+	if t.hasDstBackup && t.shadows != nil {
+		t.shadows.DiscardTransferBackup(t.newPath)
+		t.hasDstBackup = false
+	}
+	if t.idx != nil {
+		t.idx.removeMetaBackupFile(t.newPath)
+	}
+}
+
+// MovePayloadReversible moves the source shadow bytes to newPath while
+// stashing any pre-existing destination shadow + metadata under non-.shadow
+// .unlinkbak files so pre-publication failures and mid-transfer crashes can
+// restore both endpoints losslessly without inflating PendingBytes().
+func (t *PendingConflictTransfer) MovePayloadReversible() bool {
+	if t == nil || t.closed || t.prepared == nil {
+		return false
+	}
+	if t.shadows == nil {
+		return true
+	}
+	if !t.shadows.Has(t.oldPath) {
+		return false
+	}
+	t.shadows.EnsureActiveGeneration(t.oldPath)
+	if t.destWasLive && !t.destReplaced {
+		if t.origDst != nil {
+			if err := t.idx.writeMetaBackupFile(t.origDst); err != nil {
+				return false
+			}
+		}
+		backedUp, berr := t.shadows.BackupForTransfer(t.newPath)
+		if berr != nil {
+			t.idx.removeMetaBackupFile(t.newPath)
+			return false
+		}
+		if verr := t.shadows.VerifyRemoved(t.newPath); verr != nil {
+			if backedUp {
+				_ = t.shadows.RestoreTransferBackup(t.newPath)
+			}
+			t.idx.removeMetaBackupFile(t.newPath)
+			return false
+		}
+		t.hasDstBackup = backedUp
+		if err := t.idx.writePreparedWitness(t.prepared); err != nil {
+			if t.hasDstBackup {
+				_ = t.shadows.RestoreTransferBackup(t.newPath)
+				t.hasDstBackup = false
+			}
+			t.idx.removeMetaBackupFile(t.newPath)
+			return false
+		}
+		t.destReplaced = true
+		t.destMetaPersisted = true
+	}
+	if t.shadows.Rename(t.oldPath, t.newPath) {
+		t.payloadMoved = true
+		return true
+	}
+	return false
+}
+
+func (t *PendingConflictTransfer) rollbackReversibleLocked() {
+	if t.payloadMoved && t.shadows != nil {
+		t.shadows.EnsureActiveGeneration(t.newPath)
+		if t.shadows.Rename(t.newPath, t.oldPath) {
+			t.payloadMoved = false
+		}
+	}
+	if t.destWasLive {
+		if t.destReplaced {
+			restoredDst := false
+			if t.origDst != nil && !t.payloadMoved {
+				if err := t.idx.writeMetaFile(t.origDst); err == nil {
+					shadowOK := true
+					if t.hasDstBackup && t.shadows != nil {
+						if rerr := t.shadows.RestoreTransferBackup(t.newPath); rerr != nil {
+							shadowOK = false
+						} else {
+							t.hasDstBackup = false
+						}
+					}
+					if shadowOK {
+						t.idx.removeMetaBackupFile(t.newPath)
+						t.idx.mu.Lock()
+						cp := cloneWriteBackMeta(t.origDst)
+						t.idx.items[t.newPath] = &cp
+						t.idx.mu.Unlock()
+						restoredDst = true
+					} else if t.prepared != nil {
+						_ = t.idx.writePreparedWitness(t.prepared)
+					}
+				}
+			}
+			if !restoredDst {
+				t.discardDstBackupLocked()
+				t.idx.mu.Lock()
+				if t.prepared != nil {
+					cp := cloneWriteBackMeta(t.prepared)
+					cp.Kind = PendingConflict
+					t.idx.items[t.newPath] = &cp
+				} else if cur, ok := t.idx.items[t.newPath]; ok && cur != nil {
+					cur.Kind = PendingConflict
+				}
+				t.idx.mu.Unlock()
+			}
+		} else {
+			t.discardDstBackupLocked()
+		}
+	} else if !t.payloadMoved {
+		_ = os.Remove(filepath.Join(t.idx.dir, HashPath(t.newPath)+".meta"))
+		t.idx.mu.Lock()
+		delete(t.idx.items, t.newPath)
+		t.idx.mu.Unlock()
+	} else if t.prepared != nil {
+		t.idx.mu.Lock()
+		cp := cloneWriteBackMeta(t.prepared)
+		cp.Kind = PendingConflict
+		t.idx.items[t.newPath] = &cp
+		t.idx.mu.Unlock()
+	}
+	if !t.payloadMoved && (t.shadows == nil || t.shadows.Has(t.oldPath)) {
+		t.restoreSourceKindLocked()
+	}
+}
+
+// RollbackPrePublish undoes an uncommitted pre-publication transfer (including
+// reversing an already-renamed shadow payload and restoring any stashed
+// destination incumbent) and restores the source entry's original Kind.
+func (t *PendingConflictTransfer) RollbackPrePublish() {
+	if t == nil || t.closed {
+		return
+	}
+	defer t.release()
+	t.rollbackReversibleLocked()
+}
+
+// CommitReversible commits a pre-publication transfer like Commit, except if
+// fences fail or persisting the destination .meta fails, it reverses the
+// payload move back to oldPath, restores any stashed destination incumbent (or
+// removes the prepared witness when the destination was empty), and restores
+// oldPath's original Kind.
+func (t *PendingConflictTransfer) CommitReversible() (bool, error) {
+	if t == nil || t.closed || t.prepared == nil {
+		return false, nil
+	}
+	defer t.release()
+
+	if ok := t.fencesHold(); !ok {
+		t.rollbackReversibleLocked()
+		return false, nil
+	}
+	if err := t.idx.writeMetaFile(t.prepared); err != nil {
+		t.rollbackReversibleLocked()
+		return false, err
+	}
+	t.idx.mu.Lock()
+	cp := *t.prepared
+	t.idx.items[t.newPath] = &cp
+	delete(t.idx.items, t.oldPath)
+	cleared := t.idx.clearCommittedFencesLocked(t.oldPath, t.newPath)
+	t.idx.mu.Unlock()
+
+	t.discardDstBackupLocked()
+	_ = os.Remove(filepath.Join(t.idx.dir, HashPath(t.oldPath)+".meta"))
+	t.idx.removeFenceFiles(cleared)
+	safeLogPrintf("pending: reversible entry moved %s -> %s (gen %d -> %d)", t.oldPath, t.newPath, t.expectedOldGen, t.prepared.Generation)
 	return true, nil
 }
 
@@ -708,6 +1070,7 @@ func (t *PendingConflictTransfer) Abort() {
 		return
 	}
 	defer t.release()
+	t.discardDstBackupLocked()
 	if t.destReplaced {
 		// The move retired the destination's own payload (its incarnation was
 		// replaced by the remote rename) and may have persisted the prepared
@@ -740,6 +1103,7 @@ func (t *PendingConflictTransfer) Abort() {
 func (t *PendingConflictTransfer) PublishDestination() error {
 	if t == nil || t.closed || t.prepared == nil {
 		if t != nil && !t.closed {
+			t.discardDstBackupLocked()
 			t.release()
 		}
 		return nil
@@ -747,15 +1111,18 @@ func (t *PendingConflictTransfer) PublishDestination() error {
 	if t.destWasLive && !t.destReplaced {
 		// A live destination still carries its own marker describing its own
 		// bytes; overwriting it would mislabel them.
+		t.discardDstBackupLocked()
 		t.release()
 		return nil
 	}
 	defer t.release()
 	if !t.destMetaPersisted {
 		if err := t.idx.writeMetaFile(t.prepared); err != nil {
+			t.discardDstBackupLocked()
 			return err
 		}
 	}
+	t.discardDstBackupLocked()
 	t.idx.mu.Lock()
 	cp := *t.prepared
 	t.idx.items[t.newPath] = &cp
@@ -988,57 +1355,6 @@ func (idx *PendingIndex) UpdateMode(remotePath string, mode uint32) error {
 		metaPath := filepath.Join(idx.dir, HashPath(remotePath)+".meta")
 		if err := idx.writeFile(metaPath, metaBytes); err != nil {
 			return fmt.Errorf("pending index update mode: %w", err)
-		}
-	}
-	cp := updated
-	idx.items[remotePath] = &cp
-	return nil
-}
-
-// MarkLayerCommittedIfGeneration marks only the uploaded publication as a
-// durable overlay. An older completion cannot acknowledge a newer local edit.
-func (idx *PendingIndex) MarkLayerCommittedIfGeneration(remotePath string, generation uint64, committedRev int64, mode uint32, hasMode bool, identity LayerCacheIdentity) error {
-	pl := idx.acquirePathLock(remotePath)
-	defer idx.releasePathLock(remotePath, pl)
-
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-
-	meta, ok := idx.items[remotePath]
-	if !ok || generation == 0 || meta.Generation != generation || idx.layerAbandoned || meta.Kind == PendingConflict {
-		return nil
-	}
-	updated := cloneWriteBackMeta(meta)
-	updated.Kind = PendingOverwrite
-	updated.LayerClean = true
-	updated.LayerID = identity.LayerID
-	updated.LayerEntrySeq = identity.EntrySeq
-	if hasMode {
-		updated.Mode = mode & posixPermissionModeMask
-		updated.HasMode = true
-	}
-	if committedRev > 0 {
-		updated.BaseRev = committedRev
-	}
-	updated.Mtime = time.Now()
-
-	metaBytes, err := json.Marshal(&updated)
-	if err != nil {
-		return fmt.Errorf("pending index marshal committed: %w", err)
-	}
-	if idx.journal != nil {
-		// Publish under the same path lock as Put. A path-only commit marker
-		// could otherwise hide a newer WAL publication after a crash.
-		if err := idx.journal.Append(JournalEntry{Op: JournalPendingMeta, Path: remotePath, Meta: metaBytes}); err != nil {
-			return fmt.Errorf("pending index mark layer committed: %w", err)
-		}
-		if err := idx.journal.FsyncShared(); err != nil {
-			return fmt.Errorf("pending index sync layer commit: %w", err)
-		}
-	} else {
-		metaPath := filepath.Join(idx.dir, HashPath(remotePath)+".meta")
-		if err := idx.writeFile(metaPath, metaBytes); err != nil {
-			return fmt.Errorf("pending index mark layer committed: %w", err)
 		}
 	}
 	cp := updated
@@ -1300,40 +1616,14 @@ func (idx *PendingIndex) releaseTwoPathLocks(a, b string, pla, plb *pendingPathL
 func (idx *PendingIndex) putInternal(meta WriteBackMeta) (uint64, error) {
 	meta.Mode &= posixPermissionModeMask
 	meta.liveAncestors = append([]string(nil), meta.liveAncestors...)
-	return idx.publishMeta(&meta, false)
-}
-
-// publishMeta serializes a publication, including an optional absence check,
-// with acknowledgements and rollback cache removal.
-func (idx *PendingIndex) publishMeta(meta *WriteBackMeta, onlyIfAbsent bool) (uint64, error) {
-	idx.layerPublicationMu.RLock()
-	defer idx.layerPublicationMu.RUnlock()
 	remotePath := meta.Path
 	pl := idx.acquirePathLock(remotePath)
 	defer idx.releasePathLock(remotePath, pl)
 	idx.mu.RLock()
-	abandoned := idx.layerAbandoned
-	previous, exists := idx.items[remotePath]
-	if exists && !meta.LayerClean {
-		// Dirty staging retains the Layer snapshot it was based on. Replay
-		// needs this identity to detect an external update after Flush.
-		meta.LayerID, meta.LayerEntrySeq = previous.LayerID, previous.LayerEntrySeq
-		// Re-staging is not conflict resolution. In particular, a first
-		// write can be conflicted without ever having had a Layer identity.
-		if previous.Kind == PendingConflict {
-			meta.Kind = PendingConflict
-		}
-	}
-	idx.mu.RUnlock()
-	if onlyIfAbsent && exists {
-		return 0, nil
-	}
-	if abandoned {
-		if meta.LayerClean {
-			return 0, errLayerRolledBack
-		}
+	if previous := idx.items[remotePath]; previous != nil && previous.Kind == PendingConflict {
 		meta.Kind = PendingConflict
 	}
+	idx.mu.RUnlock()
 	meta.Mtime = time.Now()
 	meta.CreatedAt = meta.Mtime
 	gen := idx.nextGen.Add(1)
@@ -1374,7 +1664,7 @@ func (idx *PendingIndex) publishMeta(meta *WriteBackMeta, onlyIfAbsent bool) (ui
 	}
 
 	idx.mu.Lock()
-	idx.items[remotePath] = meta
+	idx.items[remotePath] = &meta
 	// A newer staging supersedes a landed-replay fence for the path: the fence
 	// only masks frames at or below its own generation, and leaving it would
 	// keep suppressing nothing while still pinning a stale shadow at settle.
@@ -1386,9 +1676,6 @@ func (idx *PendingIndex) publishMeta(meta *WriteBackMeta, onlyIfAbsent bool) (ui
 
 	return gen, nil
 }
-
-// abandonLayer fences clean publishers already in progress and makes future
-// dirty publications conflicts instead of reviving the abandoned Layer.
 
 // publishRecoveredMeta installs a pending entry unmarshaled from a WAL frame
 // during crash recovery. It is in-memory only: the WAL record remains on disk

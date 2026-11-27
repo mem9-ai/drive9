@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - 'perf/**'
+  workflow_dispatch:
 
 jobs:
   code-ci:

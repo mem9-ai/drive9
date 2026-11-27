@@ -4,6 +4,14 @@ package cli
 
 import "fmt"
 
+func mountLayerConfigError(action string, err error) error {
+	return fmt.Errorf("%s: %w", action, err)
+}
+
+func classifyMountLayerLookupError(ref string, err error) error {
+	return fmt.Errorf("resolve layer %q: %w", ref, err)
+}
+
 func mountFuseImpl(opts *mountFuseOptions) error {
 	_ = opts
 	return fmt.Errorf("drive9 mount: FUSE mounts are not supported on Windows; use `drive9 mount` without `--mode=fuse` on Windows (the default path uses WebDAV), or run drive9 mount on Linux or macOS")

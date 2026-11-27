@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -19,6 +20,16 @@ func SetMeta(c *client.Client, args []string) error {
 		return err
 	}
 	defer withObjectAuthLocal(authLocal)()
+	layerRef, fence, args, err := ParseLayerViewFlags(args)
+	if err != nil {
+		return err
+	}
+	if layerRef != "" {
+		c, err = BindCLIViewClient(context.Background(), c, layerRef, fence)
+		if err != nil {
+			return err
+		}
+	}
 
 	var tags map[string]string
 	tagsSet := false

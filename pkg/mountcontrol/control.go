@@ -9,27 +9,33 @@ import (
 	"fmt"
 	"net"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
 
 const DefaultDrainTimeout = 30 * time.Second
 
 type DrainRequest struct {
-	// Op is "" or "drain" (default) or "status"/"ping".
+	// Op is "" or "drain" (default), "status"/"ping", "switch", or "switch-operation".
 	Op        string `json:"op,omitempty"`
 	TimeoutMS int64  `json:"timeout_ms,omitempty"`
 }
 
-// StatusResponse is a cheap liveness reply from the mount control socket.
 type StatusResponse struct {
-	OK         bool      `json:"ok"`
-	MountPoint string    `json:"mount_point,omitempty"`
-	Op         string    `json:"op,omitempty"`
-	PID        int       `json:"pid,omitempty"`
-	StartedAt  time.Time `json:"started_at,omitempty"`
-	// Layer is the resolved fs layer ID the mount serves ("" for the base
-	// workspace). Nil means the mount predates layer reporting.
-	Layer *string `json:"layer,omitempty"`
-	Error string  `json:"error,omitempty"`
+	OK         bool                      `json:"ok"`
+	MountPoint string                    `json:"mount_point,omitempty"`
+	RemoteRoot string                    `json:"remote_root,omitempty"`
+	Op         string                    `json:"op,omitempty"`
+	PID        int                       `json:"pid,omitempty"`
+	StartedAt  time.Time                 `json:"started_at,omitempty"`
+	Layer      *string                   `json:"layer,omitempty"`
+	Error      string                    `json:"error,omitempty"`
+	ViewSwitch bool                      `json:"view_switch,omitempty"`
+	Recovering bool                      `json:"recovering,omitempty"`
+	MountID    string                    `json:"mount_id,omitempty"`
+	Generation uint64                    `json:"generation,omitempty"`
+	Binding    *mountstate.SwitchBinding `json:"binding,omitempty"`
+	Pending    *mountstate.SwitchReceipt `json:"pending,omitempty"`
 }
 
 func (r DrainRequest) Timeout() time.Duration {

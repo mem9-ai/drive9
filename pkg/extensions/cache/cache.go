@@ -636,9 +636,24 @@ func (c *Cache) Start(ctx context.Context) error { return nil }
 // Drain implements fs.Lifecycle.
 func (c *Cache) Drain(ctx context.Context) error { return nil }
 
-// Stop implements fs.Lifecycle: the on-disk block cache flushes its pending
-// writes and closes its index (v1 detachAll at unmount/reload).
 func (c *Cache) Stop(ctx context.Context) error {
+	c.fencedSweep(func() []detachedDiskReadCacheEntry {
+		if c.mem != nil {
+			c.mem.InvalidateAll()
+		}
+		c.open.Range(func(key, _ any) bool {
+			if h, ok := key.(*cachingHandle); ok {
+				h.mu.Lock()
+				if h.prefetch != nil {
+					h.prefetch.Invalidate()
+				}
+				h.identityGen++
+				h.mu.Unlock()
+			}
+			return true
+		})
+		return nil
+	})
 	if c.dsk != nil {
 		c.dsk.Close()
 	}

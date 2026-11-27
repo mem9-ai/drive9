@@ -9,6 +9,14 @@ import (
 	"github.com/mem9-ai/drive9/pkg/vaultfs"
 )
 
+func mountLayerConfigError(action string, err error) error {
+	return drive9fuse.ExitStartupPermanentErr(action, err)
+}
+
+func classifyMountLayerLookupError(ref string, err error) error {
+	return drive9fuse.ClassifyLayerStartupError(fmt.Sprintf("resolve layer %q", ref), err)
+}
+
 func mountFuseImpl(opts *mountFuseOptions) error {
 	if opts.OmitProcessStateCredentials {
 		if err := hardenMountCredentialProcess(); err != nil {
@@ -37,6 +45,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		Token:                       opts.Token,
 		MountPoint:                  opts.MountPoint,
 		RemoteRoot:                  opts.RemoteRoot,
+		RemoteRootDefaulted:         opts.RemoteRootDefaulted,
 		CacheDir:                    opts.CacheDir,
 		CacheSize:                   opts.CacheSize,
 		ReadCacheMaxFileBytes:       opts.ReadCacheMaxFileBytes,
@@ -63,7 +72,6 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		WritebackSyncWindow:         opts.WritebackSyncWindow,
 		Profile:                     opts.Profile,
 		LayerRef:                    opts.LayerRef,
-		CheckpointRef:               opts.CheckpointRef,
 		LocalRoot:                   opts.LocalRoot,
 		LocalizeQuotaBytes:          opts.LocalizeQuotaBytes,
 		LocalizeFreeRatio:           opts.LocalizeFreeRatio,

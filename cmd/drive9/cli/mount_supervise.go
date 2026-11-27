@@ -21,6 +21,10 @@ import (
 // runMountSupervise is the hidden supervisor entrypoint:
 // drive9 mount supervise --state ... -- [worker args...]
 func runMountSupervise(args []string) error {
+	return runMountSuperviseWith(args, mountsupervisor.Run)
+}
+
+func runMountSuperviseWith(args []string, run func(mountsupervisor.Config) error) error {
 	fs := flag.NewFlagSet("mount supervise", flag.ContinueOnError)
 	mountPoint := fs.String("mountpoint", "", "mount point")
 	logPath := fs.String("log", "", "log file path")
@@ -37,9 +41,12 @@ func runMountSupervise(args []string) error {
 	remoteRoot := fs.String("remote-root", "", "remote root for status metadata")
 	profile := fs.String("profile", "", "profile for status metadata")
 	mountKind := fs.String("mount-kind", "", "mount kind recorded in process state (fuse or object)")
+	layerID := fs.String("layer-id-meta", "", "canonical layer for pack metadata")
+	layerReadOnly := fs.Bool("layer-read-only-meta", false, "read-only layer mount")
 	localRootMeta := fs.String("local-root-meta", "", "local root for pack metadata")
 	packPathsJSON := fs.String("pack-paths-json", "", "JSON array of pack paths")
 	sanitizedJSON := fs.String("sanitized-args-json", "", "JSON array of sanitized args")
+	recoverLease := fs.Bool("recover-layer-lease", false, "wait for the previous worker lease")
 	adopt := fs.Bool("adopt", false, "adopt an existing worker by PID (poll-based; no waitpid)")
 	adoptWorkerPID := fs.Int("adopt-worker-pid", 0, "worker PID to adopt")
 	adoptWorkerCreation := fs.Uint64("adopt-worker-creation", 0, "worker process creation identity")
@@ -130,7 +137,7 @@ func runMountSupervise(args []string) error {
 
 	// Stop-token clearing is done inside mountsupervisor after exclusive lock
 	// so a concurrent umount intent cannot be erased by a non-owner process.
-	return mountsupervisor.Run(mountsupervisor.Config{
+	return run(mountsupervisor.Config{
 		MountPoint:          *mountPoint,
 		Executable:          exe,
 		WorkerArgs:          workerArgs,
@@ -153,6 +160,9 @@ func runMountSupervise(args []string) error {
 		Profile:             *profile,
 		MountKind:           *mountKind,
 		LocalRoot:           *localRootMeta,
+		LayerID:             *layerID,
+		LayerReadOnly:       *layerReadOnly,
+		RecoverLayerLease:   *recoverLease,
 		PackPaths:           packPaths,
 		Adopt:               *adopt,
 		AdoptWorkerPID:      *adoptWorkerPID,
@@ -172,10 +182,12 @@ func runMountStatus(args []string) error {
 	}
 	mp := fs.Arg(0)
 	snap := mountsupervisor.CollectStatus(mp)
+	view, viewErr := readMountStatusView(mp)
 	if *asJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(snap)
+		return writeMountStatusJSON(os.Stdout, snap, view, viewErr)
+	}
+	if err := writeMountStatusView(os.Stdout, view, viewErr); err != nil {
+		return err
 	}
 	fmt.Printf("mountpoint: %s\n", snap.MountPoint)
 	fmt.Printf("state: %s\n", snap.State)
@@ -362,11 +374,11 @@ func runMountEnsure(args []string) error {
 	// --server is non-secret and may be injected as a flag for clarity.
 	sanitized = injectEnsureServerFlag(sanitized, storedServer)
 	return withEnsureCredentialEnv(storedServer, storedAPIKey, storedToken, func() error {
-		return fsMountCmdWithBackground(sanitized, true)
+		return fsMountWithLeaseRecovery(sanitized, true, true)
 	})
 }
 
-func adoptSupervisorCommandArgs(mp, logPath, storedServer, sanitizedJSON string, workerPID int, workerCreation uint64, mountKind string) []string {
+func adoptSupervisorCommandArgs(mp, logPath, storedServer, sanitizedJSON string, workerPID int, workerCreation uint64, mountKind string, packState mountstate.ProcessState) ([]string, error) {
 	args := []string{
 		"mount", "supervise",
 		"--mountpoint", mp,
@@ -380,7 +392,17 @@ func adoptSupervisorCommandArgs(mp, logPath, storedServer, sanitizedJSON string,
 	if mountKind != "" {
 		args = append(args, "--mount-kind", mountKind)
 	}
-	return args
+	if packState.LayerID != "" {
+		packPaths, err := json.Marshal(packState.PackPaths)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, "--layer-id-meta", packState.LayerID, "--local-root-meta", packState.LocalRoot, "--remote-root", packState.RemoteRoot, "--profile", packState.Profile, "--pack-paths-json", string(packPaths))
+		if packState.LayerReadOnly {
+			args = append(args, "--layer-read-only-meta")
+		}
+	}
+	return args, nil
 }
 
 // ensureAdoptSupervisor starts a poll-based supervisor over a live orphan worker.
@@ -388,6 +410,7 @@ func ensureAdoptSupervisor(mp string, snap mountsupervisor.StatusSnapshot) error
 	workerCreation := snap.WorkerCreation
 	var sanitized []string
 	var storedServer, storedAPIKey, storedToken, storedKind string
+	var packState mountstate.ProcessState
 	if st, _, err := mountstate.ReadSupervisorState(mp); err == nil {
 		if workerCreation == 0 {
 			workerCreation = st.WorkerCreation
@@ -401,6 +424,9 @@ func ensureAdoptSupervisor(mp string, snap mountsupervisor.StatusSnapshot) error
 		}
 		if storedServer == "" {
 			storedServer = ps.Server
+		}
+		if ps.WorkerPID == snap.WorkerPID || ps.PID == snap.WorkerPID {
+			packState = ps
 		}
 		storedKind = ps.MountKind
 		storedAPIKey, storedToken = ps.APIKey, ps.Token
@@ -428,7 +454,10 @@ func ensureAdoptSupervisor(mp string, snap mountsupervisor.StatusSnapshot) error
 	if err != nil {
 		return err
 	}
-	args := adoptSupervisorCommandArgs(mp, logPath, storedServer, string(sanitizedJSON), snap.WorkerPID, workerCreation, storedKind)
+	args, err := adoptSupervisorCommandArgs(mp, logPath, storedServer, string(sanitizedJSON), snap.WorkerPID, workerCreation, storedKind, packState)
+	if err != nil {
+		return err
+	}
 	return withEnsureCredentialEnv(storedServer, storedAPIKey, storedToken, func() error {
 		cmd := exec.Command(exe, args...)
 		cmd.Env = mountBackgroundEnv(os.Environ(), mountBackgroundRequest{
@@ -527,7 +556,7 @@ func runMountSystemdUnit(args []string) error {
 		return err
 	}
 	// Build ExecStart with --supervise-foreground.
-	startArgs := []string{exe, "mount", "--supervise-foreground"}
+	startArgs := []string{exe, "mount", "--supervise-foreground", "--recover-layer-lease"}
 	startArgs = append(startArgs, rest...)
 	// Quote simply; escape % for systemd (%% is a literal percent).
 	execStart := systemdEscapePercents(shellJoin(startArgs))

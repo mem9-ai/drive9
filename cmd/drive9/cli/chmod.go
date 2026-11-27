@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 	"strconv"
 
@@ -15,19 +14,19 @@ func Chmod(c *client.Client, args []string) error {
 		return err
 	}
 	defer withObjectAuthLocal(authLocal)()
-	layerRef, args, err := parseLayerFlag(args)
+	layerRef, fence, args, err := ParseLayerViewFlags(args)
 	if err != nil {
 		return err
 	}
 	if len(args) != 2 {
-		return fmt.Errorf("usage: drive9 fs chmod [--layer <ref>] <mode> <path>")
+		return fmt.Errorf("usage: drive9 fs chmod [--layer <ref> [--fence <N>]] <mode> <path>")
 	}
 	modeStr, path := args[0], args[1]
 	mode64, err := strconv.ParseUint(modeStr, 8, 32)
 	if err != nil {
 		return fmt.Errorf("invalid mode %q: %w", modeStr, err)
 	}
-	h, err := fsHandleForArg(c, path)
+	h, err := fsHandleForLayerArg(c, path, layerRef, fence)
 	if err != nil {
 		return err
 	}
@@ -35,8 +34,5 @@ func Chmod(c *client.Client, args []string) error {
 		return err
 	}
 	c, path = h.Client, h.Path
-	if layerRef != "" {
-		return chmodLayerPath(context.Background(), c, layerRef, path, uint32(mode64))
-	}
 	return c.Chmod(path, uint32(mode64))
 }

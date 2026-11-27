@@ -12,6 +12,12 @@ import type {
   WriteOptions,
 } from "./models.js";
 import { Semaphore } from "./utils.js";
+import {
+  UnsupportedInLayerViewError,
+  clientFetch,
+  fetchViewObjectTargetUrl,
+  hasActiveLayerView,
+} from "./view.js";
 
 export const ExtentChunkSize = 64 * 1024 * 1024;
 export const ExtentBlockSize = 4 * 1024 * 1024;
@@ -234,7 +240,7 @@ export async function getExtentReadPlanImpl(
   end: number
 ): Promise<ExtentReadPlan> {
   const range = end >= 0 ? `bytes=${start}-${end}` : `bytes=${start}-`;
-  const resp = await fetch(client.fsUrl(path), {
+  const resp = await clientFetch(client, client.fsUrl(path), {
     method: "GET",
     headers: client.authHeaders({
       "X-Dat9-Extent-Read-Plan": "1",
@@ -281,12 +287,8 @@ export async function fetchExtentBlockRangeImpl(
   if (offset < 0 || length <= 0) {
     throw new Drive9Error(`invalid extent block range ${offset}+${length}`);
   }
-  const absUrl = new URL(blockUrl, client.baseUrl).toString();
-  const resp = await fetch(absUrl, {
-    method: "GET",
-    headers: {
-      Range: `bytes=${offset}-${offset + length - 1}`,
-    },
+  const resp = await fetchViewObjectTargetUrl(client, blockUrl, {
+    Range: `bytes=${offset}-${offset + length - 1}`,
   });
   if (resp.status === 206) {
     if (!resp.body) throw new Drive9Error("empty extent block response body");
@@ -498,7 +500,7 @@ export async function initiateExtentPatchImpl(
   if (expectedResourceId) {
     headers["X-Dat9-Expected-Resource"] = expectedResourceId;
   }
-  const resp = await fetch(client.fsUrl(path), {
+  const resp = await clientFetch(client, client.fsUrl(path), {
     method: "PATCH",
     headers,
     body: JSON.stringify({
@@ -742,13 +744,13 @@ async function truncateExtentWithLandedRevImpl(
 }
 
 export async function createExtentFileImpl(client: Client, path: string): Promise<CreateExtentFileResult> {
-  const resp = await fetch(`${client.fsUrl(path)}?create=1&layout=extent`, {
+  const resp = await clientFetch(client, `${client.fsUrl(path)}?create=1&layout=extent`, {
     method: "POST",
     headers: client.authHeaders(),
   });
   if (resp.status === 400 || resp.status === 403) {
     await resp.text().catch(() => "");
-    const fallbackResp = await fetch(`${client.fsUrl(path)}?create=1`, {
+    const fallbackResp = await clientFetch(client, `${client.fsUrl(path)}?create=1`, {
       method: "POST",
       headers: client.authHeaders(),
     });
@@ -786,7 +788,7 @@ export async function deleteFileConditionalImpl(
   if (expectedResourceId) {
     headers["X-Dat9-Expected-Resource"] = expectedResourceId;
   }
-  const resp = await fetch(`${client.fsUrl(path)}?kind=file`, {
+  const resp = await clientFetch(client, `${client.fsUrl(path)}?kind=file`, {
     method: "DELETE",
     headers,
   });
@@ -799,7 +801,7 @@ export async function presignExtentChecksums(
   uploadId: string,
   items: { number: number; checksum: string }[]
 ): Promise<PresignedPart[]> {
-  const resp = await fetch(`${client.baseUrl}/v2/uploads/${uploadId}/presign-batch`, {
+  const resp = await clientFetch(client, `${client.baseUrl}/v2/uploads/${uploadId}/presign-batch`, {
     method: "POST",
     headers: client.authHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({
@@ -899,6 +901,9 @@ export async function initiateUploadV2WithLayout(
   layout = "",
   expectedResourceId?: string
 ): Promise<UploadPlanV2> {
+  if (hasActiveLayerView(client) && description) {
+    throw new UnsupportedInLayerViewError("description metadata is unsupported in layer view");
+  }
   const payload: {
     path: string;
     total_size: number;
@@ -920,7 +925,7 @@ export async function initiateUploadV2WithLayout(
   if (expectedResourceId) {
     headers["X-Dat9-Expected-Resource"] = expectedResourceId;
   }
-  const resp = await fetch(`${client.baseUrl}/v2/uploads/initiate`, {
+  const resp = await clientFetch(client, `${client.baseUrl}/v2/uploads/initiate`, {
     method: "POST",
     headers,
     body: JSON.stringify(payload),
@@ -943,7 +948,7 @@ export async function completeUploadV2WithRevision(
   parts: CompletePart[],
   tags?: Record<string, string>
 ): Promise<number> {
-  const resp = await fetch(`${client.baseUrl}/v2/uploads/${uploadId}/complete`, {
+  const resp = await clientFetch(client, `${client.baseUrl}/v2/uploads/${uploadId}/complete`, {
     method: "POST",
     headers: client.authHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({ parts, tags }),
@@ -955,7 +960,7 @@ export async function completeUploadV2WithRevision(
 
 export async function abortUploadV2BestEffort(client: Client, uploadId: string): Promise<void> {
   try {
-    await fetch(`${client.baseUrl}/v2/uploads/${uploadId}/abort`, {
+    await clientFetch(client, `${client.baseUrl}/v2/uploads/${uploadId}/abort`, {
       method: "POST",
       headers: client.authHeaders(),
     });
@@ -1065,7 +1070,7 @@ export async function writeExtentBytesImpl(
 }
 
 async function createNativeExtentFileImpl(client: Client, path: string): Promise<number> {
-  const resp = await fetch(`${client.fsUrl(path)}?create=1&layout=extent`, {
+  const resp = await clientFetch(client, `${client.fsUrl(path)}?create=1&layout=extent`, {
     method: "POST",
     headers: client.authHeaders(),
   });
@@ -1088,6 +1093,9 @@ async function setFileMetadataImpl(
   tags?: Record<string, string>,
   description?: string
 ): Promise<void> {
+  if (hasActiveLayerView(client) && description) {
+    throw new UnsupportedInLayerViewError("description metadata is unsupported in layer view");
+  }
   const payload: { tags?: Record<string, string>; description?: string } = {};
   if (tags !== undefined) {
     payload.tags = tags;
@@ -1095,7 +1103,7 @@ async function setFileMetadataImpl(
   if (description !== undefined && description !== "") {
     payload.description = description;
   }
-  const resp = await fetch(`${client.fsUrl(path)}?setmeta=1`, {
+  const resp = await clientFetch(client, `${client.fsUrl(path)}?setmeta=1`, {
     method: "POST",
     headers: client.authHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify(payload),
@@ -1160,6 +1168,9 @@ export async function writeDirectOnlyImpl(
     description?: string;
   }
 ): Promise<number> {
+  if (hasActiveLayerView(client) && opts.description) {
+    throw new UnsupportedInLayerViewError("description metadata is unsupported in layer view");
+  }
   const headers: [string, string][] = Object.entries(
     client.authHeaders({ "Content-Type": "application/octet-stream" })
   );
@@ -1175,7 +1186,7 @@ export async function writeDirectOnlyImpl(
   for (const [key, value] of Object.entries(opts.tags || {})) {
     headers.push(["X-Dat9-Tag", `${key}=${value}`]);
   }
-  const resp = await fetch(client.fsUrl(path), {
+  const resp = await clientFetch(client, client.fsUrl(path), {
     method: "PUT",
     headers,
     body: bodyInit(data),

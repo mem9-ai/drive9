@@ -49,6 +49,14 @@ func (g *reexecGuard) release() {
 // ReexecPreflight runs every gate against the facade state. It does NOT
 // acquire the guard or install a quiesce barrier (caller's job).
 func (f *FS) ReexecPreflight() ReexecPreflightResult {
+	return f.referencePreflight(false)
+}
+
+func (f *FS) viewSwitchPreflight() ReexecPreflightResult {
+	return f.referencePreflight(f.viewLocalState)
+}
+
+func (f *FS) referencePreflight(viewLocalState bool) ReexecPreflightResult {
 	var refusals []ReexecRefusal
 	refuse := func(gate, reason string, count int) {
 		refusals = append(refusals, ReexecRefusal{Gate: gate, Reason: reason, Count: count})
@@ -66,9 +74,21 @@ func (f *FS) ReexecPreflight() ReexecPreflightResult {
 	if n := f.heldLockCount(); n > 0 {
 		refuse("fuse_locks", "FUSE locks are held", n)
 	}
+	f.mu.Lock()
+	deferredCount := len(f.deferredUnlinks)
+	f.mu.Unlock()
+	if deferredCount > 0 {
+		refuse("deferred_unlinks", "pending deferred unlinks exist", deferredCount)
+	}
 	// Extensions hold their own in-memory state (session xattrs, lazy
 	// buffers); ask each through the framework's ReexecGater capability.
 	for _, h := range f.chain.Handlers() {
+		if g, ok := h.(fs.ViewSwitchGater); ok && viewLocalState {
+			if reason, n := g.ViewSwitchRefusal(); n > 0 {
+				refuse("extension_state", reason, n)
+			}
+			continue
+		}
 		if g, ok := h.(fs.ReexecGater); ok {
 			if reason, n := g.ReexecRefusal(); n > 0 {
 				refuse("extension_state", reason, n)

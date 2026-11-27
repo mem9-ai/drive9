@@ -27,21 +27,21 @@ func TestJournalMaintenanceFailureDoesNotFailPublication(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := range 3 {
-		if _, err := idx.PutLayerCache("/a", int64(i), 0, 0600, true, LayerCacheIdentity{LayerID: "layer-1", EntrySeq: int64(i + 1)}); err != nil {
+		if _, err := idx.PutWithBaseRevAndMode("/a", int64(i), PendingOverwrite, 1, 0600, true); err != nil {
 			t.Fatalf("maintenance failure rejected publication: %v", err)
 		}
 	}
 	if err := j.compact(false); err == nil {
 		t.Fatal("wanted a maintenance failure")
 	}
-	if _, err := idx.PutLayerCache("/a", 4, 0, 0600, true, LayerCacheIdentity{LayerID: "layer-1", EntrySeq: 4}); err != nil {
+	if _, err := idx.PutWithBaseRevAndMode("/a", 4, PendingOverwrite, 1, 0600, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := j.FsyncShared(); err != nil {
 		t.Fatal(err)
 	}
 	meta, _ := idx.GetMeta("/a")
-	if meta == nil || meta.LayerEntrySeq != 4 {
+	if meta == nil || meta.Size != 4 {
 		t.Fatalf("publication not visible: %+v", meta)
 	}
 	if err := j.compact(false); err != nil {
@@ -101,7 +101,7 @@ func TestJournalShutdownTreatsCompactionAsMaintenance(t *testing.T) {
 	t.Cleanup(func() { _ = j.Close() })
 	idx.SetJournal(j)
 	for range 2 {
-		if _, err := idx.PutLayerCache("/a", 0, 0, 0600, true, LayerCacheIdentity{LayerID: "layer-1", EntrySeq: 1}); err != nil {
+		if _, err := idx.PutWithBaseRevAndMode("/a", 0, PendingOverwrite, 1, 0600, true); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -131,7 +131,33 @@ func TestJournalShutdownTreatsCompactionAsMaintenance(t *testing.T) {
 	if err := ReplayJournalIntoPending(reopened, recovered, nil); err != nil {
 		t.Fatal(err)
 	}
-	if meta, ok := recovered.GetMeta("/a"); !ok || !meta.LayerClean {
+	if meta, ok := recovered.GetMeta("/a"); !ok || meta.BaseRev != 1 || meta.Kind != PendingOverwrite {
 		t.Fatalf("maintenance failure lost durable metadata: %+v", meta)
+	}
+}
+
+func TestRecoveredLayerCacheOnlyBecomesPendingAfterLocalEdit(t *testing.T) {
+	idx, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte(`{"path":"/saved","kind":1,"generation":2,"layer_clean":true,"layer_entry_seq":1}`)
+	if err := os.WriteFile(filepath.Join(idx.dir, HashPath("/saved")+".meta"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := idx.GetMeta("/saved"); !ok {
+		t.Fatal("lost recovered cache entry")
+	}
+	if _, ok := idx.ListUncommittedPaths()["/saved"]; ok {
+		t.Fatal("recovered clean data queued for upload")
+	}
+	if _, err := idx.Put("/saved", 3, PendingOverwrite); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := idx.ListUncommittedPaths()["/saved"]; !ok {
+		t.Fatal("local edit missing from uncommitted paths")
 	}
 }

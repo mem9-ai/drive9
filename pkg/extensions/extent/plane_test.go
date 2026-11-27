@@ -74,6 +74,8 @@ type fakeV2 struct {
 	// N bytes of each block (a truncated tail), modeling an object whose
 	// content block is referenced over a shorter range.
 	partialPlan map[string]partialPlanShape
+	failStatus  atomic.Int32
+	onGetObj    atomic.Pointer[func(key, rng string, ctx context.Context)]
 }
 
 // fakeTotalParts is the multipart part count for a size: ceil(size/part),
@@ -141,6 +143,9 @@ func newFakeV2(t *testing.T) *fakeV2 {
 		key := strings.TrimPrefix(r.URL.Path, "/obj/")
 		switch r.Method {
 		case http.MethodGet:
+			if hook := f.onGetObj.Load(); hook != nil && *hook != nil {
+				(*hook)(key, r.Header.Get("Range"), r.Context())
+			}
 			f.mu.Lock()
 			data, ok := f.blocks[key]
 			f.mu.Unlock()
@@ -510,8 +515,8 @@ func newFakeV2(t *testing.T) *fakeV2 {
 			f.mu.Unlock()
 			var body struct {
 				Parts []struct {
-					Number   int    `json:"part_number"`
-					Checksum string `json:"checksum"`
+					Number   int             `json:"part_number"`
+					Checksum json.RawMessage `json:"checksum"`
 				} `json:"parts"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
@@ -521,8 +526,16 @@ func newFakeV2(t *testing.T) *fakeV2 {
 			const partSize = int64(4 << 20)
 			out := make([]map[string]any, 0, len(body.Parts))
 			for _, p := range body.Parts {
+				var csum string
+				if err := json.Unmarshal(p.Checksum, &csum); err != nil {
+					var obj struct {
+						Value string `json:"value"`
+					}
+					_ = json.Unmarshal(p.Checksum, &obj)
+					csum = obj.Value
+				}
 				f.mu.Lock()
-				exists := len(f.blocks[p.Checksum]) > 0
+				exists := csum != "" && len(f.blocks[csum]) > 0
 				f.mu.Unlock()
 				size := partSize
 				if rem := upSize - int64(p.Number-1)*partSize; rem < size {
@@ -531,7 +544,7 @@ func newFakeV2(t *testing.T) *fakeV2 {
 				if size < 0 {
 					size = 0
 				}
-				m := map[string]any{"number": p.Number, "url": fmt.Sprintf("%s/obj/%s", f.URL, p.Checksum), "size": size}
+				m := map[string]any{"number": p.Number, "url": fmt.Sprintf("%s/obj/%s", f.URL, csum), "size": size}
 				if exists {
 					m["skip_upload"] = true
 				}
@@ -599,7 +612,13 @@ func newFakeV2(t *testing.T) *fakeV2 {
 		}
 		http.Error(w, "bad upload route", http.StatusNotFound)
 	})
-	f.Server = httptest.NewServer(mux)
+	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if code := f.failStatus.Load(); code != 0 {
+			http.Error(w, "injected failure", int(code))
+			return
+		}
+		mux.ServeHTTP(w, r)
+	}))
 	t.Cleanup(f.Close)
 	return f
 }
@@ -810,7 +829,20 @@ func newTestHandler(t *testing.T, f *fakeV2, threshold int64) *Handler {
 		CacheDir:   engineCacheDir(t),
 	})
 	bus := fs.NewEventBus()
-	return New(Options{Engine: eng, Threshold: threshold, Events: bus})
+	h := New(Options{Engine: eng, Threshold: threshold, Events: bus})
+	t.Cleanup(func() {
+		h.mu.Lock()
+		var open []*engineHandle
+		for _, list := range h.handles {
+			open = append(open, list...)
+		}
+		h.mu.Unlock()
+		for _, eh := range open {
+			_ = eh.Release(context.Background())
+		}
+		_ = h.Stop(context.Background())
+	})
+	return h
 }
 
 func TestEngineClaimsExtentFile(t *testing.T) {
@@ -2840,7 +2872,6 @@ func TestFreshEngineCreateVisibleBeforeCommit(t *testing.T) {
 	}
 }
 
-
 // Round-18: a later write covering only the MIDDLE of an earlier one keeps
 // the earlier write's suffix, and fsync publishes the composed image. The
 // extent plane has no deferred-commit mode, so the very first fsync already
@@ -2932,12 +2963,6 @@ func TestLocalLookupKeepsRecordedZeroMode(t *testing.T) {
 	}
 }
 
-
-
-
-
-
-
 // Round-19: the folded OpCreate flag contract holds for still-local files —
 // O_CREAT|O_EXCL answers EEXIST and O_TRUNC truncates.
 func TestLocalClaimFlagSemantics(t *testing.T) {
@@ -2966,9 +2991,6 @@ func TestLocalClaimFlagSemantics(t *testing.T) {
 		t.Fatalf("content after O_TRUNC + write = %q, want DATA (the truncate cleared nothing)", got)
 	}
 }
-
-
-
 
 // Round-20: a write appended to b.pending while another chunk's commit is
 // in flight survives that commit (the deletion is surgical).
@@ -3054,8 +3076,6 @@ func TestDeferredOverlayThreeWritesBackwards(t *testing.T) {
 	}
 }
 
-
-
 // Round-21: a same-inode write that survives another commit's cleanup
 // keeps its staged bytes (the reference scan counts it).
 func TestSameInodeSurvivorKeepsBytes(t *testing.T) {
@@ -3085,7 +3105,6 @@ func TestSameInodeSurvivorKeepsBytes(t *testing.T) {
 		t.Fatalf("survivor's staged bytes lost: ok=%v data=%q", ok, data)
 	}
 }
-
 
 // Round-22: the recovery constraint covers TRUNCATION-ONLY publication —
 // a replacement at the saved path is never truncated.
@@ -3169,8 +3188,6 @@ func TestRecoveryConstraintSurvivesFailure(t *testing.T) {
 	}
 }
 
-
-
 // Round-24: an ordinary SAME-OBJECT revision conflict on a bound
 // publication stays an ordinary conflict — the staged data survives for
 // the retry instead of being abandoned.
@@ -3207,7 +3224,6 @@ func TestBoundPublicationOrdinaryConflictKeepsState(t *testing.T) {
 	}
 }
 
-
 // Round-25: a bound publication with the revision CAS DISABLED (-1) still
 // carries the identity precondition on the direct-PUT route.
 func TestBoundDirectPutWithoutRevisionCAS(t *testing.T) {
@@ -3229,7 +3245,6 @@ func TestBoundDirectPutWithoutRevisionCAS(t *testing.T) {
 		t.Fatalf("replacement content = %q, want OTHER untouched", got)
 	}
 }
-
 
 // Round-26: the echoed completion identity binds the descriptor directly (no
 // post-create Stat round trip), and rejects an EXTENT replacement at the same
@@ -3294,12 +3309,6 @@ func TestIdentityBindsPublicationWindow(t *testing.T) {
 	}
 }
 
-
-
-
-
-
-
 // Round-60: an echo-less completion binds NOTHING, even when the occupant's
 // whole image matches byte for byte. Content is not identity — a byte-identical
 // replacement is a different object, and adopting its ID would let this
@@ -3332,7 +3341,6 @@ func TestEcholessCompletionBindsNothing(t *testing.T) {
 		t.Fatal("the refusal must persist across retries")
 	}
 }
-
 
 // Round-47: with no completion echo, an extent occupant that replaced OUR
 // landing BEFORE the classification Stat must not be adopted — its read
@@ -3978,7 +3986,6 @@ func TestFreshCreateMarkerDoesNotSurviveReuse(t *testing.T) {
 		t.Fatalf("a reopened path must not inherit the previous incarnation's create marker: %v", err)
 	}
 }
-
 
 // The capability boundary must be established BEFORE publishing: a server that
 // does not advertise completion_identity_v1 cannot give this descriptor an

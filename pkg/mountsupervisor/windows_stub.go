@@ -29,6 +29,8 @@ type Config struct {
 	AlertFile           string
 	SanitizedArgs       []string
 	Server              string
+	LayerID             string
+	LayerReadOnly       bool
 	RemoteRoot          string
 	Profile             string
 	MountKind           string

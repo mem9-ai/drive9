@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/tagutil"
+	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 // Client is the drive9 HTTP client.
@@ -31,6 +32,9 @@ type Client struct {
 	httpClient            *http.Client
 	smallFileThreshold    int64 // 0 means use DefaultSmallFileThreshold
 	multipartAbortTimeout time.Duration
+	view                  ViewBinding
+	baseOrigin            *url.URL
+	viewDownload          *viewprotocol.ViewDownloadClient
 
 	// statusFetchMu serializes /v1/status fetches across concurrent callers
 	// so a transient warm failure can be retried but two callers never
@@ -292,6 +296,8 @@ var ErrListResponseTooLarge = errors.New("list response too large")
 // ListOptions configures one directory listing request.
 type ListOptions struct {
 	MaxResponseBytes int64
+	Limit            int
+	SinglePage       bool
 }
 
 // ListResult contains a directory listing and the number of response bytes
@@ -802,13 +808,17 @@ func (c *Client) doNoRedirect(req *http.Request) (*http.Response, error) {
 // doWith applies the client's credential headers to req and executes it with
 // hc. Credential plumbing lives here so do and doNoRedirect cannot drift apart.
 func (c *Client) doWith(req *http.Request, hc *http.Client) (*http.Response, error) {
+	out, err := c.rewriteRequestForView(req)
+	if err != nil {
+		return nil, err
+	}
 	if c.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+		out.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
 	if c.actor != "" {
-		req.Header.Set("X-Dat9-Actor", c.actor)
+		out.Header.Set("X-Dat9-Actor", c.actor)
 	}
-	return hc.Do(req)
+	return hc.Do(out)
 }
 
 // Write uploads data to a remote path.
@@ -1122,14 +1132,58 @@ func (c *Client) ListCtx(ctx context.Context, path string) ([]FileInfo, error) {
 
 // ListWithOptionsCtx returns a directory listing with optional response bounds.
 func (c *Client) ListWithOptionsCtx(ctx context.Context, path string, opts ListOptions) (ListResult, error) {
-	// Use an explicit value to avoid intermediaries dropping bare "?list".
-	req, err := c.newFSRequest(ctx, http.MethodGet, path, "?list=1", nil)
+	var (
+		allEntries []FileInfo
+		totalBytes int64
+		cursor     string
+	)
+	for {
+		rawQuery := "?list=1"
+		if c.view.LayerID != "" {
+			if opts.Limit > 0 {
+				rawQuery += "&limit=" + strconv.Itoa(min(opts.Limit-len(allEntries), 1000))
+			}
+			if cursor != "" {
+				rawQuery += "&cursor=" + url.QueryEscape(cursor)
+			}
+		}
+		remOpts := opts
+		if opts.MaxResponseBytes > 0 {
+			rem := opts.MaxResponseBytes - totalBytes
+			if rem <= 0 {
+				return ListResult{ResponseBytes: totalBytes}, fmt.Errorf("%w: limit %d bytes", ErrListResponseTooLarge, opts.MaxResponseBytes)
+			}
+			remOpts.MaxResponseBytes = rem
+		}
+		pageEntries, nextCursor, pageBytes, err := c.listOnePageCtx(ctx, path, rawQuery, remOpts)
+		totalBytes += pageBytes
+		if err != nil {
+			if errors.Is(err, ErrListResponseTooLarge) && opts.MaxResponseBytes > 0 {
+				return ListResult{ResponseBytes: totalBytes}, fmt.Errorf("%w: limit %d bytes", ErrListResponseTooLarge, opts.MaxResponseBytes)
+			}
+			return ListResult{ResponseBytes: totalBytes}, err
+		}
+		allEntries = append(allEntries, pageEntries...)
+		if opts.Limit > 0 && len(allEntries) >= opts.Limit {
+			allEntries = allEntries[:opts.Limit]
+			break
+		}
+		if opts.SinglePage || c.view.LayerID == "" || nextCursor == "" {
+			break
+		}
+		cursor = nextCursor
+	}
+	return ListResult{Entries: allEntries, ResponseBytes: totalBytes}, nil
+}
+
+func (c *Client) listOnePageCtx(ctx context.Context, path, rawQuery string, opts ListOptions) ([]FileInfo, string, int64, error) {
+	req, err := c.newFSRequest(ctx, http.MethodGet, path, rawQuery, nil)
 	if err != nil {
-		return ListResult{}, err
+		return nil, "", 0, err
 	}
 	resp, err := c.do(req)
 	if err != nil {
-		return ListResult{}, err
+		return nil, "", 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
@@ -1138,17 +1192,18 @@ func (c *Client) ListWithOptionsCtx(ctx context.Context, path string, opts ListO
 			body, readErr := io.ReadAll(io.LimitReader(resp.Body, opts.MaxResponseBytes+1))
 			responseBytes = int64(len(body))
 			if readErr != nil {
-				return ListResult{ResponseBytes: responseBytes}, readErr
+				return nil, "", responseBytes, readErr
 			}
 			if int64(len(body)) > opts.MaxResponseBytes {
-				return ListResult{ResponseBytes: responseBytes}, fmt.Errorf("%w: limit %d bytes", ErrListResponseTooLarge, opts.MaxResponseBytes)
+				return nil, "", responseBytes, fmt.Errorf("%w: limit %d bytes", ErrListResponseTooLarge, opts.MaxResponseBytes)
 			}
 			resp.Body = io.NopCloser(bytes.NewReader(body))
 		}
-		return ListResult{ResponseBytes: responseBytes}, readError(resp)
+		return nil, "", responseBytes, readError(resp)
 	}
 	var result struct {
-		Entries []FileInfo `json:"entries"`
+		Entries    []FileInfo `json:"entries"`
+		NextCursor string     `json:"next_cursor"`
 	}
 	reader := io.Reader(resp.Body)
 	var limited *io.LimitedReader
@@ -1160,27 +1215,27 @@ func (c *Client) ListWithOptionsCtx(ctx context.Context, path string, opts ListO
 	decoder := json.NewDecoder(counted)
 	if err := decoder.Decode(&result); err != nil {
 		if opts.MaxResponseBytes > 0 && counted.bytes > opts.MaxResponseBytes {
-			return ListResult{ResponseBytes: counted.bytes}, fmt.Errorf("%w: limit %d bytes", ErrListResponseTooLarge, opts.MaxResponseBytes)
+			return nil, "", counted.bytes, fmt.Errorf("%w: limit %d bytes", ErrListResponseTooLarge, opts.MaxResponseBytes)
 		}
-		return ListResult{ResponseBytes: counted.bytes}, fmt.Errorf("decode: %w", err)
+		return nil, "", counted.bytes, fmt.Errorf("decode: %w", err)
 	}
 	if opts.MaxResponseBytes > 0 {
 		var extra any
 		err := decoder.Decode(&extra)
 		if counted.bytes > opts.MaxResponseBytes {
-			return ListResult{ResponseBytes: counted.bytes}, fmt.Errorf("%w: limit %d bytes", ErrListResponseTooLarge, opts.MaxResponseBytes)
+			return nil, "", counted.bytes, fmt.Errorf("%w: limit %d bytes", ErrListResponseTooLarge, opts.MaxResponseBytes)
 		}
 		if !errors.Is(err, io.EOF) {
 			if err == nil {
-				return ListResult{ResponseBytes: counted.bytes}, fmt.Errorf("decode: unexpected trailing JSON value")
+				return nil, "", counted.bytes, fmt.Errorf("decode: unexpected trailing JSON value")
 			}
-			return ListResult{ResponseBytes: counted.bytes}, fmt.Errorf("decode: %w", err)
+			return nil, "", counted.bytes, fmt.Errorf("decode: %w", err)
 		}
 		if limited != nil && limited.N == 0 {
-			return ListResult{ResponseBytes: counted.bytes}, fmt.Errorf("%w: limit %d bytes", ErrListResponseTooLarge, opts.MaxResponseBytes)
+			return nil, "", counted.bytes, fmt.Errorf("%w: limit %d bytes", ErrListResponseTooLarge, opts.MaxResponseBytes)
 		}
 	}
-	return ListResult{Entries: result.Entries, ResponseBytes: counted.bytes}, nil
+	return result.Entries, result.NextCursor, counted.bytes, nil
 }
 
 type countingReader struct {
@@ -1316,6 +1371,9 @@ func (c *Client) BatchReadSmallCtx(ctx context.Context, paths []string, maxBytes
 func (c *Client) BatchWriteCtx(ctx context.Context, items []BatchWriteItem) ([]BatchWriteResult, error) {
 	if len(items) == 0 {
 		return []BatchWriteResult{}, nil
+	}
+	if c.view.LayerID != "" && len(items) > MaxLayerViewBatchWriteItems {
+		return nil, fmt.Errorf("batch write: %d items exceeds limit of %d", len(items), MaxLayerViewBatchWriteItems)
 	}
 	if len(items) > MaxBatchWriteItems {
 		return nil, fmt.Errorf("batch write: %d items exceeds limit of %d", len(items), MaxBatchWriteItems)
@@ -1871,16 +1929,9 @@ type SearchResult struct {
 }
 
 func (c *Client) Grep(query, pathPrefix string, limit int) ([]SearchResult, error) {
-	return c.GrepWithLayer(query, pathPrefix, limit, "")
-}
-
-func (c *Client) GrepWithLayer(query, pathPrefix string, limit int, layerRef string) ([]SearchResult, error) {
 	rawQuery := "?grep=" + url.QueryEscape(query)
 	if limit > 0 {
 		rawQuery += "&limit=" + strconv.Itoa(limit)
-	}
-	if strings.TrimSpace(layerRef) != "" {
-		rawQuery += "&layer=" + url.QueryEscape(strings.TrimSpace(layerRef))
 	}
 	req, err := c.newFSRequest(context.Background(), http.MethodGet, pathPrefix, rawQuery, nil)
 	if err != nil {

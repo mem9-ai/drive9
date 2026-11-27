@@ -56,6 +56,26 @@ type Handler struct {
 // New builds the engine-plane handler.
 func New(opts Options) *Handler {
 	h := &Handler{opts: opts, handles: make(map[string][]*engineHandle)}
+	if opts.Engine != nil && opts.Engine.Bridge != nil {
+		opts.Engine.Bridge.onRetireClosed = func(localPath string, ino meta.Ino) bool {
+			unlock := h.lockPaths(localPath)
+			defer unlock()
+			h.mu.Lock()
+			sameInoOpen := false
+			for _, eh := range h.handles[localPath] {
+				if eh.ino == ino {
+					sameInoOpen = true
+					break
+				}
+			}
+			h.mu.Unlock()
+			if sameInoOpen {
+				opts.Engine.Bridge.ClearClosedRetained(ino)
+				return true
+			}
+			return opts.Engine.Bridge.RetireClosedIno(localPath, ino)
+		}
+	}
 	if opts.Events != nil {
 		// A rename rides EventWrite for the OLD name with RenamedTo set
 		// (pkg/fuse mutatedRename), followed by a plain EventDelete for
@@ -86,8 +106,8 @@ func New(opts Options) *Handler {
 			h.mu.Lock()
 			_, open := h.handles[ev.Path]
 			h.mu.Unlock()
-			if !open {
-				h.drop(ev.Path)
+			if !open && h.opts.Engine != nil && h.opts.Engine.Bridge != nil {
+				h.opts.Engine.Bridge.ForgetInvalidatedPath(ev.Path)
 			}
 		})
 	}
@@ -212,6 +232,9 @@ func (h *Handler) release(e *engineHandle) {
 	// closing is not the inode going away, and the sweep would release a live
 	// descriptor's locks — letting a second writer in while the first still
 	// believes it holds the file.
+	if h.opts.Engine.Bridge.RetainClosedIfUncommitted(e.path, e.ino) {
+		return
+	}
 	h.opts.Engine.Bridge.ForgetPath(e.path)
 	h.opts.Engine.Bridge.DropDeletedOpen(e.path)
 }
@@ -1176,6 +1199,9 @@ func (h *Handler) tryTruncate(ctx context.Context, op *fs.Op, next fs.Next) (fs.
 }
 
 func (h *Handler) register(path string, ino uint64, fh uint64, c fs.Caller) *engineHandle {
+	if h.opts.Engine != nil && h.opts.Engine.Bridge != nil {
+		h.opts.Engine.Bridge.ClearClosedRetained(meta.Ino(ino))
+	}
 	eh := &engineHandle{plane: h, path: path, ino: meta.Ino(ino), fh: fh, caller: c, vctx: vfsCtx(c)}
 	h.mu.Lock()
 	h.handles[path] = append(h.handles[path], eh)
@@ -1283,6 +1309,14 @@ func (e *engineHandle) Sync(ctx context.Context) error {
 	if errno != 0 && !e.plane.opts.Engine.Bridge.HasPending(e.ino) {
 		return errno
 	}
+	if !e.plane.opts.Engine.Bridge.HasPending(e.ino) && e.plane.opts.Engine.Bridge.NeedsFreshIdentity(e.ino) {
+		if err := e.plane.opts.Engine.Bridge.MaterializeEmpty(ctx, e.ino); err != nil {
+			if errno != 0 {
+				return errno
+			}
+			return err
+		}
+	}
 	if err := e.plane.opts.Engine.FlushFile(ctx, uint64(e.ino)); err != nil {
 		if errno != 0 {
 			return errno // the VFS-level failure still stands
@@ -1322,6 +1356,10 @@ func (e *engineHandle) Release(ctx context.Context) error {
 	// produce exactly one owner of the final publication.
 	finalClose := e.plane.claimFinalClose(e)
 	defer unlockPath()
+	if fs.IsRejectedOpen(ctx) {
+		e.plane.release(e)
+		return nil
+	}
 	var landErr error
 	if finalClose {
 		landErr = e.plane.opts.Engine.FlushFileFinal(ctx, uint64(e.ino))
@@ -1330,4 +1368,62 @@ func (e *engineHandle) Release(ctx context.Context) error {
 	}
 	e.plane.release(e)
 	return landErr
+}
+
+// Start satisfies fs.Lifecycle.
+func (h *Handler) Start(context.Context) error { return nil }
+
+// Stop shuts down background extent retry workers before a mount stops or
+// switches to another view.
+func (h *Handler) Stop(ctx context.Context) error {
+	if h == nil || h.opts.Engine == nil || h.opts.Engine.Bridge == nil {
+		return nil
+	}
+	return h.opts.Engine.Bridge.ShutdownCtx(ctx)
+}
+
+// Drain flushes open engine handles and any pending bridge slice commits.
+func (h *Handler) Drain(ctx context.Context) error {
+	if h == nil || h.opts.Engine == nil {
+		return nil
+	}
+	h.mu.Lock()
+	var open []*engineHandle
+	for _, list := range h.handles {
+		open = append(open, list...)
+	}
+	h.mu.Unlock()
+	var firstErr error
+	for _, e := range open {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if h.opts.Engine.Bridge != nil && h.opts.Engine.Bridge.NeedsFreshIdentity(e.ino) {
+			if err := e.Sync(ctx); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if err := e.Flush(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if h.opts.Engine.Bridge != nil {
+		if err := h.opts.Engine.Bridge.Drain(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// ReexecRefusal reports uncommitted extent state that cannot be dropped across
+// a process re-exec or same-mount view switch.
+func (h *Handler) ReexecRefusal() (string, int) {
+	if h == nil || h.opts.Engine == nil || h.opts.Engine.Bridge == nil {
+		return "", 0
+	}
+	if n := h.opts.Engine.Bridge.PendingCommitCount(); n > 0 {
+		return "extent_pending", n
+	}
+	return "", 0
 }

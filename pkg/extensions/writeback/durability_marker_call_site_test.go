@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 )
 
@@ -51,6 +52,17 @@ func TestCancelQueuedForRenameReportsDurabilityFailure(t *testing.T) {
 // landed, so the local shadow/pending state must still be dropped even when the
 // commit marker could not be made durable.
 func TestOnCommitSuccessCleansUpWhenTheMarkerCannotSync(t *testing.T) {
+	base := client.New("https://fixture.invalid", "")
+	view, err := base.WithView(client.ViewBinding{LayerID: "layer_01j8z4r9w3m5n7p9q2s4t6v8xz", Fence: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Run("main", func(t *testing.T) { checkCommitCleanupAfterMarkerFailure(t, base) })
+	t.Run("layer", func(t *testing.T) { checkCommitCleanupAfterMarkerFailure(t, view) })
+}
+
+func checkCommitCleanupAfterMarkerFailure(t *testing.T, c *client.Client) {
+	t.Helper()
 	const path = "/committed.txt"
 	payload := []byte("committed image")
 
@@ -75,7 +87,7 @@ func TestOnCommitSuccessCleansUpWhenTheMarkerCannotSync(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cq := NewCommitQueue(nil, shadow, pending, j, 1, 8)
+	cq := NewCommitQueue(c, shadow, pending, j, 1, 8)
 
 	// A closed journal makes every marker append fail deterministically.
 	if err := j.Close(); err != nil {

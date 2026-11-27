@@ -1496,8 +1496,24 @@ func TestMountCmdRejectsInvalidGVisorCompatEnvironment(t *testing.T) {
 	}
 }
 
+func mountLayerRefFixture(t *testing.T) (string, string) {
+	t.Helper()
+	const id = "layer_01j8z6kh2m9q7w3r5t6y8v0p1a"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/layers/task=auth" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = fmt.Fprintf(w, `{"layer_id":%q,"base_root_path":"/repo"}`, id)
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	return srv.URL, id
+}
+
 func TestMountCmdPassesLayerRefOption(t *testing.T) {
 	stubMountProfileAppendLogProbe(t)
+	server, layerID := mountLayerRefFixture(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -1511,7 +1527,7 @@ func TestMountCmdPassesLayerRefOption(t *testing.T) {
 	err := MountCmd([]string{
 		"--foreground",
 		"--mode", "fuse",
-		"--server", "https://drive9.example",
+		"--server", server, "--profile=coding-agent", "--no-auto-unpack",
 		"--api-key", "sk-test",
 		"--layer", "task=auth",
 		":/repo",
@@ -1523,36 +1539,40 @@ func TestMountCmdPassesLayerRefOption(t *testing.T) {
 	if got == nil {
 		t.Fatal("mountFuse was not called")
 	}
-	if got.LayerRef != "task=auth" {
-		t.Errorf("LayerRef = %q, want task=auth", got.LayerRef)
+	if got.LayerRef != layerID {
+		t.Errorf("LayerRef = %q, want %q", got.LayerRef, layerID)
 	}
-	if got.RemoteRoot != "/repo" {
-		t.Errorf("RemoteRoot = %q, want /repo", got.RemoteRoot)
+	if got.RemoteRoot != "/repo" || got.RemoteRootDefaulted {
+		t.Errorf("RemoteRoot = %q (defaulted=%v), want /repo (defaulted=false)", got.RemoteRoot, got.RemoteRootDefaulted)
 	}
 }
 
-func TestMountCmdCheckpointRequiresLayer(t *testing.T) {
+func TestMountCmdLayerDefaultsRemoteRootWhenOmitted(t *testing.T) {
 	stubMountProfileAppendLogProbe(t)
+	server, layerID := mountLayerRefFixture(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
 	mountFuse = func(opts *mountFuseOptions) error {
-		t.Fatal("mountFuse should not be called")
+		copied := *opts
+		got = &copied
 		return nil
 	}
 
 	err := MountCmd([]string{
+		"--foreground",
 		"--mode", "fuse",
-		"--server", "https://drive9.example",
+		"--server", server, "--profile=coding-agent", "--no-auto-unpack",
 		"--api-key", "sk-test",
-		"--checkpoint", "cp1",
-		":/repo",
+		"--layer", "task=auth",
 		t.TempDir(),
 	})
-	if err == nil {
-		t.Fatal("MountCmd error = nil, want checkpoint requires layer")
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
 	}
-	if !strings.Contains(err.Error(), "--checkpoint requires --layer") {
-		t.Errorf("MountCmd error = %v", err)
+	if got == nil || got.LayerRef != layerID || got.RemoteRoot != "/repo" || got.RemoteRootDefaulted {
+		t.Fatal("worker must receive the canonical layer ID and resolved /repo root")
 	}
 }
 

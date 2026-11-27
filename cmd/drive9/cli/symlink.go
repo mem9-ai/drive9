@@ -13,12 +13,12 @@ import (
 //	drive9 fs symlink /target :/link
 //	drive9 fs symlink ctx:/target ctx:/link
 func Symlink(c *client.Client, args []string) error {
-	layerRef, args, err := parseLayerFlag(args)
+	layerRef, fence, args, err := ParseLayerViewFlags(args)
 	if err != nil {
 		return err
 	}
 	if len(args) != 2 {
-		return fmt.Errorf("usage: drive9 fs symlink [--layer <ref>] <target> <link>")
+		return fmt.Errorf("usage: drive9 fs symlink [--layer <ref> [--fence <N>]] <target> <link>")
 	}
 	target := args[0]
 	linkPath := args[1]
@@ -31,6 +31,9 @@ func Symlink(c *client.Client, args []string) error {
 	}
 	linkLoc = promoteBareFSArg(linkLoc)
 	linkRP, linkIsRemote := locationAsRemotePath(linkLoc)
+	if err := requireNoLayerWithRemoteContext(layerRef, c, linkRP, args[1]); err != nil {
+		return err
+	}
 
 	target, err = symlinkTargetForCLI(target, linkRP, linkIsRemote)
 	if err != nil {
@@ -41,7 +44,10 @@ func Symlink(c *client.Client, args []string) error {
 		return err
 	}
 	if layerRef != "" {
-		return symlinkLayerPath(context.Background(), c, layerRef, target, linkPath)
+		c, err = BindCLIViewClient(context.Background(), c, layerRef, fence)
+		if err != nil {
+			return err
+		}
 	}
 	return c.Symlink(target, linkPath)
 }

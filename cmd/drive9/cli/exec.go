@@ -158,7 +158,7 @@ func resolveExecLayer(ctx context.Context, options *execOptions, rt execRuntime)
 	if options.layer == "" || options.layerResolved {
 		return nil
 	}
-	layer, err := rt.client().GetFSLayer(ctx, options.layer)
+	layer, err := rt.client().GetLayer(ctx, options.layer)
 	if err != nil {
 		return fmt.Errorf("resolve layer %q: %w", options.layer, err)
 	}
@@ -422,7 +422,13 @@ func parseExecArgs(args []string) (execOptions, error) {
 	}
 	fs.Var(&env, "e", "")
 	fs.Var(&env, "env", "")
-	fs.StringVar(&options.layer, "layer", "", "")
+	fs.Func("layer", "", func(value string) error {
+		if flagProvided(fs, "layer") {
+			return errors.New("--layer specified multiple times")
+		}
+		options.layer = value
+		return nil
+	})
 	fs.BoolVar(&options.readOnly, "read-only", false, "")
 	fs.BoolVar(&options.fresh, "fresh", false, "")
 	if err := fs.Parse(args); err != nil {
@@ -431,6 +437,9 @@ func parseExecArgs(args []string) (execOptions, error) {
 			return execOptions{}, &execExitError{code: 0}
 		}
 		return execOptions{}, fmt.Errorf("%w (see drive9 exec --help)", err)
+	}
+	if flagProvided(fs, "layer") && strings.TrimSpace(options.layer) == "" {
+		return execOptions{}, errors.New("--layer requires a non-empty argument")
 	}
 	options.workspaceSet = flagProvided(fs, "w") || flagProvided(fs, "workspace")
 	options.cwdSet = flagProvided(fs, "C") || flagProvided(fs, "cwd")

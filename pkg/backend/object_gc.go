@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 )
 
 // HasConfirmedS3StorageRef checks the current tenant branch for an exact
@@ -20,11 +19,7 @@ func (b *Dat9Backend) HasConfirmedS3StorageRef(ctx context.Context, storageRefHa
 	if b == nil || b.store == nil {
 		return false, fmt.Errorf("backend store is not configured")
 	}
-	reachable, err := b.store.HasConfirmedS3StorageRef(ctx, storageRefHash, storageRef)
-	if err != nil || reachable || !strings.HasPrefix(storageRef, "layers/") {
-		return reachable, err
-	}
-	return b.store.HasFSLayerStorageRef(ctx, storageRefHash, storageRef)
+	return b.store.HasConfirmedS3StorageRef(ctx, storageRefHash, storageRef)
 }
 
 // DeleteS3ObjectForGC is the only exported physical S3 delete path for
