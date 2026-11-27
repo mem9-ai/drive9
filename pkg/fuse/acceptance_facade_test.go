@@ -410,6 +410,61 @@ func TestFacadeRejectsInvalidNamespaceNamesWithoutPollutingDrain(t *testing.T) {
 				t.Fatalf("Lookup mixed spelling after Unlink = %v, want ENOENT", st)
 			}
 
+			// Rename with cached alternate Unicode spellings on BOTH source and
+			// destination must invalidate alternate source spellings (without
+			// dropping oldName itself) and all destination spellings.
+			const (
+				srcNFC = "ren-\u00e9.txt"
+				srcNFD = "ren-e\u0301.txt"
+				dstNFC = "dst-\u00e9\u00e9.txt"
+				dstMix = "dst-\u00e9e\u0301.txt"
+			)
+			for _, createName := range []string{srcNFC, dstNFC} {
+				var co gofuse.CreateOut
+				if st := f.Create(nil, &gofuse.CreateIn{
+					InHeader: gofuse.InHeader{NodeId: 1},
+					Flags:    uint32(syscall.O_CREAT | syscall.O_RDWR),
+					Mode:     0o644,
+				}, createName, &co); st != gofuse.OK {
+					t.Fatalf("Create %q: %v", createName, st)
+				}
+				_ = f.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: co.NodeId}, Fh: co.Fh})
+				f.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: co.NodeId}, Fh: co.Fh})
+			}
+			var lo gofuse.EntryOut
+			if st := f.Lookup(nil, &gofuse.InHeader{NodeId: 1}, srcNFD, &lo); st != gofuse.OK {
+				t.Fatalf("Lookup %q: %v", srcNFD, st)
+			}
+			if st := f.Lookup(nil, &gofuse.InHeader{NodeId: 1}, dstMix, &lo); st != gofuse.OK {
+				t.Fatalf("Lookup %q: %v", dstMix, st)
+			}
+			renInv := map[string]bool{}
+			f.onInvalidateEntry = func(_ uint64, invName string) {
+				invalidatedMu.Lock()
+				renInv[invName] = true
+				invalidatedMu.Unlock()
+			}
+			if st := f.Rename(nil, &gofuse.RenameIn{
+				InHeader: gofuse.InHeader{NodeId: 1},
+				Newdir:   1,
+			}, srcNFD, dstNFC); st != gofuse.OK {
+				t.Fatalf("Rename(%q -> %q): %v", srcNFD, dstNFC, st)
+			}
+			f.onInvalidateEntry = nil
+			invalidatedMu.Lock()
+			gotSrcNFC := renInv[srcNFC]
+			gotSrcNFD := renInv[srcNFD]
+			gotDstNFC := renInv[dstNFC]
+			gotDstMix := renInv[dstMix]
+			invalidatedMu.Unlock()
+			if !gotSrcNFC || gotSrcNFD || !gotDstNFC || !gotDstMix {
+				t.Fatalf("Rename invalidations: srcNFC=%v (want true) srcNFD=%v (want false) dstNFC=%v (want true) dstMix=%v (want true)",
+					gotSrcNFC, gotSrcNFD, gotDstNFC, gotDstMix)
+			}
+			if st := f.Unlink(nil, &gofuse.InHeader{NodeId: 1}, dstNFC); st != gofuse.OK {
+				t.Fatalf("cleanup Unlink %q: %v", dstNFC, st)
+			}
+
 			// Sentinel-based client.ErrInvalidPath classification must return EINVAL
 			// even when the invalid path text contains words like "not found".
 			_, invalidErr := client.New("http://127.0.0.1:1", "").StatCtx(context.Background(), `/not found\bad`)

@@ -5251,6 +5251,8 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 		h.ledgerShadowGen = 0
 		lf := h.liveSpillFile
 		h.liveSpillFile = nil
+		sf := h.snapshotFile
+		h.snapshotFile = nil
 		// The descriptor is closed: the buffer's bytes are retained by nobody,
 		// so its memory-budget charge goes back (Discard resets it).
 		writebuffer.Discard(&h.buf)
@@ -5260,6 +5262,9 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 		}
 		if lf != nil {
 			_ = lf.Close()
+		}
+		if sf != nil {
+			_ = sf.Close()
 		}
 	}()
 	// One identity snapshot for the whole close (a concurrent retarget
@@ -5303,15 +5308,13 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 			}
 		}()
 	}
-	// A file-backed anonymous snapshot dies with its descriptor.
+	// A file-backed anonymous snapshot dies with its descriptor (snapshotFile
+	// stays open until the deferred close above so Release's own commitLocked
+	// can stream lazy parts from it).
 	h.mu.Lock()
 	if h.pendingFile != nil {
 		_ = h.pendingFile.Close()
 		h.pendingFile = nil
-	}
-	if h.snapshotFile != nil {
-		_ = h.snapshotFile.Close()
-		h.snapshotFile = nil
 	}
 	h.mu.Unlock()
 	// An O_CREAT claim that never landed must still materialize as a remote
@@ -7912,20 +7915,54 @@ func (h *bufferingHandle) seedFromDirtySiblingForObj(objGen uint64) error {
 	}
 
 	// Oversize sibling buffer (> pendingServeMaterializeBytes, e.g. spilled to
-	// liveSpillFile): wire a lazy part loader backed by best so evicted parts
-	// restore on demand without materializing the full image in RAM.
+	// liveSpillFile): snapshot best's image into an unlinked temp file outside
+	// h.mu (under coOpenLocks) and wire LoadPart to ReadAt on that file. That
+	// keeps RAM bounded while ensuring LoadPart never acquires sibling handle
+	// mutexes (e.g. inside admitFtruncate while sibling locks are held) and
+	// stays isolated from sibling close or post-unlink pathname reuse.
+	tmp, err := os.CreateTemp("", "drive9-sib-*")
+	if err != nil {
+		return err
+	}
+	_ = os.Remove(tmp.Name())
+	chunkBuf := make([]byte, 8<<20)
+	var copied int64
+	for copied < bestSize {
+		want := int64(len(chunkBuf))
+		if copied+want > bestSize {
+			want = bestSize - copied
+		}
+		n, ok, rerr := readFromSiblingHandle(best, copied, chunkBuf[:want])
+		if rerr != nil {
+			_ = tmp.Close()
+			return rerr
+		}
+		if !ok || int64(n) != want {
+			_ = tmp.Close()
+			return fmt.Errorf("co-open sibling snapshot at %d of %s unavailable", copied, h.path)
+		}
+		if _, werr := tmp.WriteAt(chunkBuf[:n], copied); werr != nil {
+			_ = tmp.Close()
+			return werr
+		}
+		copied += int64(n)
+	}
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.buf != nil || h.trunc || h.unlinked || h.appendParticipant() {
+		_ = tmp.Close()
 		return nil
 	}
+	if h.snapshotFile != nil {
+		_ = h.snapshotFile.Close()
+	}
+	h.snapshotFile = tmp
 	buf := writebuffer.NewWriteBuffer(h.path, bufferedMaxTotal, 0)
 	buf.SetMemoryBudget(h.w.budget)
 	partSize := buf.PartSize()
 	lazySize := bestSize
 	buf.SeedRemote(lazySize)
-	// Callers invoke WriteBuffer methods on h.buf while holding h.mu, so h.path
-	// and h.unlinked are already protected here without re-locking h.mu.
 	buf.LoadPart = func(partNum int) ([]byte, error) {
 		start := int64(partNum-1) * partSize
 		end := start + partSize
@@ -7936,39 +7973,14 @@ func (h *bufferingHandle) seedFromDirtySiblingForObj(objGen uint64) error {
 			return nil, nil
 		}
 		part := make([]byte, end-start)
-		n, ok, rerr := readFromSiblingHandle(best, start, part)
-		if rerr != nil {
-			return nil, rerr
-		}
-		if ok && int64(n) == end-start {
-			return part, nil
-		}
-		curPath := h.path
-		if h.unlinked {
-			if st := h.w.opts.Staging; st != nil {
-				if pin := h.w.unlinkedShadowPinFor(curPath); pin != 0 {
-					if sn, serr := st.Shadow.ReadAtGen(pin, start, part); (serr == nil || errors.Is(serr, io.EOF)) && int64(sn) == end-start {
-						return part, nil
-					}
-				}
+		n, rerr := tmp.ReadAt(part, start)
+		if (rerr != nil && !errors.Is(rerr, io.EOF)) || int64(n) != end-start {
+			if rerr != nil {
+				return nil, rerr
 			}
-			return nil, fmt.Errorf("co-open sibling part %d of unlinked %s unavailable", partNum, curPath)
+			return nil, io.ErrUnexpectedEOF
 		}
-		if st := h.w.opts.Staging; st != nil && st.Pending.HasPending(curPath) {
-			if sn, serr := st.Shadow.ReadAt(curPath, start, part); (serr == nil || errors.Is(serr, io.EOF)) && int64(sn) == end-start {
-				return part, nil
-			}
-		}
-		lctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
-		defer cancel()
-		rn, rok, ferr := h.w.readRemoteRangeFallback(lctx, curPath, start, part)
-		if ferr != nil {
-			return nil, ferr
-		}
-		if rok && int64(rn) == end-start {
-			return part, nil
-		}
-		return nil, fmt.Errorf("co-open sibling part %d of %s unavailable", partNum, curPath)
+		return part, nil
 	}
 	h.buf = buf
 	h.baseLoaded = true
@@ -9831,6 +9843,10 @@ func (h *bufferingHandle) spillToShadow(st *staging.Staging, stagePath string, b
 		if h.liveSpillFile != nil {
 			_ = h.liveSpillFile.Close()
 			h.liveSpillFile = nil
+		}
+		if h.snapshotFile != nil {
+			_ = h.snapshotFile.Close()
+			h.snapshotFile = nil
 		}
 		buf.RestorePart = func(partNum int) ([]byte, error) {
 			if h.unlinked {

@@ -2587,6 +2587,74 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 		if !bytes.Equal(n2.Data[8<<20:16<<20], wantPart1) {
 			t.Fatal("persisted <=64MiB Part 1 (8..16MiB) mismatch against full expected chunk")
 		}
+
+		// Case 3: create 68 MiB on a1, reopen b1 (O_RDWR), patch Part 0 on b1,
+		// Flush a1 while leaving a1 open, then ftruncate b1 to non-aligned
+		// 36 MiB (admitFtruncate holds a1.mu while b1.buf.Truncate loads the
+		// boundary part at 32..40 MiB — must never re-lock a1.mu or deadlock!).
+		a1, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/spilled-cs-ftrunc",
+			Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for off := int64(0); off < 64<<20; off += 8 << 20 {
+			if err := a1.Handle.Write(ctx, off, chunk); err != nil {
+				t.Fatalf("a1.Write(%d): %v", off, err)
+			}
+		}
+		if err := a1.Handle.Write(ctx, 64<<20, bytes.Repeat([]byte("Tail"), 1<<20)); err != nil {
+			t.Fatalf("a1 tail write: %v", err)
+		}
+		b1, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/spilled-cs-ftrunc", Flags: uint32(syscall.O_RDWR),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := b1.Handle.Write(ctx, 16, []byte("PATCH3")); err != nil {
+			t.Fatalf("b1.Write(16): %v", err)
+		}
+		if err := a1.Handle.Flush(ctx); err != nil {
+			t.Fatalf("a1.Flush: %v", err)
+		}
+		truncDone := make(chan error, 1)
+		go func() {
+			_, terr := ch.Dispatch(ctx, &fs.Op{
+				Kind: fs.OpSetAttr, Path: "/spilled-cs-ftrunc", Handle: b1.Handle, Size: 36 << 20,
+			})
+			truncDone <- terr
+		}()
+		select {
+		case terr := <-truncDone:
+			if terr != nil {
+				t.Fatalf("ftruncate(36MiB) on reopened spilled handle with clean sibling open: %v", terr)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("deadlock in ftruncate(36MiB) while clean sibling handle remained open")
+		}
+		if err := b1.Handle.Flush(ctx); err != nil {
+			t.Fatalf("b1.Flush: %v", err)
+		}
+		if err := b1.Handle.Release(ctx); err != nil {
+			t.Fatalf("b1.Release: %v", err)
+		}
+		if err := a1.Handle.Release(ctx); err != nil {
+			t.Fatalf("a1.Release: %v", err)
+		}
+		n3, ok := b.Node("/spilled-cs-ftrunc")
+		if !ok || len(n3.Data) != 36<<20 {
+			t.Fatalf("/spilled-cs-ftrunc len = %d (ok=%v), want %d", len(n3.Data), ok, 36<<20)
+		}
+		wantP3 := append([]byte(nil), chunk...)
+		copy(wantP3[16:], []byte("PATCH3"))
+		if !bytes.Equal(n3.Data[:8<<20], wantP3) {
+			t.Fatal("persisted 36MiB Part 0 mismatch")
+		}
+		if !bytes.Equal(n3.Data[32<<20:36<<20], chunk[:4<<20]) {
+			t.Fatal("persisted 36MiB boundary tail (32..36MiB) mismatch")
+		}
 	})
 
 	t.Run("close-sync-unlanded-reader-survives-unlink-before-flush", func(t *testing.T) {

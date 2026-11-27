@@ -2229,8 +2229,11 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 		return st
 	}
 	// v1: rename onto the same path is an immediate success — no remote
-	// round trip, no cache churn.
+	// round trip, no cache churn. Drop alternate Unicode dentries other than
+	// newName (which the kernel moves oldName onto) and record newName.
 	if oldPath == newPath {
+		f.invalidateAlternateUnicodeSpellings(input.NodeId, newName, newPath)
+		f.recordUnicodeSpelling(newName, newPath)
 		return gofuse.OK
 	}
 	f.debugf("rename start old=%s new=%s", oldPath, newPath)
@@ -2281,12 +2284,16 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 	// v1 notifyRenameTarget: invalidate ONLY the rename TARGET — the kernel
 	// moves the old name's dentry natively, and dropping it from userspace
 	// disturbs the bookkeeping for the next create of the same name in
-	// rename-churn loops. The target notify forces the next stat of the
-	// replaced destination to re-LOOKUP instead of serving a type-mismatched
-	// cached dentry (the EIO class).
+	// rename-churn loops. Alternate Unicode spellings of oldPath (sp != oldName)
+	// were NOT moved by the kernel and must be invalidated so they cannot keep
+	// resolving oldPath. At the destination, invalidate both canonical and
+	// alternate Unicode spellings of the replaced entry, then record newName.
+	f.invalidateAlternateUnicodeSpellings(input.NodeId, oldName, oldPath)
 	if pino2, ok := f.inodes.GetInode(parentDirOf(newPath)); ok {
 		f.InvalidateEntry(pino2, pathpkg.Base(newPath))
+		f.invalidateAlternateUnicodeSpellings(pino2, pathpkg.Base(newPath), newPath)
 	}
+	f.recordUnicodeSpelling(newName, newPath)
 	// A rename that REPLACED a destination must also drop the destination
 	// inode's cached data: the kernel keeps the old name's pages and attrs
 	// under the still-live inode id, so a post-close read of the new name
