@@ -234,8 +234,9 @@ type Writeback struct {
 	// mutEpoch orders handle mutations mount-wide (v1 fs.dirtySeq): the
 	// sibling-visibility tiers pick an inode's newest uncommitted image by
 	// it, no matter which fd produced the image.
-	mutEpoch  atomic.Uint64
-	commitSeq atomic.Uint64
+	mutEpoch      atomic.Uint64
+	unlinkWatchMu sync.Mutex
+	unlinkWatch   map[string]*unlinkPathWatch
 	// regMu serializes the handle-registry protocol (release vs rename
 	// retarget vs survivor promotion), mirroring the layer registry.
 	regMu sync.Mutex
@@ -302,6 +303,68 @@ func (w *Writeback) notifyTestGate(gate string) {
 type stripedLocks struct {
 	mu sync.Mutex
 	m  map[string]pathLock
+}
+
+type unlinkPathWatch struct {
+	refs int
+	seq  uint64
+}
+
+func (w *Writeback) acquireUnlinkWatch(path string) *unlinkPathWatch {
+	if w == nil || path == "" {
+		return nil
+	}
+	w.unlinkWatchMu.Lock()
+	defer w.unlinkWatchMu.Unlock()
+	if w.unlinkWatch == nil {
+		w.unlinkWatch = make(map[string]*unlinkPathWatch)
+	}
+	entry, ok := w.unlinkWatch[path]
+	if !ok {
+		entry = &unlinkPathWatch{}
+		w.unlinkWatch[path] = entry
+	}
+	entry.refs++
+	return entry
+}
+
+func (w *Writeback) releaseUnlinkWatch(path string, entry *unlinkPathWatch) {
+	if w == nil || entry == nil || path == "" {
+		return
+	}
+	w.unlinkWatchMu.Lock()
+	defer w.unlinkWatchMu.Unlock()
+	cur, ok := w.unlinkWatch[path]
+	if !ok || cur != entry {
+		return
+	}
+	cur.refs--
+	if cur.refs <= 0 {
+		delete(w.unlinkWatch, path)
+	}
+}
+
+func (w *Writeback) bumpUnlinkWatchSeq(path string) {
+	if w == nil || path == "" {
+		return
+	}
+	w.unlinkWatchMu.Lock()
+	if entry, ok := w.unlinkWatch[path]; ok && entry != nil {
+		entry.seq++
+	}
+	w.unlinkWatchMu.Unlock()
+}
+
+func (w *Writeback) currentUnlinkWatchSeq(path string) uint64 {
+	if w == nil || path == "" {
+		return 0
+	}
+	w.unlinkWatchMu.Lock()
+	defer w.unlinkWatchMu.Unlock()
+	if entry, ok := w.unlinkWatch[path]; ok && entry != nil {
+		return entry.seq
+	}
+	return 0
 }
 
 // bufferingHandle accumulates writes in a writebuffer.WriteBuffer (read-your-writes
@@ -1213,11 +1276,30 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 		canceledSurvivor bool
 		oldCacheGen      uint64
 		newCacheGen      uint64
+		unlinkWatch      *unlinkPathWatch
+		queueSeqWin      *CommitSeqWindow
+		releaseWatchOnce sync.Once
 	)
+	releaseUnlinkWatch := func() {
+		releaseWatchOnce.Do(func() {
+			if queueSeqWin != nil {
+				queueSeqWin.End()
+				queueSeqWin = nil
+			}
+			if unlinkWatch != nil {
+				w.releaseUnlinkWatch(p, unlinkWatch)
+				unlinkWatch = nil
+			}
+		})
+	}
 	w.waitUploaderPath(p)
 	if hasSurvivor {
 		w.waitUploaderPath(survivor)
 	} else {
+		unlinkWatch = w.acquireUnlinkWatch(p)
+		if w.queue != nil {
+			queueSeqWin = w.queue.BeginCommitSeqWindow(p, "")
+		}
 		prepStamp = w.currentUnlinkContentStamp(p)
 		_, prepared, snapshotErr = w.prepareUnlinkSnapshots(p)
 	}
@@ -1283,8 +1365,12 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 			}
 		}
 		releasePathLock()
+		releaseUnlinkWatch()
 		if hadLock && !fenced && !isAborted() {
 			w.submitOrphanedCacheForRollback(p, false)
+			if hasSurvivor {
+				w.submitOrphanedCacheForRollback(survivor, false)
+			}
 		}
 		closePrepared()
 	}
@@ -1304,8 +1390,12 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 			}
 		}
 		releasePathLock()
+		releaseUnlinkWatch()
 		if !fenced && !isAborted() {
 			w.submitOrphanedCacheForRollback(p, false)
+			if hasSurvivor {
+				w.submitOrphanedCacheForRollback(survivor, false)
+			}
 		}
 		closePrepared()
 	}
@@ -1314,9 +1404,11 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 			extAborted = aborted
 		}
 		if isAborted() {
+			releaseUnlinkWatch()
 			return errLayerRolledBack
 		}
 		if snapshotErr != nil {
+			releaseUnlinkWatch()
 			return snapshotErr
 		}
 		w.waitUploaderPath(p)
@@ -1368,6 +1460,7 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 			if w.opts.Staging != nil && w.queue != nil {
 				unlock, err := w.queue.AcquireCancelPathLock(p, isAborted)
 				if err != nil {
+					releaseUnlinkWatch()
 					return err
 				}
 				pathUnlock = unlock
@@ -1375,6 +1468,7 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 				unlock := w.pathLocks.lock(p)
 				if isAborted() {
 					unlock()
+					releaseUnlinkWatch()
 					return errLayerRolledBack
 				}
 				pathUnlock = unlock
@@ -1384,6 +1478,7 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 					w.queue.PreserveAbortedUnlinkLocked(p)
 				}
 				releasePathLock()
+				releaseUnlinkWatch()
 				return errLayerRolledBack
 			}
 			curStamp := w.currentUnlinkContentStamp(p)
@@ -1393,23 +1488,26 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 			if refresh >= maxUnlinkSnapshotRefreshes {
 				reenqueueCanceledPathLocked(p)
 				releasePathLock()
+				releaseUnlinkWatch()
 				if !isAborted() {
 					w.submitOrphanedCacheForRollback(p, false)
 				}
 				closePrepared()
 				return syscall.EAGAIN
 			}
-			// A sibling flushed to wbCache or landed an upload before pathLocks(p)
-			// was acquired; refresh clean-reader snapshots off pathLocks(p).
+			// A sibling flushed to wbCache or landed an upload on p before
+			// pathLocks(p) was acquired; refresh clean-reader snapshots off pathLocks(p).
 			reenqueueCanceledPathLocked(p)
 			releasePathLock()
 			closePrepared()
 			prepStamp = w.currentUnlinkContentStamp(p)
 			_, prepared, snapshotErr = w.prepareUnlinkSnapshots(p)
 			if snapshotErr != nil {
+				releaseUnlinkWatch()
 				return snapshotErr
 			}
 			if isAborted() {
+				releaseUnlinkWatch()
 				return errLayerRolledBack
 			}
 		}
@@ -1424,7 +1522,10 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 		}
 		if hasSurvivor {
 			walCommitted := false
+			committedStagingTransfer := false
 			dropCachedAtSource := false
+			needMoveCache := false
+			var candidateOldCacheGen uint64
 			if w.wbCache != nil {
 				if remMeta, ok := w.wbCache.GetMeta(p); ok && remMeta != nil {
 					srcPutGen := remMeta.PutGen()
@@ -1440,40 +1541,8 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 								return fmt.Errorf("writeback: staged cache payload for %s unavailable: %w", p, serr)
 							}
 						}
-					}
-				}
-			}
-			reverseWBCache := func() {
-				if movedCache && w.wbCache != nil {
-					_ = w.wbCache.RenamePending(survivor, p)
-					movedCache = false
-					oldCacheGen, newCacheGen = 0, 0
-				}
-			}
-			if w.wbCache != nil && !dropCachedAtSource {
-				if remMeta, ok := w.wbCache.GetMeta(p); ok && remMeta != nil {
-					// If no Staging work will write WAL, linearize against
-					// binding.fenceMu before mutating wbCache.
-					willWriteStaging := false
-					if w.opts.Staging != nil && w.opts.Staging.Pending != nil {
-						_, _, sc, sl := w.pendingImageState(p)
-						willWriteStaging = sc || sl || (w.opts.Staging.Shadow != nil && w.opts.Staging.Shadow.Has(p))
-					}
-					if !willWriteStaging && linearizeNoWAL != nil && !linearizeNoWAL() {
-						rollbackFailedCommit()
-						return errLayerRolledBack
-					}
-					oldCacheGen = remMeta.Generation
-					movedCache = w.wbCache.RenamePending(p, survivor)
-					if !movedCache {
-						rollbackFailedCommit()
-						return fmt.Errorf("writeback: moving staged cache %s -> %s failed", p, survivor)
-					}
-					if survMeta, sok := w.wbCache.GetMeta(survivor); sok && survMeta != nil {
-						newCacheGen = survMeta.Generation
-					}
-					if !willWriteStaging {
-						walCommitted = true // already linearized above
+						needMoveCache = true
+						candidateOldCacheGen = remMeta.Generation
 					}
 				}
 			}
@@ -1489,17 +1558,14 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 					}
 					_, dstConflictNow, dstLiveNow, dstProtected := w.dstProtected(survivor, fence)
 					if (dstConflictNow || dstLiveNow) && dstProtected {
-						reverseWBCache()
 						rollbackFailedCommit()
 						return fmt.Errorf("writeback: newer image already sits at %s", survivor)
 					}
 					if isAborted() {
-						reverseWBCache()
 						rollbackFailedCommit()
 						return errLayerRolledBack
 					}
 					if st.Shadow != nil && !st.Shadow.Has(p) {
-						reverseWBCache()
 						rollbackFailedCommit()
 						return fmt.Errorf("writeback: staged image of %s has no payload to move to %s", p, survivor)
 					}
@@ -1530,7 +1596,6 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 						if !isAborted() && srcLive && origKind != staging.PendingConflict {
 							st.Pending.RestoreKindIfGeneration(p, srcGen, origKind)
 						}
-						reverseWBCache()
 						rollbackFailedCommit()
 						if terr != nil {
 							return terr
@@ -1539,27 +1604,23 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 					}
 					if !transfer.MovePayloadReversible() {
 						transfer.RollbackPrePublish()
-						reverseWBCache()
 						rollbackFailedCommit()
 						return fmt.Errorf("writeback: staged image of %s could not move to %s", p, survivor)
 					}
 					if isAborted() {
 						transfer.RollbackPrePublish()
-						reverseWBCache()
 						rollbackFailedCommit()
 						return errLayerRolledBack
 					}
 					if w.queue != nil {
 						if _, jerr := w.queue.JournalRenameMarkerLocked(p, isAborted); jerr != nil {
 							transfer.RollbackPrePublish()
-							reverseWBCache()
 							rollbackFailedCommit()
 							return jerr
 						}
 					}
 					committed, cerr := transfer.CommitReversible()
 					if cerr != nil || !committed {
-						reverseWBCache()
 						rollbackFailedCommit()
 						if cerr != nil {
 							return cerr
@@ -1568,6 +1629,7 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 					}
 					canceledSurvivor = false
 					walCommitted = true
+					committedStagingTransfer = true
 					if srcLive {
 						newPendingGen := transfer.PreparedGeneration()
 						if isAborted() {
@@ -1589,7 +1651,6 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 					if w.queue != nil {
 						wrote, ferr := w.queue.FinishCancelPathLockedWithAbort(p, false, isAborted)
 						if ferr != nil {
-							reverseWBCache()
 							rollbackFailedCommit()
 							return ferr
 						}
@@ -1600,9 +1661,27 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 				}
 			}
 			if !walCommitted && linearizeNoWAL != nil && !linearizeNoWAL() {
-				reverseWBCache()
 				rollbackFailedCommit()
 				return errLayerRolledBack
+			}
+			if needMoveCache && w.wbCache != nil {
+				movedCache = w.wbCache.RenamePending(p, survivor)
+				if !movedCache {
+					if !committedStagingTransfer {
+						rollbackFailedCommit()
+						return fmt.Errorf("writeback: moving staged cache %s -> %s failed", p, survivor)
+					}
+					dropCachedAtSource = true
+				} else {
+					oldCacheGen = candidateOldCacheGen
+					if survMeta, sok := w.wbCache.GetMeta(survivor); sok && survMeta != nil {
+						newCacheGen = survMeta.Generation
+					}
+				}
+			}
+			if canceledSurvivor {
+				reenqueueCanceledPathLocked(survivor)
+				canceledSurvivor = false
 			}
 			if w.queue != nil {
 				w.queue.RenameTerminalFailure(p, survivor, nil)
@@ -1635,9 +1714,9 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 		)
 		if w.opts.Staging != nil && w.queue != nil {
 			st := w.opts.Staging
-			if _, ok := w.pendingMeta(p); ok && st.Shadow != nil && st.Shadow.Has(p) {
+			if _, ok := st.Pending.GetMeta(p); ok && st.Shadow != nil && st.Shadow.Has(p) {
 				hadPendingImage = true
-				preContentGen = st.Shadow.ActiveGeneration(p)
+				preContentGen = st.Shadow.EnsureActiveGeneration(p)
 				if hasLiveBefore {
 					prePin, prePinned = st.Shadow.PinIfExists(p)
 				}
@@ -1664,9 +1743,9 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 		stagedGen := preContentGen
 		if !hasStagedShadow && w.opts.Staging != nil && w.queue != nil {
 			st := w.opts.Staging
-			if _, ok := w.pendingMeta(p); ok && st.Shadow != nil && st.Shadow.Has(p) {
+			if _, ok := st.Pending.GetMeta(p); ok && st.Shadow != nil && st.Shadow.Has(p) {
 				hasStagedShadow = true
-				stagedGen = st.Shadow.ActiveGeneration(p)
+				stagedGen = st.Shadow.EnsureActiveGeneration(p)
 			}
 		}
 
@@ -1699,7 +1778,7 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 					st.Shadow.Remove(p)
 				} else {
 					hasStagedShadow = true
-					stagedGen = st.Shadow.ActiveGeneration(p)
+					stagedGen = st.Shadow.EnsureActiveGeneration(p)
 				}
 			}
 		}
@@ -1786,7 +1865,8 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 			}
 		}
 		releasePathLock()
-		if hasSurvivor && movedCache && w.uploader != nil && !w.hasUnclosedStagedCacheOwner(survivor) {
+		releaseUnlinkWatch()
+		if hasSurvivor && movedCache && !isAborted() && w.uploader != nil && !w.hasUnclosedStagedCacheOwner(survivor) {
 			w.uploader.Submit(survivor)
 		}
 	}
@@ -1822,7 +1902,7 @@ func (w *Writeback) PreparePathUnlink(p string, hasSurvivor bool) func(bool) err
 }
 
 type unlinkContentStamp struct {
-	commitSeq      uint64
+	watchSeq       uint64
 	queueCommitSeq uint64
 	pendingGen     uint64
 	hasPending     bool
@@ -1831,7 +1911,7 @@ type unlinkContentStamp struct {
 }
 
 func (w *Writeback) currentUnlinkContentStamp(p string) unlinkContentStamp {
-	st := unlinkContentStamp{commitSeq: w.commitSeq.Load()}
+	st := unlinkContentStamp{watchSeq: w.currentUnlinkWatchSeq(p)}
 	if w.queue != nil {
 		st.queueCommitSeq = w.queue.CommitSeq(p)
 	}
@@ -4140,7 +4220,7 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 	}
 	if h.buf == nil {
 		isNew := h.isNew
-		if !isNew {
+		if !isNew && !h.unlinked {
 			// OpenWritable preload: the first touch materializes the staged
 			// .dat/.meta image (newer than the remote) instead of serving the
 			// remote's stale bytes.
@@ -4213,17 +4293,10 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 					}
 					return 0, fs.ErrNotFound
 				}
-				// Legacy marker: no pin, so only the active shadow can serve.
-				if data, rerr := h.w.opts.Staging.Shadow.ReadAll(h.path); rerr == nil && data != nil {
-					if off >= int64(len(data)) {
-						return 0, nil
-					}
-					return copy(dest, data[off:]), nil
-				}
-				// The bytes are gone. Falling through would serve the
-				// pending/shadow tiers, which describe whichever object now
-				// owns the reused name — exactly the cross-object read this
-				// branch exists to prevent.
+				// No lifecycle pin was recorded for this anonymous handle (e.g.
+				// an unwritten handle unlinked before any shadow snapshot existed).
+				// Never fall back to unpinned Shadow.ReadAll(h.path), which would
+				// serve a same-name replacement file's bytes across objects.
 				return 0, fs.ErrNotFound
 			}
 			if h.inner == nil {
@@ -7682,7 +7755,7 @@ func (w *Writeback) landSiblingAliasOverwriteForWrite(ctx context.Context, fileI
 // close/write-sync modes land on every close, so this seam dominates
 // their ENOENT counts).
 func (w *Writeback) landedAt(path string, rev, size int64, crc uint32, image []byte) {
-	w.commitSeq.Add(1)
+	w.bumpUnlinkWatchSeq(path)
 	if rev <= 0 {
 		return
 	}
@@ -8226,7 +8299,7 @@ func (w *Writeback) commitReaderOpt(ctx context.Context, path string, newReader 
 		// against a raced create included) falls back to the conditional
 		// write below.
 		if rev, err := w.opts.Client.CreateFileCtx(ctx, rp); err == nil {
-			w.commitSeq.Add(1)
+			w.bumpUnlinkWatchSeq(path)
 			return rev, nil
 		}
 	}
@@ -8254,7 +8327,7 @@ func (w *Writeback) commitReaderOpt(ctx context.Context, path string, newReader 
 				var landedRev int64
 				pctx := client.WithCompletedRevisionSink(ctx, &landedRev)
 				if perr := w.opts.Client.CommitExtentPatch(pctx, rp, 0, nil, expected); perr == nil {
-					w.commitSeq.Add(1)
+					w.bumpUnlinkWatchSeq(path)
 					return landedRev, nil
 				} else {
 					werr = perr
@@ -8267,7 +8340,7 @@ func (w *Writeback) commitReaderOpt(ctx context.Context, path string, newReader 
 				if n, rerr := io.ReadFull(newReader(), data); rerr == nil && int64(n) == size {
 					rev, perr := w.opts.Client.WriteCtxConditionalWithRevision(ctx, rp, data, expected)
 					if perr == nil {
-						w.commitSeq.Add(1)
+						w.bumpUnlinkWatchSeq(path)
 						return rev, nil
 					}
 					werr = perr
@@ -8295,7 +8368,7 @@ func (w *Writeback) commitReaderOpt(ctx context.Context, path string, newReader 
 			}
 			return 0, mapErr(werr)
 		}
-		w.commitSeq.Add(1)
+		w.bumpUnlinkWatchSeq(path)
 		return 0, nil
 	}
 	return 0, &fs.StatusError{Path: path, Status: gofuse.EAGAIN}
@@ -8444,14 +8517,8 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 			h.baseLoaded = true
 			return nil
 		}
-		if data, rerr := h.w.opts.Staging.Shadow.ReadAll(h.path); rerr == nil && data != nil {
-			if _, err := h.buf.Write(0, data); err != nil {
-				return err
-			}
-			h.buf.ClearDirty()
-			h.baseLoaded = true
-			return nil
-		}
+		// No lifecycle pin was recorded for this anonymous handle; keep the
+		// zero-length base rather than reading a replacement file's active shadow.
 		h.baseLoaded = true
 		return nil
 	}
@@ -8469,7 +8536,7 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 		h.baseLoaded = true
 		return nil
 	}
-	if !h.isNew && h.w.wbCache != nil && !ledgerOwned {
+	if !h.isNew && !h.unlinked && h.w.wbCache != nil && !ledgerOwned {
 		// The write cache is LOCAL-path keyed (stageToWriteCache Put uses
 		// h.path): querying the remote name under a RemoteRoot subtree
 		// missed every not-yet-uploaded image and served the stale remote
@@ -8487,7 +8554,7 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 			return nil
 		}
 	}
-	if (h.isNew || h.inner == nil || ledgerOwned) && h.w.opts.Staging != nil {
+	if !h.unlinked && (h.isNew || h.inner == nil || ledgerOwned) && h.w.opts.Staging != nil {
 		// A pending image owns this path (queue track): preload the
 		// staged bytes so the handle reads its own image. Ledger-owned
 		// existing handles preload here too — their remote row may not

@@ -194,6 +194,11 @@ type FS struct {
 	// budget is the process-wide memory budget (nil when disabled). Retained
 	// for the drain/status snapshot.
 	budget *membudget.Budget
+
+	// testUnlinkSurvivorRetryHook is an optional test-only callback invoked
+	// inside FS.Unlink's survivor convergence loop right before acquiring
+	// lockOpenNamePair(child, surv0). Nil in production.
+	testUnlinkSurvivorRetryHook func(attempt int, surv0 string)
 }
 
 // New assembles the facade: chain, Context, and identity tables. Register
@@ -2205,6 +2210,9 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 			break
 		}
 		unlockGate()
+		if f.testUnlinkSurvivorRetryHook != nil {
+			f.testUnlinkSurvivorRetryHook(attempt, surv0)
+		}
 		unlockGate = f.lockOpenNamePair(child, surv0)
 		if !f.openIdx.HasOpenPath(child) {
 			survivor = ""
@@ -2569,14 +2577,55 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 }
 
 func (f *FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, filename string, out *gofuse.EntryOut) gofuse.Status {
-	oldPath, ok := f.inodes.GetPath(input.Oldnodeid)
-	if !ok {
-		return gofuse.ENOENT
-	}
 	newPath, st := f.childOf(input.NodeId, filename)
 	if st != gofuse.OK {
 		return st
 	}
+	livePathOf := func(ino uint64) (string, bool) {
+		p, ok := f.inodes.GetPath(ino)
+		if !ok || p == "" {
+			return "", false
+		}
+		if curIno, iok := f.inodes.GetInode(p); iok && curIno == ino {
+			return p, true
+		}
+		entry, eok := f.inodes.GetEntry(ino)
+		if !eok || len(entry.Paths) == 0 {
+			return "", false
+		}
+		for alias := range entry.Paths {
+			if curIno, iok := f.inodes.GetInode(alias); iok && curIno == ino {
+				return alias, true
+			}
+		}
+		return "", false
+	}
+	var (
+		oldPath     string
+		unlockNames func()
+		resolved    bool
+	)
+	for attempt := 0; attempt < 64; attempt++ {
+		candOld, ok := livePathOf(input.Oldnodeid)
+		if !ok {
+			return gofuse.ENOENT
+		}
+		unlock := f.lockOpenNamePair(candOld, newPath)
+		if curIno, iok := f.inodes.GetInode(candOld); iok && curIno == input.Oldnodeid {
+			oldPath = candOld
+			unlockNames = unlock
+			resolved = true
+			break
+		}
+		unlock()
+		if _, stillAlive := livePathOf(input.Oldnodeid); !stillAlive {
+			return gofuse.ENOENT
+		}
+	}
+	if !resolved {
+		return gofuse.EAGAIN
+	}
+	defer unlockNames()
 	if err := f.flushDeferredUnlink(newPath); err != nil {
 		return fs.StatusOf(err)
 	}

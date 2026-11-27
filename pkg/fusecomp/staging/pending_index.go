@@ -155,6 +155,9 @@ func (idx *PendingIndex) RecoverFromDisk() error {
 	if err := idx.loadCommittedFences(); err != nil {
 		return err
 	}
+	if err := idx.reconcileTransferBackups(); err != nil {
+		return err
+	}
 	entries, err := os.ReadDir(idx.dir)
 	if err != nil {
 		return fmt.Errorf("pending index recovery: %w", err)
@@ -479,7 +482,7 @@ type PendingConflictTransfer struct {
 	// so Abort degenerates into finishing the publication.
 	payloadMoved   bool
 	origDst        *WriteBackMeta
-	dstBackupPath  string
+	hasDstBackup   bool
 	expectedOldGen uint64
 	expectedNewGen uint64
 	closed         bool
@@ -683,9 +686,86 @@ func (t *PendingConflictTransfer) Commit() (bool, error) {
 	t.idx.mu.Unlock()
 
 	_ = os.Remove(filepath.Join(t.idx.dir, HashPath(t.oldPath)+".meta"))
+	t.discardDstBackupLocked()
 	t.idx.removeFenceFiles(cleared)
 	safeLogPrintf("pending: conflict marker moved %s -> %s (gen %d -> %d)", t.oldPath, t.newPath, t.expectedOldGen, t.prepared.Generation)
 	return true, nil
+}
+
+func (idx *PendingIndex) metaBackupFilePath(remotePath string) string {
+	return filepath.Join(idx.dir, HashPath(remotePath)+".meta.unlinkbak")
+}
+
+func (idx *PendingIndex) writeMetaBackupFile(meta *WriteBackMeta) error {
+	if idx == nil || meta == nil {
+		return nil
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("marshal pending backup meta for %s: %w", meta.Path, err)
+	}
+	if err := idx.writeFile(idx.metaBackupFilePath(meta.Path), raw); err != nil {
+		return fmt.Errorf("persist pending backup meta for %s: %w", meta.Path, err)
+	}
+	return nil
+}
+
+func (idx *PendingIndex) removeMetaBackupFile(remotePath string) {
+	if idx == nil || remotePath == "" {
+		return
+	}
+	_ = os.Remove(idx.metaBackupFilePath(remotePath))
+}
+
+func (idx *PendingIndex) reconcileTransferBackups() error {
+	entries, err := os.ReadDir(idx.dir)
+	if err != nil {
+		return fmt.Errorf("pending index backup scan: %w", err)
+	}
+	mutatedDir := false
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".meta.unlinkbak") {
+			continue
+		}
+		hash := strings.TrimSuffix(name, ".meta.unlinkbak")
+		metaBakPath := filepath.Join(idx.dir, name)
+		metaPath := filepath.Join(idx.dir, hash+".meta")
+		if idx.shadows != nil && idx.shadows.Dir() != "" {
+			shadowDir := idx.shadows.Dir()
+			shadowPath := filepath.Join(shadowDir, hash+".shadow")
+			shadowBakPath := filepath.Join(shadowDir, hash+".shadow.unlinkbak")
+			_, bakErr := os.Stat(shadowBakPath)
+			_, curErr := os.Stat(shadowPath)
+			if bakErr == nil && errors.Is(curErr, os.ErrNotExist) {
+				if raw, rerr := os.ReadFile(metaBakPath); rerr == nil {
+					var bakMeta WriteBackMeta
+					if json.Unmarshal(raw, &bakMeta) == nil && bakMeta.Path != "" {
+						if rerr := os.Rename(shadowBakPath, shadowPath); rerr == nil {
+							_ = atomicWrite(metaPath, raw)
+							idx.shadows.AdoptRecoveredHashFile(hash)
+						}
+					}
+				}
+			}
+			_ = os.Remove(shadowBakPath)
+		}
+		_ = os.Remove(metaBakPath)
+		mutatedDir = true
+	}
+	if idx.shadows != nil && idx.shadows.Dir() != "" {
+		if sEntries, serr := os.ReadDir(idx.shadows.Dir()); serr == nil {
+			for _, se := range sEntries {
+				if strings.HasSuffix(se.Name(), ".shadow.unlinkbak") {
+					_ = os.Remove(filepath.Join(idx.shadows.Dir(), se.Name()))
+				}
+			}
+		}
+	}
+	if mutatedDir {
+		_ = fsyncDir(idx.dir)
+	}
+	return nil
 }
 
 // RestoreKindIfGeneration restores path's Kind when its generation still
@@ -698,40 +778,70 @@ func (idx *PendingIndex) RestoreKindIfGeneration(path string, expectedGen uint64
 	pl := idx.acquirePathLock(path)
 	defer idx.releasePathLock(path, pl)
 	var snapshot *WriteBackMeta
+	idx.mu.RLock()
+	if src, ok := idx.items[path]; ok && src != nil && src.Generation == expectedGen {
+		cp := cloneWriteBackMeta(src)
+		cp.Kind = kind
+		snapshot = &cp
+	}
+	idx.mu.RUnlock()
+	if snapshot == nil {
+		return
+	}
+	if err := idx.writeMetaFile(snapshot); err != nil {
+		return
+	}
 	idx.mu.Lock()
 	if src, ok := idx.items[path]; ok && src != nil && src.Generation == expectedGen {
 		src.Kind = kind
-		cp := cloneWriteBackMeta(src)
-		snapshot = &cp
 	}
 	idx.mu.Unlock()
-	if snapshot != nil {
-		_ = idx.writeMetaFile(snapshot)
-	}
 }
 
-// restoreSourceKindLocked restores oldPath's pre-transfer Kind in memory (and
-// best-effort on disk) while both endpoint path locks are held.
+// restoreSourceKindLocked restores oldPath's pre-transfer Kind on disk first
+// and then in memory while both endpoint path locks are held.
 func (t *PendingConflictTransfer) restoreSourceKindLocked() {
 	if t == nil || t.prepared == nil || t.prepared.Kind == PendingConflict {
 		return
 	}
 	var snapshot *WriteBackMeta
+	t.idx.mu.RLock()
+	if src, ok := t.idx.items[t.oldPath]; ok && src != nil && src.Generation == t.expectedOldGen {
+		cp := cloneWriteBackMeta(src)
+		cp.Kind = t.prepared.Kind
+		snapshot = &cp
+	}
+	t.idx.mu.RUnlock()
+	if snapshot == nil {
+		return
+	}
+	if err := t.idx.writeMetaFile(snapshot); err != nil {
+		return
+	}
 	t.idx.mu.Lock()
 	if src, ok := t.idx.items[t.oldPath]; ok && src != nil && src.Generation == t.expectedOldGen {
 		src.Kind = t.prepared.Kind
-		cp := cloneWriteBackMeta(src)
-		snapshot = &cp
 	}
 	t.idx.mu.Unlock()
-	if snapshot != nil {
-		_ = t.idx.writeMetaFile(snapshot)
+}
+
+func (t *PendingConflictTransfer) discardDstBackupLocked() {
+	if t == nil {
+		return
+	}
+	if t.hasDstBackup && t.shadows != nil {
+		t.shadows.DiscardTransferBackup(t.newPath)
+		t.hasDstBackup = false
+	}
+	if t.idx != nil {
+		t.idx.removeMetaBackupFile(t.newPath)
 	}
 }
 
 // MovePayloadReversible moves the source shadow bytes to newPath while
-// stashing any pre-existing destination shadow under a temporary rollback slot
-// so pre-publication failures can restore both endpoints losslessly.
+// stashing any pre-existing destination shadow + metadata under non-.shadow
+// .unlinkbak files so pre-publication failures and mid-transfer crashes can
+// restore both endpoints losslessly without inflating PendingBytes().
 func (t *PendingConflictTransfer) MovePayloadReversible() bool {
 	if t == nil || t.closed || t.prepared == nil {
 		return false
@@ -744,24 +854,30 @@ func (t *PendingConflictTransfer) MovePayloadReversible() bool {
 	}
 	t.shadows.EnsureActiveGeneration(t.oldPath)
 	if t.destWasLive && !t.destReplaced {
-		if t.shadows.Has(t.newPath) {
-			backup := "\x00unlink-dst-backup:" + t.newPath
-			t.shadows.Remove(backup)
-			t.shadows.EnsureActiveGeneration(t.newPath)
-			if !t.shadows.Rename(t.newPath, backup) {
+		if t.origDst != nil {
+			if err := t.idx.writeMetaBackupFile(t.origDst); err != nil {
 				return false
 			}
-			if verr := t.shadows.VerifyRemoved(t.newPath); verr != nil {
-				_ = t.shadows.Rename(backup, t.newPath)
-				return false
-			}
-			t.dstBackupPath = backup
 		}
-		if err := t.idx.writePreparedWitness(t.prepared); err != nil {
-			if t.dstBackupPath != "" {
-				_ = t.shadows.Rename(t.dstBackupPath, t.newPath)
-				t.dstBackupPath = ""
+		backedUp, berr := t.shadows.BackupForTransfer(t.newPath)
+		if berr != nil {
+			t.idx.removeMetaBackupFile(t.newPath)
+			return false
+		}
+		if verr := t.shadows.VerifyRemoved(t.newPath); verr != nil {
+			if backedUp {
+				_ = t.shadows.RestoreTransferBackup(t.newPath)
 			}
+			t.idx.removeMetaBackupFile(t.newPath)
+			return false
+		}
+		t.hasDstBackup = backedUp
+		if err := t.idx.writePreparedWitness(t.prepared); err != nil {
+			if t.hasDstBackup {
+				_ = t.shadows.RestoreTransferBackup(t.newPath)
+				t.hasDstBackup = false
+			}
+			t.idx.removeMetaBackupFile(t.newPath)
 			return false
 		}
 		t.destReplaced = true
@@ -782,37 +898,55 @@ func (t *PendingConflictTransfer) rollbackReversibleLocked() {
 		}
 	}
 	if t.destWasLive {
-		if t.dstBackupPath != "" && t.shadows != nil && !t.payloadMoved {
-			if t.shadows.Rename(t.dstBackupPath, t.newPath) {
-				t.dstBackupPath = ""
-			}
-		}
 		if t.destReplaced {
-			if t.origDst != nil && !t.payloadMoved && t.dstBackupPath == "" {
+			restoredDst := false
+			if t.origDst != nil && !t.payloadMoved {
 				if err := t.idx.writeMetaFile(t.origDst); err == nil {
-					t.idx.mu.Lock()
-					cp := cloneWriteBackMeta(t.origDst)
-					t.idx.items[t.newPath] = &cp
-					t.idx.mu.Unlock()
-				} else {
-					t.idx.mu.Lock()
-					if cur, ok := t.idx.items[t.newPath]; ok && cur != nil {
-						cur.Kind = PendingConflict
+					shadowOK := true
+					if t.hasDstBackup && t.shadows != nil {
+						if rerr := t.shadows.RestoreTransferBackup(t.newPath); rerr != nil {
+							shadowOK = false
+						} else {
+							t.hasDstBackup = false
+						}
 					}
-					t.idx.mu.Unlock()
+					if shadowOK {
+						t.idx.removeMetaBackupFile(t.newPath)
+						t.idx.mu.Lock()
+						cp := cloneWriteBackMeta(t.origDst)
+						t.idx.items[t.newPath] = &cp
+						t.idx.mu.Unlock()
+						restoredDst = true
+					} else if t.prepared != nil {
+						_ = t.idx.writePreparedWitness(t.prepared)
+					}
 				}
-			} else {
+			}
+			if !restoredDst {
+				t.discardDstBackupLocked()
 				t.idx.mu.Lock()
-				if cur, ok := t.idx.items[t.newPath]; ok && cur != nil {
+				if t.prepared != nil {
+					cp := cloneWriteBackMeta(t.prepared)
+					cp.Kind = PendingConflict
+					t.idx.items[t.newPath] = &cp
+				} else if cur, ok := t.idx.items[t.newPath]; ok && cur != nil {
 					cur.Kind = PendingConflict
 				}
 				t.idx.mu.Unlock()
 			}
+		} else {
+			t.discardDstBackupLocked()
 		}
-	} else {
+	} else if !t.payloadMoved {
 		_ = os.Remove(filepath.Join(t.idx.dir, HashPath(t.newPath)+".meta"))
 		t.idx.mu.Lock()
 		delete(t.idx.items, t.newPath)
+		t.idx.mu.Unlock()
+	} else if t.prepared != nil {
+		t.idx.mu.Lock()
+		cp := cloneWriteBackMeta(t.prepared)
+		cp.Kind = PendingConflict
+		t.idx.items[t.newPath] = &cp
 		t.idx.mu.Unlock()
 	}
 	if !t.payloadMoved && (t.shadows == nil || t.shadows.Has(t.oldPath)) {
@@ -857,10 +991,7 @@ func (t *PendingConflictTransfer) CommitReversible() (bool, error) {
 	cleared := t.idx.clearCommittedFencesLocked(t.oldPath, t.newPath)
 	t.idx.mu.Unlock()
 
-	if t.dstBackupPath != "" && t.shadows != nil {
-		t.shadows.Remove(t.dstBackupPath)
-		t.dstBackupPath = ""
-	}
+	t.discardDstBackupLocked()
 	_ = os.Remove(filepath.Join(t.idx.dir, HashPath(t.oldPath)+".meta"))
 	t.idx.removeFenceFiles(cleared)
 	safeLogPrintf("pending: reversible entry moved %s -> %s (gen %d -> %d)", t.oldPath, t.newPath, t.expectedOldGen, t.prepared.Generation)
@@ -882,6 +1013,7 @@ func (t *PendingConflictTransfer) Abort() {
 		return
 	}
 	defer t.release()
+	t.discardDstBackupLocked()
 	if t.destReplaced {
 		// The move retired the destination's own payload (its incarnation was
 		// replaced by the remote rename) and may have persisted the prepared
@@ -914,6 +1046,7 @@ func (t *PendingConflictTransfer) Abort() {
 func (t *PendingConflictTransfer) PublishDestination() error {
 	if t == nil || t.closed || t.prepared == nil {
 		if t != nil && !t.closed {
+			t.discardDstBackupLocked()
 			t.release()
 		}
 		return nil
@@ -921,15 +1054,18 @@ func (t *PendingConflictTransfer) PublishDestination() error {
 	if t.destWasLive && !t.destReplaced {
 		// A live destination still carries its own marker describing its own
 		// bytes; overwriting it would mislabel them.
+		t.discardDstBackupLocked()
 		t.release()
 		return nil
 	}
 	defer t.release()
 	if !t.destMetaPersisted {
 		if err := t.idx.writeMetaFile(t.prepared); err != nil {
+			t.discardDstBackupLocked()
 			return err
 		}
 	}
+	t.discardDstBackupLocked()
 	t.idx.mu.Lock()
 	cp := *t.prepared
 	t.idx.items[t.newPath] = &cp

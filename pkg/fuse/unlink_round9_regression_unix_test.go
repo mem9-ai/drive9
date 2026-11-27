@@ -10,7 +10,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1159,7 +1158,6 @@ func TestRound9IncrementalFollowUpRegressions(t *testing.T) {
 	t.Run("acquire_lock_refresh_exhaustion_returns_eagain_without_unlocked_commit", func(t *testing.T) {
 		b := testbackend.NewBackend()
 		b.Seed("/churn", []byte("v00"))
-		b.Seed("/other", []byte("o0"))
 		srv := httptest.NewServer(b)
 		t.Cleanup(srv.Close)
 
@@ -1218,7 +1216,7 @@ func TestRound9IncrementalFollowUpRegressions(t *testing.T) {
 	})
 
 	t.Run("dest_was_live_reversible_rollback_restores_both_endpoints_and_queues", func(t *testing.T) {
-		// Part 1: Direct PendingConflictTransfer with destWasLive == true + CommitReversible meta failure.
+		// Part 1a: RollbackPrePublish with destWasLive == true restores both endpoints and exact PendingBytes.
 		dir := t.TempDir()
 		ledger, err := staging.NewStaging(dir)
 		require.NoError(t, err)
@@ -1235,24 +1233,12 @@ func TestRound9IncrementalFollowUpRegressions(t *testing.T) {
 		require.NoError(t, err)
 		require.Greater(t, srcGen, dstGen)
 
-		tx, ok, err := ledger.Pending.BeginConflictTransfer("/held", "/survivor", srcGen, dstGen, ledger.Shadow)
+		txPre, ok, err := ledger.Pending.BeginConflictTransfer("/held", "/survivor", srcGen, dstGen, ledger.Shadow)
 		require.NoError(t, err)
 		require.True(t, ok)
-		require.True(t, tx.MovePayloadReversible())
+		require.True(t, txPre.MovePayloadReversible())
+		txPre.RollbackPrePublish()
 
-		// Force CommitReversible's writeMetaFile("/survivor") to fail via EISDIR.
-		dstMetaPath := filepath.Join(dir, "pending", staging.HashPath("/survivor")+".meta")
-		require.NoError(t, os.Remove(dstMetaPath))
-		require.NoError(t, os.MkdirAll(filepath.Join(dstMetaPath, "blocker"), 0o755))
-
-		committed, cerr := tx.CommitReversible()
-		require.Error(t, cerr)
-		require.False(t, committed)
-
-		// Remove blocker dir so we can inspect/recover cleanly.
-		require.NoError(t, os.RemoveAll(dstMetaPath))
-
-		// Both /held and /survivor shadows must be restored to their exact original bytes!
 		gotSrc, err := ledger.Shadow.ReadAll("/held")
 		require.NoError(t, err)
 		require.Equal(t, string(srcBytes), string(gotSrc))
@@ -1262,12 +1248,84 @@ func TestRound9IncrementalFollowUpRegressions(t *testing.T) {
 		srcMeta, sok := ledger.Pending.GetMeta("/held")
 		require.True(t, sok)
 		require.Equal(t, staging.PendingOverwrite, srcMeta.Kind)
+		dstMeta, dok := ledger.Pending.GetMeta("/survivor")
+		require.True(t, dok)
+		require.Equal(t, staging.PendingOverwrite, dstMeta.Kind)
 		require.Equal(t, int64(len(srcBytes)+len(dstBytes)), ledger.Shadow.PendingBytes())
 
-		// Part 2: End-to-end FS.Unlink with both /held and /survivor queued when WAL JournalRenameMarkerLocked fails!
+		// Part 1b: CommitReversible writeMetaFile failure WITHOUT deleting dstMetaPath
+		// (read-only pending dir so atomicWrite fails while dstMetaPath witness remains):
+		// source is restored, backup shadow is discarded (never paired with prepared witness),
+		// and PendingBytes() equals len(srcBytes) only.
+		txFail, ok, err := ledger.Pending.BeginConflictTransfer("/held", "/survivor", srcGen, dstGen, ledger.Shadow)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.True(t, txFail.MovePayloadReversible())
+
+		pendingDir := filepath.Join(dir, "pending")
+		require.NoError(t, os.Chmod(pendingDir, 0o555))
+		committed, cerr := txFail.CommitReversible()
+		require.NoError(t, os.Chmod(pendingDir, 0o755))
+		require.Error(t, cerr)
+		require.False(t, committed)
+
+		gotSrc, err = ledger.Shadow.ReadAll("/held")
+		require.NoError(t, err)
+		require.Equal(t, string(srcBytes), string(gotSrc))
+		require.False(t, ledger.Shadow.Has("/survivor"), "backup shadow must be discarded when origDst .meta cannot be restored")
+		dstConflictMeta, dcOK := ledger.Pending.GetMeta("/survivor")
+		require.True(t, dcOK)
+		require.Equal(t, staging.PendingConflict, dstConflictMeta.Kind)
+		require.Equal(t, int64(len(srcBytes)), ledger.Shadow.PendingBytes())
+
+		// Part 1c: Crash recovery with leftover .unlinkbak files (both mid-move restore and orphan sweep).
+		crashDir := t.TempDir()
+		crashLedger, err := staging.NewStaging(crashDir)
+		require.NoError(t, err)
+		require.NoError(t, crashLedger.Shadow.WriteFull("/survivor", dstBytes, 1))
+		cDstGen, err := crashLedger.Pending.Put("/survivor", int64(len(dstBytes)), staging.PendingOverwrite)
+		require.NoError(t, err)
+		require.NoError(t, crashLedger.Shadow.WriteFull("/held", srcBytes, 1))
+		cSrcGen, err := crashLedger.Pending.Put("/held", int64(len(srcBytes)), staging.PendingOverwrite)
+		require.NoError(t, err)
+		txCrash, ok, err := crashLedger.Pending.BeginConflictTransfer("/held", "/survivor", cSrcGen, cDstGen, crashLedger.Shadow)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.True(t, txCrash.MovePayloadReversible())
+		// Simulate a mid-move crash BEFORE Rename(Shadow[/held] -> Shadow[/survivor]) by moving
+		// Shadow[/survivor] back to Shadow[/held] on disk while .meta.unlinkbak + .shadow.unlinkbak remain,
+		// plus plant an orphan .shadow.unlinkbak to verify PendingBytes() ignores it and startup sweeps it.
+		crashLedger.Close()
+		shadowSubdir := filepath.Join(crashDir, "shadow")
+		survShadowDisk := filepath.Join(shadowSubdir, staging.HashPath("/survivor")+".shadow")
+		heldShadowDisk := filepath.Join(shadowSubdir, staging.HashPath("/held")+".shadow")
+		require.NoError(t, os.Rename(survShadowDisk, heldShadowDisk))
+		orphanBak := filepath.Join(shadowSubdir, staging.HashPath("/orphan")+".shadow.unlinkbak")
+		require.NoError(t, os.WriteFile(orphanBak, []byte("orphan-backup-bytes"), 0o644))
+
+		reopened, err := staging.NewStaging(crashDir)
+		require.NoError(t, err)
+		t.Cleanup(reopened.Close)
+		_, orphanStatErr := os.Stat(orphanBak)
+		require.True(t, os.IsNotExist(orphanStatErr), "NewShadowStoreWithQuota must sweep orphan .shadow.unlinkbak")
+		reopened.Shadow.RecoverPendingBytes()
+		require.Equal(t, int64(len(srcBytes)), reopened.Shadow.PendingBytes(), "unreconciled .shadow.unlinkbak must not count in PendingBytes")
+
+		require.NoError(t, reopened.Shadow.RecoverFromDisk())
+		require.NoError(t, reopened.Recover())
+		reopened.Shadow.RecoverPendingBytes()
+		require.Equal(t, int64(len(srcBytes)+len(dstBytes)), reopened.Shadow.PendingBytes())
+		recMeta, rmOK := reopened.Pending.GetMeta("/survivor")
+		require.True(t, rmOK)
+		require.Equal(t, staging.PendingOverwrite, recMeta.Kind)
+		require.Equal(t, int64(len(dstBytes)), recMeta.Size)
+		reopened.Shadow.EnsureActiveGeneration("/survivor")
+		recDst, err := reopened.Shadow.ReadAll("/survivor")
+		require.NoError(t, err)
+		require.Equal(t, string(dstBytes), string(recDst))
+
+		// Part 2: End-to-end FS.Unlink with both /held2 and /surv2 queued when WAL JournalRenameMarkerLocked fails!
 		b := testbackend.NewBackend()
-		b.Seed("/held", []byte("v0"))
-		b.Seed("/survivor", []byte("v0"))
 		var holdPut atomic.Bool
 		holdPut.Store(true)
 		releasePut := make(chan struct{})
@@ -1432,39 +1490,15 @@ func TestRound9IncrementalFollowUpRegressions(t *testing.T) {
 
 		cur, next := surv0, surv1
 		require.True(t, f.inodes.AddAlias(ino, cur, "", 2, false, 2, time.Now()))
-		muCur := f.openNameLock(cur)
-		muNext := f.openNameLock(next)
-		muCur.Lock()
-		muNext.Lock()
-
-		unlinkDone := make(chan gofuse.Status, 1)
-		go func() { unlinkDone <- f.Unlink(nil, rootHeader(), childName) }()
-
-		deadline := time.Now().Add(5 * time.Second)
-		var gotStatus gofuse.Status
-		finished := false
-		for time.Now().Before(deadline) {
-			select {
-			case gotStatus = <-unlinkDone:
-				finished = true
-			default:
+		f.testUnlinkSurvivorRetryHook = func(_ int, surv string) {
+			if surv == cur {
+				require.True(t, f.inodes.AddAlias(ino, next, "", 2, false, 2, time.Now()))
+				f.inodes.RemoveLinkPreserve(cur)
+				cur, next = next, cur
 			}
-			if finished {
-				break
-			}
-			require.True(t, f.inodes.AddAlias(ino, next, "", 2, false, 2, time.Now()))
-			f.inodes.RemoveLinkPreserve(cur)
-			muCur.Unlock()
-			runtime.Gosched()
-			muCur.Lock()
-			cur, next = next, cur
-			muCur, muNext = muNext, muCur
 		}
-		muCur.Unlock()
-		muNext.Unlock()
-		if !finished {
-			gotStatus = <-unlinkDone
-		}
+		gotStatus := f.Unlink(nil, rootHeader(), childName)
+		f.testUnlinkSurvivorRetryHook = nil
 		require.Equal(t, gofuse.EAGAIN, gotStatus)
 
 		// Child path must still be open, bound to ino, and readable/flushable!
@@ -1473,5 +1507,327 @@ func TestRound9IncrementalFollowUpRegressions(t *testing.T) {
 		require.True(t, f.openIdx.HasOpenPath(childPath))
 		require.Equal(t, gofuse.OK, f.Flush(nil, &gofuse.FlushIn{InHeader: hdr, Fh: openOut.Fh}))
 		f.Release(nil, &gofuse.ReleaseIn{InHeader: hdr, Fh: openOut.Fh})
+	})
+}
+
+func TestRound10MornyxReviewRegressions(t *testing.T) {
+	t.Run("has_survivor_default_branch_reenqueues_canceled_survivor", func(t *testing.T) {
+		b := testbackend.NewBackend()
+		b.Seed("/src", []byte("v0"))
+		b.Seed("/surv", []byte("v0"))
+		var holdPut atomic.Bool
+		holdPut.Store(true)
+		releasePut := make(chan struct{})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if (r.Method == http.MethodPut || r.Method == http.MethodPost) && holdPut.Load() {
+				select {
+				case <-r.Context().Done():
+					http.Error(w, "canceled", http.StatusRequestTimeout)
+					return
+				case <-releasePut:
+				}
+			}
+			b.ServeHTTP(w, r)
+		}))
+		t.Cleanup(srv.Close)
+
+		cl := client.New(srv.URL, "")
+		cl.SetSmallFileThresholdForTests(1 << 20)
+		ledger, err := staging.NewStaging(t.TempDir())
+		require.NoError(t, err)
+		t.Cleanup(ledger.Close)
+		wb, err := writeback.New(writeback.Options{
+			Policy:                  writeback.PolicyWriteBack,
+			SyncMode:                "interactive",
+			Client:                  cl,
+			Staging:                 ledger,
+			RemoteCommitWaitTimeout: 100 * time.Millisecond,
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+		t.Cleanup(func() {
+			holdPut.Store(false)
+			select {
+			case <-releasePut:
+			default:
+				close(releasePut)
+			}
+		})
+
+		var injectOnce sync.Once
+		hook := &round9UnlinkHook{
+			Writeback: wb,
+			beforeCommit: func() {
+				// Simulate /src's upload completing right before commit() inspects
+				// pendingImageState, while /surv's CommitQueue entry was already
+				// canceled in acquireLock: commit() enters default: and MUST re-enqueue /surv!
+				injectOnce.Do(func() {
+					ledger.Pending.Remove("/src")
+					ledger.Shadow.Remove("/src")
+				})
+			},
+		}
+		terminal, err := core.New(cl, core.Options{})
+		require.NoError(t, err)
+		f, err := New(Options{Extensions: []fs.Handler{hook, terminal}, DefaultPermissions: true})
+		require.NoError(t, err)
+
+		survIno := lookupFacade(t, f, "surv")
+		survHdr := gofuse.InHeader{NodeId: survIno}
+		var survOut gofuse.OpenOut
+		require.Equal(t, gofuse.OK, f.Open(nil, &gofuse.OpenIn{InHeader: survHdr, Flags: syscall.O_RDWR}, &survOut))
+		survPayload := []byte("survivor-must-not-be-stranded")
+		_, st := f.Write(nil, &gofuse.WriteIn{InHeader: survHdr, Fh: survOut.Fh}, survPayload)
+		require.Equal(t, gofuse.OK, st)
+		require.Equal(t, gofuse.OK, f.Fsync(nil, &gofuse.FsyncIn{InHeader: survHdr, Fh: survOut.Fh}))
+		f.Release(nil, &gofuse.ReleaseIn{InHeader: survHdr, Fh: survOut.Fh})
+
+		srcIno := lookupFacade(t, f, "src")
+		srcHdr := gofuse.InHeader{NodeId: srcIno}
+		var srcOut gofuse.OpenOut
+		require.Equal(t, gofuse.OK, f.Open(nil, &gofuse.OpenIn{InHeader: srcHdr, Flags: syscall.O_RDWR}, &srcOut))
+		_, st = f.Write(nil, &gofuse.WriteIn{InHeader: srcHdr, Fh: srcOut.Fh}, []byte("src-newer-payload"))
+		require.Equal(t, gofuse.OK, st)
+		require.Equal(t, gofuse.OK, f.Fsync(nil, &gofuse.FsyncIn{InHeader: srcHdr, Fh: srcOut.Fh}))
+		f.inodes.RemoveLink("/surv")
+		require.True(t, f.inodes.AddAlias(srcIno, "/surv", "", 2, false, 2, time.Now()))
+
+		require.Equal(t, gofuse.OK, f.Unlink(nil, rootHeader(), "src"))
+		holdPut.Store(false)
+		close(releasePut)
+		f.Release(nil, &gofuse.ReleaseIn{InHeader: srcHdr, Fh: srcOut.Fh})
+
+		dresp := f.Drain(context.Background())
+		require.True(t, dresp.OK, dresp.Error)
+		refusalReason, refusalCount := wb.ReexecRefusal()
+		require.Empty(t, refusalReason)
+		require.Zero(t, refusalCount)
+		require.False(t, f.isDeferredUnlink("/src"))
+		survNode, ok := b.Node("/surv")
+		require.True(t, ok)
+		require.Equal(t, string(survPayload), string(survNode.Data))
+	})
+
+	t.Run("unrelated_commits_during_open_unlink_never_cause_spurious_eagain", func(t *testing.T) {
+		b := testbackend.NewBackend()
+		b.Seed("/target", []byte("target-bytes"))
+		for i := 0; i < 8; i++ {
+			b.Seed(fmt.Sprintf("/unrelated_%d", i), []byte("init"))
+		}
+		var pauseTargetGet atomic.Bool
+		targetGetEntered := make(chan struct{})
+		releaseTargetGet := make(chan struct{})
+		var enterOnce sync.Once
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/target") && pauseTargetGet.Load() {
+				enterOnce.Do(func() { close(targetGetEntered) })
+				<-releaseTargetGet
+			}
+			b.ServeHTTP(w, r)
+		}))
+		t.Cleanup(srv.Close)
+
+		cl := client.New(srv.URL, "")
+		cl.SetSmallFileThresholdForTests(1 << 20)
+		dir := t.TempDir()
+		ledger, err := staging.NewStaging(filepath.Join(dir, "ledger"))
+		require.NoError(t, err)
+		t.Cleanup(ledger.Close)
+		wbCache, err := staging.NewWriteBackCache(filepath.Join(dir, "wbc"))
+		require.NoError(t, err)
+		wb, err := writeback.New(writeback.Options{
+			Policy:     writeback.PolicyWriteBack,
+			SyncMode:   "interactive",
+			Client:     cl,
+			Staging:    ledger,
+			WriteCache: wbCache,
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+
+		terminal, err := core.New(cl, core.Options{})
+		require.NoError(t, err)
+		f, err := New(Options{Extensions: []fs.Handler{wb, terminal}, DefaultPermissions: true})
+		require.NoError(t, err)
+
+		tIno := lookupFacade(t, f, "target")
+		tHdr := gofuse.InHeader{NodeId: tIno}
+		var rOut gofuse.OpenOut
+		require.Equal(t, gofuse.OK, f.Open(nil, &gofuse.OpenIn{InHeader: tHdr, Flags: syscall.O_RDONLY}, &rOut))
+
+		pauseTargetGet.Store(true)
+		unlinkCh := make(chan gofuse.Status, 1)
+		go func() { unlinkCh <- f.Unlink(nil, rootHeader(), "target") }()
+
+		<-targetGetEntered
+		// Commit 8 unrelated files while PrepareOpenUnlink("/target") is capturing its snapshot!
+		for i := 0; i < 8; i++ {
+			uName := fmt.Sprintf("unrelated_%d", i)
+			uIno := lookupFacade(t, f, uName)
+			uHdr := gofuse.InHeader{NodeId: uIno}
+			var uOut gofuse.OpenOut
+			require.Equal(t, gofuse.OK, f.Open(nil, &gofuse.OpenIn{InHeader: uHdr, Flags: syscall.O_RDWR}, &uOut))
+			_, st := f.Write(nil, &gofuse.WriteIn{InHeader: uHdr, Fh: uOut.Fh}, []byte(fmt.Sprintf("new-%d", i)))
+			require.Equal(t, gofuse.OK, st)
+			require.Equal(t, gofuse.OK, f.Fsync(nil, &gofuse.FsyncIn{InHeader: uHdr, Fh: uOut.Fh}))
+			f.Release(nil, &gofuse.ReleaseIn{InHeader: uHdr, Fh: uOut.Fh})
+		}
+		require.True(t, f.Drain(context.Background()).OK)
+
+		pauseTargetGet.Store(false)
+		close(releaseTargetGet)
+		require.Equal(t, gofuse.OK, <-unlinkCh, "unrelated file commits must not trigger EAGAIN on POSIX unlink")
+		f.Release(nil, &gofuse.ReleaseIn{InHeader: tHdr, Fh: rOut.Fh})
+	})
+
+	t.Run("anonymous_unlinked_handle_isolates_replacement_and_cleans_recovered_shadow", func(t *testing.T) {
+		b := testbackend.NewBackend()
+		srv := httptest.NewServer(b)
+		t.Cleanup(srv.Close)
+
+		cl := client.New(srv.URL, "")
+		cl.SetSmallFileThresholdForTests(1 << 20)
+		dir := t.TempDir()
+		ledger, err := staging.NewStaging(filepath.Join(dir, "ledger"))
+		require.NoError(t, err)
+		t.Cleanup(ledger.Close)
+		wbCache, err := staging.NewWriteBackCache(filepath.Join(dir, "wbc"))
+		require.NoError(t, err)
+		wb, err := writeback.New(writeback.Options{
+			Policy:     writeback.PolicyWriteBack,
+			SyncMode:   "interactive",
+			Client:     cl,
+			Staging:    ledger,
+			WriteCache: wbCache,
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+
+		terminal, err := core.New(cl, core.Options{})
+		require.NoError(t, err)
+		f, err := New(Options{Extensions: []fs.Handler{wb, terminal}, DefaultPermissions: true})
+		require.NoError(t, err)
+
+		// 1. Open unwritten O_CREAT handle at /reuse, unlink /reuse (pin == 0), then create
+		// a new file at /reuse with staged Shadow + wbCache bytes; old fd must NEVER read replacement bytes!
+		var cEntry gofuse.EntryOut
+		var cOut gofuse.CreateOut
+		require.Equal(t, gofuse.OK, f.Create(nil, &gofuse.CreateIn{InHeader: *rootHeader(), Flags: syscall.O_CREAT | syscall.O_RDWR, Mode: 0o644}, "reuse", &cOut))
+		cEntry = cOut.EntryOut
+		oldHdr := gofuse.InHeader{NodeId: cEntry.NodeId}
+		require.Equal(t, gofuse.OK, f.Unlink(nil, rootHeader(), "reuse"))
+
+		var repOut gofuse.CreateOut
+		require.Equal(t, gofuse.OK, f.Create(nil, &gofuse.CreateIn{InHeader: *rootHeader(), Flags: syscall.O_CREAT | syscall.O_RDWR, Mode: 0o644}, "reuse", &repOut))
+		repHdr := gofuse.InHeader{NodeId: repOut.NodeId}
+		_, st := f.Write(nil, &gofuse.WriteIn{InHeader: repHdr, Fh: repOut.Fh}, []byte("SECRET-REPLACEMENT-BYTES"))
+		require.Equal(t, gofuse.OK, st)
+		require.Equal(t, gofuse.OK, f.Flush(nil, &gofuse.FlushIn{InHeader: repHdr, Fh: repOut.Fh}))
+		require.NoError(t, ledger.Shadow.WriteFull("/reuse", []byte("SECRET-SHADOW-BYTES"), 1))
+
+		// Reading or partial-writing on the old anonymous O_CREAT handle must see 0 replacement bytes!
+		rr, rst := f.Read(nil, &gofuse.ReadIn{InHeader: oldHdr, Fh: cOut.Fh, Offset: 0, Size: 64}, make([]byte, 64))
+		require.Equal(t, gofuse.OK, rst)
+		nRead, _ := rr.Bytes(make([]byte, 64))
+		require.Empty(t, nRead)
+		_, wst := f.Write(nil, &gofuse.WriteIn{InHeader: oldHdr, Fh: cOut.Fh, Offset: 4}, []byte("xy"))
+		require.Equal(t, gofuse.OK, wst)
+		buf := make([]byte, 16)
+		rr2, rst2 := f.Read(nil, &gofuse.ReadIn{InHeader: oldHdr, Fh: cOut.Fh, Offset: 0, Size: 16}, buf)
+		require.Equal(t, gofuse.OK, rst2)
+		gotSlice, _ := rr2.Bytes(buf)
+		require.Equal(t, "\x00\x00\x00\x00xy", string(gotSlice))
+
+		f.Release(nil, &gofuse.ReleaseIn{InHeader: oldHdr, Fh: cOut.Fh})
+		f.Release(nil, &gofuse.ReleaseIn{InHeader: repHdr, Fh: repOut.Fh})
+		ledger.Shadow.Remove("/reuse")
+	})
+
+	t.Run("wbcache_deferred_until_staging_succeeds_and_link_serializes_with_unlink", func(t *testing.T) {
+		b := testbackend.NewBackend()
+		b.Seed("/a", []byte("v0"))
+		b.Seed("/b", []byte("v0"))
+		srv := httptest.NewServer(b)
+		t.Cleanup(srv.Close)
+
+		cl := client.New(srv.URL, "")
+		cl.SetSmallFileThresholdForTests(1 << 20)
+		dir := t.TempDir()
+		ledger, err := staging.NewStaging(filepath.Join(dir, "ledger"))
+		require.NoError(t, err)
+		t.Cleanup(ledger.Close)
+		wbCache, err := staging.NewWriteBackCache(filepath.Join(dir, "wbc"))
+		require.NoError(t, err)
+		wb, err := writeback.New(writeback.Options{
+			Policy:     writeback.PolicyWriteBack,
+			SyncMode:   "interactive",
+			Client:     cl,
+			Staging:    ledger,
+			WriteCache: wbCache,
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+
+		terminal, err := core.New(cl, core.Options{})
+		require.NoError(t, err)
+		f, err := New(Options{Extensions: []fs.Handler{wb, terminal}, DefaultPermissions: true})
+		require.NoError(t, err)
+
+		// Stage older wbCache at /b and newer wbCache + Staging at /a, then close WAL so Staging fails:
+		// /b's older wbCache entry must NOT have been destructively overwritten!
+		bCacheBytes := []byte("b-cache-intact")
+		aCacheBytes := []byte("a-cache-newer")
+		_, _, err = wbCache.PutWithBaseRevAndModeAndLineageTimingsNoSync("/b", bCacheBytes, int64(len(bCacheBytes)), staging.PendingOverwrite, 1, 0, false, "", "", false)
+		require.NoError(t, err)
+		_, _, err = wbCache.PutWithBaseRevAndModeAndLineageTimingsNoSync("/a", aCacheBytes, int64(len(aCacheBytes)), staging.PendingOverwrite, 1, 0, false, "", "", false)
+		require.NoError(t, err)
+
+		aIno := lookupFacade(t, f, "a")
+		aHdr := gofuse.InHeader{NodeId: aIno}
+		var aOut gofuse.OpenOut
+		require.Equal(t, gofuse.OK, f.Open(nil, &gofuse.OpenIn{InHeader: aHdr, Flags: syscall.O_RDWR}, &aOut))
+		f.inodes.RemoveLink("/b")
+		require.True(t, f.inodes.AddAlias(aIno, "/b", "", 2, false, 2, time.Now()))
+
+		require.NoError(t, ledger.Shadow.WriteFull("/a", []byte("a-staging"), 1))
+		_, err = ledger.Pending.Put("/a", int64(len("a-staging")), staging.PendingOverwrite)
+		require.NoError(t, err)
+		require.NoError(t, ledger.Journal.Close())
+
+		require.NotEqual(t, gofuse.OK, f.Unlink(nil, rootHeader(), "a"))
+		gotBCache, bok := wbCache.Get("/b")
+		require.True(t, bok)
+		require.Equal(t, "b-cache-intact", string(gotBCache))
+		f.Release(nil, &gofuse.ReleaseIn{InHeader: aHdr, Fh: aOut.Fh})
+
+		// Also verify concurrent FS.Link + FS.Unlink on an open file never leaves a dangling alias or panics under -race.
+		b.Seed("/link_src", []byte("link-seed"))
+		lIno := lookupFacade(t, f, "link_src")
+		lHdr := gofuse.InHeader{NodeId: lIno}
+		var lOut gofuse.OpenOut
+		require.Equal(t, gofuse.OK, f.Open(nil, &gofuse.OpenIn{InHeader: lHdr, Flags: syscall.O_RDWR}, &lOut))
+		var wg sync.WaitGroup
+		var linkSt, unlinkSt gofuse.Status
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			var eo gofuse.EntryOut
+			linkSt = f.Link(nil, &gofuse.LinkIn{InHeader: *rootHeader(), Oldnodeid: lIno}, "link_dst", &eo)
+		}()
+		go func() {
+			defer wg.Done()
+			unlinkSt = f.Unlink(nil, rootHeader(), "link_src")
+		}()
+		wg.Wait()
+		require.Equal(t, gofuse.OK, unlinkSt)
+		if linkSt == gofuse.OK {
+			// Link ran before Unlink: /link_dst must be bound to lIno as survivor!
+			dstIno, dok := f.inodes.GetInode("/link_dst")
+			require.True(t, dok)
+			require.Equal(t, lIno, dstIno)
+		} else {
+			require.Equal(t, gofuse.ENOENT, linkSt)
+		}
+		f.Release(nil, &gofuse.ReleaseIn{InHeader: lHdr, Fh: lOut.Fh})
 	})
 }
