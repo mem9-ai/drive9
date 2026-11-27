@@ -5,10 +5,12 @@ package fuse
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -749,6 +751,18 @@ type failingStopHandler struct {
 	stopErr error
 }
 
+type churnReadHandle struct {
+	fs.Handle
+	onRead func()
+}
+
+func (h *churnReadHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
+	if h.onRead != nil {
+		h.onRead()
+	}
+	return h.Handle.Read(ctx, off, dest)
+}
+
 func (h *failingStopHandler) Start(context.Context) error { return nil }
 func (h *failingStopHandler) Drain(context.Context) error { return nil }
 func (h *failingStopHandler) Stop(context.Context) error  { return h.stopErr }
@@ -1052,5 +1066,412 @@ func TestSelfFenceStep2ToStep3AbortAndPendingTargetStopError(t *testing.T) {
 
 		require.Equal(t, mountcontrol.CodeSwitchRecovering, resp.Code)
 		require.Contains(t, resp.Error, "injected pendingTarget stop failure")
+	})
+}
+
+// TestRound9IncrementalFollowUpRegressions covers the 4 narrow Round 9
+// incremental review findings:
+//  1. Drain(ctx) cancels promptly while a prior last-close DELETE holds deferredUnlink lock
+//     + prepareViewSwitch retains failed deferred DELETE and succeeds on retry (@dev-2);
+//  2. acquireLock 4-refresh exhaustion returns EAGAIN instead of running commit unlocked (@adversary-2);
+//  3. destWasLive == true reversible rollback restores both endpoints' shadows, kinds,
+//     and CommitQueue entries on pre-publish / WAL / meta failure (@adversary-1 #1);
+//  4. FS.Unlink 64-attempt hardlink churn exhaustion returns EAGAIN instead of falling
+//     through with survivor == "" (@adversary-1 #2).
+func TestRound9IncrementalFollowUpRegressions(t *testing.T) {
+	t.Run("drain_cancels_while_prior_release_delete_holds_lock_and_prepare_switch_retries", func(t *testing.T) {
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		var once sync.Once
+		unblock := func() { once.Do(func() { close(release) }) }
+		t.Cleanup(unblock)
+
+		h := fs.HandlerFunc(func(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
+			if op.Kind == fs.OpUnlink {
+				close(entered)
+				<-release
+				return fs.Result{}, nil
+			}
+			return next(ctx, op)
+		})
+		f, err := New(Options{Extensions: []fs.Handler{h}})
+		require.NoError(t, err)
+
+		entry := &deferredUnlink{path: "/gone", ino: 99}
+		f.deferredUnlinks = map[string]*deferredUnlink{"/gone": entry}
+		deleted := make(chan error, 1)
+		go func() { deleted <- f.runDeferredUnlink(entry, true) }()
+		<-entered
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+		drained := make(chan mountcontrol.DrainResponse, 1)
+		go func() { drained <- f.Drain(ctx) }()
+		<-ctx.Done()
+
+		select {
+		case resp := <-drained:
+			require.False(t, resp.OK)
+		case <-time.After(250 * time.Millisecond):
+			unblock()
+			t.Fatal("Drain ignored expired caller context while last-close DELETE held deferredUnlink lock")
+		}
+		// Deferred entry remains tracked while the prior DELETE is still in flight.
+		require.True(t, f.isDeferredUnlink("/gone"))
+
+		unblock()
+		require.NoError(t, <-deleted)
+		require.False(t, f.isDeferredUnlink("/gone"))
+
+		// Also verify prepareViewSwitch retains failed deferred DELETE and clears on retry.
+		failDelete := true
+		h2 := fs.HandlerFunc(func(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
+			if op.Kind == fs.OpUnlink {
+				if failDelete {
+					return fs.Result{}, errors.New("injected remote delete failure")
+				}
+				return fs.Result{}, nil
+			}
+			return next(ctx, op)
+		})
+		f2, err := New(Options{Extensions: []fs.Handler{h2}})
+		require.NoError(t, err)
+		f2.deferredUnlinks = map[string]*deferredUnlink{"/gone": {path: "/gone", ino: 99}}
+		v := &viewRequestFS{inner: f2}
+		v.selected.Store(&viewRequestTarget{fs: f2, generation: 1})
+		fence := func(context.Context) error { return nil }
+
+		pause, _, perr := v.prepareViewSwitch(context.Background(), f2, noopViewNotifier{}, fence)
+		require.ErrorIs(t, perr, errViewPrepareFailed)
+		require.Nil(t, pause)
+		require.True(t, f2.isDeferredUnlink("/gone"))
+		require.False(t, f2.viewSwitchPreflight().OK)
+
+		failDelete = false
+		pause, _, perr = v.prepareViewSwitch(context.Background(), f2, noopViewNotifier{}, fence)
+		require.NoError(t, perr)
+		require.NotNil(t, pause)
+		defer func() { _ = pause.resume() }()
+		require.False(t, f2.isDeferredUnlink("/gone"))
+		require.True(t, f2.viewSwitchPreflight().OK)
+	})
+
+	t.Run("acquire_lock_refresh_exhaustion_returns_eagain_without_unlocked_commit", func(t *testing.T) {
+		b := testbackend.NewBackend()
+		b.Seed("/churn", []byte("v00"))
+		b.Seed("/other", []byte("o0"))
+		srv := httptest.NewServer(b)
+		t.Cleanup(srv.Close)
+
+		cl := client.New(srv.URL, "")
+		cl.SetSmallFileThresholdForTests(1 << 20)
+		wbCache, err := staging.NewWriteBackCache(filepath.Join(t.TempDir(), "wbc"))
+		require.NoError(t, err)
+		wb, err := writeback.New(writeback.Options{
+			Policy:     writeback.PolicyWriteBack,
+			Client:     cl,
+			WriteCache: wbCache,
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+
+		var commitCalled atomic.Bool
+		var bumpCount atomic.Int32
+		var armChurn atomic.Bool
+
+		hook := &round9UnlinkHook{
+			Writeback: wb,
+			beforeCommit: func() {
+				commitCalled.Store(true)
+			},
+		}
+		// Wrap inner handle reads on /churn so every captureSnapshot (initial +
+		// all 4 refreshes) advances wbCache's PutGen while keeping len(.dat)=2 != meta.Size=3
+		// so stagedImage keeps falling through to h.inner.Read without pruning .meta.
+		readBump := fs.HandlerFunc(func(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
+			res, err := next(ctx, op)
+			if err == nil && op.Path == "/churn" && res.Handle != nil {
+				res.Handle = &churnReadHandle{Handle: res.Handle, onRead: func() {
+					if armChurn.Load() && bumpCount.Add(1) <= 16 {
+						_, _, _ = wbCache.PutWithBaseRevAndModeAndLineageTimingsNoSync("/churn", []byte("xx"), 3, staging.PendingOverwrite, 1, 0, false, "", "", false)
+					}
+				}}
+			}
+			return res, err
+		})
+		terminal, err := core.New(cl, core.Options{})
+		require.NoError(t, err)
+		f, err := New(Options{Extensions: []fs.Handler{hook, readBump, terminal}, DefaultPermissions: true})
+		require.NoError(t, err)
+
+		cIno := lookupFacade(t, f, "churn")
+		cHdr := gofuse.InHeader{NodeId: cIno}
+		var rOut gofuse.OpenOut
+		require.Equal(t, gofuse.OK, f.Open(nil, &gofuse.OpenIn{InHeader: cHdr, Flags: syscall.O_RDONLY}, &rOut))
+		armChurn.Store(true)
+
+		st := f.Unlink(nil, rootHeader(), "churn")
+		require.Equal(t, gofuse.Status(syscall.EAGAIN), st)
+		require.False(t, commitCalled.Load(), "commit must never run when acquireLock exhausts snapshot refreshes")
+
+		f.Release(nil, &gofuse.ReleaseIn{InHeader: cHdr, Fh: rOut.Fh})
+	})
+
+	t.Run("dest_was_live_reversible_rollback_restores_both_endpoints_and_queues", func(t *testing.T) {
+		// Part 1: Direct PendingConflictTransfer with destWasLive == true + CommitReversible meta failure.
+		dir := t.TempDir()
+		ledger, err := staging.NewStaging(dir)
+		require.NoError(t, err)
+		t.Cleanup(ledger.Close)
+
+		dstBytes := []byte("older-survivor-payload")
+		srcBytes := []byte("newer-source-payload!!")
+		require.NoError(t, ledger.Shadow.WriteFull("/survivor", dstBytes, 1))
+		dstGen, err := ledger.Pending.Put("/survivor", int64(len(dstBytes)), staging.PendingOverwrite)
+		require.NoError(t, err)
+
+		require.NoError(t, ledger.Shadow.WriteFull("/held", srcBytes, 1))
+		srcGen, err := ledger.Pending.Put("/held", int64(len(srcBytes)), staging.PendingOverwrite)
+		require.NoError(t, err)
+		require.Greater(t, srcGen, dstGen)
+
+		tx, ok, err := ledger.Pending.BeginConflictTransfer("/held", "/survivor", srcGen, dstGen, ledger.Shadow)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.True(t, tx.MovePayloadReversible())
+
+		// Force CommitReversible's writeMetaFile("/survivor") to fail via EISDIR.
+		dstMetaPath := filepath.Join(dir, "pending", staging.HashPath("/survivor")+".meta")
+		require.NoError(t, os.Remove(dstMetaPath))
+		require.NoError(t, os.MkdirAll(filepath.Join(dstMetaPath, "blocker"), 0o755))
+
+		committed, cerr := tx.CommitReversible()
+		require.Error(t, cerr)
+		require.False(t, committed)
+
+		// Remove blocker dir so we can inspect/recover cleanly.
+		require.NoError(t, os.RemoveAll(dstMetaPath))
+
+		// Both /held and /survivor shadows must be restored to their exact original bytes!
+		gotSrc, err := ledger.Shadow.ReadAll("/held")
+		require.NoError(t, err)
+		require.Equal(t, string(srcBytes), string(gotSrc))
+		gotDst, err := ledger.Shadow.ReadAll("/survivor")
+		require.NoError(t, err)
+		require.Equal(t, string(dstBytes), string(gotDst))
+		srcMeta, sok := ledger.Pending.GetMeta("/held")
+		require.True(t, sok)
+		require.Equal(t, staging.PendingOverwrite, srcMeta.Kind)
+		require.Equal(t, int64(len(srcBytes)+len(dstBytes)), ledger.Shadow.PendingBytes())
+
+		// Part 2: End-to-end FS.Unlink with both /held and /survivor queued when WAL JournalRenameMarkerLocked fails!
+		b := testbackend.NewBackend()
+		b.Seed("/held", []byte("v0"))
+		b.Seed("/survivor", []byte("v0"))
+		var holdPut atomic.Bool
+		holdPut.Store(true)
+		releasePut := make(chan struct{})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if (r.Method == http.MethodPut || r.Method == http.MethodPost) && holdPut.Load() {
+				select {
+				case <-r.Context().Done():
+					http.Error(w, "canceled", http.StatusRequestTimeout)
+					return
+				case <-releasePut:
+				}
+			}
+			b.ServeHTTP(w, r)
+		}))
+		t.Cleanup(srv.Close)
+
+		cl := client.New(srv.URL, "")
+		cl.SetSmallFileThresholdForTests(1 << 20)
+		e2eDir := t.TempDir()
+		e2eLedger, err := staging.NewStaging(e2eDir)
+		require.NoError(t, err)
+		t.Cleanup(e2eLedger.Close)
+		wb, err := writeback.New(writeback.Options{
+			Policy:                  writeback.PolicyWriteBack,
+			SyncMode:                "interactive",
+			Client:                  cl,
+			Staging:                 e2eLedger,
+			RemoteCommitWaitTimeout: 100 * time.Millisecond,
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+		t.Cleanup(func() {
+			holdPut.Store(false)
+			select {
+			case <-releasePut:
+			default:
+				close(releasePut)
+			}
+		})
+
+		terminal, err := core.New(cl, core.Options{})
+		require.NoError(t, err)
+		f, err := New(Options{Extensions: []fs.Handler{wb, terminal}, DefaultPermissions: true})
+		require.NoError(t, err)
+
+		// Open /held2 as its own inode first, stage newer write, then bind /surv2 as alias so /held2 has live handle + newer Pending!
+		b.Seed("/held2", []byte("v0"))
+		b.Seed("/surv2", []byte("v0"))
+		surv2Ino := lookupFacade(t, f, "surv2")
+		surv2Hdr := gofuse.InHeader{NodeId: surv2Ino}
+		var surv2Out gofuse.OpenOut
+		require.Equal(t, gofuse.OK, f.Open(nil, &gofuse.OpenIn{InHeader: surv2Hdr, Flags: syscall.O_RDWR}, &surv2Out))
+		_, st := f.Write(nil, &gofuse.WriteIn{InHeader: surv2Hdr, Fh: surv2Out.Fh}, dstBytes)
+		require.Equal(t, gofuse.OK, st)
+		require.Equal(t, gofuse.OK, f.Fsync(nil, &gofuse.FsyncIn{InHeader: surv2Hdr, Fh: surv2Out.Fh}))
+		f.Release(nil, &gofuse.ReleaseIn{InHeader: surv2Hdr, Fh: surv2Out.Fh})
+
+		held2Ino := lookupFacade(t, f, "held2")
+		held2Hdr := gofuse.InHeader{NodeId: held2Ino}
+		var held2Out gofuse.OpenOut
+		require.Equal(t, gofuse.OK, f.Open(nil, &gofuse.OpenIn{InHeader: held2Hdr, Flags: syscall.O_RDWR}, &held2Out))
+		_, st = f.Write(nil, &gofuse.WriteIn{InHeader: held2Hdr, Fh: held2Out.Fh}, srcBytes)
+		require.Equal(t, gofuse.OK, st)
+		require.Equal(t, gofuse.OK, f.Fsync(nil, &gofuse.FsyncIn{InHeader: held2Hdr, Fh: held2Out.Fh}))
+		// Rebind /surv2 onto held2Ino so both /held2 (newer) and /surv2 (older) are live in Staging + CommitQueue!
+		f.inodes.RemoveLink("/surv2")
+		require.True(t, f.inodes.AddAlias(held2Ino, "/surv2", "", 2, false, 2, time.Now()))
+
+		// Close the WAL fd so JournalRenameMarkerLocked fails deterministically!
+		require.NoError(t, e2eLedger.Journal.Close())
+
+		ust := f.Unlink(nil, rootHeader(), "held2")
+		require.NotEqual(t, gofuse.OK, ust)
+
+		// Both /held2 and /surv2 must retain their original shadows, live PendingOverwrite kind, and re-enqueued uploads!
+		gotH2, err := e2eLedger.Shadow.ReadAll("/held2")
+		require.NoError(t, err)
+		require.Equal(t, string(srcBytes), string(gotH2))
+		gotS2, err := e2eLedger.Shadow.ReadAll("/surv2")
+		require.NoError(t, err)
+		require.Equal(t, string(dstBytes), string(gotS2))
+		hm2, hok := e2eLedger.Pending.GetMeta("/held2")
+		require.True(t, hok)
+		require.Equal(t, staging.PendingOverwrite, hm2.Kind)
+		sm2, sok2 := e2eLedger.Pending.GetMeta("/surv2")
+		require.True(t, sok2)
+		require.Equal(t, staging.PendingOverwrite, sm2.Kind)
+
+		// Unblock uploads and verify BOTH re-enqueued entries land on the backend!
+		holdPut.Store(false)
+		close(releasePut)
+		f.Release(nil, &gofuse.ReleaseIn{InHeader: held2Hdr, Fh: held2Out.Fh})
+		dresp := f.Drain(context.Background())
+		require.True(t, dresp.OK, dresp.Error)
+		nH2, okH2 := b.Node("/held2")
+		require.True(t, okH2)
+		require.Equal(t, string(srcBytes), string(nH2.Data))
+		nS2, okS2 := b.Node("/surv2")
+		require.True(t, okS2)
+		require.Equal(t, string(dstBytes), string(nS2.Data))
+	})
+
+	t.Run("hardlink_churn_64_attempts_returns_eagain_without_destroying_state", func(t *testing.T) {
+		b := testbackend.NewBackend()
+		srv := httptest.NewServer(b)
+		t.Cleanup(srv.Close)
+
+		cl := client.New(srv.URL, "")
+		cl.SetSmallFileThresholdForTests(1 << 20)
+		ledger, err := staging.NewStaging(t.TempDir())
+		require.NoError(t, err)
+		t.Cleanup(ledger.Close)
+		wb, err := writeback.New(writeback.Options{
+			Policy:   writeback.PolicyWriteBack,
+			SyncMode: "interactive",
+			Client:   cl,
+			Staging:  ledger,
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+		terminal, err := core.New(cl, core.Options{})
+		require.NoError(t, err)
+		f, err := New(Options{Extensions: []fs.Handler{wb, terminal}, DefaultPermissions: true})
+		require.NoError(t, err)
+
+		// Pick a child name whose openNameStripe leaves at least two higher stripes for ping-pong survivors.
+		var childName, childPath string
+		var childStripe int
+		for idx := 0; idx < 512; idx++ {
+			candName := fmt.Sprintf("target_%d", idx)
+			candPath := "/" + candName
+			s := f.openNameStripe(candPath)
+			if s <= len(f.openNames)-3 {
+				childName, childPath, childStripe = candName, candPath, s
+				break
+			}
+		}
+		require.NotEmpty(t, childName)
+
+		var surv0, surv1 string
+		for idx := 0; idx < 2048 && (surv0 == "" || surv1 == ""); idx++ {
+			cand := fmt.Sprintf("/surv_%d", idx)
+			s := f.openNameStripe(cand)
+			if s > childStripe {
+				if surv0 == "" {
+					surv0 = cand
+				} else if s != f.openNameStripe(surv0) {
+					surv1 = cand
+				}
+			}
+		}
+		require.NotEmpty(t, surv0)
+		require.NotEmpty(t, surv1)
+
+		b.Seed(childPath, []byte("seed"))
+		ino := lookupFacade(t, f, childName)
+		hdr := gofuse.InHeader{NodeId: ino}
+		var openOut gofuse.OpenOut
+		require.Equal(t, gofuse.OK, f.Open(nil, &gofuse.OpenIn{InHeader: hdr, Flags: syscall.O_RDWR}, &openOut))
+		_, st := f.Write(nil, &gofuse.WriteIn{InHeader: hdr, Fh: openOut.Fh}, []byte("buffered-edit"))
+		require.Equal(t, gofuse.OK, st)
+
+		cur, next := surv0, surv1
+		require.True(t, f.inodes.AddAlias(ino, cur, "", 2, false, 2, time.Now()))
+		muCur := f.openNameLock(cur)
+		muNext := f.openNameLock(next)
+		muCur.Lock()
+		muNext.Lock()
+
+		unlinkDone := make(chan gofuse.Status, 1)
+		go func() { unlinkDone <- f.Unlink(nil, rootHeader(), childName) }()
+
+		deadline := time.Now().Add(5 * time.Second)
+		var gotStatus gofuse.Status
+		finished := false
+		for time.Now().Before(deadline) {
+			select {
+			case gotStatus = <-unlinkDone:
+				finished = true
+			default:
+			}
+			if finished {
+				break
+			}
+			require.True(t, f.inodes.AddAlias(ino, next, "", 2, false, 2, time.Now()))
+			f.inodes.RemoveLinkPreserve(cur)
+			muCur.Unlock()
+			runtime.Gosched()
+			muCur.Lock()
+			cur, next = next, cur
+			muCur, muNext = muNext, muCur
+		}
+		muCur.Unlock()
+		muNext.Unlock()
+		if !finished {
+			gotStatus = <-unlinkDone
+		}
+		require.Equal(t, gofuse.EAGAIN, gotStatus)
+
+		// Child path must still be open, bound to ino, and readable/flushable!
+		_, stillBound := f.inodes.GetInode(childPath)
+		require.True(t, stillBound)
+		require.True(t, f.openIdx.HasOpenPath(childPath))
+		require.Equal(t, gofuse.OK, f.Flush(nil, &gofuse.FlushIn{InHeader: hdr, Fh: openOut.Fh}))
+		f.Release(nil, &gofuse.ReleaseIn{InHeader: hdr, Fh: openOut.Fh})
 	})
 }

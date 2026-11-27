@@ -1204,14 +1204,15 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 ) {
 	hasSurvivor := survivor != "" && survivor != p
 	var (
-		prepared    []preparedUnlinkSnapshot
-		snapshotErr error
-		prepStamp   unlinkContentStamp
-		extAborted  func() bool
-		pathUnlock  func()
-		movedCache  bool
-		oldCacheGen uint64
-		newCacheGen uint64
+		prepared         []preparedUnlinkSnapshot
+		snapshotErr      error
+		prepStamp        unlinkContentStamp
+		extAborted       func() bool
+		pathUnlock       func()
+		movedCache       bool
+		canceledSurvivor bool
+		oldCacheGen      uint64
+		newCacheGen      uint64
 	)
 	w.waitUploaderPath(p)
 	if hasSurvivor {
@@ -1239,10 +1240,10 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 		}
 		prepared = nil
 	}
-	reenqueueCanceledSourceLocked := func() {
+	reenqueueCanceledPathLocked := func(targetPath string) {
 		if isAborted() {
 			if w.queue != nil {
-				w.queue.PreserveAbortedUnlinkLocked(p)
+				w.queue.PreserveAbortedUnlinkLocked(targetPath)
 			}
 			return
 		}
@@ -1250,14 +1251,14 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 			return
 		}
 		st := w.opts.Staging
-		if st.Pending != nil && st.Pending.HasPending(p) && st.Shadow != nil && st.Shadow.Has(p) && !w.queue.HasPath(p) {
-			if entry := w.queue.recoveredEntry(p); entry != nil {
+		if m, mok := st.Pending.GetMeta(targetPath); mok && m != nil && m.Kind != staging.PendingConflict && st.Shadow != nil && st.Shadow.Has(targetPath) && !w.queue.HasPath(targetPath) {
+			if entry := w.queue.recoveredEntry(targetPath); entry != nil {
 				entry.PayloadBaseRev, entry.PayloadBaseRevSet = 0, false
 				if enqErr := w.queue.Enqueue(entry); enqErr != nil {
 					if errors.Is(enqErr, errLayerRolledBack) || isAborted() {
-						w.queue.PreserveAbortedUnlinkLocked(p)
+						w.queue.PreserveAbortedUnlinkLocked(targetPath)
 					} else {
-						safeLogPrintf("writeback: re-driving %s after failed open unlink: %v", p, enqErr)
+						safeLogPrintf("writeback: re-driving %s after failed open unlink: %v", targetPath, enqErr)
 					}
 				}
 			}
@@ -1270,9 +1271,15 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 			if fenced {
 				if w.queue != nil {
 					w.queue.PreserveAbortedUnlinkLocked(p)
+					if hasSurvivor && canceledSurvivor {
+						w.queue.PreserveAbortedUnlinkLocked(survivor)
+					}
 				}
 			} else {
-				reenqueueCanceledSourceLocked()
+				reenqueueCanceledPathLocked(p)
+				if hasSurvivor && canceledSurvivor {
+					reenqueueCanceledPathLocked(survivor)
+				}
 			}
 		}
 		releasePathLock()
@@ -1286,9 +1293,15 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 		if fenced {
 			if w.queue != nil {
 				w.queue.PreserveAbortedUnlinkLocked(p)
+				if hasSurvivor && canceledSurvivor {
+					w.queue.PreserveAbortedUnlinkLocked(survivor)
+				}
 			}
 		} else {
-			reenqueueCanceledSourceLocked()
+			reenqueueCanceledPathLocked(p)
+			if hasSurvivor && canceledSurvivor {
+				reenqueueCanceledPathLocked(survivor)
+			}
 		}
 		releasePathLock()
 		if !fenced && !isAborted() {
@@ -1309,27 +1322,49 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 		w.waitUploaderPath(p)
 		if hasSurvivor {
 			w.waitUploaderPath(survivor)
+			cancelStaleSurvivor := func() {
+				if w.opts.Staging == nil || w.opts.Staging.Pending == nil || w.queue == nil {
+					return
+				}
+				srcGen, _, srcConflict, srcLive := w.pendingImageState(p)
+				dstGen, _, dstConflict, dstLive := w.pendingImageState(survivor)
+				if (srcLive || srcConflict) && (dstLive || dstConflict) && dstGen <= srcGen {
+					cancels := w.queue.cancelPathEntries(survivor)
+					if len(cancels) > 0 || dstLive {
+						canceledSurvivor = true
+					}
+					for _, cancel := range cancels {
+						cancel()
+					}
+				}
+			}
 			if w.queue != nil {
 				for _, cancel := range w.queue.cancelPathEntries(p) {
 					cancel()
 				}
+				cancelStaleSurvivor()
 			}
 			pathUnlock = w.lockRenamePaths(p, survivor)
 			if w.queue != nil {
 				for _, cancel := range w.queue.cancelPathEntries(p) {
 					cancel()
 				}
+				cancelStaleSurvivor()
 			}
 			if isAborted() {
 				if w.queue != nil {
 					w.queue.PreserveAbortedUnlinkLocked(p)
+					if canceledSurvivor {
+						w.queue.PreserveAbortedUnlinkLocked(survivor)
+					}
 				}
 				releasePathLock()
 				return errLayerRolledBack
 			}
 			return nil
 		}
-		for refresh := 0; refresh < 4; refresh++ {
+		const maxUnlinkSnapshotRefreshes = 4
+		for refresh := 0; ; refresh++ {
 			if w.opts.Staging != nil && w.queue != nil {
 				unlock, err := w.queue.AcquireCancelPathLock(p, isAborted)
 				if err != nil {
@@ -1353,11 +1388,20 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 			}
 			curStamp := w.currentUnlinkContentStamp(p)
 			if curStamp == prepStamp || curStamp.hasPending {
-				break
+				return nil
+			}
+			if refresh >= maxUnlinkSnapshotRefreshes {
+				reenqueueCanceledPathLocked(p)
+				releasePathLock()
+				if !isAborted() {
+					w.submitOrphanedCacheForRollback(p, false)
+				}
+				closePrepared()
+				return syscall.EAGAIN
 			}
 			// A sibling flushed to wbCache or landed an upload before pathLocks(p)
 			// was acquired; refresh clean-reader snapshots off pathLocks(p).
-			reenqueueCanceledSourceLocked()
+			reenqueueCanceledPathLocked(p)
 			releasePathLock()
 			closePrepared()
 			prepStamp = w.currentUnlinkContentStamp(p)
@@ -1369,7 +1413,6 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 				return errLayerRolledBack
 			}
 		}
-		return nil
 	}
 	commit = func(aborted func() bool, linearizeNoWAL func() bool) error {
 		if aborted != nil {
@@ -1439,7 +1482,7 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 				srcGen, _, srcConflict, srcLive := w.pendingImageState(p)
 				dstGen, _, dstConflict, dstLive := w.pendingImageState(survivor)
 				switch {
-				case (srcLive || srcConflict) && !((dstLive || dstConflict) && dstGen > srcGen):
+				case (srcLive || srcConflict) && ((!dstLive && !dstConflict) || dstGen <= srcGen):
 					fence := renameFence{movedAt: time.Now()}
 					if dstGen != 0 {
 						fence.preGen = map[string]uint64{survivor: dstGen}
@@ -1469,7 +1512,11 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 							cancel()
 						}
 						if dstConflictNow || dstLiveNow {
-							for _, cancel := range w.queue.cancelPathEntries(survivor) {
+							cancels := w.queue.cancelPathEntries(survivor)
+							if len(cancels) > 0 || dstLiveNow {
+								canceledSurvivor = true
+							}
+							for _, cancel := range cancels {
 								cancel()
 							}
 						}
@@ -1490,7 +1537,7 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 						}
 						return fmt.Errorf("writeback: begin survivor transfer %s -> %s failed", p, survivor)
 					}
-					if !transfer.MovePayload() {
+					if !transfer.MovePayloadReversible() {
 						transfer.RollbackPrePublish()
 						reverseWBCache()
 						rollbackFailedCommit()
@@ -1502,6 +1549,14 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 						rollbackFailedCommit()
 						return errLayerRolledBack
 					}
+					if w.queue != nil {
+						if _, jerr := w.queue.JournalRenameMarkerLocked(p, isAborted); jerr != nil {
+							transfer.RollbackPrePublish()
+							reverseWBCache()
+							rollbackFailedCommit()
+							return jerr
+						}
+					}
 					committed, cerr := transfer.CommitReversible()
 					if cerr != nil || !committed {
 						reverseWBCache()
@@ -1511,10 +1566,8 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 						}
 						return fmt.Errorf("writeback: survivor transfer %s -> %s lost fence", p, survivor)
 					}
+					canceledSurvivor = false
 					walCommitted = true
-					if w.queue != nil {
-						_, _ = w.queue.JournalRenameMarkerLocked(p, nil)
-					}
 					if srcLive {
 						newPendingGen := transfer.PreparedGeneration()
 						if isAborted() {
@@ -1675,7 +1728,6 @@ func (w *Writeback) PrepareOpenUnlink(p, survivor string) (
 				if pin == 0 {
 					if prePinned {
 						pin = prePin
-						prePinned = false
 					} else {
 						pin = w.opts.Staging.Shadow.Pin(p)
 					}
@@ -1770,15 +1822,19 @@ func (w *Writeback) PreparePathUnlink(p string, hasSurvivor bool) func(bool) err
 }
 
 type unlinkContentStamp struct {
-	commitSeq  uint64
-	pendingGen uint64
-	hasPending bool
-	cacheGen   uint64
-	hasCache   bool
+	commitSeq      uint64
+	queueCommitSeq uint64
+	pendingGen     uint64
+	hasPending     bool
+	cacheGen       uint64
+	hasCache       bool
 }
 
 func (w *Writeback) currentUnlinkContentStamp(p string) unlinkContentStamp {
 	st := unlinkContentStamp{commitSeq: w.commitSeq.Load()}
+	if w.queue != nil {
+		st.queueCommitSeq = w.queue.CommitSeq(p)
+	}
 	if w.opts.Staging != nil && w.opts.Staging.Pending != nil {
 		if m, ok := w.opts.Staging.Pending.GetMeta(p); ok && m != nil {
 			st.hasPending = true

@@ -564,9 +564,35 @@ func (f *FS) stampOwner(ino uint64, caller fs.Caller) {
 }
 
 type deferredUnlink struct {
-	mu   sync.Mutex
-	path string
-	ino  uint64
+	once   sync.Once
+	lockCh chan struct{}
+	path   string
+	ino    uint64
+}
+
+func (d *deferredUnlink) sem() chan struct{} {
+	d.once.Do(func() {
+		d.lockCh = make(chan struct{}, 1)
+		d.lockCh <- struct{}{}
+	})
+	return d.lockCh
+}
+
+func (d *deferredUnlink) lock() {
+	<-d.sem()
+}
+
+func (d *deferredUnlink) lockContext(ctx context.Context) error {
+	select {
+	case <-d.sem():
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (d *deferredUnlink) unlock() {
+	d.sem() <- struct{}{}
 }
 
 // isDeferredUnlink also includes deletions whose remote request is in flight.
@@ -600,12 +626,22 @@ func (f *FS) maybeRunDeferredUnlink(ino uint64) {
 // during I/O. Waiters recheck ownership after acquiring the entry's lock: a
 // completed deletion must never run again against a replacement object.
 func (f *FS) runDeferredUnlink(pending *deferredUnlink, requireClosed bool) error {
-	return f.runDeferredUnlinkWithContext(nil, pending, requireClosed)
+	pending.lock()
+	defer pending.unlock()
+	// Detached budget: release completes deletion before replying, even if the
+	// caller's original request has already been cancelled.
+	return f.runDeferredUnlinkLocked(context.Background(), pending, requireClosed)
 }
 
 func (f *FS) runDeferredUnlinkWithContext(parentCtx context.Context, pending *deferredUnlink, requireClosed bool) error {
-	pending.mu.Lock()
-	defer pending.mu.Unlock()
+	if err := pending.lockContext(parentCtx); err != nil {
+		return err
+	}
+	defer pending.unlock()
+	return f.runDeferredUnlinkLocked(parentCtx, pending, requireClosed)
+}
+
+func (f *FS) runDeferredUnlinkLocked(parentCtx context.Context, pending *deferredUnlink, requireClosed bool) error {
 	f.mu.Lock()
 	current := f.deferredUnlinks[pending.path] == pending
 	f.mu.Unlock()
@@ -615,11 +651,6 @@ func (f *FS) runDeferredUnlinkWithContext(parentCtx context.Context, pending *de
 	path := pending.path
 	// A name rebound to a newer inode is not the old object's to delete.
 	if cur, ok := f.inodes.GetInode(path); !ok || cur == pending.ino {
-		if parentCtx == nil {
-			// Detached budget: release completes deletion before replying, even
-			// if the caller's original request has already been cancelled.
-			parentCtx = context.Background()
-		}
 		ctx, cancel := context.WithTimeout(parentCtx, 30*time.Second)
 		defer cancel()
 		if _, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpUnlink, Path: path}); err != nil && fs.StatusOf(err) != gofuse.ENOENT {
@@ -2151,48 +2182,58 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 	}()
 	survivor := ""
 	candSurv := ""
+	resolved := false
 	for attempt := 0; attempt < 64; attempt++ {
 		if !f.openIdx.HasOpenPath(child) {
 			survivor = ""
+			resolved = true
 			break
 		}
 		ino0, ok0 := f.inodes.GetInode(child)
 		if !ok0 {
 			survivor = ""
+			resolved = true
 			break
 		}
 		surv0 := candSurv
-		candSurv = ""
 		if surv0 == "" || surv0 == child {
 			surv0, _ = f.inodes.SurvivorOfInode(ino0, child)
 		}
 		if surv0 == "" || surv0 == child {
 			survivor = ""
+			resolved = true
 			break
 		}
 		unlockGate()
 		unlockGate = f.lockOpenNamePair(child, surv0)
 		if !f.openIdx.HasOpenPath(child) {
 			survivor = ""
+			resolved = true
 			break
 		}
 		ino1, ok1 := f.inodes.GetInode(child)
 		if !ok1 {
 			survivor = ""
+			resolved = true
 			break
 		}
 		if survIno, sok := f.inodes.GetInode(surv0); sok && survIno == ino1 {
 			survivor = surv0
+			resolved = true
 			break
 		}
 		surv1, _ := f.inodes.SurvivorOfInode(ino1, child)
 		if surv1 == "" || surv1 == child {
 			survivor = ""
+			resolved = true
 			break
 		}
 		candSurv = surv1
 	}
 	defer unlockGate()
+	if !resolved {
+		return gofuse.EAGAIN
+	}
 	f.debugf("unlink start path=%s parent_ino=%d name=%s", child, header.NodeId, name)
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
@@ -2206,6 +2247,9 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 			survivor = ""
 		} else if survivor != "" {
 			if survIno, sok := f.inodes.GetInode(survivor); !sok || survIno != ino {
+				if alt, ok := f.inodes.SurvivorOfInode(ino, child); ok && alt != "" && alt != child {
+					return gofuse.EAGAIN
+				}
 				survivor = ""
 			}
 		}
@@ -2306,7 +2350,7 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 			return gofuse.EIO
 		}
 		pending := &deferredUnlink{path: child, ino: ino}
-		pending.mu.Lock()
+		pending.lock()
 		if survivor != "" {
 			f.openIdx.RetargetPath(child, survivor)
 		} else {
@@ -2336,7 +2380,7 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 		f.markNameNegative(child)
 		f.touchParentMtime(header.NodeId)
 		f.mutated(fs.EventDelete, child)
-		pending.mu.Unlock()
+		pending.unlock()
 		// The last Release may have completed while PrepareOpenUnlink was
 		// preparing the anonymous handle state, before registration existed.
 		// Recheck after publication so that close cannot strand the delete.

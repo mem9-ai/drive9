@@ -478,6 +478,8 @@ type PendingConflictTransfer struct {
 	// destination: the durable state already describes the committed pairing,
 	// so Abort degenerates into finishing the publication.
 	payloadMoved   bool
+	origDst        *WriteBackMeta
+	dstBackupPath  string
 	expectedOldGen uint64
 	expectedNewGen uint64
 	closed         bool
@@ -512,7 +514,7 @@ func (idx *PendingIndex) BeginConflictTransfer(oldPath, newPath string, expected
 		}
 	}
 	pla, plb := idx.acquireTwoPathLocks(oldPath, newPath)
-	prepared, ok, destWasLive, err := idx.prepareConflictTransferLocked(oldPath, newPath, expectedOldGen, expectedNewGen, srcKind)
+	prepared, origDst, ok, destWasLive, err := idx.prepareConflictTransferLocked(oldPath, newPath, expectedOldGen, expectedNewGen, srcKind)
 	if err != nil || !ok {
 		idx.releaseTwoPathLocks(oldPath, newPath, pla, plb)
 		return nil, false, err
@@ -524,6 +526,7 @@ func (idx *PendingIndex) BeginConflictTransfer(oldPath, newPath string, expected
 		newPath:           newPath,
 		locks:             [2]*pendingPathLock{pla, plb},
 		prepared:          prepared,
+		origDst:           origDst,
 		destWasLive:       destWasLive,
 		destMetaPersisted: !destWasLive,
 		expectedOldGen:    expectedOldGen,
@@ -532,23 +535,26 @@ func (idx *PendingIndex) BeginConflictTransfer(oldPath, newPath string, expected
 }
 
 // prepareConflictTransferLocked fences both endpoints and builds the prepared
-// meta. The caller holds both path locks. It returns the prepared meta, ok,
-// whether the destination was live, and an error when the prepared file could
-// not be persisted.
-func (idx *PendingIndex) prepareConflictTransferLocked(oldPath, newPath string, expectedOldGen, expectedNewGen uint64, keepKind PendingKind) (*WriteBackMeta, bool, bool, error) {
+// meta. The caller holds both path locks. It returns the prepared meta, any
+// pre-existing destination meta copy, ok, whether the destination was live,
+// and an error when the prepared file could not be persisted.
+func (idx *PendingIndex) prepareConflictTransferLocked(oldPath, newPath string, expectedOldGen, expectedNewGen uint64, keepKind PendingKind) (*WriteBackMeta, *WriteBackMeta, bool, bool, error) {
 	idx.mu.RLock()
 	src, hasSrc := idx.items[oldPath]
 	dst, hasDst := idx.items[newPath]
 	idx.mu.RUnlock()
 	if !hasSrc || src == nil || src.Generation != expectedOldGen {
-		return nil, false, false, nil
+		return nil, nil, false, false, nil
 	}
+	var origDst *WriteBackMeta
 	if hasDst {
 		if dst == nil || dst.Generation != expectedNewGen {
-			return nil, false, false, nil
+			return nil, nil, false, false, nil
 		}
+		dstCopy := cloneWriteBackMeta(dst)
+		origDst = &dstCopy
 	} else if expectedNewGen != 0 {
-		return nil, false, false, nil
+		return nil, nil, false, false, nil
 	}
 	gen := idx.nextGen.Add(1)
 	clone := cloneWriteBackMeta(src)
@@ -569,10 +575,10 @@ func (idx *PendingIndex) prepareConflictTransferLocked(oldPath, newPath string, 
 	prepared := &clone
 	if !hasDst {
 		if err := idx.writePreparedWitness(prepared); err != nil {
-			return nil, false, false, err
+			return nil, nil, false, false, err
 		}
 	}
-	return prepared, true, hasDst, nil
+	return prepared, origDst, true, hasDst, nil
 }
 
 // writePreparedWitness persists the prepared entry at the destination as a
@@ -723,19 +729,87 @@ func (t *PendingConflictTransfer) restoreSourceKindLocked() {
 	}
 }
 
-// RollbackPrePublish undoes an uncommitted pre-publication transfer (including
-// reversing an already-renamed shadow payload when the destination had no live
-// incumbent) and restores the source entry's original Kind.
-func (t *PendingConflictTransfer) RollbackPrePublish() {
-	if t == nil || t.closed {
-		return
+// MovePayloadReversible moves the source shadow bytes to newPath while
+// stashing any pre-existing destination shadow under a temporary rollback slot
+// so pre-publication failures can restore both endpoints losslessly.
+func (t *PendingConflictTransfer) MovePayloadReversible() bool {
+	if t == nil || t.closed || t.prepared == nil {
+		return false
 	}
-	defer t.release()
-	if t.payloadMoved && !t.destWasLive && t.shadows != nil {
-		_ = t.shadows.Rename(t.newPath, t.oldPath)
-		t.payloadMoved = false
+	if t.shadows == nil {
+		return true
 	}
-	if t.destReplaced || !t.destWasLive {
+	if !t.shadows.Has(t.oldPath) {
+		return false
+	}
+	t.shadows.EnsureActiveGeneration(t.oldPath)
+	if t.destWasLive && !t.destReplaced {
+		if t.shadows.Has(t.newPath) {
+			backup := "\x00unlink-dst-backup:" + t.newPath
+			t.shadows.Remove(backup)
+			t.shadows.EnsureActiveGeneration(t.newPath)
+			if !t.shadows.Rename(t.newPath, backup) {
+				return false
+			}
+			if verr := t.shadows.VerifyRemoved(t.newPath); verr != nil {
+				_ = t.shadows.Rename(backup, t.newPath)
+				return false
+			}
+			t.dstBackupPath = backup
+		}
+		if err := t.idx.writePreparedWitness(t.prepared); err != nil {
+			if t.dstBackupPath != "" {
+				_ = t.shadows.Rename(t.dstBackupPath, t.newPath)
+				t.dstBackupPath = ""
+			}
+			return false
+		}
+		t.destReplaced = true
+		t.destMetaPersisted = true
+	}
+	if t.shadows.Rename(t.oldPath, t.newPath) {
+		t.payloadMoved = true
+		return true
+	}
+	return false
+}
+
+func (t *PendingConflictTransfer) rollbackReversibleLocked() {
+	if t.payloadMoved && t.shadows != nil {
+		t.shadows.EnsureActiveGeneration(t.newPath)
+		if t.shadows.Rename(t.newPath, t.oldPath) {
+			t.payloadMoved = false
+		}
+	}
+	if t.destWasLive {
+		if t.dstBackupPath != "" && t.shadows != nil && !t.payloadMoved {
+			if t.shadows.Rename(t.dstBackupPath, t.newPath) {
+				t.dstBackupPath = ""
+			}
+		}
+		if t.destReplaced {
+			if t.origDst != nil && !t.payloadMoved && t.dstBackupPath == "" {
+				if err := t.idx.writeMetaFile(t.origDst); err == nil {
+					t.idx.mu.Lock()
+					cp := cloneWriteBackMeta(t.origDst)
+					t.idx.items[t.newPath] = &cp
+					t.idx.mu.Unlock()
+				} else {
+					t.idx.mu.Lock()
+					if cur, ok := t.idx.items[t.newPath]; ok && cur != nil {
+						cur.Kind = PendingConflict
+					}
+					t.idx.mu.Unlock()
+				}
+			} else {
+				t.idx.mu.Lock()
+				if cur, ok := t.idx.items[t.newPath]; ok && cur != nil {
+					cur.Kind = PendingConflict
+				}
+				t.idx.mu.Unlock()
+			}
+		}
+	} else {
 		_ = os.Remove(filepath.Join(t.idx.dir, HashPath(t.newPath)+".meta"))
 		t.idx.mu.Lock()
 		delete(t.idx.items, t.newPath)
@@ -746,39 +820,34 @@ func (t *PendingConflictTransfer) RollbackPrePublish() {
 	}
 }
 
+// RollbackPrePublish undoes an uncommitted pre-publication transfer (including
+// reversing an already-renamed shadow payload and restoring any stashed
+// destination incumbent) and restores the source entry's original Kind.
+func (t *PendingConflictTransfer) RollbackPrePublish() {
+	if t == nil || t.closed {
+		return
+	}
+	defer t.release()
+	t.rollbackReversibleLocked()
+}
+
 // CommitReversible commits a pre-publication transfer like Commit, except if
-// fences fail or persisting the destination .meta fails when the destination
-// had no live incumbent, it reverses the payload move back to oldPath, removes
-// the prepared destination witness, and restores oldPath's original Kind.
+// fences fail or persisting the destination .meta fails, it reverses the
+// payload move back to oldPath, restores any stashed destination incumbent (or
+// removes the prepared witness when the destination was empty), and restores
+// oldPath's original Kind.
 func (t *PendingConflictTransfer) CommitReversible() (bool, error) {
 	if t == nil || t.closed || t.prepared == nil {
 		return false, nil
 	}
 	defer t.release()
 
-	rollbackToSource := func() {
-		if t.destWasLive {
-			return
-		}
-		if t.payloadMoved && t.shadows != nil {
-			_ = t.shadows.Rename(t.newPath, t.oldPath)
-			t.payloadMoved = false
-		}
-		_ = os.Remove(filepath.Join(t.idx.dir, HashPath(t.newPath)+".meta"))
-		t.idx.mu.Lock()
-		delete(t.idx.items, t.newPath)
-		t.idx.mu.Unlock()
-		if t.shadows == nil || t.shadows.Has(t.oldPath) {
-			t.restoreSourceKindLocked()
-		}
-	}
-
 	if ok := t.fencesHold(); !ok {
-		rollbackToSource()
+		t.rollbackReversibleLocked()
 		return false, nil
 	}
 	if err := t.idx.writeMetaFile(t.prepared); err != nil {
-		rollbackToSource()
+		t.rollbackReversibleLocked()
 		return false, err
 	}
 	t.idx.mu.Lock()
@@ -788,6 +857,10 @@ func (t *PendingConflictTransfer) CommitReversible() (bool, error) {
 	cleared := t.idx.clearCommittedFencesLocked(t.oldPath, t.newPath)
 	t.idx.mu.Unlock()
 
+	if t.dstBackupPath != "" && t.shadows != nil {
+		t.shadows.Remove(t.dstBackupPath)
+		t.dstBackupPath = ""
+	}
 	_ = os.Remove(filepath.Join(t.idx.dir, HashPath(t.oldPath)+".meta"))
 	t.idx.removeFenceFiles(cleared)
 	safeLogPrintf("pending: reversible entry moved %s -> %s (gen %d -> %d)", t.oldPath, t.newPath, t.expectedOldGen, t.prepared.Generation)
