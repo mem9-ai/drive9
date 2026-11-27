@@ -225,7 +225,6 @@ func TestPrepareOpenUnlinkAbortReenqueuesOverDyingCanceledInFlightEntry(t *testi
 		b.ServeHTTP(w, r)
 	}))
 	t.Cleanup(srv.Close)
-	t.Cleanup(unblockFirstPut)
 
 	cl := client.New(srv.URL, "")
 	cl.SetSmallFileThresholdForTests(1 << 20)
@@ -246,6 +245,9 @@ func TestPrepareOpenUnlinkAbortReenqueuesOverDyingCanceledInFlightEntry(t *testi
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+	// Registered after wb.Stop so LIFO teardown unblocks any held HTTP handler
+	// before wb.Stop waits on DrainAll().
+	t.Cleanup(unblockFirstPut)
 
 	terminal, err := core.New(cl, core.Options{})
 	if err != nil {
@@ -269,55 +271,64 @@ func TestPrepareOpenUnlinkAbortReenqueuesOverDyingCanceledInFlightEntry(t *testi
 	}
 
 	// Wait until the first CommitQueue worker is actively inside the HTTP PUT.
-	<-firstPutStarted
+	select {
+	case <-firstPutStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for initial CommitQueue PUT to start")
+	}
 
 	acquireLock, _, _, abort := wb.PrepareOpenUnlink(targetPath, "")
 	if err := acquireLock(nil); err != nil {
 		t.Fatalf("acquireLock: %v", err)
 	}
+	var abortOnce sync.Once
+	callAbort := func() { abortOnce.Do(abort) }
+	defer callAbort()
 
-	// Pin the exact race window where the canceled worker has released pathLock
-	// (allowing acquireLock to return) while its canceled CommitEntry has not
-	// yet executed defer cq.endInFlight(entry).
+	// Verify any still-visible live entry was marked canceled, then drain the
+	// live canceled goroutine completely (WaitPathDeadline only acquires cq.mu,
+	// never pathLock) before pinning a deterministic synthetic dying entry.
 	wb.queue.mu.Lock()
-	dying := wb.queue.inFlight[targetPath]
-	pinnedSynthetic := false
-	if dying == nil {
-		dying = &CommitEntry{Path: targetPath, canceled: true}
-		wb.queue.inFlight[targetPath] = dying
-		pinnedSynthetic = true
-	} else if !dying.canceled {
-		wb.queue.mu.Unlock()
-		abort()
+	liveCur := wb.queue.inFlight[targetPath]
+	liveUncanceled := liveCur != nil && !liveCur.canceled
+	wb.queue.mu.Unlock()
+	if liveUncanceled {
 		t.Fatalf("expected in-flight entry for %s to be marked canceled after acquireLock", targetPath)
 	}
+	unblockFirstPut()
+	if !wb.queue.WaitPathDeadline(targetPath, 5*time.Second) {
+		t.Fatalf("timed out waiting for live canceled worker on %s to finish endInFlight", targetPath)
+	}
+
+	// Unconditionally pin a synthetic dying canceled CommitEntry in inFlight[targetPath]
+	// representing a canceled worker paused between unlockPath() and endInFlight(),
+	// with zero background goroutines racing to clear it across HasPath, abort(),
+	// and HasUncanceledPath assertions.
+	dying := &CommitEntry{Path: targetPath, canceled: true}
+	wb.queue.mu.Lock()
+	wb.queue.inFlight[targetPath] = dying
 	wb.queue.mu.Unlock()
+	defer wb.queue.endInFlight(dying)
 
 	if !wb.queue.HasPath(targetPath) {
-		abort()
 		t.Fatal("precondition: HasPath must be true while dying canceled entry remains in inFlight")
 	}
 	if wb.queue.HasUncanceledPath(targetPath) {
-		abort()
 		t.Fatal("precondition: HasUncanceledPath must be false before abort() re-enqueues")
 	}
 
 	// Execute PrepareOpenUnlink's real abort() -> reenqueueCanceledPathLocked(targetPath)
-	// while the dying canceled entry is still present in inFlight[targetPath].
-	abort()
+	// while the dying canceled entry remains in inFlight[targetPath] (which also
+	// prevents the replacement worker from passing canBeginInFlightLocked yet).
+	callAbort()
 
 	if !wb.queue.HasUncanceledPath(targetPath) {
-		if pinnedSynthetic {
-			wb.queue.endInFlight(dying)
-		}
 		t.Fatal("abort() failed to re-enqueue replacement entry while dying canceled entry remained in inFlight")
 	}
 
 	// Complete the dying worker's deferred endInFlight cleanup so the replacement
 	// worker can begin in-flight execution and drain staging to the backend.
-	if pinnedSynthetic {
-		wb.queue.endInFlight(dying)
-	}
+	wb.queue.endInFlight(dying)
 
 	drainCtx, cancelDrain := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelDrain()
