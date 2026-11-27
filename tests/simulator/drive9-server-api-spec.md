@@ -168,7 +168,7 @@ Because `resource_id` is the inode UUID/hex identity, the `ETag` changes on ever
       "next_offset": 67108864
     }
     ```
-  - Without `X-Dat9-Extent-Read-Plan`: returns `422 Unprocessable Entity` with headers `X-Dat9-Content-Layout: extent`, `X-Dat9-Storage-Type: extent`, `X-Dat9-Extent-Length: <size>` (so older clients never mistake a JSON block plan for file content).
+  - Without `X-Dat9-Extent-Read-Plan`: the content is streamed inline as bytes (`200`, or `206` for a `Range`, `application/octet-stream`) with headers `X-Dat9-Content-Layout: extent`, `X-Dat9-Storage-Type: extent`, `X-Dat9-Extent-Length: <size>`, and the same range/conditional semantics as a classic read. Extent layout is an internal storage choice: a client that cannot parse a plan still reads the file, and it never receives a JSON block plan as file bytes.
 
 ### 4.4 `GET /v1/fs/{path}?stat`
 - Returns `200` JSON metadata (+ headers `X-Dat9-Mtime`, `X-Dat9-Btime`), or `404` if missing:

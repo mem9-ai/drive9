@@ -266,10 +266,21 @@ async fn fs_read(state: Arc<AppState>, t: Arc<TenantDb>, req: FsReq) -> Response
     // A client that did not opt into the block plan still reads the bytes:
     // extent layout is an internal storage choice, never a client contract.
     let data = if n.is_extent() {
-        match read_extent_bytes(state.clone(), t.clone(), &p, n.size).await {
+        let data = match read_extent_bytes(state.clone(), t.clone(), &p, n.size).await {
             Ok(d) => d,
             Err(r) => return r,
+        };
+        // The node (and so the ETag, revision and extent length) was read
+        // before the mappings. A concurrent commit between those two store
+        // reads must not pair a newer body with this response's generation, so
+        // reject the mixed read instead of returning a body the validators do
+        // not describe.
+        match t.get_node(&p) {
+            Ok(after) if after.revision == n.revision && after.size == n.size => {}
+            Ok(_) => return err_code_resp(409, "revision_conflict", "file changed since it was opened"),
+            Err(e) => return store_err(e),
         }
+        data
     } else {
         match read_bytes(state, t, p).await {
             Ok(d) => d,
