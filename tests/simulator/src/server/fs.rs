@@ -223,7 +223,7 @@ fn set_extent_headers(h: &mut HeaderMap, n: &Node) {
 // extent_read_is_current reports whether the file at `p` still carries the ETag
 // the response was assembled for. The ETag includes the inode, so a delete plus
 // same-size recreate (new inode, revision 1 again) is detected too.
-fn extent_read_is_current(t: &TenantDb, p: &str, etag: &str) -> Result<bool, StoreError> {
+pub(crate) fn extent_read_is_current(t: &TenantDb, p: &str, etag: &str) -> Result<bool, StoreError> {
     let after = t.get_node(p)?;
     Ok(read_etag(&after.inode, after.revision, after.size) == etag)
 }

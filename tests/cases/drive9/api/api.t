@@ -5,6 +5,9 @@
 #   1. Client CI:    `drive9-simulator run --no-mount tests/cases/drive9/api/api.t` (built-in server)
 #   2. Server CI:    `drive9-simulator run --no-mount --server http://127.0.0.1:9009 tests/cases/drive9/api/api.t`
 #   3. Daily Action: `drive9-simulator run --no-mount --server https://... --api-key $KEY tests/cases/drive9/api/api.t`
+# The plain extent GETs below need a server that carries the inline extent read
+# (tidbcloud/fs#394). Against an older server they fail with 422 by design: that
+# is deployment skew, not a regression in this case.
 set -eu
 
 API_ROOT="/api-contract-$$-$(date +%s)"
