@@ -418,10 +418,21 @@ fn uploads_v2_extent_contract() {
     assert!(h.to_lowercase().contains("x-dat9-content-layout: extent"));
     assert!(h.to_lowercase().contains("etag:"));
 
+    // A plain GET returns the extent bytes inline (no plan opt-in required).
     let (st, h, b) = http(&addr, req("GET", "/v1/fs/x/a.bin", Some(&auth), &[], &[]), &[]);
-    assert_eq!(st, 422);
+    assert_eq!(st, 200, "{}", String::from_utf8_lossy(&b));
+    assert!(h.to_lowercase().contains("x-dat9-content-layout: extent"));
     assert!(h.to_lowercase().contains("x-dat9-extent-length"));
-    assert!(String::from_utf8_lossy(&b).contains("not served inline"));
+    assert_eq!(b, data);
+
+    // Ranges apply to the inline bytes like the classic path.
+    let (st, _, b) = http(
+        &addr,
+        req("GET", "/v1/fs/x/a.bin", Some(&auth), &[("Range", "bytes=2-5")], &[]),
+        &[],
+    );
+    assert_eq!(st, 206, "{}", String::from_utf8_lossy(&b));
+    assert_eq!(b, &data[2..=5]);
 
     let (st, _, b) = http(
         &addr,

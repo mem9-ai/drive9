@@ -261,17 +261,20 @@ async fn fs_read(state: Arc<AppState>, t: Arc<TenantDb>, req: FsReq) -> Response
                 Err(e) => err_code_resp(503, "s3_unavailable", &e),
             };
         }
-        let mut resp = err_resp(422, "extent content is not served inline");
-        let h = resp.headers_mut();
-        h.insert("x-dat9-content-layout", "extent".parse().unwrap());
-        h.insert("x-dat9-storage-type", "extent".parse().unwrap());
-        h.insert("x-dat9-extent-length", n.size.to_string().parse().unwrap());
-        return resp;
     }
 
-    let data = match read_bytes(state, t, p).await {
-        Ok(d) => d,
-        Err(r) => return r,
+    // A client that did not opt into the block plan still reads the bytes:
+    // extent layout is an internal storage choice, never a client contract.
+    let data = if n.is_extent() {
+        match read_extent_bytes(state.clone(), t.clone(), &p, n.size).await {
+            Ok(d) => d,
+            Err(r) => return r,
+        }
+    } else {
+        match read_bytes(state, t, p).await {
+            Ok(d) => d,
+            Err(r) => return r,
+        }
     };
     let total = data.len() as i64;
     let effective_range = match (req.header("range"), req.header("if-range")) {
@@ -293,6 +296,11 @@ async fn fs_read(state: Arc<AppState>, t: Arc<TenantDb>, req: FsReq) -> Response
                     format!("bytes {start}-{end}/{total}").parse().unwrap(),
                 );
                 set_file_read_headers(h, &n);
+                if n.is_extent() {
+                    h.insert("x-dat9-content-layout", "extent".parse().unwrap());
+                    h.insert("x-dat9-storage-type", "extent".parse().unwrap());
+                    h.insert("x-dat9-extent-length", n.size.to_string().parse().unwrap());
+                }
                 return resp;
             }
             None => {
@@ -312,6 +320,11 @@ async fn fs_read(state: Arc<AppState>, t: Arc<TenantDb>, req: FsReq) -> Response
     h.insert("content-type", "application/octet-stream".parse().unwrap());
     h.insert("content-length", total.to_string().parse().unwrap());
     set_file_read_headers(h, &n);
+    if n.is_extent() {
+        h.insert("x-dat9-content-layout", "extent".parse().unwrap());
+        h.insert("x-dat9-storage-type", "extent".parse().unwrap());
+        h.insert("x-dat9-extent-length", n.size.to_string().parse().unwrap());
+    }
     resp
 }
 
