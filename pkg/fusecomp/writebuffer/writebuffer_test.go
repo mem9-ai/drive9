@@ -366,3 +366,33 @@ func TestEvictedPartFallsBackToRemoteWhenShadowIsGone(t *testing.T) {
 		t.Fatal("an un-armed fallback silently replaced staged bytes with the stale remote image")
 	}
 }
+
+func TestCanMaterializeFullRejectsEvictedUploadedParts(t *testing.T) {
+	wb := partModeBuffer(4)
+	wb.SetSmallFileMax(1)
+	if _, err := wb.Write(0, []byte("abcd1234")); err != nil {
+		t.Fatal(err)
+	}
+	if !wb.CanMaterializeFull() {
+		t.Fatal("expected resident unseeded buffer to report CanMaterializeFull=true")
+	}
+	wb.RestorePart = func(partNum int) ([]byte, error) {
+		if partNum == 1 {
+			return []byte("abcd"), nil
+		}
+		return []byte("1234"), nil
+	}
+	wb.EvictPart(0)
+	if wb.CanMaterializeFull() {
+		t.Fatal("expected CanMaterializeFull=false when part 0 is evicted with remoteSize=0")
+	}
+	if err := wb.ForceEnsurePartsForWrite(0, wb.Size()); err != nil {
+		t.Fatalf("ForceEnsurePartsForWrite: %v", err)
+	}
+	if !wb.CanMaterializeFull() {
+		t.Fatal("expected CanMaterializeFull=true after restoring evicted part")
+	}
+	if got := string(wb.Bytes()); got != "abcd1234" {
+		t.Fatalf("Bytes after restore = %q, want abcd1234", got)
+	}
+}

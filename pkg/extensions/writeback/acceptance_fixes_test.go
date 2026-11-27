@@ -1495,21 +1495,37 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 					t.Fatal(err)
 				}
 				if closeOrder == "creator-last" {
-					_ = h2.Handle.Flush(ctx)
-					_ = h2.Handle.Release(ctx)
+					if err := h2.Handle.Flush(ctx); err != nil {
+						t.Fatalf("h2.Flush: %v", err)
+					}
+					if err := h2.Handle.Release(ctx); err != nil {
+						t.Fatalf("h2.Release: %v", err)
+					}
 					if err := wb.Drain(ctx); err != nil {
 						t.Fatal(err)
 					}
-					_ = h1.Handle.Flush(ctx)
-					_ = h1.Handle.Release(ctx)
+					if err := h1.Handle.Flush(ctx); err != nil {
+						t.Fatalf("h1.Flush: %v", err)
+					}
+					if err := h1.Handle.Release(ctx); err != nil {
+						t.Fatalf("h1.Release: %v", err)
+					}
 				} else {
-					_ = h1.Handle.Flush(ctx)
-					_ = h1.Handle.Release(ctx)
+					if err := h1.Handle.Flush(ctx); err != nil {
+						t.Fatalf("h1.Flush: %v", err)
+					}
+					if err := h1.Handle.Release(ctx); err != nil {
+						t.Fatalf("h1.Release: %v", err)
+					}
 					if err := wb.Drain(ctx); err != nil {
 						t.Fatal(err)
 					}
-					_ = h2.Handle.Flush(ctx)
-					_ = h2.Handle.Release(ctx)
+					if err := h2.Handle.Flush(ctx); err != nil {
+						t.Fatalf("h2.Flush: %v", err)
+					}
+					if err := h2.Handle.Release(ctx); err != nil {
+						t.Fatalf("h2.Release: %v", err)
+					}
 				}
 				if err := wb.Drain(ctx); err != nil {
 					t.Fatal(err)
@@ -1574,18 +1590,22 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 		// Recreate tries to replace /unlink-recreate with "REPLACEMENT".
 		inFallback := make(chan struct{})
 		allowFallback := make(chan struct{})
-		var fbOnce, allowOnce sync.Once
+		unlinkWaiting := make(chan struct{})
+		var fbOnce, allowOnce, waitOnce sync.Once
 		releaseFB := func() { allowOnce.Do(func() { close(allowFallback) }) }
 		t.Cleanup(func() {
 			wb.testGateHook.Store(nil)
 			releaseFB()
 		})
 		hookFB := func(gate string) {
-			if gate == "read:remoteFallback" {
+			switch gate {
+			case "read:remoteFallback":
 				fbOnce.Do(func() {
 					close(inFallback)
 					<-allowFallback
 				})
+			case "unlink:waitingLinkedReads":
+				waitOnce.Do(func() { close(unlinkWaiting) })
 			}
 		}
 		wb.testGateHook.Store(&hookFB)
@@ -1611,10 +1631,18 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 			_, uerr := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/unlink-recreate"})
 			unlinkDone <- uerr
 		}()
-		// Unlink must wait on r1.remoteReadMu until readRemoteRangeFallback finishes.
+		// Unlink must reach the read-drain boundary and remain blocked until
+		// readRemoteRangeFallback finishes.
+		select {
+		case <-unlinkWaiting:
+		case uerr := <-unlinkDone:
+			t.Fatalf("Unlink completed before reaching linked-read drain boundary: %v", uerr)
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for unlink:waitingLinkedReads")
+		}
 		select {
 		case uerr := <-unlinkDone:
-			t.Fatalf("Unlink completed before in-flight readRemoteRangeFallback released lock: %v", uerr)
+			t.Fatalf("Unlink completed while readRemoteRangeFallback was still paused: %v", uerr)
 		default:
 		}
 		releaseFB()
@@ -1817,18 +1845,22 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 
 		pausedBeforeLive := make(chan struct{})
 		allowLive := make(chan struct{})
-		var pOnce, aOnce sync.Once
+		unlinkWaiting := make(chan struct{})
+		var pOnce, aOnce, wOnce sync.Once
 		releaseLive := func() { aOnce.Do(func() { close(allowLive) }) }
 		t.Cleanup(func() {
 			wb.testGateHook.Store(nil)
 			releaseLive()
 		})
 		hook := func(gate string) {
-			if gate == "read:beforeLiveWriter" {
+			switch gate {
+			case "read:beforeLiveWriter":
 				pOnce.Do(func() {
 					close(pausedBeforeLive)
 					<-allowLive
 				})
+			case "unlink:waitingLinkedReads":
+				wOnce.Do(func() { close(unlinkWaiting) })
 			}
 		}
 		wb.testGateHook.Store(&hook)
@@ -1854,6 +1886,13 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 			_, uerr := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/live-writer-fence"})
 			unlinkDone <- uerr
 		}()
+		select {
+		case <-unlinkWaiting:
+		case uerr := <-unlinkDone:
+			t.Fatalf("Unlink finished before reaching linked-read drain boundary: %v", uerr)
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for unlink:waitingLinkedReads")
+		}
 		select {
 		case uerr := <-unlinkDone:
 			t.Fatalf("Unlink finished before linked Read drained: %v", uerr)
@@ -1964,7 +2003,6 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 		uploadEntered := make(chan struct{})
 		var enterOnce, relOnce sync.Once
 		releaseUpload := func() { relOnce.Do(func() { close(blockUpload) }) }
-		t.Cleanup(releaseUpload)
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodPost || r.Method == http.MethodPut {
 				enterOnce.Do(func() {
@@ -1989,6 +2027,9 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+		// Register gate release AFTER wb.Stop and ts.Close so LIFO cleanup
+		// unblocks in-flight HTTP handlers before teardown waits on them.
+		t.Cleanup(releaseUpload)
 		terminal, err := core.New(cl, core.Options{})
 		if err != nil {
 			t.Fatal(err)
@@ -2024,6 +2065,7 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("ftruncate(0): %v", err)
 		}
+		releaseUpload()
 		if err := res.Handle.Write(ctx, 30<<20, []byte("NEW!")); err != nil {
 			t.Fatal(err)
 		}
@@ -2033,7 +2075,6 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 		if err := res.Handle.Release(ctx); err != nil {
 			t.Fatal(err)
 		}
-		releaseUpload()
 		if err := wb.Drain(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -2065,7 +2106,6 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 		putEntered := make(chan struct{})
 		var putOnce, relOnce sync.Once
 		releasePut := func() { relOnce.Do(func() { close(blockPut) }) }
-		t.Cleanup(releasePut)
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if blockActive.Load() && (r.Method == http.MethodPost || r.Method == http.MethodPut) {
 				putOnce.Do(func() {
@@ -2086,6 +2126,9 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+		// Register gate release AFTER wb.Stop and ts.Close so LIFO cleanup
+		// unblocks in-flight HTTP handlers before teardown waits on them.
+		t.Cleanup(releasePut)
 		terminal, err := core.New(cl, core.Options{})
 		if err != nil {
 			t.Fatal(err)
@@ -2247,18 +2290,34 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 				want := append(append([]byte(nil), header...), body...)
 
 				if closeOrder == "writer-first" {
-					_ = h1.Handle.Flush(ctx)
-					_ = h1.Handle.Release(ctx)
+					if err := h1.Handle.Flush(ctx); err != nil {
+						t.Fatalf("h1.Flush: %v", err)
+					}
+					if err := h1.Handle.Release(ctx); err != nil {
+						t.Fatalf("h1.Release: %v", err)
+					}
 					if err := wb.Drain(ctx); err != nil {
 						t.Fatal(err)
 					}
-					_ = h2.Handle.Flush(ctx)
-					_ = h2.Handle.Release(ctx)
+					if err := h2.Handle.Flush(ctx); err != nil {
+						t.Fatalf("h2.Flush: %v", err)
+					}
+					if err := h2.Handle.Release(ctx); err != nil {
+						t.Fatalf("h2.Release: %v", err)
+					}
 				} else {
-					_ = h2.Handle.Flush(ctx)
-					_ = h2.Handle.Release(ctx)
-					_ = h1.Handle.Flush(ctx)
-					_ = h1.Handle.Release(ctx)
+					if err := h2.Handle.Flush(ctx); err != nil {
+						t.Fatalf("h2.Flush: %v", err)
+					}
+					if err := h2.Handle.Release(ctx); err != nil {
+						t.Fatalf("h2.Release: %v", err)
+					}
+					if err := h1.Handle.Flush(ctx); err != nil {
+						t.Fatalf("h1.Flush: %v", err)
+					}
+					if err := h1.Handle.Release(ctx); err != nil {
+						t.Fatalf("h1.Release: %v", err)
+					}
 				}
 				if err := wb.Drain(ctx); err != nil {
 					t.Fatal(err)
@@ -2371,5 +2430,294 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 			_ = ha.Handle.Release(ctx)
 			_ = hb.Handle.Release(ctx)
 		}
+	})
+
+	t.Run("close-sync-spilled-create-reopen-preserves-evicted-parts", func(t *testing.T) {
+		ledger, err := staging.NewStagingWithQuota(t.TempDir(), 0, 256)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(ledger.Close)
+		b := testbackend.NewBackend()
+		ts := httptest.NewServer(b)
+		t.Cleanup(ts.Close)
+		cl := client.New(ts.URL, "")
+		wb, err := New(Options{Policy: PolicyCloseSync, Client: cl, Staging: ledger})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+		terminal, err := core.New(cl, core.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ch, err := fs.NewChain(wb, terminal)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Create /spilled-cs and write 68 MiB (> 64 MiB liveSpillThreshold) so
+		// Part 0 spills to liveSpillFile while remoteSize remains 0.
+		h1, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/spilled-cs",
+			Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		chunk := bytes.Repeat([]byte("SpilData"), 1<<20) // 8 MiB
+		for off := int64(0); off < 64<<20; off += 8 << 20 {
+			if err := h1.Handle.Write(ctx, off, chunk); err != nil {
+				t.Fatalf("h1.Write(%d): %v", off, err)
+			}
+		}
+		if err := h1.Handle.Write(ctx, 64<<20, bytes.Repeat([]byte("Tail"), 1<<20)); err != nil {
+			t.Fatalf("h1 tail write triggering liveSpillFile: %v", err)
+		}
+		bh1 := writebackHandleOf(h1.Handle)
+		bh1.mu.Lock()
+		spilled := bh1.liveSpillFile != nil
+		canMat := bh1.buf.CanMaterializeFull()
+		bh1.mu.Unlock()
+		if !spilled {
+			t.Fatal("expected 68 MiB close-sync write to spill parts into liveSpillFile")
+		}
+		if canMat {
+			t.Fatal("expected CanMaterializeFull()=false while liveSpillFile holds evicted parts")
+		}
+
+		// Case 1 (> 64 MiB): reopen exercises lazy SeedRemote + LoadPart backed
+		// by bh1 while Part 0 is evicted to liveSpillFile.
+		h2, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/spilled-cs", Flags: uint32(syscall.O_RDWR),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := h2.Handle.Write(ctx, 16, []byte("PATCH1")); err != nil {
+			t.Fatalf("h2.Write(16): %v", err)
+		}
+		gotHead := make([]byte, 32)
+		if n, rerr := h2.Handle.Read(ctx, 0, gotHead); rerr != nil || n != 32 {
+			t.Fatalf("h2.Read(0..32) = (%d, %v)", n, rerr)
+		}
+		wantHead := append(append([]byte(nil), []byte("SpilDataSpilData")...), []byte("PATCH1taSpilData")...)
+		if !bytes.Equal(gotHead, wantHead) {
+			t.Fatalf("h2 head after patch on >64MiB spilled sibling = %q, want %q", gotHead, wantHead)
+		}
+		if err := h1.Handle.Release(ctx); err != nil {
+			t.Fatalf("h1.Release: %v", err)
+		}
+		if err := h2.Handle.Flush(ctx); err != nil {
+			t.Fatalf("h2.Flush: %v", err)
+		}
+		if err := h2.Handle.Release(ctx); err != nil {
+			t.Fatalf("h2.Release: %v", err)
+		}
+		n1, ok := b.Node("/spilled-cs")
+		if !ok || len(n1.Data) != 68<<20 {
+			t.Fatalf("/spilled-cs len = %d (ok=%v), want %d", len(n1.Data), ok, 68<<20)
+		}
+		if !bytes.Equal(n1.Data[:32], wantHead) {
+			t.Fatalf("persisted >64MiB Part 0 head = %q, want %q", n1.Data[:32], wantHead)
+		}
+
+		// Case 2 (<= 64 MiB): spill 68 MiB on c1 so Part 0 & Part 1 evict to
+		// liveSpillFile, ftruncate c1 down to 16 MiB while c1 is the sole open
+		// handle, then reopen c2 (O_RDWR) to exercise ForceEnsurePartsForWrite.
+		c1, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/spilled-cs-small",
+			Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for off := int64(0); off < 64<<20; off += 8 << 20 {
+			if err := c1.Handle.Write(ctx, off, chunk); err != nil {
+				t.Fatalf("c1.Write(%d): %v", off, err)
+			}
+		}
+		if err := c1.Handle.Write(ctx, 64<<20, bytes.Repeat([]byte("Tail"), 1<<20)); err != nil {
+			t.Fatalf("c1 tail write: %v", err)
+		}
+		if _, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpSetAttr, Path: "/spilled-cs-small", Handle: c1.Handle, Size: 16 << 20,
+		}); err != nil {
+			t.Fatalf("ftruncate(16MiB): %v", err)
+		}
+		c2, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/spilled-cs-small", Flags: uint32(syscall.O_RDWR),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c2.Handle.Write(ctx, (8<<20)+8, []byte("PATCH2")); err != nil {
+			t.Fatalf("c2.Write(8MiB+8): %v", err)
+		}
+		if err := c1.Handle.Release(ctx); err != nil {
+			t.Fatalf("c1.Release: %v", err)
+		}
+		if err := c2.Handle.Flush(ctx); err != nil {
+			t.Fatalf("c2.Flush: %v", err)
+		}
+		if err := c2.Handle.Release(ctx); err != nil {
+			t.Fatalf("c2.Release: %v", err)
+		}
+		n2, ok := b.Node("/spilled-cs-small")
+		if !ok || len(n2.Data) != 16<<20 {
+			t.Fatalf("/spilled-cs-small len = %d (ok=%v), want %d", len(n2.Data), ok, 16<<20)
+		}
+		if !bytes.Equal(n2.Data[:16], []byte("SpilDataSpilData")) {
+			t.Fatalf("persisted <=64MiB Part 0 head = %q, want SpilDataSpilData", n2.Data[:16])
+		}
+		wantPart1Head := []byte("SpilDataPATCH2ta")
+		if !bytes.Equal(n2.Data[8<<20:(8<<20)+16], wantPart1Head) {
+			t.Fatalf("persisted <=64MiB Part 1 head = %q, want %q", n2.Data[8<<20:(8<<20)+16], wantPart1Head)
+		}
+	})
+
+	t.Run("close-sync-unlanded-reader-survives-unlink-before-flush", func(t *testing.T) {
+		for _, withStaging := range []bool{false, true} {
+			name := "no-staging"
+			if withStaging {
+				name = "with-staging"
+			}
+			t.Run(name, func(t *testing.T) {
+				b := testbackend.NewBackend()
+				ts := httptest.NewServer(b)
+				t.Cleanup(ts.Close)
+				cl := client.New(ts.URL, "")
+				opts := Options{Policy: PolicyCloseSync, Client: cl}
+				if withStaging {
+					ledger, err := staging.NewStaging(t.TempDir())
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(ledger.Close)
+					opts.Staging = ledger
+				}
+				wb, err := New(opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+				terminal, err := core.New(cl, core.Options{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				ch, err := fs.NewChain(wb, terminal)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				w1, err := ch.Dispatch(ctx, &fs.Op{
+					Kind: fs.OpCreate, Path: "/cs-unlink",
+					Flags: uint32(syscall.O_CREAT | syscall.O_WRONLY), Mode: 0o644, HasMode: true,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				const payload = "unlanded-close-sync-payload"
+				if err := w1.Handle.Write(ctx, 0, []byte(payload)); err != nil {
+					t.Fatal(err)
+				}
+				r1, err := ch.Dispatch(ctx, &fs.Op{
+					Kind: fs.OpCreate, Path: "/cs-unlink", Flags: uint32(syscall.O_RDONLY),
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/cs-unlink"}); err != nil {
+					t.Fatalf("OpUnlink: %v", err)
+				}
+
+				buf := make([]byte, 64)
+				n, err := r1.Handle.Read(ctx, 0, buf)
+				if err != nil || string(buf[:n]) != payload {
+					t.Fatalf("post-unlink Read while writer open = (%q, %v), want %q", string(buf[:n]), err, payload)
+				}
+				if err := w1.Handle.Release(ctx); err != nil {
+					t.Fatalf("w1.Release: %v", err)
+				}
+				n, err = r1.Handle.Read(ctx, 0, buf)
+				if err != nil || string(buf[:n]) != payload {
+					t.Fatalf("post-unlink Read after writer closed = (%q, %v), want %q", string(buf[:n]), err, payload)
+				}
+				if err := r1.Handle.Release(ctx); err != nil {
+					t.Fatalf("r1.Release: %v", err)
+				}
+				if _, ok := b.Node("/cs-unlink"); ok {
+					t.Fatal("unlinked close-sync file unexpectedly landed on remote")
+				}
+			})
+		}
+	})
+
+	t.Run("delegated-dirty-survives-non-sync-flush-for-later-fsync", func(t *testing.T) {
+		var rejectPut atomic.Bool
+		b := testbackend.NewBackend()
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if rejectPut.Load() && r.Method == http.MethodPut {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			b.ServeHTTP(w, r)
+		}))
+		t.Cleanup(ts.Close)
+		cl := client.New(ts.URL, "")
+		wbcache, err := staging.NewWriteBackCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCache: wbcache})
+		if err != nil {
+			t.Fatal(err)
+		}
+		wb.SetMemoryBudget(membudget.New(96<<10, membudget.ModeEnforce, nil))
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+		terminal, err := core.New(cl, core.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ch, err := fs.NewChain(wb, terminal)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		h1, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/delegated-sync",
+			Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h2, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/delegated-sync", Flags: uint32(syscall.O_RDWR),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := h2.Handle.Write(ctx, 0, []byte("HDR:")); err != nil {
+			t.Fatal(err)
+		}
+		if err := h1.Handle.Write(ctx, 4, bytes.Repeat([]byte("D"), 60<<10)); err != nil {
+			t.Fatal(err)
+		}
+		// Non-sync Flush on h2 stages h1's image into wbCache without waiting
+		// for remote upload; while PUTs are rejected, h2.Sync MUST still observe
+		// delegatedDirty and fail instead of returning nil prematurely!
+		rejectPut.Store(true)
+		if err := h2.Handle.Flush(ctx); err != nil {
+			t.Fatalf("h2.Flush: %v", err)
+		}
+		if serr := h2.Handle.Sync(ctx); serr == nil {
+			t.Fatal("expected h2.Sync to wait/fail while delegated sibling staging has not landed")
+		}
+		rejectPut.Store(false)
+		if serr := h2.Handle.Sync(ctx); serr != nil {
+			t.Fatalf("h2.Sync after remote recovered: %v", serr)
+		}
+		_ = h2.Handle.Release(ctx)
+		_ = h1.Handle.Release(ctx)
 	})
 }

@@ -982,6 +982,11 @@ func (wb *WriteBuffer) CanMaterializeFull() bool {
 	if wb.smallFileData != nil {
 		return true
 	}
+	for idx, evicted := range wb.uploadedParts {
+		if evicted && int64(idx)*wb.partSize < wb.totalSize && !wb.IsPartLoaded(idx) {
+			return false
+		}
+	}
 	covered := wb.remoteSize
 	if wb.totalSize < covered {
 		covered = wb.totalSize

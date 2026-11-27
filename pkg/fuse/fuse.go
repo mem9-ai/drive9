@@ -2129,6 +2129,7 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 		f.touchParentMtime(header.NodeId)
 		f.mutated(fs.EventDelete, child)
 		f.markNameNegative(child)
+		f.invalidateAlternateUnicodeSpellings(header.NodeId, name, child)
 		pending.mu.Unlock()
 		// The last Release may have completed while MarkPathUnlinked was
 		// preparing the anonymous handle state, before registration existed.
@@ -2150,6 +2151,7 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 	f.touchParentMtime(header.NodeId)
 	f.mutated(fs.EventDelete, child)
 	f.markNameNegative(child)
+	f.invalidateAlternateUnicodeSpellings(header.NodeId, name, child)
 	return gofuse.OK
 }
 
@@ -2194,6 +2196,7 @@ func (f *FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name string)
 	f.touchParentMtime(header.NodeId)
 	f.mutated(fs.EventDelete, child)
 	f.markNameNegative(child)
+	f.invalidateAlternateUnicodeSpellings(header.NodeId, name, child)
 	return gofuse.OK
 }
 
@@ -3956,6 +3959,24 @@ func (f *FS) InvalidateEntry(parentIno uint64, name string) {
 			defer f.notifyWg.Done()
 			_ = s.EntryNotify(parentIno, name)
 		}()
+	}
+}
+
+// invalidateAlternateUnicodeSpellings drops cached kernel dentries for NFC/NFD
+// equivalents of a removed entry when they differ from rawName so an earlier
+// decomposed or composed Lookup cannot stay positively cached past Unlink/Rmdir.
+func (f *FS) invalidateAlternateUnicodeSpellings(parentIno uint64, rawName, canonChild string) {
+	canonName := pathpkg.Base(canonChild)
+	if canonName == "" || canonName == "/" || canonName == "." {
+		return
+	}
+	if canonName != rawName {
+		f.InvalidateEntry(parentIno, canonName)
+	}
+	if utf8.ValidString(canonName) {
+		if nfdName := norm.NFD.String(canonName); nfdName != canonName && nfdName != rawName {
+			f.InvalidateEntry(parentIno, nfdName)
+		}
 	}
 }
 

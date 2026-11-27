@@ -329,16 +329,32 @@ func TestFacadeRejectsInvalidNamespaceNamesWithoutPollutingDrain(t *testing.T) {
 			if _, ok := f.inodes.GetInode("/cafe\u0301.txt"); ok {
 				t.Fatal("unexpected un-normalized NFD inode key /cafe\\u0301.txt")
 			}
-			// Self-rename with NFD oldName -> NFC newName must be a clean no-op.
+			// Self-rename with NFD oldName -> NFC newName must be a clean no-op
+			// and keep the canonical inode reachable.
 			if st := f.Rename(nil, &gofuse.RenameIn{
 				InHeader: gofuse.InHeader{NodeId: 1},
 				Newdir:   1,
 			}, "cafe\u0301.txt", "caf\u00e9.txt"); st != gofuse.OK {
 				t.Fatalf("self-Rename NFD->NFC: %v", st)
 			}
-			// Unlink with NFD spelling must purge /café.txt staging and inode cleanly.
+			var nfcAfterRename gofuse.EntryOut
+			if st := f.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "caf\u00e9.txt", &nfcAfterRename); st != gofuse.OK {
+				t.Fatalf("Lookup NFC after self-rename: %v, want OK", st)
+			}
+			if nfcAfterRename.NodeId != nfdOut.NodeId {
+				t.Fatalf("Lookup NFC NodeId after self-rename = %d, want %d", nfcAfterRename.NodeId, nfdOut.NodeId)
+			}
+			// Unlink with NFD spelling must remove the canonical inode, make NFC
+			// Lookup fail with ENOENT, and purge staging cleanly.
 			if st := f.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "cafe\u0301.txt"); st != gofuse.OK {
 				t.Fatalf("Unlink NFD: %v", st)
+			}
+			if _, ok := f.inodes.GetInode("/caf\u00e9.txt"); ok {
+				t.Fatal("expected canonical inode /café.txt to be removed after NFD Unlink")
+			}
+			var nfcAfterUnlink gofuse.EntryOut
+			if st := f.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "caf\u00e9.txt", &nfcAfterUnlink); st != gofuse.ENOENT {
+				t.Fatalf("Lookup NFC after NFD Unlink = %v, want ENOENT", st)
 			}
 			if reason, count := wb.DrainPending(); reason != "" || count != 0 {
 				t.Fatalf("DrainPending after NFD Unlink = (%q, %d), want (\"\", 0)", reason, count)

@@ -405,11 +405,11 @@ type bufferingHandle struct {
 	// objGen identifies the file object incarnation for co-open handles born
 	// from a local creation (survives isNew->false landings and renames).
 	objGen uint64
-	// linkedReadCount / linkedReadsIdle / unlinkSnapDone fence linked Read tiers
+	// linkedReadCount / linkedReadsIdle / unlinkSnap fence linked Read tiers
 	// against unlink/rename-over under h.mu alone (no multi-handle lock order).
 	linkedReadCount int32
 	linkedReadsIdle chan struct{}
-	unlinkSnapDone  chan struct{}
+	unlinkSnap      *unlinkSnapState
 	// delegatedDirty marks a handle whose dirty buffer was discarded on a
 	// sibling propagation budget error because a co-open writer's buffer already
 	// holds a superset of its acknowledged bytes; Flush/Sync/Release flushes
@@ -3546,6 +3546,11 @@ func (w *Writeback) pathHasLocalImage(h *bufferingHandle) bool {
 	return false
 }
 
+type unlinkSnapState struct {
+	done chan struct{}
+	err  error
+}
+
 func (h *bufferingHandle) endLinkedRead() {
 	h.mu.Lock()
 	h.linkedReadCount--
@@ -3574,8 +3579,8 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 
 	for {
 		h.mu.Lock()
-		if h.unlinked && h.unlinkSnapDone != nil {
-			waitSnap := h.unlinkSnapDone
+		if h.unlinked && h.unlinkSnap != nil {
+			waitSnap := h.unlinkSnap.done
 			h.mu.Unlock()
 			select {
 			case <-waitSnap:
@@ -3589,6 +3594,16 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 			linkedReadActive = true
 		}
 		break
+	}
+	if !linkedReadActive && h.buf == nil && h.objGen != 0 {
+		myObjGen := h.objGen
+		h.mu.Unlock()
+		if n, ok, derr := h.w.readDirtySiblingByObj(ctx, myObjGen, h, off, dest); derr != nil {
+			return 0, derr
+		} else if ok {
+			return n, nil
+		}
+		h.mu.Lock()
 	}
 	if h.unlinked && h.pendingImage != nil {
 		if off < 0 || off >= int64(len(h.pendingImage)) {
@@ -3671,11 +3686,13 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 				return copy(dest, data[off:]), nil
 			}
 		}
-		// An ANONYMOUS fd (its name was unlinked or overwritten) reads its
-		// own unlink snapshot FIRST: the pending/shadow tiers below now
-		// describe the REPLACEMENT object that reused the name, and serving
-		// them handed the old fd the new file's bytes.
-		if h.unlinked {
+		// An ANONYMOUS fd (admitted after unlink/rename-over) reads its own
+		// unlink snapshot FIRST: the pending/shadow tiers below now describe
+		// the REPLACEMENT object that reused the name. Pre-unlink admitted
+		// reads (linkedReadActive == true) keep serving the original object
+		// while markUnlinkedSnapshot waits on readDrains before deleting or
+		// replacing the name.
+		if !linkedReadActive {
 			if h.w.opts.Staging != nil && h.w.unlinkedShadowServed(h.path) {
 				// The snapshot is GENERATION-bound: a replacement that
 				// reused the name wrote a newer generation at the same
@@ -3711,6 +3728,12 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 				return 0, fs.ErrNotFound
 			}
 			if h.inner == nil {
+				if h.pendingShadowGen != 0 && h.w.opts.Staging != nil {
+					n, rerr := h.w.opts.Staging.Shadow.ReadAtGen(h.pendingShadowGen, off, dest)
+					if rerr == nil || rerr == io.EOF {
+						return n, nil
+					}
+				}
 				return 0, fs.ErrNotFound
 			}
 			return h.inner.Read(ctx, off, dest)
@@ -3751,34 +3774,8 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 		if h.inner == nil {
 			h.mu.Lock()
 			curPath := h.path
-			unlinkedNow := h.unlinked
 			stillNew := h.isNew
-			pinnedImg := h.pendingImage
-			pinnedFile := h.pendingFile
-			pinnedFileSize := h.pendingFileSize
 			h.mu.Unlock()
-			if unlinkedNow {
-				if pinnedFile != nil {
-					if off < 0 || off >= pinnedFileSize {
-						return 0, nil
-					}
-					return pinnedFile.ReadAt(dest, off)
-				}
-				if pinnedImg != nil {
-					if off < 0 || off >= int64(len(pinnedImg)) {
-						return 0, nil
-					}
-					return copy(dest, pinnedImg[off:]), nil
-				}
-				if h.pendingShadowGen != 0 && h.w.opts.Staging != nil {
-					gen := h.pendingShadowGen
-					n, rerr := h.w.opts.Staging.Shadow.ReadAtGen(gen, off, dest)
-					if rerr == nil || rerr == io.EOF {
-						return n, nil
-					}
-				}
-				return 0, fs.ErrNotFound
-			}
 			// For linked handles without a terminal commit failure, prefer a
 			// landed remote image ahead of an open-time pendingImage/pendingShadowGen
 			// capture so a sibling write that subsequently landed and drained is
@@ -3965,21 +3962,18 @@ func (h *bufferingHandle) Write(ctx context.Context, off int64, data []byte) err
 		h.w.notifyTestGate("write:coOpenAcquired")
 	}
 	if coObjGen != 0 && h.buf == nil && !h.trunc && !h.unlinked && !h.appendParticipant() {
-		// Pre-capture any dirty co-open sibling's bytes outside h.mu while
-		// holding coOpenLocks(coObjGen) so lazy buffer creation never misses a
-		// sibling write due to TryLock contention or post-landing isNew reset.
+		// Pre-seed from any dirty co-open sibling outside h.mu while holding
+		// coOpenLocks(coObjGen), restoring spilled parts (or wiring lazy part
+		// loads above the materialization cap) so evicted regions never turn
+		// into zeros.
 		h.mu.Unlock()
-		sibImg, hasSib := h.w.dirtySiblingBytesForObj(coObjGen, h)
+		if serr := h.seedFromDirtySiblingForObj(coObjGen); serr != nil {
+			return serr
+		}
 		h.mu.Lock()
 		if e := h.migratedLocked(); e != nil {
 			h.mu.Unlock()
 			return e.Write(ctx, off, data)
-		}
-		if hasSib && h.buf == nil && !h.trunc && !h.unlinked && !h.appendParticipant() {
-			if err := h.seedBufferFromBytesLocked(sibImg); err != nil {
-				h.mu.Unlock()
-				return err
-			}
 		}
 	}
 	if err := h.ensureBufferLocked(ctx); err != nil {
@@ -6338,12 +6332,13 @@ func restoreMarked(marked []*bufferingHandle) {
 func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHandle, error) {
 	prefix := strings.TrimSuffix(p, "/") + "/"
 	type cleanSnapTarget struct {
-		h    *bufferingHandle
-		done chan struct{}
+		h  *bufferingHandle
+		st *unlinkSnapState
 	}
 	var clean []cleanSnapTarget
 	var marked []*bufferingHandle
-	var submitting, readDrains, otherSnapWaits []chan struct{}
+	var submitting, readDrains []chan struct{}
+	var otherSnapWaits []*unlinkSnapState
 	w.liveSet.Range(func(key, _ any) bool {
 		h := key.(*bufferingHandle)
 		h.mu.Lock()
@@ -6359,12 +6354,12 @@ func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHand
 			h.unlinked = true
 			marked = append(marked, h)
 			if h.buf == nil && !h.isNew && !h.dirty && h.pendingImage == nil && h.pendingFile == nil && h.pendingShadowGen == 0 {
-				snapCh := make(chan struct{})
-				h.unlinkSnapDone = snapCh
-				clean = append(clean, cleanSnapTarget{h: h, done: snapCh})
+				snapSt := &unlinkSnapState{done: make(chan struct{})}
+				h.unlinkSnap = snapSt
+				clean = append(clean, cleanSnapTarget{h: h, st: snapSt})
 			}
-		} else if h.unlinkSnapDone != nil {
-			otherSnapWaits = append(otherSnapWaits, h.unlinkSnapDone)
+		} else if h.unlinkSnap != nil {
+			otherSnapWaits = append(otherSnapWaits, h.unlinkSnap)
 		}
 		if h.linkedReadCount > 0 {
 			if h.linkedReadsIdle == nil {
@@ -6378,8 +6373,11 @@ func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHand
 	for _, ch := range submitting {
 		<-ch
 	}
-	for _, ch := range readDrains {
-		<-ch
+	if len(readDrains) > 0 {
+		w.notifyTestGate("unlink:waitingLinkedReads")
+		for _, ch := range readDrains {
+			<-ch
+		}
 	}
 	var firstErr error
 	for _, ct := range clean {
@@ -6389,18 +6387,22 @@ func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHand
 		} else {
 			err = w.snapshotUnlinkedImage(ct.h)
 		}
+		ct.st.err = err
 		ct.h.mu.Lock()
-		if ct.h.unlinkSnapDone == ct.done {
-			ct.h.unlinkSnapDone = nil
+		if ct.h.unlinkSnap == ct.st {
+			ct.h.unlinkSnap = nil
 		}
 		ct.h.mu.Unlock()
-		close(ct.done)
+		close(ct.st.done)
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
-	for _, ch := range otherSnapWaits {
-		<-ch
+	for _, st := range otherSnapWaits {
+		<-st.done
+		if st.err != nil && firstErr == nil {
+			firstErr = st.err
+		}
 	}
 	return marked, firstErr
 }
@@ -6508,6 +6510,9 @@ func (w *Writeback) liveObjectSize(ctx context.Context, h *bufferingHandle) int6
 	if meta, ok := w.pendingImageMeta(h.path); ok && meta != nil {
 		return meta.Size
 	}
+	if sib, sibSize := w.newestBufferedSiblingByObj(h.objGen, h); sib != nil {
+		return sibSize
+	}
 	if st, err := w.opts.Client.StatCtx(ctx, w.remotePath(h.path)); err == nil && st != nil {
 		return st.Size
 	}
@@ -6540,9 +6545,19 @@ func (w *Writeback) captureSnapshot(h *bufferingHandle, size int64) ([]byte, *os
 	if data, ok := w.stagedImage(h.path, size); ok {
 		return data, nil, nil
 	}
+	sibSrc, _ := w.newestBufferedSiblingByObj(h.objGen, h)
 	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
 	defer cancel()
 	readChunk := func(off int64, dst []byte) (int, error) {
+		if sibSrc != nil {
+			n, ok, serr := readFromSiblingHandle(sibSrc, off, dst)
+			if serr != nil {
+				return n, serr
+			}
+			if ok {
+				return n, nil
+			}
+		}
 		if h.inner != nil {
 			return h.inner.Read(ctx, off, dst)
 		}
@@ -6551,6 +6566,12 @@ func (w *Writeback) captureSnapshot(h *bufferingHandle, size int64) ([]byte, *os
 			return n, rerr
 		}
 		if !ok {
+			h.mu.Lock()
+			unlandedReopen := h.reopenedNoCreat && !h.landed
+			h.mu.Unlock()
+			if unlandedReopen && size == 0 {
+				return 0, nil
+			}
 			return 0, fs.ErrNotFound
 		}
 		return n, nil
@@ -7268,11 +7289,24 @@ func (w *Writeback) snapshotDirtySiblingBytes(path string, skip *bufferingHandle
 		if !sib.mu.TryLock() {
 			continue
 		}
-		if sib.path == path && sib.dirty && sib.buf != nil && !sib.unlinked && !sib.closed && sib.buf.CanMaterializeFull() {
-			if !found || sib.mutSeq >= bestSeq {
-				best = append([]byte(nil), sib.buf.Bytes()...)
-				bestSeq = sib.mutSeq
-				found = true
+		if sib.path == path && sib.dirty && sib.buf != nil && !sib.unlinked && !sib.closed {
+			sibSize := sib.buf.Size()
+			if sib.buf.CanMaterializeFull() {
+				if !found || sib.mutSeq >= bestSeq {
+					best = append([]byte(nil), sib.buf.Bytes()...)
+					bestSeq = sib.mutSeq
+					found = true
+				}
+			} else if sibSize >= 0 && sibSize <= pendingServeMaterializeBytes {
+				if !found || sib.mutSeq >= bestSeq {
+					if err := sib.buf.ForceEnsurePartsForWrite(0, sibSize); err == nil {
+						out := make([]byte, sibSize)
+						sib.buf.ReadAt(0, out)
+						best = out
+						bestSeq = sib.mutSeq
+						found = true
+					}
+				}
 			}
 		}
 		sib.mu.Unlock()
@@ -7327,95 +7361,109 @@ func (w *Writeback) openLiveUnlandedHandle(ctx context.Context, op *fs.Op) (fs.R
 	if w == nil || op == nil {
 		return fs.Result{}, false, nil
 	}
-	w.regMu.Lock()
-	candidates := make([]*bufferingHandle, 0, len(w.liveByPath[op.Path]))
-	for h := range w.liveByPath[op.Path] {
-		candidates = append(candidates, h)
-	}
-	w.regMu.Unlock()
-	if len(candidates) == 0 {
-		return fs.Result{}, false, nil
-	}
-
-	var src *bufferingHandle
-	var srcDirty bool
-	var srcSeq uint64
-	hasPendingBefore := w.hasPendingLocalState(op.Path)
-	for _, cand := range candidates {
-		cand.mu.Lock()
-		eligible := cand.path == op.Path && cand.isNew && !cand.landed && !cand.unlinked && !cand.closed
-		dirty := cand.dirty && cand.buf != nil
-		seq := cand.mutSeq
-		stagedClean := cand.stagedToCache && !dirty && hasPendingBefore
-		cand.mu.Unlock()
-		if !eligible || stagedClean {
-			continue
-		}
-		if src == nil || (dirty && !srcDirty) || (dirty == srcDirty && seq >= srcSeq) {
-			src = cand
-			srcDirty = dirty
-			srcSeq = seq
-		}
-	}
-	if src == nil {
-		return fs.Result{}, false, nil
-	}
-
 	flags := op.Flags
 	isReadOnly := flags&uint32(syscall.O_ACCMODE) == uint32(syscall.O_RDONLY) &&
 		flags&uint32(syscall.O_TRUNC) == 0
 	trunc := flags&uint32(syscall.O_TRUNC) != 0
 
-	// Under PolicyWriteBack, materialize the active handle's current local
-	// state into the writeback pending layer without triggering a remote upload.
-	// flushLocalForReopen serializes on src.flushMu like Flush, stages into
-	// wbCache or ShadowStore+CommitQueue when available, and leaves oversize
-	// buffers in memory when no staging ledger exists instead of falling through
-	// to a synchronous remote commitInline on open(2).
-	if w.opts.Policy == PolicyWriteBack && !trunc {
-		if srcDirty {
-			if ferr := src.flushLocalForReopen(ctx); ferr != nil {
-				return fs.Result{}, false, ferr
+	var (
+		src       *bufferingHandle
+		srcDirty  bool
+		unlock    func()
+		size      int64
+		mode      uint32
+		hasMode   bool
+		srcObjGen uint64
+	)
+	for attempt := 0; ; attempt++ {
+		w.regMu.Lock()
+		candidates := make([]*bufferingHandle, 0, len(w.liveByPath[op.Path]))
+		for h := range w.liveByPath[op.Path] {
+			candidates = append(candidates, h)
+		}
+		w.regMu.Unlock()
+		if len(candidates) == 0 {
+			return fs.Result{}, false, nil
+		}
+
+		src = nil
+		srcDirty = false
+		var srcSeq uint64
+		hasPendingBefore := w.hasPendingLocalState(op.Path)
+		for _, cand := range candidates {
+			cand.mu.Lock()
+			eligible := cand.path == op.Path && cand.isNew && !cand.landed && !cand.unlinked && !cand.closed
+			dirty := cand.dirty && cand.buf != nil
+			seq := cand.mutSeq
+			stagedClean := cand.stagedToCache && !dirty && hasPendingBefore
+			cand.mu.Unlock()
+			if !eligible || stagedClean {
+				continue
 			}
-		} else if w.wbCache != nil {
-			snap, serr := src.stageToWriteCache(ctx, stageFullDurable)
-			if serr != nil && !errors.Is(serr, errWriteCacheBypass) {
-				return fs.Result{}, false, serr
-			}
-			if snap != nil {
-				src.mu.Lock()
-				if !src.unlinked && !src.closed {
-					src.stagedToCache = true
-				}
-				src.mu.Unlock()
+			if src == nil || (dirty && !srcDirty) || (dirty == srcDirty && seq >= srcSeq) {
+				src = cand
+				srcDirty = dirty
+				srcSeq = seq
 			}
 		}
-	}
+		if src == nil {
+			return fs.Result{}, false, nil
+		}
 
-	unlock := w.pathLocks.lock(op.Path)
-	src.mu.Lock()
-	if src.unlinked || src.closed {
+		// Under PolicyWriteBack, materialize the active handle's current local
+		// state into the writeback pending layer without triggering a remote upload.
+		if w.opts.Policy == PolicyWriteBack && !trunc {
+			if srcDirty {
+				if ferr := src.flushLocalForReopen(ctx); ferr != nil {
+					return fs.Result{}, false, ferr
+				}
+			} else if w.wbCache != nil {
+				snap, serr := src.stageToWriteCache(ctx, stageFullDurable)
+				if serr != nil && !errors.Is(serr, errWriteCacheBypass) {
+					return fs.Result{}, false, serr
+				}
+				if snap != nil {
+					src.mu.Lock()
+					if src.path == op.Path && !src.unlinked && !src.closed {
+						src.stagedToCache = true
+					}
+					src.mu.Unlock()
+				}
+			}
+		}
+
+		unlock = w.pathLocks.lock(op.Path)
+		w.regMu.Lock()
+		_, stillRegistered := w.liveByPath[op.Path][src]
+		w.regMu.Unlock()
+		src.mu.Lock()
+		if !stillRegistered || src.path != op.Path || src.unlinked || src.closed {
+			src.mu.Unlock()
+			unlock()
+			if attempt == 0 {
+				continue
+			}
+			return fs.Result{}, false, nil
+		}
+		if src.landed || !src.isNew {
+			// Landed concurrently; let the normal open path serve the committed file.
+			src.mu.Unlock()
+			unlock()
+			return fs.Result{}, false, nil
+		}
+		size = src.baseSize
+		if src.buf != nil {
+			size = src.buf.Size()
+		}
+		mode, hasMode = src.pendingMode, src.hasPendingMode
+		srcObjGen = src.objGen
+		if srcObjGen == 0 {
+			srcObjGen = w.nextObjGen.Add(1)
+			src.objGen = srcObjGen
+		}
 		src.mu.Unlock()
-		unlock()
-		return fs.Result{}, false, nil
+		break
 	}
-	if src.landed || !src.isNew {
-		// Landed concurrently; let the normal open path serve the committed file.
-		src.mu.Unlock()
-		unlock()
-		return fs.Result{}, false, nil
-	}
-	size := src.baseSize
-	if src.buf != nil {
-		size = src.buf.Size()
-	}
-	mode, hasMode := src.pendingMode, src.hasPendingMode
-	srcObjGen := src.objGen
-	if srcObjGen == 0 {
-		srcObjGen = w.nextObjGen.Add(1)
-		src.objGen = srcObjGen
-	}
-	src.mu.Unlock()
 
 	attr, ok := w.pendingAttr(op.Path)
 	if !ok {
@@ -7674,9 +7722,6 @@ func (w *Writeback) acknowledgeObjGenLanding(objGen uint64, rev int64, seq uint6
 		return
 	}
 	w.recordObjLandedSeq(objGen, seq)
-	if rev <= 0 {
-		return
-	}
 	w.regMu.Lock()
 	siblings := make([]*bufferingHandle, 0, len(w.liveByObj[objGen]))
 	for h := range w.liveByObj[objGen] {
@@ -7685,16 +7730,49 @@ func (w *Writeback) acknowledgeObjGenLanding(objGen uint64, rev int64, seq uint6
 	w.regMu.Unlock()
 	for _, sib := range siblings {
 		sib.mu.Lock()
-		if !sib.unlinked && !sib.closed && !sib.appendParticipant() && rev > sib.baseRev {
-			sib.baseRev = rev
+		if !sib.unlinked && !sib.closed && !sib.appendParticipant() {
+			sib.landed = true
+			sib.isNew = false
+			if rev > sib.baseRev {
+				sib.baseRev = rev
+			}
 		}
 		sib.mu.Unlock()
 	}
 }
 
-func (w *Writeback) dirtySiblingBytesForObj(objGen uint64, skip *bufferingHandle) ([]byte, bool) {
+func readFromSiblingHandle(sib *bufferingHandle, off int64, dst []byte) (int, bool, error) {
+	sib.mu.Lock()
+	defer sib.mu.Unlock()
+	if sib.closed || sib.buf == nil {
+		return 0, false, nil
+	}
+	total := sib.buf.Size()
+	if off < 0 || off >= total {
+		return 0, true, nil
+	}
+	want := int64(len(dst))
+	if off+want > total {
+		want = total - off
+	}
+	partSize := sib.buf.PartSize()
+	if err := sib.buf.ForceEnsurePartsForWrite(off, want); err != nil {
+		return 0, false, err
+	}
+	n := sib.buf.ReadAt(off, dst[:want])
+	if partSize > 0 {
+		firstIdx := int(off / partSize)
+		lastIdx := int((off + want - 1) / partSize)
+		for idx := firstIdx; idx <= lastIdx; idx++ {
+			sib.buf.ReleaseCleanPart(idx)
+		}
+	}
+	return n, true, nil
+}
+
+func (w *Writeback) newestBufferedSiblingByObj(objGen uint64, skip *bufferingHandle) (*bufferingHandle, int64) {
 	if w == nil || objGen == 0 {
-		return nil, false
+		return nil, 0
 	}
 	w.regMu.Lock()
 	handles := make([]*bufferingHandle, 0, len(w.liveByObj[objGen]))
@@ -7704,21 +7782,167 @@ func (w *Writeback) dirtySiblingBytesForObj(objGen uint64, skip *bufferingHandle
 		}
 	}
 	w.regMu.Unlock()
-	var best []byte
+	var best *bufferingHandle
 	var bestSeq uint64
-	found := false
+	var bestSize int64
 	for _, sib := range handles {
 		sib.mu.Lock()
-		if !sib.unlinked && !sib.closed && sib.dirty && sib.buf != nil && sib.buf.CanMaterializeFull() {
-			if !found || sib.mutSeq >= bestSeq {
-				best = append([]byte(nil), sib.buf.Bytes()...)
+		if !sib.closed && sib.buf != nil && (sib.dirty || sib.isNew) {
+			if best == nil || sib.mutSeq >= bestSeq {
+				best = sib
 				bestSeq = sib.mutSeq
-				found = true
+				bestSize = sib.buf.Size()
 			}
 		}
 		sib.mu.Unlock()
 	}
-	return best, found
+	return best, bestSize
+}
+
+func (w *Writeback) readDirtySiblingByObj(ctx context.Context, objGen uint64, skip *bufferingHandle, off int64, dest []byte) (int, bool, error) {
+	if w == nil || objGen == 0 {
+		return 0, false, nil
+	}
+	w.regMu.Lock()
+	handles := make([]*bufferingHandle, 0, len(w.liveByObj[objGen]))
+	for h := range w.liveByObj[objGen] {
+		if h != skip {
+			handles = append(handles, h)
+		}
+	}
+	w.regMu.Unlock()
+	var best *bufferingHandle
+	var bestSeq uint64
+	for _, sib := range handles {
+		sib.mu.Lock()
+		if !sib.closed && sib.dirty && sib.buf != nil {
+			if best == nil || sib.mutSeq >= bestSeq {
+				best = sib
+				bestSeq = sib.mutSeq
+			}
+		}
+		sib.mu.Unlock()
+	}
+	if best == nil {
+		return 0, false, nil
+	}
+	_ = ctx
+	return readFromSiblingHandle(best, off, dest)
+}
+
+func (h *bufferingHandle) seedFromDirtySiblingForObj(objGen uint64) error {
+	if h.w == nil || objGen == 0 {
+		return nil
+	}
+	h.w.regMu.Lock()
+	handles := make([]*bufferingHandle, 0, len(h.w.liveByObj[objGen]))
+	for sib := range h.w.liveByObj[objGen] {
+		if sib != h {
+			handles = append(handles, sib)
+		}
+	}
+	h.w.regMu.Unlock()
+
+	var best *bufferingHandle
+	var bestSeq uint64
+	var bestSize int64
+	for _, sib := range handles {
+		sib.mu.Lock()
+		if !sib.unlinked && !sib.closed && sib.dirty && sib.buf != nil {
+			if best == nil || sib.mutSeq >= bestSeq {
+				best = sib
+				bestSeq = sib.mutSeq
+				bestSize = sib.buf.Size()
+			}
+		}
+		sib.mu.Unlock()
+	}
+	if best == nil {
+		return nil
+	}
+
+	if bestSize <= pendingServeMaterializeBytes {
+		best.mu.Lock()
+		if best.unlinked || best.closed || !best.dirty || best.buf == nil {
+			best.mu.Unlock()
+			return nil
+		}
+		curSize := best.buf.Size()
+		var img []byte
+		if curSize > 0 {
+			if err := best.buf.ForceEnsurePartsForWrite(0, curSize); err != nil {
+				best.mu.Unlock()
+				return err
+			}
+			img = make([]byte, curSize)
+			best.buf.ReadAt(0, img)
+		} else {
+			img = []byte{}
+		}
+		best.mu.Unlock()
+
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if h.buf == nil && !h.trunc && !h.unlinked && !h.appendParticipant() {
+			return h.seedBufferFromBytesLocked(img)
+		}
+		return nil
+	}
+
+	// Oversize sibling buffer (> pendingServeMaterializeBytes, e.g. spilled to
+	// liveSpillFile): wire a lazy part loader backed by best so evicted parts
+	// restore on demand without materializing the full image in RAM.
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.buf != nil || h.trunc || h.unlinked || h.appendParticipant() {
+		return nil
+	}
+	buf := writebuffer.NewWriteBuffer(h.path, bufferedMaxTotal, 0)
+	buf.SetMemoryBudget(h.w.budget)
+	partSize := buf.PartSize()
+	lazySize := bestSize
+	buf.SeedRemote(lazySize)
+	// Callers invoke WriteBuffer methods on h.buf while holding h.mu, so h.path
+	// and h.unlinked are already protected here without re-locking h.mu.
+	buf.LoadPart = func(partNum int) ([]byte, error) {
+		start := int64(partNum-1) * partSize
+		end := start + partSize
+		if end > lazySize {
+			end = lazySize
+		}
+		if end <= start {
+			return nil, nil
+		}
+		part := make([]byte, end-start)
+		n, ok, rerr := readFromSiblingHandle(best, start, part)
+		if rerr != nil {
+			return nil, rerr
+		}
+		if ok && int64(n) == end-start {
+			return part, nil
+		}
+		curPath := h.path
+		if st := h.w.opts.Staging; st != nil && st.Pending.HasPending(curPath) {
+			if sn, serr := st.Shadow.ReadAt(curPath, start, part); (serr == nil || errors.Is(serr, io.EOF)) && int64(sn) == end-start {
+				return part, nil
+			}
+		}
+		if !h.unlinked {
+			lctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+			defer cancel()
+			rn, rok, ferr := h.w.readRemoteRangeFallback(lctx, curPath, start, part)
+			if ferr != nil {
+				return nil, ferr
+			}
+			if rok && int64(rn) == end-start {
+				return part, nil
+			}
+		}
+		return nil, fmt.Errorf("co-open sibling part %d of %s unavailable", partNum, curPath)
+	}
+	h.buf = buf
+	h.baseLoaded = true
+	return nil
 }
 
 func (h *bufferingHandle) flushDelegatedDirtySiblings(ctx context.Context, syncBarrier bool) error {
@@ -7740,9 +7964,11 @@ func (h *bufferingHandle) flushDelegatedDirtySiblings(ctx context.Context, syncB
 	h.w.regMu.Unlock()
 	for _, sib := range siblings {
 		sib.mu.Lock()
-		dirty := sib.dirty && sib.buf != nil && !sib.unlinked && !sib.closed
+		sibPath := sib.path
+		needFlush := !sib.unlinked && !sib.closed && sib.isWritableCapableLocked() &&
+			((sib.dirty && sib.buf != nil) || (syncBarrier && (sib.stagedToCache || h.w.hasPendingLocalState(sibPath))))
 		sib.mu.Unlock()
-		if !dirty {
+		if !needFlush {
 			continue
 		}
 		var ferr error
@@ -7755,9 +7981,11 @@ func (h *bufferingHandle) flushDelegatedDirtySiblings(ctx context.Context, syncB
 			return ferr
 		}
 	}
-	h.mu.Lock()
-	h.delegatedDirty = false
-	h.mu.Unlock()
+	if syncBarrier {
+		h.mu.Lock()
+		h.delegatedDirty = false
+		h.mu.Unlock()
+	}
 	return nil
 }
 
@@ -8721,8 +8949,10 @@ func (w *Writeback) commitReaderOptHook(ctx context.Context, path string, newRea
 				}
 			}
 		}
+		var streamedRev int64
 		if werr == nil {
-			werr = w.opts.Client.WriteStreamConditional(ctx, rp, newReader(), size, nil, expected)
+			sctx := client.WithCompletedRevisionSink(ctx, &streamedRev)
+			werr = w.opts.Client.WriteStreamConditional(sctx, rp, newReader(), size, nil, expected)
 		}
 		if werr != nil {
 			if errors.Is(werr, client.ErrConflict) {
@@ -8744,7 +8974,7 @@ func (w *Writeback) commitReaderOptHook(ctx context.Context, path string, newRea
 			}
 			return 0, mapErr(werr)
 		}
-		return 0, nil
+		return streamedRev, nil
 	}
 	return 0, &fs.StatusError{Path: path, Status: gofuse.EAGAIN}
 }
@@ -9225,6 +9455,18 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 		// lockStagePath re-verifies h.path after acquiring pathLocks so a concurrent
 		// atomic retarget + cache move never races a stage onto the old pathname.
 		stagePath, unlock := h.lockStagePath()
+		h.mu.Lock()
+		needRevProbe := !h.isNew && h.baseRev <= 0 && !h.unlinked && !h.closed && h.dirty
+		h.mu.Unlock()
+		if needRevProbe && w.opts.Client != nil {
+			if rst, rerr := w.opts.Client.StatCtx(ctx, w.remotePath(stagePath)); rerr == nil && rst != nil && rst.Revision > 0 {
+				h.mu.Lock()
+				if h.baseRev <= 0 {
+					h.baseRev = rst.Revision
+				}
+				h.mu.Unlock()
+			}
+		}
 		var cachePutGen uint64
 		if w.wbCache != nil {
 			if meta, ok := w.wbCache.GetMeta(stagePath); ok && meta != nil {
@@ -9454,8 +9696,9 @@ func (h *bufferingHandle) spillToShadow(st *staging.Staging, stagePath string, b
 	hadShadowBefore := st.Shadow.Has(stagePath)
 	// Clear stale shadow bytes beyond any shrink watermark (or from a prior
 	// unspilled incarnation on a zero-base create/truncate) before skipping
-	// unloaded zero-extended parts below.
-	if zeroBase && buf.RestorePart == nil {
+	// unloaded zero-extended parts below. Keep an active pending shadow intact
+	// when a co-open sibling is lazy-loading untouched parts from it.
+	if (h.trunc || (zeroBase && !st.Pending.HasPending(stagePath))) && buf.RestorePart == nil {
 		if st.Shadow.Size(stagePath) > 0 {
 			if err := st.Shadow.Truncate(stagePath, 0, baseRev); err != nil {
 				return err
@@ -9481,7 +9724,7 @@ func (h *bufferingHandle) spillToShadow(st *staging.Staging, stagePath string, b
 	// non-streamed parts at or beyond RemoteSize() are pure zero holes and
 	// are served by the final st.Shadow.Truncate(stagePath, size, baseRev).
 	remoteLimit := buf.RemoteSize()
-	if zeroBase {
+	if h.trunc {
 		remoteLimit = 0
 	}
 	streamed := buf.StreamedPartIndices()
@@ -9493,9 +9736,6 @@ func (h *bufferingHandle) spillToShadow(st *staging.Staging, stagePath string, b
 	}
 	var deferredEvict []int
 	rollbackPartialSpill := func() {
-		for idx := range preEvicted {
-			buf.EvictPart(idx)
-		}
 		if !hadShadowBefore {
 			st.Shadow.Remove(stagePath)
 		} else if preLoopShadowSize >= 0 && st.Shadow.Size(stagePath) > preLoopShadowSize {
@@ -9529,10 +9769,18 @@ func (h *bufferingHandle) spillToShadow(st *staging.Staging, stagePath string, b
 			return err
 		}
 		if !retainBuffer {
-			// Defer eviction of all written parts until the entire spill +
-			// Truncate succeeds so a mid-spill ENOSPC rollback never loses
-			// bytes from buf or liveSpillFile.
-			deferredEvict = append(deferredEvict, partIdx)
+			if preEvicted[partIdx] {
+				// RestorePart / liveSpillFile already holds this part on disk;
+				// evicting immediately bounds spill memory while keeping it
+				// recoverable on retry.
+				buf.EvictPart(partIdx)
+			} else {
+				// ReleaseCleanPart drops clean remote-backed parts immediately
+				// (keeping multi-GiB spills O(1 part) in RAM), while resident
+				// dirty parts stay until st.Shadow.Truncate succeeds below.
+				buf.ReleaseCleanPart(partIdx)
+				deferredEvict = append(deferredEvict, partIdx)
+			}
 		}
 	}
 	if err := st.Shadow.Truncate(stagePath, size, baseRev); err != nil {
@@ -9551,6 +9799,11 @@ func (h *bufferingHandle) spillToShadow(st *staging.Staging, stagePath string, b
 			h.liveSpillFile = nil
 		}
 		buf.RestorePart = func(partNum int) ([]byte, error) {
+			if h.unlinked {
+				if pin := h.w.unlinkedShadowPinFor(h.path); pin != 0 {
+					return restorePinnedShadowPart(st.Shadow, pin, buf, partNum)
+				}
+			}
 			return restoreShadowPart(st.Shadow, h.path, buf, partNum)
 		}
 		buf.OnPartFull = func(partIdx int, data []byte) {
@@ -9562,6 +9815,30 @@ func (h *bufferingHandle) spillToShadow(st *staging.Staging, stagePath string, b
 		}
 	}
 	return nil
+}
+
+func restorePinnedShadowPart(store *staging.ShadowStore, pin staging.PinGen, wb *writebuffer.WriteBuffer, partNum int) ([]byte, error) {
+	partSize := wb.PartSize()
+	if store == nil || pin == 0 || wb == nil || partNum < 1 || partSize <= 0 {
+		return nil, fmt.Errorf("invalid pinned shadow part restore")
+	}
+	start := int64(partNum-1) * partSize
+	end := start + partSize
+	if total := wb.Size(); total > 0 && end > total {
+		end = total
+	}
+	if end <= start {
+		return nil, fmt.Errorf("empty pinned shadow part %d", partNum)
+	}
+	buf := make([]byte, end-start)
+	n, err := store.ReadAtGen(pin, start, buf)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	if int64(n) != end-start {
+		return nil, fmt.Errorf("pinned shadow part %d short read n=%d want=%d", partNum, n, end-start)
+	}
+	return buf, nil
 }
 
 // restoreShadowPart re-reads one evicted buffer part from the shadow (v1
