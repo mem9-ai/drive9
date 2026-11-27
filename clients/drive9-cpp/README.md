@@ -128,6 +128,21 @@ client when an unrelated expired session cannot be cleaned.
 
 ## Validation
 
+`Clone(handle, target, expected_inode)` publishes a metadata-only copy through
+the existing `/v1/extent/meta` transaction. `CloneSupported()` requires both
+`new_session.clone_v1` and `session_guard`. The source handle must hold a shared
+or exclusive whole-file lock; applications must also choose their own consistent
+source boundary (for example, a completed database checkpoint). `expected_inode`
+is a destination compare-and-swap: zero creates only if absent, a nonzero value
+replaces exactly that inode. The returned inode identifies the new generation.
+Existing readers retain the replaced inode through their normal open references.
+The source handle is unchanged. The server shares immutable object slices and
+retains/reclaims them through existing reference counts, without transferring
+their bytes. A definite conflict can be retried after rereading the destination;
+an ambiguous or malformed acknowledgement invalidates the session and is never
+automatically replayed. This API requires a server advertising the capability;
+the public legacy server does not yet advertise it.
+
 Standalone tests exercise HTTP deadline and pool behavior, redirect rejection,
 mutation acknowledgement loss without replay, sparse dirty-buffer reads,
 overlapping slice/hole decoding, exact large session IDs, shared open references,
