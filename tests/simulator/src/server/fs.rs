@@ -82,6 +82,19 @@ async fn read_bytes(
     }
 }
 
+async fn read_file_bytes(
+    state: Arc<AppState>,
+    t: Arc<TenantDb>,
+    p: String,
+    n: &Node,
+) -> Result<Vec<u8>, Response> {
+    if n.is_extent() {
+        read_extent_bytes(state, t, &p, n.size).await
+    } else {
+        read_bytes(state, t, p).await
+    }
+}
+
 async fn read_extent_bytes(
     state: Arc<AppState>,
     t: Arc<TenantDb>,
@@ -199,6 +212,22 @@ fn set_file_read_headers(h: &mut HeaderMap, n: &Node) {
     }
 }
 
+// The inline-bytes representation of an extent file carries the layout, the
+// storage type and the full length alongside the classic read headers.
+fn set_extent_headers(h: &mut HeaderMap, n: &Node) {
+    h.insert("x-dat9-content-layout", "extent".parse().unwrap());
+    h.insert("x-dat9-storage-type", "extent".parse().unwrap());
+    h.insert("x-dat9-extent-length", n.size.to_string().parse().unwrap());
+}
+
+// extent_read_is_current reports whether the file at `p` still carries the ETag
+// the response was assembled for. The ETag includes the inode, so a delete plus
+// same-size recreate (new inode, revision 1 again) is detected too.
+fn extent_read_is_current(t: &TenantDb, p: &str, etag: &str) -> Result<bool, StoreError> {
+    let after = t.get_node(p)?;
+    Ok(read_etag(&after.inode, after.revision, after.size) == etag)
+}
+
 async fn fs_read(state: Arc<AppState>, t: Arc<TenantDb>, req: FsReq) -> Response {
     let p0 = match fs_path(&req, false) {
         Ok(p) => p,
@@ -227,66 +256,58 @@ async fn fs_read(state: Arc<AppState>, t: Arc<TenantDb>, req: FsReq) -> Response
         return err_resp(412, "precondition failed");
     }
 
-    if n.is_extent() {
-        if req.header(super::extent::READ_PLAN_HEADER).is_some() {
-            let size = n.size;
-            let effective_range = match (req.header("range"), req.header("if-range")) {
-                (Some(_), Some(ir)) if ir.trim() != etag => None,
-                (r, _) => r,
-            };
-            let (start, end) = match effective_range {
-                Some(r) => match parse_range(r, size) {
-                    Some(se) => se,
-                    None => {
-                        let mut resp = err_code_resp(416, "invalid_range", "range not satisfiable");
-                        resp.headers_mut().insert(
-                            "content-range",
-                            format!("bytes */{size}").parse().unwrap(),
-                        );
-                        return resp;
-                    }
-                },
-                None => (0, size.saturating_sub(1)),
-            };
-            let s3_conn = state.s3_for(&req.headers);
-            return match super::extent::read_plan(s3_conn, t, p, size, n.revision, start, end).await {
-                Ok(plan) => {
-                    let mut resp = json_resp(206, plan);
-                    let h = resp.headers_mut();
-                    set_file_read_headers(h, &n);
-                    h.insert("x-dat9-content-layout", "extent".parse().unwrap());
-                    h.insert("x-dat9-storage-type", "extent".parse().unwrap());
-                    resp
+    if n.is_extent() && req.header(super::extent::READ_PLAN_HEADER).is_some() {
+        let size = n.size;
+        let effective_range = match (req.header("range"), req.header("if-range")) {
+            (Some(_), Some(ir)) if ir.trim() != etag => None,
+            (r, _) => r,
+        };
+        let (start, end) = match effective_range {
+            Some(r) => match parse_range(r, size) {
+                Some(se) => se,
+                None => {
+                    let mut resp = err_code_resp(416, "invalid_range", "range not satisfiable");
+                    resp.headers_mut().insert(
+                        "content-range",
+                        format!("bytes */{size}").parse().unwrap(),
+                    );
+                    return resp;
                 }
-                Err(e) => err_code_resp(503, "s3_unavailable", &e),
-            };
-        }
+            },
+            None => (0, size.saturating_sub(1)),
+        };
+        let s3_conn = state.s3_for(&req.headers);
+        return match super::extent::read_plan(s3_conn, t, p, size, n.revision, start, end).await {
+            Ok(plan) => {
+                let mut resp = json_resp(206, plan);
+                let h = resp.headers_mut();
+                set_file_read_headers(h, &n);
+                h.insert("x-dat9-content-layout", "extent".parse().unwrap());
+                h.insert("x-dat9-storage-type", "extent".parse().unwrap());
+                resp
+            }
+            Err(e) => err_code_resp(503, "s3_unavailable", &e),
+        };
     }
 
     // A client that did not opt into the block plan still reads the bytes:
     // extent layout is an internal storage choice, never a client contract.
-    let data = if n.is_extent() {
-        let data = match read_extent_bytes(state.clone(), t.clone(), &p, n.size).await {
-            Ok(d) => d,
-            Err(r) => return r,
-        };
+    let data = match read_file_bytes(state.clone(), t.clone(), p.clone(), &n).await {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    if n.is_extent() {
         // The node (and so the ETag, revision and extent length) was read
         // before the mappings. A concurrent commit between those two store
-        // reads must not pair a newer body with this response's generation, so
-        // reject the mixed read instead of returning a body the validators do
-        // not describe.
-        match t.get_node(&p) {
-            Ok(after) if after.revision == n.revision && after.size == n.size => {}
-            Ok(_) => return err_code_resp(409, "revision_conflict", "file changed since it was opened"),
-            Err(e) => return store_err(e),
+        // reads must not pair a newer body with this response's generation;
+        // comparing the full ETag also catches a delete plus same-size recreate.
+        match extent_read_is_current(&t, &p, &etag) {
+            Ok(true) => {}
+            Ok(false) => return err_resp(409, "file changed since it was opened"),
+            // The file is gone: the body is not a representation of anything.
+            Err(_) => return err_resp(404, "not found"),
         }
-        data
-    } else {
-        match read_bytes(state, t, p).await {
-            Ok(d) => d,
-            Err(r) => return r,
-        }
-    };
+    }
     let total = data.len() as i64;
     let effective_range = match (req.header("range"), req.header("if-range")) {
         (Some(_), Some(ir)) if ir.trim() != etag => None,
@@ -308,9 +329,7 @@ async fn fs_read(state: Arc<AppState>, t: Arc<TenantDb>, req: FsReq) -> Response
                 );
                 set_file_read_headers(h, &n);
                 if n.is_extent() {
-                    h.insert("x-dat9-content-layout", "extent".parse().unwrap());
-                    h.insert("x-dat9-storage-type", "extent".parse().unwrap());
-                    h.insert("x-dat9-extent-length", n.size.to_string().parse().unwrap());
+                    set_extent_headers(h, &n);
                 }
                 return resp;
             }
@@ -332,9 +351,7 @@ async fn fs_read(state: Arc<AppState>, t: Arc<TenantDb>, req: FsReq) -> Response
     h.insert("content-length", total.to_string().parse().unwrap());
     set_file_read_headers(h, &n);
     if n.is_extent() {
-        h.insert("x-dat9-content-layout", "extent".parse().unwrap());
-        h.insert("x-dat9-storage-type", "extent".parse().unwrap());
-        h.insert("x-dat9-extent-length", n.size.to_string().parse().unwrap());
+        set_extent_headers(h, &n);
     }
     resp
 }
@@ -1439,16 +1456,9 @@ async fn fs_grep(state: Arc<AppState>, t: Arc<TenantDb>, req: FsReq, query: Stri
         if n.size > MAX_GREP_FILE_BYTES {
             continue;
         }
-        let data = if n.is_extent() {
-            match read_extent_bytes(state.clone(), t.clone(), &target_path, n.size).await {
-                Ok(d) => d,
-                Err(_) => continue,
-            }
-        } else {
-            match read_bytes(state.clone(), t.clone(), target_path).await {
-                Ok(d) => d,
-                Err(_) => continue,
-            }
+        let data = match read_file_bytes(state.clone(), t.clone(), target_path, &n).await {
+            Ok(d) => d,
+            Err(_) => continue,
         };
         let text = String::from_utf8_lossy(&data);
         for line in text.lines() {

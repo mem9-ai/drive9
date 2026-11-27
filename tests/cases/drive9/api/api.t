@@ -709,6 +709,16 @@ def step_uploads_v2_and_extent():
     assert eh.get("x-dat9-content-layout") == "extent", eh
     assert eh.get("x-dat9-extent-length") == str(len(ext_data)), eh
 
+    # Ranges on those inline bytes behave like the classic path, and an
+    # unsatisfiable range is still a 416.
+    st, rh, rbody = req("GET", f"/v1/fs{ext_path}", headers={"Range": "bytes=2-5"})
+    assert st == 206 and rbody == ext_data[2:6], (st, rh)
+    assert rh.get("content-range") == f"bytes 2-5/{len(ext_data)}", rh
+    assert rh.get("x-dat9-extent-length") == str(len(ext_data)), rh
+    st, uh, _ = req("GET", f"/v1/fs{ext_path}", headers={"Range": f"bytes={len(ext_data)}-"})
+    assert st == 416, (st, uh)
+    assert uh.get("content-range") == f"bytes */{len(ext_data)}", uh
+
     st, _, plan = req_json("GET", f"/v1/fs{ext_path}", headers={"X-Dat9-Extent-Read-Plan": "1"})
     assert st == 206 and plan["size"] == len(ext_data) and len(plan["blocks"]) == 1, (st, plan)
 

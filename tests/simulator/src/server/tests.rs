@@ -415,24 +415,56 @@ fn uploads_v2_extent_contract() {
 
     let (st, h, _) = http(&addr, req("HEAD", "/v1/fs/x/a.bin", Some(&auth), &[], &[]), &[]);
     assert_eq!(st, 200);
-    assert!(h.to_lowercase().contains("x-dat9-content-layout: extent"));
-    assert!(h.to_lowercase().contains("etag:"));
+    assert_eq!(header(&h, "x-dat9-content-layout").as_deref(), Some("extent"));
+    assert_eq!(header(&h, "x-dat9-storage-type").as_deref(), Some("extent"));
+    assert_eq!(header(&h, "x-dat9-revision").as_deref(), Some("1"));
+    let etag = header(&h, "etag").expect("etag on HEAD");
 
-    // A plain GET returns the extent bytes inline (no plan opt-in required).
+    // A plain GET returns the extent bytes inline (no plan opt-in required),
+    // carrying the layout, the storage type and the full length.
     let (st, h, b) = http(&addr, req("GET", "/v1/fs/x/a.bin", Some(&auth), &[], &[]), &[]);
     assert_eq!(st, 200, "{}", String::from_utf8_lossy(&b));
-    assert!(h.to_lowercase().contains("x-dat9-content-layout: extent"));
-    assert!(h.to_lowercase().contains("x-dat9-extent-length"));
+    assert_eq!(header(&h, "x-dat9-content-layout").as_deref(), Some("extent"));
+    assert_eq!(header(&h, "x-dat9-storage-type").as_deref(), Some("extent"));
+    assert_eq!(
+        header(&h, "x-dat9-extent-length").as_deref(),
+        Some(data.len().to_string().as_str())
+    );
+    assert_eq!(header(&h, "x-dat9-revision").as_deref(), Some("1"));
+    assert_eq!(header(&h, "accept-ranges").as_deref(), Some("bytes"));
+    assert_eq!(header(&h, "etag").as_deref(), Some(etag.as_str()));
     assert_eq!(b, data);
 
     // Ranges apply to the inline bytes like the classic path.
-    let (st, _, b) = http(
+    let (st, h, b) = http(
         &addr,
         req("GET", "/v1/fs/x/a.bin", Some(&auth), &[("Range", "bytes=2-5")], &[]),
         &[],
     );
     assert_eq!(st, 206, "{}", String::from_utf8_lossy(&b));
     assert_eq!(b, &data[2..=5]);
+    assert_eq!(header(&h, "content-length").as_deref(), Some("4"));
+    assert_eq!(
+        header(&h, "content-range").as_deref(),
+        Some(format!("bytes 2-5/{}", data.len()).as_str())
+    );
+    assert_eq!(header(&h, "x-dat9-content-layout").as_deref(), Some("extent"));
+    assert_eq!(
+        header(&h, "x-dat9-extent-length").as_deref(),
+        Some(data.len().to_string().as_str())
+    );
+
+    // An unsatisfiable range is still a 416 on the inline path.
+    let (st, h, _) = http(
+        &addr,
+        req("GET", "/v1/fs/x/a.bin", Some(&auth), &[("Range", "bytes=99999-")], &[]),
+        &[],
+    );
+    assert_eq!(st, 416);
+    assert_eq!(
+        header(&h, "content-range").as_deref(),
+        Some(format!("bytes */{}", data.len()).as_str())
+    );
 
     let (st, _, b) = http(
         &addr,
