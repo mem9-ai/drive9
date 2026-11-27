@@ -144,3 +144,31 @@ func TestSchemaRetryDelayCaps(t *testing.T) {
 	require.Equal(t, 100*time.Millisecond, schemaRetryDelay(2))
 	require.Equal(t, schemaStatementRetryMax, schemaRetryDelay(8))
 }
+
+func TestExecSchemaStatementExhaustsMaxAttemptsOnPersistentTransientError(t *testing.T) {
+	var attempts atomic.Int32
+	transient := &mysql.MySQLError{Number: 8028, Message: "Information schema is changed during the execution of the statement [try again later]"}
+	db := newTestRepairDB(t, func(string) testRepairQueryResult {
+		return testRepairQueryResult{}
+	}, func(string) error {
+		attempts.Add(1)
+		return transient
+	})
+	err := execSchemaStatement(context.Background(), db, `ALTER TABLE uploads ADD COLUMN mode INT UNSIGNED NOT NULL DEFAULT 420`, 1, 1)
+	require.ErrorIs(t, err, transient)
+	require.Equal(t, int32(maxSchemaStatementAttempts), attempts.Load())
+}
+
+func TestExecSchemaStatementFailsImmediatelyOnNonRetryableError(t *testing.T) {
+	var attempts atomic.Int32
+	nonRetryable := &mysql.MySQLError{Number: 1146, Message: "Table 'missing' doesn't exist"}
+	db := newTestRepairDB(t, func(string) testRepairQueryResult {
+		return testRepairQueryResult{}
+	}, func(string) error {
+		attempts.Add(1)
+		return nonRetryable
+	})
+	err := execSchemaStatement(context.Background(), db, `ALTER TABLE missing ADD COLUMN mode INT UNSIGNED NOT NULL DEFAULT 420`, 1, 1)
+	require.ErrorIs(t, err, nonRetryable)
+	require.Equal(t, int32(1), attempts.Load())
+}
