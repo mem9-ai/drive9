@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -348,7 +349,25 @@ func migrateOpenFlags(flags uint32) uint32 {
 // else passes through.
 func (h *Handler) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
 	switch op.Kind {
+	case fs.OpList:
+		res, err := next(ctx, op)
+		if err != nil || len(res.Entries) == 0 || h.opts.Engine == nil || h.opts.Engine.Bridge == nil {
+			return res, err
+		}
+		br := h.opts.Engine.Bridge
+		filtered := res.Entries[:0]
+		for _, entry := range res.Entries {
+			if br.IsSentinel(childPath(op.Path, entry.Name)) {
+				continue
+			}
+			filtered = append(filtered, entry)
+		}
+		res.Entries = filtered
+		return res, nil
 	case fs.OpUnlink, fs.OpRmdir:
+		if op.Kind == fs.OpRmdir {
+			h.waitClosingSentinelsInDir(ctx, op.Path)
+		}
 		// Unlink of a file with live engine handles: plans and commits
 		// resolve through the pathname, so a plain delete would break the
 		// open descriptor (and a later flush would resurrect the name).
@@ -1196,6 +1215,61 @@ type engineHandle struct {
 	// concurrent releases each mark themselves and then count the handles
 	// still unreleased, so exactly one of them observes zero.
 	released bool
+	// flushed records that FUSE_FLUSH ran on this descriptor (close(2) has
+	// returned or is about to return while asynchronous FUSE_RELEASE is in
+	// flight from the kernel).
+	flushed atomic.Bool
+}
+
+// waitClosingSentinelsInDir waits briefly before OpRmdir when a directory
+// contains internal .d9open-* sentinels whose handles have already flushed or
+// begun releasing (the asynchronous FUSE_RELEASE / DropDeletedOpen window
+// immediately after close(2)). Genuinely open, unflushed descriptors do not
+// block rmdir.
+func (h *Handler) waitClosingSentinelsInDir(ctx context.Context, dir string) {
+	if h == nil || h.opts.Engine == nil || h.opts.Engine.Bridge == nil {
+		return
+	}
+	br := h.opts.Engine.Bridge
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		active, dropping := br.SentinelsInDir(dir)
+		if len(active) == 0 && len(dropping) == 0 {
+			return
+		}
+		if len(active) > 0 {
+			allClosing := true
+			h.mu.Lock()
+			for _, s := range active {
+				for _, eh := range h.handles[s] {
+					if !eh.released && !eh.flushed.Load() {
+						allClosing = false
+						break
+					}
+				}
+				if !allClosing {
+					break
+				}
+			}
+			h.mu.Unlock()
+			if !allClosing {
+				return
+			}
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			return
+		}
+		waitCh := br.SentinelChanged()
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-waitCh:
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		}
+		timer.Stop()
+	}
 }
 
 func (e *engineHandle) GetLk(ctx context.Context, lk fs.FileLock) (fs.FileLock, error) {
@@ -1293,6 +1367,7 @@ func (e *engineHandle) Sync(ctx context.Context) error {
 }
 
 func (e *engineHandle) Flush(ctx context.Context) error {
+	e.flushed.Store(true)
 	e.plane.opts.Engine.Bridge.kickPendingFlush()
 	if errno := e.plane.opts.Engine.VFS.Flush(e.vctx, e.ino, e.fh, fs.FlushOwnerOf(ctx)); errno != 0 {
 		return errno

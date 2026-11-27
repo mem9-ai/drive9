@@ -1,0 +1,294 @@
+package fuse
+
+import (
+	"context"
+	"net/http/httptest"
+	"syscall"
+	"testing"
+
+	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+
+	"github.com/mem9-ai/drive9/internal/testbackend"
+	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/extensions/core"
+	"github.com/mem9-ai/drive9/pkg/extensions/specials"
+	"github.com/mem9-ai/drive9/pkg/extensions/writeback"
+	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
+)
+
+func newFacadeWritebackTestStack(t *testing.T, policy writeback.Policy) (*FS, *writeback.Writeback, *testbackend.Backend) {
+	t.Helper()
+	b := testbackend.NewBackend()
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+
+	cl := client.New(ts.URL, "")
+	wbcache, err := staging.NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := staging.NewStaging(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ledger.Close)
+
+	bus := fs.NewEventBus()
+	wb, err := writeback.New(writeback.Options{
+		Policy:     policy,
+		Client:     cl,
+		WriteCache: wbcache,
+		Staging:    ledger,
+		Events:     bus,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+
+	sp, err := specials.New(specials.Options{Events: bus})
+	if err != nil {
+		t.Fatal(err)
+	}
+	term, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := New(Options{
+		Extensions:         []fs.Handler{sp, wb, term},
+		Events:             bus,
+		DefaultPermissions: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb.SetInodeTable(f.Ctx.Inodes)
+	wb.SetSurvivorLookup(f.SurvivorAlias)
+	return f, wb, b
+}
+
+// TestFacadeReopenUnflushedCreateWritableAndFlock verifies the full FUSE
+// facade flow for Issue 1 (Rust std::fs::File::create + OpenOptions::write +
+// shared/exclusive flock across two open file handles without closing f1).
+func TestFacadeReopenUnflushedCreateWritableAndFlock(t *testing.T) {
+	for _, policy := range []writeback.Policy{writeback.PolicyWriteBack, writeback.PolicyCloseSync} {
+		name := "writeback"
+		if policy == writeback.PolicyCloseSync {
+			name = "close-sync"
+		}
+		t.Run(name, func(t *testing.T) {
+			f, wb, b := newFacadeWritebackTestStack(t, policy)
+
+			// 1. Create /locktarget (O_CREAT|O_WRONLY|O_TRUNC) and keep fh1 open & unflushed.
+			var cOut gofuse.CreateOut
+			st := f.Create(nil, &gofuse.CreateIn{
+				InHeader: gofuse.InHeader{NodeId: 1},
+				Flags:    uint32(syscall.O_CREAT | syscall.O_WRONLY | syscall.O_TRUNC),
+				Mode:     0o644,
+			}, "locktarget", &cOut)
+			if st != gofuse.OK {
+				t.Fatalf("Create locktarget: %v", st)
+			}
+
+			// 2. Lookup + Open(O_WRONLY) and Open(O_RDWR) without O_CREAT.
+			var eOut gofuse.EntryOut
+			if st := f.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "locktarget", &eOut); st != gofuse.OK {
+				t.Fatalf("Lookup locktarget while fh1 open: %v", st)
+			}
+			if eOut.NodeId != cOut.NodeId {
+				t.Fatalf("Lookup NodeId=%d, Create NodeId=%d", eOut.NodeId, cOut.NodeId)
+			}
+
+			var oOut gofuse.OpenOut
+			if st := f.Open(nil, &gofuse.OpenIn{
+				InHeader: gofuse.InHeader{NodeId: cOut.NodeId},
+				Flags:    uint32(syscall.O_RDWR),
+			}, &oOut); st != gofuse.OK {
+				t.Fatalf("Open(O_RDWR) on unflushed Create: %v (want OK, not ENOENT)", st)
+			}
+
+			// 3. Shared flock on fh1 and fh2 both succeed; exclusive flock on fh2 conflicts with EAGAIN.
+			flockShared := func(fh, owner uint64) *gofuse.LkIn {
+				return &gofuse.LkIn{
+					InHeader: gofuse.InHeader{NodeId: cOut.NodeId, Caller: gofuse.Caller{Pid: 100}},
+					Fh:       fh,
+					Owner:    owner,
+					LkFlags:  gofuse.FUSE_LK_FLOCK,
+					Lk:       gofuse.FileLock{Start: 0, End: (1 << 63) - 1, Typ: syscall.F_RDLCK, Pid: 100},
+				}
+			}
+			flockExcl := func(fh, owner uint64) *gofuse.LkIn {
+				in := flockShared(fh, owner)
+				in.Lk.Typ = syscall.F_WRLCK
+				return in
+			}
+			flockUn := func(fh, owner uint64) *gofuse.LkIn {
+				in := flockShared(fh, owner)
+				in.Lk.Typ = syscall.F_UNLCK
+				return in
+			}
+
+			if st := f.SetLk(nil, flockShared(cOut.Fh, 1001)); st != gofuse.OK {
+				t.Fatalf("fh1 shared flock: %v", st)
+			}
+			if st := f.SetLk(nil, flockShared(oOut.Fh, 1002)); st != gofuse.OK {
+				t.Fatalf("fh2 shared flock: %v", st)
+			}
+			if st := f.SetLk(nil, flockExcl(oOut.Fh, 1002)); st != gofuse.EAGAIN {
+				t.Fatalf("fh2 exclusive flock over fh1 shared = %v, want EAGAIN", st)
+			}
+			if st := f.SetLk(nil, flockUn(cOut.Fh, 1001)); st != gofuse.OK {
+				t.Fatalf("fh1 unlock: %v", st)
+			}
+			if st := f.SetLk(nil, flockExcl(oOut.Fh, 1002)); st != gofuse.OK {
+				t.Fatalf("fh2 upgrade to exclusive flock after fh1 unlock: %v", st)
+			}
+
+			// 4. Write through fh1, read back through fh2 before flush/close!
+			written, wst := f.Write(nil, &gofuse.WriteIn{
+				InHeader: gofuse.InHeader{NodeId: cOut.NodeId},
+				Fh:       cOut.Fh, Offset: 0, Size: 5,
+			}, []byte("locks"))
+			if wst != gofuse.OK || written != 5 {
+				t.Fatalf("Write fh1 = (%d, %v)", written, wst)
+			}
+			rr, rst := f.Read(nil, &gofuse.ReadIn{
+				InHeader: gofuse.InHeader{NodeId: cOut.NodeId},
+				Fh:       oOut.Fh, Offset: 0, Size: 16,
+			}, make([]byte, 16))
+			if rst != gofuse.OK {
+				t.Fatalf("Read fh2: %v", rst)
+			}
+			rb, _ := rr.Bytes(make([]byte, 16))
+			if string(rb) != "locks" {
+				t.Fatalf("Read fh2 = %q, want locks", string(rb))
+			}
+
+			// 5. Close both handles and verify remote durability & clean drain.
+			if st := f.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: cOut.NodeId}, Fh: oOut.Fh, LockOwner: 1002}); st != gofuse.OK {
+				t.Fatalf("Flush fh2: %v", st)
+			}
+			f.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: cOut.NodeId}, Fh: oOut.Fh, LockOwner: 1002})
+			if st := f.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: cOut.NodeId}, Fh: cOut.Fh, LockOwner: 1001}); st != gofuse.OK {
+				t.Fatalf("Flush fh1: %v", st)
+			}
+			f.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: cOut.NodeId}, Fh: cOut.Fh, LockOwner: 1001})
+
+			if err := wb.Drain(context.Background()); err != nil {
+				t.Fatalf("Drain: %v", err)
+			}
+			if reason, count := wb.DrainPending(); reason != "" || count != 0 {
+				t.Fatalf("DrainPending = (%q, %d), want empty", reason, count)
+			}
+			if n, ok := b.Node("/locktarget"); !ok || string(n.Data) != "locks" {
+				t.Fatalf("remote /locktarget = (%v, %q), want locks", ok, n.Data)
+			}
+		})
+	}
+}
+
+// TestFacadeRejectsInvalidNamespaceNamesWithoutPollutingDrain verifies Issue 3
+// at the FUSE facade boundary across both writeback and close-sync policies:
+// control characters (0x04), backslashes (D:\abspath), and invalid UTF-8
+// (\xff\xfe) are rejected synchronously with EINVAL at Create, Mkdir, Mknod,
+// Symlink (link name only; relative symlink target ../ok is allowed), Link,
+// and Rename, allocating zero inodes and leaving DrainPending() clean.
+func TestFacadeRejectsInvalidNamespaceNamesWithoutPollutingDrain(t *testing.T) {
+	for _, policy := range []writeback.Policy{writeback.PolicyWriteBack, writeback.PolicyCloseSync} {
+		name := "writeback"
+		if policy == writeback.PolicyCloseSync {
+			name = "close-sync"
+		}
+		t.Run(name, func(t *testing.T) {
+			f, wb, _ := newFacadeWritebackTestStack(t, policy)
+
+			// Seed one valid file so Link and Rename have a valid source inode.
+			var validOut gofuse.CreateOut
+			if st := f.Create(nil, &gofuse.CreateIn{
+				InHeader: gofuse.InHeader{NodeId: 1},
+				Flags:    uint32(syscall.O_CREAT | syscall.O_WRONLY),
+				Mode:     0o644,
+			}, "valid.txt", &validOut); st != gofuse.OK {
+				t.Fatalf("Create valid.txt: %v", st)
+			}
+			_, _ = f.Write(nil, &gofuse.WriteIn{InHeader: gofuse.InHeader{NodeId: validOut.NodeId}, Fh: validOut.Fh, Size: 2}, []byte("ok"))
+			_ = f.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: validOut.NodeId}, Fh: validOut.Fh})
+			f.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: validOut.NodeId}, Fh: validOut.Fh})
+			if err := wb.Drain(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+
+			// Valid symlink with a relative "../valid.txt" target MUST still succeed.
+			var symOut gofuse.EntryOut
+			if st := f.Symlink(nil, &gofuse.InHeader{NodeId: 1}, "../valid.txt", "rel.link", &symOut); st != gofuse.OK {
+				t.Fatalf("Symlink with relative pointedTo failed: %v", st)
+			}
+
+			badNames := []string{
+				"=\xd8\x04\xdc",
+				`D:\abspath`,
+				"bad\xff\xfe",
+			}
+			wantEINVAL := gofuse.Status(syscall.EINVAL)
+			for _, bad := range badNames {
+				var cOut gofuse.CreateOut
+				if st := f.Create(nil, &gofuse.CreateIn{
+					InHeader: gofuse.InHeader{NodeId: 1},
+					Flags:    uint32(syscall.O_CREAT | syscall.O_WRONLY),
+					Mode:     0o644,
+				}, bad, &cOut); st != wantEINVAL {
+					t.Fatalf("Create(%q) = %v, want EINVAL", bad, st)
+				}
+
+				var dirOut gofuse.EntryOut
+				if st := f.Mkdir(nil, &gofuse.MkdirIn{
+					InHeader: gofuse.InHeader{NodeId: 1},
+					Mode:     0o755,
+				}, bad, &dirOut); st != wantEINVAL {
+					t.Fatalf("Mkdir(%q) = %v, want EINVAL", bad, st)
+				}
+
+				var nodOut gofuse.EntryOut
+				if st := f.Mknod(nil, &gofuse.MknodIn{
+					InHeader: gofuse.InHeader{NodeId: 1},
+					Mode:     syscall.S_IFIFO | 0o644,
+				}, bad, &nodOut); st != wantEINVAL {
+					t.Fatalf("Mknod(%q) = %v, want EINVAL", bad, st)
+				}
+
+				var badSymOut gofuse.EntryOut
+				if st := f.Symlink(nil, &gofuse.InHeader{NodeId: 1}, "valid.txt", bad, &badSymOut); st != wantEINVAL {
+					t.Fatalf("Symlink(%q) = %v, want EINVAL", bad, st)
+				}
+
+				var linkOut gofuse.EntryOut
+				if st := f.Link(nil, &gofuse.LinkIn{
+					InHeader:  gofuse.InHeader{NodeId: 1},
+					Oldnodeid: validOut.NodeId,
+				}, bad, &linkOut); st != wantEINVAL {
+					t.Fatalf("Link(%q) = %v, want EINVAL", bad, st)
+				}
+
+				if st := f.Rename(nil, &gofuse.RenameIn{
+					InHeader: gofuse.InHeader{NodeId: 1},
+					Newdir:   1,
+				}, "valid.txt", bad); st != wantEINVAL {
+					t.Fatalf("Rename(valid.txt -> %q) = %v, want EINVAL", bad, st)
+				}
+
+				if _, exists := f.inodes.GetInode("/" + bad); exists {
+					t.Fatalf("invalid path /%q allocated an inode", bad)
+				}
+			}
+
+			if err := wb.Drain(context.Background()); err != nil {
+				t.Fatalf("Drain after invalid names: %v", err)
+			}
+			if reason, count := wb.DrainPending(); reason != "" || count != 0 {
+				t.Fatalf("DrainPending = (%q, %d), want (\"\", 0)", reason, count)
+			}
+		})
+	}
+}

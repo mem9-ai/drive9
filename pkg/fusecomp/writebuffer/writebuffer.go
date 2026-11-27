@@ -706,6 +706,12 @@ func (wb *WriteBuffer) SetRemoteSize(size int64) {
 	wb.remoteSize = size
 }
 
+// RemoteSize returns the retained remote prefix length (0 for new or
+// truncated-to-zero buffers).
+func (wb *WriteBuffer) RemoteSize() int64 {
+	return wb.remoteSize
+}
+
 // ContentVersion returns the buffer's content generation: every Write,
 // Truncate, or Reset increments it, so an unchanged version together with
 // an unchanged snapshot ID proves the live buffer still holds exactly the

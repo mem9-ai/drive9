@@ -187,7 +187,12 @@ type CommitQueue struct {
 	// shadow reclaimed: the staging handle refused certification (its
 	// buffer moved on), but the shadow is still the only restore source for
 	// the landing's unchanged evicted parts. Consumed by the cleanup pass.
-	retainedShadows   sync.Map
+	retainedShadows sync.Map
+	// retainedLiveShadows tracks shadow generations kept alive by
+	// retainedShadows after their PendingIndex entry was retired, so a
+	// subsequent non-shadow commit (wbCache), unlink, or final close can
+	// reclaim the orphaned shadow and release its quotaBytes.
+	retainedLiveShadows sync.Map
 	extentGlobs       []globMatcher
 	extentMatchCutoff int64
 	extentMinSize     int64
@@ -373,6 +378,67 @@ func (cq *CommitQueue) RetainShadowForLanding(path string, gen staging.ContentGe
 		return
 	}
 	cq.retainedShadows.Store(path, gen)
+}
+
+// ReclaimRetainedShadow removes a shadow generation previously kept alive by
+// RetainShadowForLanding if it has not been replaced by a newer shadow write.
+func (cq *CommitQueue) ReclaimRetainedShadow(path string, gen staging.ContentGen) {
+	if cq == nil || cq.shadows == nil || path == "" {
+		return
+	}
+	cq.retainedShadows.Delete(path)
+	if stored, ok := cq.retainedLiveShadows.Load(path); ok {
+		storedGen, _ := stored.(staging.ContentGen)
+		if gen == 0 {
+			gen = storedGen
+		}
+		if storedGen == gen {
+			cq.retainedLiveShadows.Delete(path)
+		}
+	}
+	if gen != 0 {
+		cq.shadows.RemoveIfGeneration(path, gen)
+	}
+}
+
+// ReclaimOrphanRetainedShadow removes any shadow generation retained for an
+// open handle once the last handle at path has closed and no pending entry
+// owns path.
+func (cq *CommitQueue) ReclaimOrphanRetainedShadow(path string) {
+	if cq == nil || cq.shadows == nil || path == "" {
+		return
+	}
+	cq.retainedShadows.Delete(path)
+	if stored, ok := cq.retainedLiveShadows.LoadAndDelete(path); ok {
+		if gen, gok := stored.(staging.ContentGen); gok && gen != 0 {
+			cq.shadows.RemoveIfGeneration(path, gen)
+		}
+	}
+}
+
+// HasDrainableWork reports whether queued, in-flight, or immediate commits
+// exist that may release shadow byte quota upon completion.
+func (cq *CommitQueue) HasDrainableWork() bool {
+	if cq == nil {
+		return false
+	}
+	cq.mu.Lock()
+	busy := len(cq.queue) > 0 || len(cq.inFlight) > 0 || len(cq.immediate) > 0
+	cq.mu.Unlock()
+	return busy
+}
+
+// CommitClock returns the monotonic count of completed commits across all
+// paths, allowing callers to distinguish active queue drain progress from a
+// stalled backend.
+func (cq *CommitQueue) CommitClock() uint64 {
+	if cq == nil {
+		return 0
+	}
+	cq.mu.Lock()
+	c := cq.commitClock
+	cq.mu.Unlock()
+	return c
 }
 
 // ConfigureBatchWrite enables a small writeback-only direct-PUT batch window.
@@ -1017,7 +1083,53 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 	if cq.queuedByPath != nil {
 		cq.rebuildQueuedIndexLocked()
 	}
+	for p := range cq.terminalFailures {
+		if strings.HasPrefix(p, prefix) {
+			delete(cq.terminalFailures, p)
+		}
+	}
 	cq.mu.Unlock()
+
+	seenPaths := make(map[string]struct{}, len(cancelled))
+	deduped := make([]string, 0, len(cancelled))
+	addCancelledPath := func(p string) {
+		if p == "" || !strings.HasPrefix(p, prefix) {
+			return
+		}
+		if _, exists := seenPaths[p]; exists {
+			return
+		}
+		seenPaths[p] = struct{}{}
+		deduped = append(deduped, p)
+	}
+	for _, p := range cancelled {
+		addCancelledPath(p)
+	}
+	if cq.index != nil {
+		for p := range cq.index.ListPendingPaths() {
+			addCancelledPath(p)
+		}
+	}
+	if cq.shadows != nil {
+		for _, p := range cq.shadows.PathsWithPrefix(prefix) {
+			addCancelledPath(p)
+		}
+	}
+	cq.retainedShadows.Range(func(key, _ any) bool {
+		if p, ok := key.(string); ok && strings.HasPrefix(p, prefix) {
+			cq.retainedShadows.Delete(p)
+			addCancelledPath(p)
+		}
+		return true
+	})
+	cq.retainedLiveShadows.Range(func(key, _ any) bool {
+		if p, ok := key.(string); ok && strings.HasPrefix(p, prefix) {
+			cq.retainedLiveShadows.Delete(p)
+			addCancelledPath(p)
+		}
+		return true
+	})
+	cancelled = deduped
 
 	for _, cancel := range cancels {
 		cancel()
@@ -2871,6 +2983,11 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 			// The staging handle kept newer local bytes: the shadow stays as
 			// the restore source for this landing's evicted parts.
 			retained = true
+			if entry.ShadowGen != 0 {
+				cq.retainedLiveShadows.Store(entry.Path, entry.ShadowGen)
+			}
+		} else {
+			cq.retainedLiveShadows.Delete(entry.Path)
 		}
 		if !retained && entry.ShadowGen != 0 {
 			if markerErr != nil {

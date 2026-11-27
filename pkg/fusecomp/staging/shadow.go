@@ -92,6 +92,11 @@ type ShadowStore struct {
 	pendingBytes        atomic.Int64 // logical shadow sizes, including holes and recovered files
 	quotaBytes          atomic.Int64 // current-process written coverage of active shadows only
 
+	// quotaNotifyMu / quotaNotifyCh wake backpressure waiters whenever
+	// quotaBytes decreases (Remove, Truncate, overwrite shrink).
+	quotaNotifyMu sync.Mutex
+	quotaNotifyCh chan struct{}
+
 	// Accounted disk-only sizes from the startup scan, keyed by disk path.
 	// This avoids rescanning the entire directory when Open discards one orphan.
 	recoveredSizes map[string]int64
@@ -187,6 +192,7 @@ func NewShadowStoreWithQuota(dir string, freeRatio float64, maxBytes int64) (*Sh
 		writeGen:            make(map[string]ContentGen),
 		writeCacheFreeRatio: freeRatio,
 		writeCacheMaxBytes:  maxBytes,
+		quotaNotifyCh:       make(chan struct{}),
 		pathLocks:           make(map[string]*shadowPathLock),
 	}
 	return ss, nil
@@ -241,6 +247,70 @@ func (s *ShadowStore) SubPendingBytes(n int64) {}
 // RecoverPendingBytes remains the cold startup reconciliation path.
 func (s *ShadowStore) PendingBytes() int64 {
 	return s.pendingBytes.Load()
+}
+
+// QuotaBytes returns the current-process written byte coverage counted against
+// the write-back byte quota.
+func (s *ShadowStore) QuotaBytes() int64 {
+	if s == nil {
+		return 0
+	}
+	return s.quotaBytes.Load()
+}
+
+// MaxByteQuota returns the configured write-back byte quota (0 when disabled).
+func (s *ShadowStore) MaxByteQuota() int64 {
+	if s == nil {
+		return 0
+	}
+	return s.writeCacheMaxBytes
+}
+
+// ByteQuotaAvailable reports whether requiredBytes fits within the current
+// byte quota without logging or failing.
+func (s *ShadowStore) ByteQuotaAvailable(requiredBytes int64) bool {
+	if s == nil || s.writeCacheMaxBytes <= 0 || requiredBytes <= 0 {
+		return true
+	}
+	return requiredBytes <= s.writeCacheMaxBytes-s.quotaBytes.Load()
+}
+
+// QuotaChanged returns a channel that is closed the next time quotaBytes
+// decreases, allowing backpressure callers to wake immediately when background
+// commits reclaim shadow space.
+func (s *ShadowStore) QuotaChanged() <-chan struct{} {
+	s.quotaNotifyMu.Lock()
+	if s.quotaNotifyCh == nil {
+		s.quotaNotifyCh = make(chan struct{})
+	}
+	ch := s.quotaNotifyCh
+	s.quotaNotifyMu.Unlock()
+	return ch
+}
+
+func (s *ShadowStore) notifyQuotaReleased() {
+	s.quotaNotifyMu.Lock()
+	if s.quotaNotifyCh != nil {
+		close(s.quotaNotifyCh)
+	}
+	s.quotaNotifyCh = make(chan struct{})
+	s.quotaNotifyMu.Unlock()
+}
+
+// PathsWithPrefix returns active in-memory shadow paths under prefix.
+func (s *ShadowStore) PathsWithPrefix(prefix string) []string {
+	if s == nil || prefix == "" {
+		return nil
+	}
+	s.mu.RLock()
+	var out []string
+	for p := range s.files {
+		if strings.HasPrefix(p, prefix) {
+			out = append(out, p)
+		}
+	}
+	s.mu.RUnlock()
+	return out
 }
 
 // RecoverPendingBytes scans the shadow directory and sets the pending byte
@@ -512,13 +582,17 @@ func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64)
 	oldFd := sf.fd
 	sf.fd = newFd
 	sf.size = n
-	s.quotaBytes.Add(n - sf.writtenBytes)
+	quotaDelta := n - sf.writtenBytes
+	s.quotaBytes.Add(quotaDelta)
 	sf.written = shadowWrittenRanges{}
 	sf.written.add(0, n)
 	sf.writtenBytes = n
 	sf.establishProvenance(baseRev, true)
 	s.bumpWriteGenLocked(remotePath)
 	s.mu.Unlock()
+	if quotaDelta < 0 {
+		s.notifyQuotaReleased()
+	}
 	// Safe to close: ReadAt/ReadAll hold RLock during the actual fd.ReadAt
 	// call, and WriteStream holds full Lock during the swap, so no concurrent
 	// reader can be using oldFd after we release Lock.
