@@ -8,9 +8,19 @@ package writeback
 // window restores the bound without waiting for future commits.
 
 import (
+	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/mem9-ai/drive9/internal/testbackend"
+	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/extensions/core"
+	"github.com/mem9-ai/drive9/pkg/fs"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 )
 
@@ -180,4 +190,151 @@ func TestHasUncanceledPathIgnoresCanceledInFlightAndQueuedEntries(t *testing.T) 
 	cq.queue = nil
 	cq.rebuildQueuedIndexLocked()
 	cq.mu.Unlock()
+}
+
+// TestPrepareOpenUnlinkAbortReenqueuesOverDyingCanceledInFlightEntry verifies
+// deterministically that PrepareOpenUnlink's rollback/abort re-enqueue path
+// enqueues a replacement commit and drains staged data even when a dying
+// canceled worker entry is still recorded in CommitQueue.inFlight between
+// unlockPath() and endInFlight(). Reverting PrepareOpenUnlink to HasPath
+// causes this test to fail deterministically with stranded pending data.
+func TestPrepareOpenUnlinkAbortReenqueuesOverDyingCanceledInFlightEntry(t *testing.T) {
+	const targetPath = "/dying-reenq.txt"
+	const payload = "reenqueued-after-dying-worker"
+
+	b := testbackend.NewBackend()
+	var holdFirstPut atomic.Bool
+	holdFirstPut.Store(true)
+	firstPutStarted := make(chan struct{})
+	releaseFirstPut := make(chan struct{})
+	var releaseOnce sync.Once
+	unblockFirstPut := func() {
+		releaseOnce.Do(func() { close(releaseFirstPut) })
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if (r.Method == http.MethodPut || r.Method == http.MethodPost) && holdFirstPut.CompareAndSwap(true, false) {
+			close(firstPutStarted)
+			select {
+			case <-r.Context().Done():
+			case <-releaseFirstPut:
+			}
+			http.Error(w, "canceled", http.StatusRequestTimeout)
+			return
+		}
+		b.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(unblockFirstPut)
+
+	cl := client.New(srv.URL, "")
+	cl.SetSmallFileThresholdForTests(1 << 20)
+	ledger, err := staging.NewStaging(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ledger.Close)
+
+	wb, err := New(Options{
+		Policy:                  PolicyWriteBack,
+		SyncMode:                "interactive",
+		Client:                  cl,
+		Staging:                 ledger,
+		RemoteCommitWaitTimeout: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	h := open(t, ch, targetPath)
+	if err := h.Write(ctx, 0, []byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait until the first CommitQueue worker is actively inside the HTTP PUT.
+	<-firstPutStarted
+
+	acquireLock, _, _, abort := wb.PrepareOpenUnlink(targetPath, "")
+	if err := acquireLock(nil); err != nil {
+		t.Fatalf("acquireLock: %v", err)
+	}
+
+	// Pin the exact race window where the canceled worker has released pathLock
+	// (allowing acquireLock to return) while its canceled CommitEntry has not
+	// yet executed defer cq.endInFlight(entry).
+	wb.queue.mu.Lock()
+	dying := wb.queue.inFlight[targetPath]
+	pinnedSynthetic := false
+	if dying == nil {
+		dying = &CommitEntry{Path: targetPath, canceled: true}
+		wb.queue.inFlight[targetPath] = dying
+		pinnedSynthetic = true
+	} else if !dying.canceled {
+		wb.queue.mu.Unlock()
+		abort()
+		t.Fatalf("expected in-flight entry for %s to be marked canceled after acquireLock", targetPath)
+	}
+	wb.queue.mu.Unlock()
+
+	if !wb.queue.HasPath(targetPath) {
+		abort()
+		t.Fatal("precondition: HasPath must be true while dying canceled entry remains in inFlight")
+	}
+	if wb.queue.HasUncanceledPath(targetPath) {
+		abort()
+		t.Fatal("precondition: HasUncanceledPath must be false before abort() re-enqueues")
+	}
+
+	// Execute PrepareOpenUnlink's real abort() -> reenqueueCanceledPathLocked(targetPath)
+	// while the dying canceled entry is still present in inFlight[targetPath].
+	abort()
+
+	if !wb.queue.HasUncanceledPath(targetPath) {
+		if pinnedSynthetic {
+			wb.queue.endInFlight(dying)
+		}
+		t.Fatal("abort() failed to re-enqueue replacement entry while dying canceled entry remained in inFlight")
+	}
+
+	// Complete the dying worker's deferred endInFlight cleanup so the replacement
+	// worker can begin in-flight execution and drain staging to the backend.
+	if pinnedSynthetic {
+		wb.queue.endInFlight(dying)
+	}
+
+	drainCtx, cancelDrain := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelDrain()
+	if err := wb.Drain(drainCtx); err != nil {
+		t.Fatalf("wb.Drain: %v", err)
+	}
+	if got := ledger.Pending.Count(); got != 0 {
+		t.Fatalf("Pending.Count() after Drain = %d, want 0", got)
+	}
+	if ledger.Shadow.Has(targetPath) {
+		t.Fatalf("Shadow.Has(%q) = true after Drain, want false", targetPath)
+	}
+	node, ok := b.Node(targetPath)
+	if !ok {
+		t.Fatalf("backend missing %q after replacement commit drained", targetPath)
+	}
+	if string(node.Data) != payload {
+		t.Fatalf("backend payload = %q, want %q", string(node.Data), payload)
+	}
 }
