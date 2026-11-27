@@ -7778,46 +7778,7 @@ func (w *Writeback) acknowledgeObjGenLanding(objGen uint64, rev int64, seq uint6
 }
 
 func readWriteBufferRangePreservingEviction(buf *writebuffer.WriteBuffer, off int64, dst []byte) (int, error) {
-	if len(dst) == 0 {
-		return 0, nil
-	}
-	want := int64(len(dst))
-	partSize := buf.PartSize()
-	var reEvict []int
-	var firstIdx, lastIdx int
-	if partSize > 0 {
-		firstIdx = int(off / partSize)
-		lastIdx = int((off + want - 1) / partSize)
-		streamed := buf.StreamedPartIndices()
-		for idx := firstIdx; idx <= lastIdx; idx++ {
-			if !buf.IsPartLoaded(idx) && streamed[idx] {
-				reEvict = append(reEvict, idx)
-			}
-		}
-	}
-	if err := buf.ForceEnsurePartsForWrite(off, want); err != nil {
-		for _, idx := range reEvict {
-			if buf.IsPartLoaded(idx) {
-				buf.EvictPart(idx)
-			}
-		}
-		return 0, err
-	}
-	n := buf.ReadAt(off, dst)
-	if partSize > 0 {
-		evictSet := make(map[int]struct{}, len(reEvict))
-		for _, idx := range reEvict {
-			evictSet[idx] = struct{}{}
-		}
-		for idx := firstIdx; idx <= lastIdx; idx++ {
-			if _, ok := evictSet[idx]; ok {
-				buf.EvictPart(idx)
-			} else {
-				buf.ReleaseCleanPart(idx)
-			}
-		}
-	}
-	return n, nil
+	return buf.CopyRange(off, dst)
 }
 
 func readFromSiblingHandle(sib *bufferingHandle, off int64, dst []byte) (int, bool, error) {
@@ -9867,10 +9828,13 @@ func (h *bufferingHandle) spillToShadow(st *staging.Staging, stagePath string, b
 				// loaded in memory and stay in deferredEvict until Truncate commits.
 				buf.EvictPart(partIdx)
 			} else {
-				// ReleaseCleanPart drops clean remote-backed parts immediately
-				// (keeping multi-GiB spills O(1 part) in RAM), while resident
-				// dirty parts stay until st.Shadow.Truncate succeeds below.
-				buf.ReleaseCleanPart(partIdx)
+				// ReleaseCleanPart drops newly-hydrated clean remote-backed parts
+				// immediately (keeping multi-GiB spills O(1 part) in RAM), while
+				// pre-spill resident parts (dirty or seeded clean without LoadPart)
+				// stay until st.Shadow.Truncate succeeds below so rollback is lossless.
+				if !wasLoadedBeforeSpill {
+					buf.ReleaseCleanPart(partIdx)
+				}
 				deferredEvict = append(deferredEvict, partIdx)
 			}
 		}

@@ -3011,4 +3011,108 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 			t.Fatalf("/lazy-landed after lazy-seeded 4B patch: ok=%v len=%d, want %d bytes", ok, len(n.Data), len(want))
 		}
 	})
+
+	t.Run("close-sync-chained-reopen-preserves-resident-clean-parts", func(t *testing.T) {
+		b := testbackend.NewBackend()
+		ts := httptest.NewServer(b)
+		t.Cleanup(ts.Close)
+		cl := client.New(ts.URL, "")
+		wb, err := New(Options{Policy: PolicyCloseSync, Client: cl})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+		terminal, err := core.New(cl, core.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ch, err := fs.NewChain(wb, terminal)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Create a 16 MiB unlanded file (two 8 MiB parts: part 0 = 'A', part 1 = 'B').
+		h1, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/chained-16m",
+			Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		const partSz = 8 << 20
+		base := make([]byte, 2*partSz)
+		for i := 0; i < partSz; i++ {
+			base[i] = 'A'
+		}
+		for i := partSz; i < 2*partSz; i++ {
+			base[i] = 'B'
+		}
+		if err := h1.Handle.Write(ctx, 0, base); err != nil {
+			t.Fatalf("h1.Write(16MiB): %v", err)
+		}
+
+		// Reopen h2 (O_RDWR, no O_CREAT) and partially write part 0 so h2 is
+		// initialized via seedBufferFromBytesLocked with dirty part 0 and
+		// resident clean part 1 (LoadPart == nil, remoteSize == 0).
+		h2, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/chained-16m", Flags: uint32(syscall.O_RDWR),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := h2.Handle.Write(ctx, 0, []byte("H2!!")); err != nil {
+			t.Fatalf("h2.Write: %v", err)
+		}
+
+		// Reopen h3 (O_RDWR, no O_CREAT) and write at offset 64: h3 selects h2
+		// as its seed and copies [0, 16 MiB) via CopyRange. That copy must NOT
+		// release h2's resident clean part 1.
+		h3, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/chained-16m", Flags: uint32(syscall.O_RDWR),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := h3.Handle.Write(ctx, 64, []byte("H3!!")); err != nil {
+			t.Fatalf("h3.Write: %v", err)
+		}
+
+		// Direct read on h2 in untouched part 1 and sibling read via O_RDONLY
+		// handle r4 must still observe 'B', never zero-fill.
+		tailProbe := make([]byte, 32)
+		if rn, rerr := h2.Handle.Read(ctx, partSz+123, tailProbe); rerr != nil || rn != len(tailProbe) || !bytes.Equal(tailProbe, bytes.Repeat([]byte{'B'}, len(tailProbe))) {
+			t.Fatalf("h2.Read untouched part 1 = (%d, %v, %q), want all 'B'", rn, rerr, string(tailProbe))
+		}
+		r4, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/chained-16m", Flags: uint32(syscall.O_RDONLY),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rn, rerr := r4.Handle.Read(ctx, partSz+456, tailProbe); rerr != nil || rn != len(tailProbe) || !bytes.Equal(tailProbe, bytes.Repeat([]byte{'B'}, len(tailProbe))) {
+			t.Fatalf("r4.Read untouched part 1 = (%d, %v, %q), want all 'B'", rn, rerr, string(tailProbe))
+		}
+
+		// Make h2 the final writer and flush/close all handles: publication from
+		// h2 must preserve the entire [8 MiB, 16 MiB) 'B' tail.
+		if err := h2.Handle.Write(ctx, 128, []byte("LAST")); err != nil {
+			t.Fatalf("h2.Write(128): %v", err)
+		}
+		for _, h := range []fs.Result{r4, h1, h3, h2} {
+			if err := h.Handle.Flush(ctx); err != nil {
+				t.Fatalf("Flush: %v", err)
+			}
+			if err := h.Handle.Release(ctx); err != nil {
+				t.Fatalf("Release: %v", err)
+			}
+		}
+
+		wantFinal := append([]byte(nil), base...)
+		copy(wantFinal[0:], []byte("H2!!"))
+		copy(wantFinal[64:], []byte("H3!!"))
+		copy(wantFinal[128:], []byte("LAST"))
+		if n, ok := b.Node("/chained-16m"); !ok || !bytes.Equal(n.Data, wantFinal) {
+			t.Fatalf("/chained-16m final mismatch: ok=%v len=%d, want %d bytes", ok, len(n.Data), len(wantFinal))
+		}
+	})
 }

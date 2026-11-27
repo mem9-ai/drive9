@@ -965,6 +965,63 @@ func (wb *WriteBuffer) ReadAt(offset int64, buf []byte) int {
 	return total
 }
 
+// CopyRange reads up to len(dst) bytes starting at offset into dst while
+// preserving every part's pre-call residency and eviction state. Resident parts
+// (including clean parts populated by an eager preload or sibling seed without
+// LoadPart backing) remain in memory; evicted or lazy remote-backed parts are
+// hydrated one part at a time (charged past the memory budget for publication /
+// co-open reads) and immediately released back to their pre-call state; sparse
+// unloaded holes are zero-filled without inserting nil part entries.
+func (wb *WriteBuffer) CopyRange(offset int64, dst []byte) (int, error) {
+	if wb == nil || offset < 0 || offset >= wb.totalSize || len(dst) == 0 {
+		return 0, nil
+	}
+	want := int64(len(dst))
+	if offset+want > wb.totalSize {
+		want = wb.totalSize - offset
+	}
+	if wb.smallFileData != nil || wb.partSize <= 0 {
+		return wb.ReadAt(offset, dst[:want]), nil
+	}
+
+	pos := offset
+	copied := 0
+	total := int(want)
+	for copied < total {
+		partIdx := int(pos / wb.partSize)
+		partOff := pos % wb.partSize
+		canRead := wb.partSize - partOff
+		if rem := int64(total - copied); canRead > rem {
+			canRead = rem
+		}
+		_, wasLoaded := wb.parts[partIdx]
+		if !wasLoaded {
+			partStart := int64(partIdx) * wb.partSize
+			needHydrate := (wb.uploadedParts != nil && wb.uploadedParts[partIdx]) ||
+				(wb.LoadPart != nil && partStart < wb.remoteSize)
+			if !needHydrate {
+				clear(dst[copied : copied+int(canRead)])
+				pos += canRead
+				copied += int(canRead)
+				continue
+			}
+			if err := wb.ensurePart(partIdx, true); err != nil {
+				return copied, err
+			}
+		}
+		wb.ReadAt(pos, dst[copied:copied+int(canRead)])
+		if !wasLoaded {
+			if part, ok := wb.parts[partIdx]; ok {
+				wb.subMemory(int64(cap(part)))
+				delete(wb.parts, partIdx)
+			}
+		}
+		pos += canRead
+		copied += int(canRead)
+	}
+	return total, nil
+}
+
 // IsPartLoaded reports whether the 0-based part index is in memory.
 func (wb *WriteBuffer) IsPartLoaded(partIdx int) bool {
 	if wb.smallFileData != nil {
