@@ -380,6 +380,14 @@ func (idx *PendingIndex) Generation(remotePath string) uint64 {
 	return 0
 }
 
+// MaxGeneration returns the highest pending-index generation allocated so far.
+func (idx *PendingIndex) MaxGeneration() uint64 {
+	if idx == nil {
+		return 0
+	}
+	return idx.nextGen.Load()
+}
+
 // ReparentSnapshotIfGeneration path-compresses one exact process-local
 // pending snapshot after its direct queued parent is coalesced. The generation
 // and snapshot checks prevent an older queue entry from rewriting newer

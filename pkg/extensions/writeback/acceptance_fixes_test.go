@@ -951,8 +951,240 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 		if err != nil || string(buf[:n]) != "v2-fresh" {
 			t.Fatalf("second read after sibling write = (%q, %v), want v2-fresh", string(buf[:n]), err)
 		}
+		// Flush + close w1 and Drain so "v2-fresh" lands remotely and wbCache
+		// retires: linked r1 must STILL read "v2-fresh" (not stale "v1")!
+		if err := w1.Handle.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := w1.Handle.Release(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := wb.Drain(ctx); err != nil {
+			t.Fatal(err)
+		}
+		n, err = r1.Handle.Read(ctx, 0, buf)
+		if err != nil || string(buf[:n]) != "v2-fresh" {
+			t.Fatalf("read after sibling write landed & drained = (%q, %v), want v2-fresh", string(buf[:n]), err)
+		}
 		_ = r1.Handle.Release(ctx)
-		_ = w1.Handle.Release(ctx)
+	})
+
+	t.Run("concurrent-sibling-writes-and-open-trunc-interleaving", func(t *testing.T) {
+		b := testbackend.NewBackend()
+		ts := httptest.NewServer(b)
+		t.Cleanup(ts.Close)
+		cl := client.New(ts.URL, "")
+		wbcache, _ := staging.NewWriteBackCache(t.TempDir())
+		wb, _ := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCache: wbcache})
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+		terminal, _ := core.New(cl, core.Options{})
+		ch, _ := fs.NewChain(wb, terminal)
+
+		// 1. Concurrent non-overlapping writes across co-open handles: pause A
+		// at write:beforePropagate while B concurrently writes byte 1, then
+		// verify BOTH descriptors hold "AB" (neither drops the other's byte).
+		a, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/race-ab",
+			Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		bH, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/race-ab", Flags: uint32(syscall.O_RDWR),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Pre-initialize both buffers so both have buf != nil before the race.
+		if err := a.Handle.Write(ctx, 0, []byte("__")); err != nil {
+			t.Fatal(err)
+		}
+		if err := bH.Handle.Write(ctx, 0, []byte("__")); err != nil {
+			t.Fatal(err)
+		}
+
+		aEntered := make(chan struct{})
+		allowA := make(chan struct{})
+		var aOnce sync.Once
+		hookAB := func(gate string) {
+			if gate == "write:beforePropagate" {
+				aOnce.Do(func() {
+					close(aEntered)
+					<-allowA
+				})
+			}
+		}
+		wb.testGateHook.Store(&hookAB)
+
+		aDone := make(chan error, 1)
+		bDone := make(chan error, 1)
+		go func() { aDone <- a.Handle.Write(ctx, 0, []byte("A")) }()
+		<-aEntered
+		go func() { bDone <- bH.Handle.Write(ctx, 1, []byte("B")) }()
+		// Let B contend on coOpenLocks, then release A.
+		close(allowA)
+		if err := <-aDone; err != nil {
+			t.Fatal(err)
+		}
+		if err := <-bDone; err != nil {
+			t.Fatal(err)
+		}
+		wb.testGateHook.Store(nil)
+
+		// Close A first, then B last (so B's Flush/Release owns final image).
+		_ = a.Handle.Flush(ctx)
+		_ = a.Handle.Release(ctx)
+		_ = bH.Handle.Flush(ctx)
+		_ = bH.Handle.Release(ctx)
+		if err := wb.Drain(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if n, ok := b.Node("/race-ab"); !ok || string(n.Data) != "AB" {
+			t.Fatalf("/race-ab = (%v, %q), want AB", ok, n.Data)
+		}
+
+		// 2. Deterministic O_TRUNC + concurrent sibling Write interleaving:
+		// s1 holds "abcdef"; t2 opens with O_WRONLY|O_TRUNC and pauses at
+		// openTrunc:coOpenLocked while s1 concurrently calls Write(2, "Y");
+		// releasing the gate must drop "abcdef" AND preserve "Y" -> "\x00\x00Y"!
+		s1, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/trunc-interleave",
+			Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s1.Handle.Write(ctx, 0, []byte("abcdef")); err != nil {
+			t.Fatal(err)
+		}
+
+		truncEntered := make(chan struct{})
+		writeEntering := make(chan struct{})
+		allowTrunc := make(chan struct{})
+		var truncOnce, writeOnce sync.Once
+		hookTrunc := func(gate string) {
+			switch gate {
+			case "openTrunc:coOpenLocked":
+				truncOnce.Do(func() {
+					close(truncEntered)
+					<-allowTrunc
+				})
+			case "write:coOpenEntering":
+				writeOnce.Do(func() {
+					close(writeEntering)
+				})
+			}
+		}
+		wb.testGateHook.Store(&hookTrunc)
+
+		type truncOpenRes struct {
+			res fs.Result
+			err error
+		}
+		t2Ch := make(chan truncOpenRes, 1)
+		go func() {
+			r, oerr := ch.Dispatch(ctx, &fs.Op{
+				Kind: fs.OpCreate, Path: "/trunc-interleave",
+				Flags: uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+			})
+			t2Ch <- truncOpenRes{res: r, err: oerr}
+		}()
+		<-truncEntered
+
+		s1WriteDone := make(chan error, 1)
+		go func() {
+			s1WriteDone <- s1.Handle.Write(ctx, 2, []byte("Y"))
+		}()
+		<-writeEntering
+		close(allowTrunc)
+
+		t2Out := <-t2Ch
+		if t2Out.err != nil {
+			t.Fatalf("open O_TRUNC: %v", t2Out.err)
+		}
+		if err := <-s1WriteDone; err != nil {
+			t.Fatalf("post-trunc sibling write: %v", err)
+		}
+		wb.testGateHook.Store(nil)
+
+		// Flush s1 LAST so if s1 had retained pre-truncate "abcdef" tail it
+		// would stage "abYdef" instead of "\x00\x00Y"!
+		_ = t2Out.res.Handle.Flush(ctx)
+		_ = t2Out.res.Handle.Release(ctx)
+		_ = s1.Handle.Flush(ctx)
+		_ = s1.Handle.Release(ctx)
+		if err := wb.Drain(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if n, ok := b.Node("/trunc-interleave"); !ok || !bytes.Equal(n.Data, []byte{0, 0, 'Y'}) {
+			t.Fatalf("/trunc-interleave = (%v, %q), want \"\\x00\\x00Y\"", ok, n.Data)
+		}
+	})
+
+	t.Run("cancel-prefix-coherent-pair-preserves-newer-stage", func(t *testing.T) {
+		ledger, err := staging.NewStagingWithQuota(t.TempDir(), 0, 16)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(ledger.Close)
+		b := testbackend.NewBackend()
+		ts := httptest.NewServer(b)
+		t.Cleanup(ts.Close)
+		cl := client.New(ts.URL, "")
+		wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, Staging: ledger})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+
+		// Stage an old conflicted entry under /sub/old.bin and verify CancelPrefix
+		// removes both its PendingIndex and ShadowStore while leaving a newer
+		// path lock-protected write untouched if staged after the snapshot.
+		if err := ledger.Shadow.WriteFull("/sub/old.bin", []byte("old-shadow"), 0); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ledger.Pending.PutWithBaseRev("/sub/old.bin", 10, staging.PendingNew, 0); err != nil {
+			t.Fatal(err)
+		}
+		if err := ledger.Pending.MarkConflict("/sub/old.bin"); err != nil {
+			t.Fatal(err)
+		}
+
+		// Hold pathLock on /sub/new.bin across CancelPrefix's snapshot to
+		// simulate a concurrent writer completing its Shadow + Pending pair
+		// right as CancelPrefix runs!
+		unlockNew := wb.pathLocks.lock("/sub/new.bin")
+		cancelDone := make(chan struct{})
+		go func() {
+			defer close(cancelDone)
+			wb.queue.CancelPrefix("/sub/")
+		}()
+		// Stage /sub/new.bin while holding its pathLock (allocates newer
+		// generations than CancelPrefix's snapshot if CancelPrefix already
+		// entered, or gets fenced coherently if before). Either way, Pending
+		// and Shadow must NEVER end up half-deleted!
+		if err := ledger.Shadow.WriteFull("/sub/new.bin", []byte("coherent-new"), 0); err != nil {
+			unlockNew()
+			t.Fatal(err)
+		}
+		if _, err := ledger.Pending.PutWithBaseRev("/sub/new.bin", 12, staging.PendingNew, 0); err != nil {
+			unlockNew()
+			t.Fatal(err)
+		}
+		unlockNew()
+		<-cancelDone
+
+		hasPend := ledger.Pending.HasPending("/sub/new.bin")
+		hasShad := ledger.Shadow.Has("/sub/new.bin")
+		if hasPend != hasShad {
+			t.Fatalf("incoherent CancelPrefix state on /sub/new.bin: hasPending=%v hasShadow=%v", hasPend, hasShad)
+		}
+		if ledger.Pending.HasPending("/sub/old.bin") || ledger.Shadow.Has("/sub/old.bin") {
+			t.Fatal("expected /sub/old.bin to be purged by CancelPrefix")
+		}
+		ledger.Pending.Remove("/sub/new.bin")
+		ledger.Shadow.Remove("/sub/new.bin")
 	})
 
 	t.Run("reopen-bypass-size-without-ledger-does-not-put-on-open", func(t *testing.T) {

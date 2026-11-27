@@ -1241,6 +1241,14 @@ func (s *ShadowStore) ActiveGeneration(remotePath string) ContentGen {
 	return s.writeGen[remotePath]
 }
 
+// MaxContentGeneration returns the highest content generation allocated so far.
+func (s *ShadowStore) MaxContentGeneration() ContentGen {
+	if s == nil {
+		return 0
+	}
+	return ContentGen(s.nextWriteGen.Load())
+}
+
 // EnsureActiveGeneration loads the active shadow for remotePath, including a
 // hash-keyed shadow recovered from disk, and returns a nonzero content
 // generation for it. Recovered shadows start without memory-only writeGen

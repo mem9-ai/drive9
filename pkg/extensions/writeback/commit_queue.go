@@ -1033,16 +1033,25 @@ func (cq *CommitQueue) CancelQueuedZeroTruncatePreserveLocal(path string) bool {
 // is entry-scoped, so future entries under the same prefix are unaffected.
 func (cq *CommitQueue) CancelPrefix(prefix string) {
 	type cancelTarget struct {
-		path       string
-		shadowGen  staging.ContentGen
-		hasShadow  bool
-		pendingGen uint64
-		hasPending bool
-		failureSeq uint64
-		hasFailure bool
+		path        string
+		retainedGen staging.ContentGen
+		failureSeq  uint64
+		hasFailure  bool
+		shadowGen   staging.ContentGen
+		hasShadow   bool
+		pendingGen  uint64
+		hasPending  bool
 	}
 
 	cq.mu.Lock()
+	var maxPendingAtCancel uint64
+	if cq.index != nil {
+		maxPendingAtCancel = cq.index.MaxGeneration()
+	}
+	var maxShadowAtCancel staging.ContentGen
+	if cq.shadows != nil {
+		maxShadowAtCancel = cq.shadows.MaxContentGeneration()
+	}
 	for path := range cq.landed {
 		if strings.HasPrefix(path, prefix) {
 			delete(cq.landed, path)
@@ -1052,6 +1061,9 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 	targetsByPath := make(map[string]*cancelTarget)
 	var targetOrder []string
 	ensureTarget := func(p string) *cancelTarget {
+		if p == "" || !strings.HasPrefix(p, prefix) {
+			return nil
+		}
 		if t, exists := targetsByPath[p]; exists {
 			return t
 		}
@@ -1059,22 +1071,6 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 		targetsByPath[p] = t
 		targetOrder = append(targetOrder, p)
 		return t
-	}
-	recordEntry := func(p string, e *CommitEntry) {
-		if p == "" || !strings.HasPrefix(p, prefix) {
-			return
-		}
-		t := ensureTarget(p)
-		if e != nil {
-			if e.ShadowGen != 0 {
-				t.shadowGen = e.ShadowGen
-				t.hasShadow = true
-			}
-			if e.PendingIndexGen != 0 {
-				t.pendingGen = e.PendingIndexGen
-				t.hasPending = true
-			}
-		}
 	}
 	var cancels []context.CancelFunc
 	seen := make(map[*CommitEntry]struct{})
@@ -1098,19 +1094,19 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 	for p, e := range cq.inFlight {
 		if strings.HasPrefix(p, prefix) {
 			markCanceled(e)
-			recordEntry(p, e)
+			ensureTarget(p)
 		}
 	}
 	for e := range cq.immediate {
 		if e != nil && strings.HasPrefix(e.Path, prefix) {
 			markCanceled(e)
-			recordEntry(e.Path, e)
+			ensureTarget(e.Path)
 		}
 	}
 	for _, e := range cq.queue {
 		if strings.HasPrefix(e.Path, prefix) {
 			markCanceled(e)
-			recordEntry(e.Path, e)
+			ensureTarget(e.Path)
 		} else {
 			remaining = append(remaining, e)
 		}
@@ -1121,48 +1117,29 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 	}
 	for p, f := range cq.terminalFailures {
 		if strings.HasPrefix(p, prefix) {
-			t := ensureTarget(p)
-			t.failureSeq = f.seq
-			t.hasFailure = true
+			if t := ensureTarget(p); t != nil {
+				t.failureSeq = f.seq
+				t.hasFailure = true
+			}
 			delete(cq.terminalFailures, p)
 		}
 	}
-	// Snapshot pending index and shadow generations under cq.mu so cleanup
-	// after unlock is strictly generation-fenced and cannot delete a newer
-	// creation/write staged concurrently after CancelPrefix's snapshot.
 	if cq.index != nil {
 		for p := range cq.index.ListPendingPaths() {
-			if !strings.HasPrefix(p, prefix) {
-				continue
-			}
-			if meta, ok := cq.index.GetMeta(p); ok && meta != nil && meta.Generation != 0 {
-				t := ensureTarget(p)
-				if meta.Generation >= t.pendingGen {
-					t.pendingGen = meta.Generation
-					t.hasPending = true
-				}
-			}
+			ensureTarget(p)
 		}
 	}
 	if cq.shadows != nil {
 		for _, p := range cq.shadows.PathsWithPrefix(prefix) {
-			if gen := cq.shadows.ActiveGeneration(p); gen != 0 {
-				t := ensureTarget(p)
-				if gen >= t.shadowGen {
-					t.shadowGen = gen
-					t.hasShadow = true
-				}
-			}
+			ensureTarget(p)
 		}
 	}
 	cq.retainedShadows.Range(func(key, val any) bool {
 		if p, ok := key.(string); ok && strings.HasPrefix(p, prefix) {
-			cq.retainedShadows.CompareAndDelete(p, val)
-			if gen, gok := val.(staging.ContentGen); gok && gen != 0 {
-				t := ensureTarget(p)
-				if !t.hasShadow {
-					t.shadowGen = gen
-					t.hasShadow = true
+			if gen, gok := val.(staging.ContentGen); gok && gen != 0 && (maxShadowAtCancel == 0 || gen <= maxShadowAtCancel) {
+				cq.retainedShadows.CompareAndDelete(p, val)
+				if t := ensureTarget(p); t != nil && t.retainedGen == 0 {
+					t.retainedGen = gen
 				}
 			}
 		}
@@ -1170,12 +1147,10 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 	})
 	cq.retainedLiveShadows.Range(func(key, val any) bool {
 		if p, ok := key.(string); ok && strings.HasPrefix(p, prefix) {
-			cq.retainedLiveShadows.CompareAndDelete(p, val)
-			if gen, gok := val.(staging.ContentGen); gok && gen != 0 {
-				t := ensureTarget(p)
-				if !t.hasShadow {
-					t.shadowGen = gen
-					t.hasShadow = true
+			if gen, gok := val.(staging.ContentGen); gok && gen != 0 && (maxShadowAtCancel == 0 || gen <= maxShadowAtCancel) {
+				cq.retainedLiveShadows.CompareAndDelete(p, val)
+				if t := ensureTarget(p); t != nil && t.retainedGen == 0 {
+					t.retainedGen = gen
 				}
 			}
 		}
@@ -1186,18 +1161,67 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 	for _, cancel := range cancels {
 		cancel()
 	}
+
+	// Lock candidate paths in deterministic lexicographic order AFTER releasing
+	// cq.mu (respecting pathLocks -> cq.mu lock order) so each path's pending
+	// metadata and active shadow generation are observed coherently from the
+	// exact same staged write, and any write staged after maxPendingAtCancel /
+	// maxShadowAtCancel is left completely untouched.
+	sort.Strings(targetOrder)
+	var eligible []*cancelTarget
+	var heldUnlocks []func()
+	for _, p := range targetOrder {
+		t := targetsByPath[p]
+		unlockPath := cq.lockPath(p)
+		var meta *staging.WriteBackMeta
+		if cq.index != nil {
+			if m, ok := cq.index.GetMeta(p); ok && m != nil {
+				meta = m
+			}
+		}
+		var shadowGen staging.ContentGen
+		if cq.shadows != nil {
+			shadowGen = cq.shadows.ActiveGeneration(p)
+		}
+		if shadowGen == 0 && t.retainedGen != 0 {
+			shadowGen = t.retainedGen
+		}
+		if (meta != nil && meta.Generation > maxPendingAtCancel) ||
+			(shadowGen != 0 && shadowGen > maxShadowAtCancel) {
+			// A newer write staged after CancelPrefix's snapshot owns this path:
+			// keep both its pending metadata and its shadow intact.
+			unlockPath()
+			continue
+		}
+		if meta != nil && meta.Generation != 0 {
+			t.pendingGen = meta.Generation
+			t.hasPending = true
+		}
+		if shadowGen != 0 {
+			t.shadowGen = shadowGen
+			t.hasShadow = true
+		}
+		eligible = append(eligible, t)
+		heldUnlocks = append(heldUnlocks, unlockPath)
+	}
+	defer func() {
+		for i := len(heldUnlocks) - 1; i >= 0; i-- {
+			heldUnlocks[i]()
+		}
+	}()
+
 	// One fsync for the whole subtree: the markers are only a fence once they
 	// are on disk, and a cancel usually arrives as one rename/rmdir of a tree.
 	markerDurable := false
-	if cq.journal != nil && len(targetOrder) > 0 {
+	if cq.journal != nil && len(eligible) > 0 {
 		appended := true
-		for _, p := range targetOrder {
+		for _, t := range eligible {
 			if err := cq.journal.Append(staging.JournalEntry{
 				Op:   staging.JournalCommit,
-				Path: p,
+				Path: t.path,
 			}); err != nil {
 				appended = false
-				safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", p, err)
+				safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", t.path, err)
 			}
 		}
 		// Unconditional: one failed append must not leave the other subtree
@@ -1210,24 +1234,21 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 		}
 		markerDurable = appended
 	}
-	for _, p := range targetOrder {
-		t := targetsByPath[p]
+	for _, t := range eligible {
 		if cq.shadows != nil && t.hasShadow && t.shadowGen != 0 {
 			if markerDurable {
-				// Generation-fenced removal preserves any newer generation staged
-				// concurrently after CancelPrefix's snapshot.
-				cq.shadows.RemoveIfGeneration(p, t.shadowGen)
+				cq.shadows.RemoveIfGeneration(t.path, t.shadowGen)
 			} else {
-				if _, err := cq.shadows.RemoveIfGenerationDurable(p, t.shadowGen); err != nil {
-					safeLogPrintf("commit queue: subtree shadow removal for %s was not durable: %v", p, err)
+				if _, err := cq.shadows.RemoveIfGenerationDurable(t.path, t.shadowGen); err != nil {
+					safeLogPrintf("commit queue: subtree shadow removal for %s was not durable: %v", t.path, err)
 				}
 			}
 		}
 		if cq.index != nil && t.hasPending && t.pendingGen != 0 {
-			cq.index.RemoveIfGeneration(p, t.pendingGen)
+			cq.index.RemoveIfGeneration(t.path, t.pendingGen)
 		}
 		if t.hasFailure {
-			cq.ClearTerminalFailureIfSeq(p, t.failureSeq)
+			cq.ClearTerminalFailureIfSeq(t.path, t.failureSeq)
 		}
 	}
 }

@@ -57,6 +57,8 @@ type Handler struct {
 	// waitClosingSentinelsInDir observes an active/dropping sentinel and enters
 	// its wait path.
 	onSentinelWait func()
+	// flushGrace overrides sentinelFlushDispatchGrace in unit tests when > 0.
+	flushGrace time.Duration
 }
 
 // New builds the engine-plane handler.
@@ -1240,6 +1242,10 @@ func (h *Handler) waitClosingSentinelsInDir(ctx context.Context, dir string) {
 		return
 	}
 	br := h.opts.Engine.Bridge
+	grace := sentinelFlushDispatchGrace
+	if h.flushGrace > 0 {
+		grace = h.flushGrace
+	}
 	releaseDeadline := time.Now().Add(2 * time.Second)
 	notifiedWait := false
 	for {
@@ -1254,13 +1260,20 @@ func (h *Handler) waitClosingSentinelsInDir(ctx context.Context, dir string) {
 			allClosingOrFlushed := true
 			h.mu.Lock()
 			for _, s := range active {
-				for _, eh := range h.handles[s] {
+				handles := h.handles[s]
+				if len(handles) == 0 {
+					// The last handle already retired from h.handles and is
+					// entering DropDeletedOpen; wait for sentinel deletion.
+					hasConfirmedRelease = true
+					continue
+				}
+				for _, eh := range handles {
 					if eh.released {
 						hasConfirmedRelease = true
 						continue
 					}
 					flushedAt := eh.flushedAtNano.Load()
-					if flushedAt != 0 && now.Sub(time.Unix(0, flushedAt)) <= sentinelFlushDispatchGrace {
+					if flushedAt != 0 && now.Sub(time.Unix(0, flushedAt)) <= grace {
 						hasFlushGraceOnly = true
 						continue
 					}
@@ -1391,7 +1404,9 @@ func (e *engineHandle) Sync(ctx context.Context) error {
 }
 
 func (e *engineHandle) Flush(ctx context.Context) error {
-	e.flushedAtNano.Store(time.Now().UnixNano())
+	defer func() {
+		e.flushedAtNano.Store(time.Now().UnixNano())
+	}()
 	e.plane.opts.Engine.Bridge.kickPendingFlush()
 	if errno := e.plane.opts.Engine.VFS.Flush(e.vctx, e.ino, e.fh, fs.FlushOwnerOf(ctx)); errno != 0 {
 		return errno

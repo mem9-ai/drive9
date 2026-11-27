@@ -93,6 +93,11 @@ func TestRmdirWaitsForFlushedClosingSentinel(t *testing.T) {
 		t.Fatalf("expected 1 active sentinel before async Release, got %v", got)
 	}
 
+	// Use a generous deterministic grace window while testing the Rmdir ->
+	// async Release handoff so CI scheduler delays cannot expire eligibility
+	// before waitClosingSentinelsInDir runs; default 25ms aging is verified
+	// separately below.
+	h.flushGrace = 5 * time.Second
 	waitEntered := make(chan struct{})
 	var waitOnce sync.Once
 	h.onSentinelWait = func() {
@@ -124,7 +129,10 @@ func TestRmdirWaitsForFlushedClosingSentinel(t *testing.T) {
 	}
 
 	// Also verify a duplicated descriptor that flushed >25ms ago without
-	// starting Release does NOT stall OpRmdir for 2 seconds.
+	// starting Release does NOT stall OpRmdir for 2 seconds (restore default
+	// 25ms dispatch grace first).
+	h.flushGrace = 0
+	h.onSentinelWait = nil
 	f.seedExtent(t, "/dupdir/keep.txt", "still-open")
 	ehDup := claimOpen(t, h, "/dupdir/keep.txt")
 	defer func() { _ = ehDup.Release(ctx) }()
