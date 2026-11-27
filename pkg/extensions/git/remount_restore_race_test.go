@@ -212,7 +212,7 @@ func TestFreshLocalRootLinkedWorktreeDotGitLookupWaitsForRestore(t *testing.T) {
 	indexEntries := run(t, linkedRepoA, "ls-files", "--stage")
 
 	b.SeedGitWorkspaceFull("ws-main", "/base", "file://"+bare, head)
-	b.SeedGitWorktree("ws-linked", "/linked", "file://"+bare, head, "ws-main", ".git/worktrees/linked")
+	b.SeedGitWorktreeNamed("ws-linked", "/linked", "file://"+bare, head, "ws-main", ".git/worktrees/linked", "linked")
 
 	ts := httptest.NewServer(b)
 	t.Cleanup(ts.Close)
@@ -224,7 +224,7 @@ func TestFreshLocalRootLinkedWorktreeDotGitLookupWaitsForRestore(t *testing.T) {
 	mainWS := &workspace{id: "ws-main", root: "/base", headCommit: head, repoURL: "file://" + bare, fastBlobless: true}
 	linkedWS := &workspace{
 		id: "ws-linked", root: "/linked", headCommit: head, repoURL: "file://" + bare,
-		fastBlobless: true, workspaceKind: "linked", commonID: "ws-main", gitDirRel: ".git/worktrees/linked",
+		fastBlobless: true, workspaceKind: "linked", commonID: "ws-main", gitDirRel: ".git/worktrees/linked", worktreeName: "linked",
 	}
 	gA.workspaces = []*workspace{mainWS, linkedWS}
 	require.NoError(t, gA.checkpointWorkspace(ctx, mainWS, filepath.Join(baseRepoA, ".git")))

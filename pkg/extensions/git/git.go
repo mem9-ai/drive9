@@ -70,6 +70,7 @@ type workspace struct {
 	workspaceKind string
 	commonID      string
 	gitDirRel     string
+	worktreeName  string
 	// createdAt anchors the clean-tree mtime (v1 gitCleanTreeMtime): a
 	// stable timestamp per commit lets git's stat comparison trust clean
 	// tree files instead of content-checking every one on every status.
@@ -218,6 +219,25 @@ func (w *workspace) gitDirRelPath() string {
 	return w.gitDirRel
 }
 
+func (w *workspace) worktreeAdminName() string {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.worktreeName
+}
+
+// withFrozenLinkedTarget runs fn while holding the write lock, so a reload cannot
+// change the linked identity in the middle of it. The restore validates the target
+// and swaps it in inside one frozen section: a reload between the two would
+// otherwise let the check approve a target the swap does not write.
+// The root is passed through as well: it is part of what the caller acts on (the
+// worktree pointer is written under it) and reading it through the accessor inside
+// the frozen section would deadlock on the lock the section holds.
+func (w *workspace) withFrozenLinkedTarget(fn func(commonID, gitDirRel, worktreeName, root string) error) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return fn(w.commonID, w.gitDirRel, w.worktreeName, w.root)
+}
+
 func (w *workspace) commonWorkspaceID() string {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
@@ -240,9 +260,9 @@ func (w *workspace) setMeta(root, head, repo string, blobless bool, createdAt ti
 }
 
 // setLinkedMeta refreshes the linked-worktree identity fields.
-func (w *workspace) setLinkedMeta(kind, commonID, gitDirRel string) {
+func (w *workspace) setLinkedMeta(kind, commonID, gitDirRel, worktreeName string) {
 	w.mu.Lock()
-	w.workspaceKind, w.commonID, w.gitDirRel = kind, commonID, gitDirRel
+	w.workspaceKind, w.commonID, w.gitDirRel, w.worktreeName = kind, commonID, gitDirRel, worktreeName
 	w.mu.Unlock()
 }
 
@@ -253,6 +273,30 @@ func (g *Git) workspaceByID(id string) *workspace {
 	}
 	g.mu.RLock()
 	defer g.mu.RUnlock()
+	return g.workspaceByIDLocked(id)
+}
+
+// withRegistryReadLock runs fn with the workspace registry read-locked. The restore
+// keeps it across the target check and the swap so a reload cannot remove or replace
+// the workspaces the check resolved; the order is g.mu -> w.mu, the same one the
+// reload path uses.
+//
+// fn must not take the registry again, not even for a read: a reload queued for the
+// write lock waits for fn to return, and a nested read lock would wait for that
+// reload. Verification that needs a lookup runs after the section ends.
+func (g *Git) withRegistryReadLock(fn func() error) error {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return fn()
+}
+
+// workspaceByIDLocked is workspaceByID for a caller that already holds g.mu. The
+// restore path holds it across the target check and the swap, so a reload cannot
+// remove the common workspace the check resolved.
+func (g *Git) workspaceByIDLocked(id string) *workspace {
+	if id == "" {
+		return nil
+	}
 	for _, w := range g.workspaces {
 		if w.id == id {
 			return w
@@ -854,7 +898,7 @@ func (g *Git) ensure(ctx context.Context) {
 		if existing, ok := prev[gw.WorkspaceID]; ok {
 			w = existing
 			w.setMeta(root, gw.HeadCommit, gw.RepoURL, gw.Mode == "fast-blobless", gw.CreatedAt)
-			w.setLinkedMeta(gw.WorkspaceKind, gw.CommonWorkspaceID, gw.GitDirRel)
+			w.setLinkedMeta(gw.WorkspaceKind, gw.CommonWorkspaceID, gw.GitDirRel, gw.WorktreeName)
 			delete(prev, gw.WorkspaceID)
 		} else {
 			w = &workspace{
@@ -867,6 +911,7 @@ func (g *Git) ensure(ctx context.Context) {
 				workspaceKind: gw.WorkspaceKind,
 				commonID:      gw.CommonWorkspaceID,
 				gitDirRel:     gw.GitDirRel,
+				worktreeName:  gw.WorktreeName,
 			}
 		}
 		ws = append(ws, w)

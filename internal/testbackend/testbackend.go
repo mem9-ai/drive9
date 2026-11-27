@@ -251,12 +251,18 @@ func (b *Backend) SeedGitWorkspaceFull(id, root, repoURL, headCommit string) {
 // SeedGitWorktree registers a LINKED worktree workspace: kind, common
 // workspace id, and the gitdir path relative to the common repository.
 func (b *Backend) SeedGitWorktree(id, root, repoURL, headCommit, commonID, gitDirRel string) {
+	b.SeedGitWorktreeNamed(id, root, repoURL, headCommit, commonID, gitDirRel, "")
+}
+
+// SeedGitWorktreeNamed registers a LINKED worktree workspace with an explicit
+// worktree_name matching worktrees/<worktree_name>.
+func (b *Backend) SeedGitWorktreeNamed(id, root, repoURL, headCommit, commonID, gitDirRel, worktreeName string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.gitWorkspaces = append(b.gitWorkspaces, map[string]any{
 		"workspace_id": id, "root_path": root, "status": "active", "workspace_kind": "linked",
 		"repo_url": repoURL, "head_commit": headCommit,
-		"common_workspace_id": commonID, "gitdir_rel": gitDirRel,
+		"common_workspace_id": commonID, "gitdir_rel": gitDirRel, "worktree_name": worktreeName,
 	})
 }
 
