@@ -253,7 +253,10 @@ type Writeback struct {
 	perfShim *fusePerfCounters
 	// unlinkedMu/unlinkedShadow track per-path unlink snapshots staged into
 	// the shadow for anonymous clean fds (v1
-	// snapshotUnlinkedRemoteToShadow).
+	// snapshotUnlinkedRemoteToShadow). unlinkClaimMu linearizes Pass 1 batch
+	// claiming in markUnlinkedSnapshot so overlapping scans form a strict DAG
+	// without cyclic waits.
+	unlinkClaimMu  sync.Mutex
 	unlinkedMu     sync.Mutex
 	unlinkedShadow map[string]struct{}
 	// unlinkedShadowGen is the CONTENT generation the snapshot captured:
@@ -6361,6 +6364,8 @@ func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHand
 	var marked []*bufferingHandle
 	var submitting, readDrains []chan struct{}
 	var otherSnapWaits []*unlinkSnapState
+	seenWaits := make(map[*unlinkSnapState]struct{})
+	w.unlinkClaimMu.Lock()
 	w.liveSet.Range(func(key, _ any) bool {
 		h := key.(*bufferingHandle)
 		h.mu.Lock()
@@ -6380,7 +6385,10 @@ func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHand
 				clean = append(clean, h)
 			}
 		} else if h.unlinkSnap != nil {
-			otherSnapWaits = append(otherSnapWaits, h.unlinkSnap)
+			if _, dup := seenWaits[h.unlinkSnap]; !dup {
+				seenWaits[h.unlinkSnap] = struct{}{}
+				otherSnapWaits = append(otherSnapWaits, h.unlinkSnap)
+			}
 		}
 		if h.linkedReadCount > 0 {
 			if h.linkedReadsIdle == nil {
@@ -6391,6 +6399,7 @@ func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHand
 		h.mu.Unlock()
 		return true
 	})
+	w.unlinkClaimMu.Unlock()
 	for _, ch := range submitting {
 		<-ch
 	}
@@ -7292,27 +7301,26 @@ func (w *Writeback) dirtyLiveWriterAtPath(path string, skip *bufferingHandle) *b
 }
 
 // snapshotDirtySiblingBytes copies the newest dirty sibling buffer at path when
-// it can be materialized in memory, using non-blocking TryLock so callers
-// holding h.mu (or admitFtruncate holding all sibling mutexes) can never
-// deadlock on lock order.
+// it can be materialized in memory, enumerating w.liveSet lock-free and using
+// non-blocking TryLock so callers holding h.mu (or admitFtruncate holding all
+// sibling mutexes) never acquire regMu or invert lock order.
 func (w *Writeback) snapshotDirtySiblingBytes(path string, skip *bufferingHandle) ([]byte, bool) {
-	if w == nil {
+	if w == nil || path == "" {
 		return nil, false
 	}
-	w.regMu.Lock()
-	handles := make([]*bufferingHandle, 0, len(w.liveByPath[path]))
-	for h := range w.liveByPath[path] {
-		if h != skip {
-			handles = append(handles, h)
-		}
-	}
-	w.regMu.Unlock()
 	var best []byte
 	var bestSeq uint64
 	found := false
-	for _, sib := range handles {
+	w.liveSet.Range(func(key, val any) bool {
+		sib, ok := key.(*bufferingHandle)
+		if !ok || sib == skip {
+			return true
+		}
+		if info, iok := val.(*handleInfo); iok && info != nil && info.path != path {
+			return true
+		}
 		if !sib.mu.TryLock() {
-			continue
+			return true
 		}
 		if sib.path == path && sib.dirty && sib.buf != nil && !sib.unlinked && !sib.closed {
 			sibSize := sib.buf.Size()
@@ -7324,9 +7332,8 @@ func (w *Writeback) snapshotDirtySiblingBytes(path string, skip *bufferingHandle
 				}
 			} else if sibSize >= 0 && sibSize <= pendingServeMaterializeBytes {
 				if !found || sib.mutSeq >= bestSeq {
-					if err := sib.buf.ForceEnsurePartsForWrite(0, sibSize); err == nil {
-						out := make([]byte, sibSize)
-						sib.buf.ReadAt(0, out)
+					out := make([]byte, sibSize)
+					if _, err := readWriteBufferRangePreservingEviction(sib.buf, 0, out); err == nil {
 						best = out
 						bestSeq = sib.mutSeq
 						found = true
@@ -7335,7 +7342,8 @@ func (w *Writeback) snapshotDirtySiblingBytes(path string, skip *bufferingHandle
 			}
 		}
 		sib.mu.Unlock()
-	}
+		return true
+	})
 	return best, found
 }
 
@@ -7625,31 +7633,34 @@ func (w *Writeback) hasPendingNewState(path string) bool {
 }
 
 // hasDirtySiblingTry performs a non-blocking check (safe while another handle's
-// mutex is held) for whether any sibling handle at path currently holds a
-// dirty buffer.
+// mutex is held, without acquiring regMu) for whether any sibling handle at
+// path currently holds a dirty buffer.
 func (w *Writeback) hasDirtySiblingTry(path string, exclude *bufferingHandle) bool {
 	if w == nil || path == "" {
 		return false
 	}
-	w.regMu.Lock()
-	siblings := make([]*bufferingHandle, 0, len(w.liveByPath[path]))
-	for h := range w.liveByPath[path] {
-		if h != exclude {
-			siblings = append(siblings, h)
-		}
-	}
-	w.regMu.Unlock()
-	for _, sib := range siblings {
-		if !sib.mu.TryLock() {
+	foundDirty := false
+	w.liveSet.Range(func(key, val any) bool {
+		sib, ok := key.(*bufferingHandle)
+		if !ok || sib == exclude {
 			return true
+		}
+		if info, iok := val.(*handleInfo); iok && info != nil && info.path != path {
+			return true
+		}
+		if !sib.mu.TryLock() {
+			foundDirty = true
+			return false
 		}
 		dirty := sib.path == path && !sib.unlinked && !sib.closed && sib.dirty && sib.buf != nil
 		sib.mu.Unlock()
 		if dirty {
-			return true
+			foundDirty = true
+			return false
 		}
-	}
-	return false
+		return true
+	})
+	return foundDirty
 }
 
 // clearLinkedReaderPendingImages drops open-time pendingImage captures on
@@ -7766,6 +7777,49 @@ func (w *Writeback) acknowledgeObjGenLanding(objGen uint64, rev int64, seq uint6
 	}
 }
 
+func readWriteBufferRangePreservingEviction(buf *writebuffer.WriteBuffer, off int64, dst []byte) (int, error) {
+	if len(dst) == 0 {
+		return 0, nil
+	}
+	want := int64(len(dst))
+	partSize := buf.PartSize()
+	var reEvict []int
+	var firstIdx, lastIdx int
+	if partSize > 0 {
+		firstIdx = int(off / partSize)
+		lastIdx = int((off + want - 1) / partSize)
+		streamed := buf.StreamedPartIndices()
+		for idx := firstIdx; idx <= lastIdx; idx++ {
+			if !buf.IsPartLoaded(idx) && streamed[idx] {
+				reEvict = append(reEvict, idx)
+			}
+		}
+	}
+	if err := buf.ForceEnsurePartsForWrite(off, want); err != nil {
+		for _, idx := range reEvict {
+			if buf.IsPartLoaded(idx) {
+				buf.EvictPart(idx)
+			}
+		}
+		return 0, err
+	}
+	n := buf.ReadAt(off, dst)
+	if partSize > 0 {
+		evictSet := make(map[int]struct{}, len(reEvict))
+		for _, idx := range reEvict {
+			evictSet[idx] = struct{}{}
+		}
+		for idx := firstIdx; idx <= lastIdx; idx++ {
+			if _, ok := evictSet[idx]; ok {
+				buf.EvictPart(idx)
+			} else {
+				buf.ReleaseCleanPart(idx)
+			}
+		}
+	}
+	return n, nil
+}
+
 func readFromSiblingHandle(sib *bufferingHandle, off int64, dst []byte) (int, bool, error) {
 	sib.mu.Lock()
 	defer sib.mu.Unlock()
@@ -7780,17 +7834,9 @@ func readFromSiblingHandle(sib *bufferingHandle, off int64, dst []byte) (int, bo
 	if off+want > total {
 		want = total - off
 	}
-	partSize := sib.buf.PartSize()
-	if err := sib.buf.ForceEnsurePartsForWrite(off, want); err != nil {
+	n, err := readWriteBufferRangePreservingEviction(sib.buf, off, dst[:want])
+	if err != nil {
 		return 0, false, err
-	}
-	n := sib.buf.ReadAt(off, dst[:want])
-	if partSize > 0 {
-		firstIdx := int(off / partSize)
-		lastIdx := int((off + want - 1) / partSize)
-		for idx := firstIdx; idx <= lastIdx; idx++ {
-			sib.buf.ReleaseCleanPart(idx)
-		}
 	}
 	return n, true, nil
 }
@@ -7895,12 +7941,11 @@ func (h *bufferingHandle) seedFromDirtySiblingForObj(objGen uint64) error {
 		curSize := best.buf.Size()
 		var img []byte
 		if curSize > 0 {
-			if err := best.buf.ForceEnsurePartsForWrite(0, curSize); err != nil {
+			img = make([]byte, curSize)
+			if _, err := readWriteBufferRangePreservingEviction(best.buf, 0, img); err != nil {
 				best.mu.Unlock()
 				return err
 			}
-			img = make([]byte, curSize)
-			best.buf.ReadAt(0, img)
 		} else {
 			img = []byte{}
 		}
@@ -9373,6 +9418,7 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 			h.baseLoaded = true
 			return nil
 		}
+		h.buf.SeedRemote(remoteSize)
 		h.armRemoteRestoreLocked(remoteSize)
 		h.baseLoaded = true
 		return nil

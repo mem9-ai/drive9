@@ -192,8 +192,13 @@ type FS struct {
 	budget *membudget.Budget
 
 	unicodeSpellingsMu sync.Mutex
-	unicodeSpellings   map[string]map[string]struct{}
+	unicodeSpellings   map[unicodeSpellingKey]map[string]struct{}
 	onInvalidateEntry  func(parentIno uint64, name string)
+}
+
+type unicodeSpellingKey struct {
+	parentIno uint64
+	canonName string
 }
 
 // New assembles the facade: chain, Context, and identity tables. Register
@@ -1629,7 +1634,7 @@ func (f *FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string
 	}
 	isDir := res.Attr != nil && res.Attr.IsDir()
 	f.fillEntryOut(child, res.Attr, isDir, out)
-	f.recordUnicodeSpelling(name, child)
+	f.recordUnicodeSpelling(header.NodeId, name, child)
 	return gofuse.OK
 }
 
@@ -2009,6 +2014,7 @@ func (f *FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name string, o
 	}
 	f.mutated(fs.EventWrite, child)
 	f.fillEntryOut(child, res.Attr, false, out)
+	f.recordUnicodeSpelling(input.NodeId, name, child)
 	if res.Attr != nil && res.Attr.Mode&syscall.S_IFMT != 0 && res.Attr.Mode&syscall.S_IFMT != syscall.S_IFREG {
 		out.Mode = res.Attr.Mode // specials carry their own S_IFMT
 		// The device number rides the record (mknod/11 major,minor rows):
@@ -2059,7 +2065,7 @@ func (f *FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, o
 	}
 	f.mutated(fs.EventWrite, child)
 	f.fillEntryOut(child, &mode, true, out)
-	f.recordUnicodeSpelling(name, child)
+	f.recordUnicodeSpelling(input.NodeId, name, child)
 	f.dirCacheUpsert(child, &mode)
 	caller := fs.CallerFrom(input.InHeader)
 	f.stampOwner(out.NodeId, caller)
@@ -2192,6 +2198,9 @@ func (f *FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name string)
 		return st
 	}
 	f.inodes.AdjustLinkCount(header.NodeId, -1)
+	if dirIno, ok := f.inodes.GetInode(child); ok {
+		f.clearUnicodeSpellingsUnderDir(dirIno)
+	}
 	// Detach the removed directory's NAME while keeping its inode for the
 	// references that outlive it (an open descriptor, a process cwd). Left
 	// mapped, the name would hand the removed object's nodeid to a later
@@ -2232,8 +2241,8 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 	// round trip, no cache churn. Drop alternate Unicode dentries other than
 	// newName (which the kernel moves oldName onto) and record newName.
 	if oldPath == newPath {
-		f.invalidateAlternateUnicodeSpellings(input.NodeId, newName, newPath)
-		f.recordUnicodeSpelling(newName, newPath)
+		f.invalidateAlternateUnicodeSpellings(input.Newdir, newName, newPath)
+		f.recordUnicodeSpelling(input.Newdir, newName, newPath)
 		return gofuse.OK
 	}
 	f.debugf("rename start old=%s new=%s", oldPath, newPath)
@@ -2289,11 +2298,9 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 	// resolving oldPath. At the destination, invalidate both canonical and
 	// alternate Unicode spellings of the replaced entry, then record newName.
 	f.invalidateAlternateUnicodeSpellings(input.NodeId, oldName, oldPath)
-	if pino2, ok := f.inodes.GetInode(parentDirOf(newPath)); ok {
-		f.InvalidateEntry(pino2, pathpkg.Base(newPath))
-		f.invalidateAlternateUnicodeSpellings(pino2, pathpkg.Base(newPath), newPath)
-	}
-	f.recordUnicodeSpelling(newName, newPath)
+	f.InvalidateEntry(input.Newdir, pathpkg.Base(newPath))
+	f.invalidateAlternateUnicodeSpellings(input.Newdir, pathpkg.Base(newPath), newPath)
+	f.recordUnicodeSpelling(input.Newdir, newName, newPath)
 	// A rename that REPLACED a destination must also drop the destination
 	// inode's cached data: the kernel keeps the old name's pages and attrs
 	// under the still-live inode id, so a post-close read of the new name
@@ -2372,6 +2379,7 @@ func (f *FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, filename string,
 	// compare the survivor's ctime across link+unlink cycles.
 	f.inodes.UpdateCtime(input.Oldnodeid, time.Now())
 	f.fillEntryOut(newPath, res.Attr, false, out)
+	f.recordUnicodeSpelling(input.NodeId, filename, newPath)
 	if res.Attr != nil {
 		f.dirCacheUpsert(newPath, res.Attr)
 	}
@@ -2421,6 +2429,7 @@ func (f *FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, pointedTo 
 	// attr/dentry type mismatch).
 	attr := &fs.Attr{Kind: fs.KindSymlink, Mode: uint32(syscall.S_IFLNK) | 0o777, Size: int64(len(pointedTo))}
 	f.fillEntryOut(child, attr, false, out)
+	f.recordUnicodeSpelling(header.NodeId, linkName, child)
 	f.inodes.UpdateMode(out.NodeId, attr.Mode)
 	f.dirCacheUpsert(child, attr)
 	caller := fs.CallerFrom(*header)
@@ -2717,7 +2726,7 @@ func (f *FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name string,
 	f.mutated(fs.EventWrite, child)
 	isDir := res.Attr != nil && res.Attr.IsDir()
 	f.fillEntryOut(child, res.Attr, isDir, &out.EntryOut)
-	f.recordUnicodeSpelling(name, child)
+	f.recordUnicodeSpelling(input.NodeId, name, child)
 	f.dirCacheUpsert(child, res.Attr)
 	// v1 Create records the create mode on the inode entry
 	// (inodes.UpdateMode): the entry's mode is what later Landed settles and
@@ -3979,31 +3988,46 @@ func (f *FS) InvalidateEntry(parentIno uint64, name string) {
 	}
 }
 
-func (f *FS) recordUnicodeSpelling(rawName, canonChild string) {
+func (f *FS) recordUnicodeSpelling(parentIno uint64, rawName, canonChild string) {
 	canonName := pathpkg.Base(canonChild)
-	if rawName == "" || canonName == "" || rawName == canonName {
+	if parentIno == 0 || rawName == "" || canonName == "" || canonName == "/" || canonName == "." || rawName == canonName {
 		return
 	}
+	key := unicodeSpellingKey{parentIno: parentIno, canonName: canonName}
 	f.unicodeSpellingsMu.Lock()
 	if f.unicodeSpellings == nil {
-		f.unicodeSpellings = make(map[string]map[string]struct{})
+		f.unicodeSpellings = make(map[unicodeSpellingKey]map[string]struct{})
 	}
-	set := f.unicodeSpellings[canonChild]
+	set := f.unicodeSpellings[key]
 	if set == nil {
 		set = make(map[string]struct{})
-		f.unicodeSpellings[canonChild] = set
+		f.unicodeSpellings[key] = set
 	}
 	set[rawName] = struct{}{}
 	f.unicodeSpellingsMu.Unlock()
 }
 
+func (f *FS) clearUnicodeSpellingsUnderDir(dirIno uint64) {
+	if dirIno == 0 {
+		return
+	}
+	f.unicodeSpellingsMu.Lock()
+	for k := range f.unicodeSpellings {
+		if k.parentIno == dirIno {
+			delete(f.unicodeSpellings, k)
+		}
+	}
+	f.unicodeSpellingsMu.Unlock()
+}
+
 // invalidateAlternateUnicodeSpellings drops cached kernel dentries for NFC,
-// NFD, and any previously looked-up mixed Unicode spellings of a removed entry
-// when they differ from rawName so an earlier Lookup cannot stay positively
-// cached past Unlink/Rmdir.
+// NFD, and any previously recorded mixed Unicode spellings of an entry under
+// parentIno when they differ from rawName so an earlier Lookup/Create/Symlink/
+// Link/Mknod/Mkdir/Rename cannot stay positively cached (including across
+// ancestor directory renames, since parentIno stays stable).
 func (f *FS) invalidateAlternateUnicodeSpellings(parentIno uint64, rawName, canonChild string) {
 	canonName := pathpkg.Base(canonChild)
-	if canonName == "" || canonName == "/" || canonName == "." {
+	if parentIno == 0 || canonName == "" || canonName == "/" || canonName == "." {
 		return
 	}
 	notified := map[string]struct{}{rawName: {}}
@@ -4017,9 +4041,10 @@ func (f *FS) invalidateAlternateUnicodeSpellings(parentIno uint64, rawName, cano
 		notified[sp] = struct{}{}
 		f.InvalidateEntry(parentIno, sp)
 	}
+	key := unicodeSpellingKey{parentIno: parentIno, canonName: canonName}
 	f.unicodeSpellingsMu.Lock()
-	recorded := f.unicodeSpellings[canonChild]
-	delete(f.unicodeSpellings, canonChild)
+	recorded := f.unicodeSpellings[key]
+	delete(f.unicodeSpellings, key)
 	f.unicodeSpellingsMu.Unlock()
 
 	notify(canonName)

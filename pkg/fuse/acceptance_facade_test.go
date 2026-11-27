@@ -465,6 +465,102 @@ func TestFacadeRejectsInvalidNamespaceNamesWithoutPollutingDrain(t *testing.T) {
 				t.Fatalf("cleanup Unlink %q: %v", dstNFC, st)
 			}
 
+			// Symlink created with mixed spelling (without intervening Lookup)
+			// and descendant inside a renamed directory (/udir -> /umoved) must
+			// both invalidate their recorded mixed spellings when replaced.
+			const (
+				symMix = "sym-\u00e9e\u0301"
+				symNFC = "sym-\u00e9\u00e9"
+			)
+			var symMixOut gofuse.EntryOut
+			if st := f.Symlink(nil, &gofuse.InHeader{NodeId: 1}, "/target", symMix, &symMixOut); st != gofuse.OK {
+				t.Fatalf("Symlink %q: %v", symMix, st)
+			}
+			var replCreate gofuse.CreateOut
+			if st := f.Create(nil, &gofuse.CreateIn{
+				InHeader: gofuse.InHeader{NodeId: 1},
+				Flags:    uint32(syscall.O_CREAT | syscall.O_RDWR),
+				Mode:     0o644,
+			}, "repl.txt", &replCreate); st != gofuse.OK {
+				t.Fatalf("Create repl.txt: %v", st)
+			}
+			_ = f.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: replCreate.NodeId}, Fh: replCreate.Fh})
+			f.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: replCreate.NodeId}, Fh: replCreate.Fh})
+			symInv := map[string]bool{}
+			f.onInvalidateEntry = func(_ uint64, invName string) {
+				invalidatedMu.Lock()
+				symInv[invName] = true
+				invalidatedMu.Unlock()
+			}
+			if st := f.Rename(nil, &gofuse.RenameIn{
+				InHeader: gofuse.InHeader{NodeId: 1},
+				Newdir:   1,
+			}, "repl.txt", symNFC); st != gofuse.OK {
+				t.Fatalf("Rename over symlink %q: %v", symNFC, st)
+			}
+			f.onInvalidateEntry = nil
+			invalidatedMu.Lock()
+			gotSymMix := symInv[symMix]
+			invalidatedMu.Unlock()
+			if !gotSymMix {
+				t.Fatalf("Rename over %q did not invalidate mixed Symlink spelling %q", symNFC, symMix)
+			}
+			_ = f.Unlink(nil, &gofuse.InHeader{NodeId: 1}, symNFC)
+
+			// Directory rename /udir -> /umoved keeps child spelling records
+			// keyed by stable parentIno.
+			var dirOut gofuse.EntryOut
+			if st := f.Mkdir(nil, &gofuse.MkdirIn{
+				InHeader: gofuse.InHeader{NodeId: 1},
+				Mode:     0o755,
+			}, "udir", &dirOut); st != gofuse.OK {
+				t.Fatalf("Mkdir udir: %v", st)
+			}
+			for _, cn := range []string{nfcDouble, "src.txt"} {
+				var co gofuse.CreateOut
+				if st := f.Create(nil, &gofuse.CreateIn{
+					InHeader: gofuse.InHeader{NodeId: dirOut.NodeId},
+					Flags:    uint32(syscall.O_CREAT | syscall.O_RDWR),
+					Mode:     0o644,
+				}, cn, &co); st != gofuse.OK {
+					t.Fatalf("Create /udir/%s: %v", cn, st)
+				}
+				_ = f.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: co.NodeId}, Fh: co.Fh})
+				f.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: co.NodeId}, Fh: co.Fh})
+			}
+			if st := f.Lookup(nil, &gofuse.InHeader{NodeId: dirOut.NodeId}, mixedName, &lo); st != gofuse.OK {
+				t.Fatalf("Lookup /udir/%q: %v", mixedName, st)
+			}
+			if st := f.Rename(nil, &gofuse.RenameIn{
+				InHeader: gofuse.InHeader{NodeId: 1},
+				Newdir:   1,
+			}, "udir", "umoved"); st != gofuse.OK {
+				t.Fatalf("Rename udir -> umoved: %v", st)
+			}
+			movedInv := map[string]bool{}
+			f.onInvalidateEntry = func(pino uint64, invName string) {
+				if pino == dirOut.NodeId {
+					invalidatedMu.Lock()
+					movedInv[invName] = true
+					invalidatedMu.Unlock()
+				}
+			}
+			if st := f.Rename(nil, &gofuse.RenameIn{
+				InHeader: gofuse.InHeader{NodeId: dirOut.NodeId},
+				Newdir:   dirOut.NodeId,
+			}, "src.txt", nfcDouble); st != gofuse.OK {
+				t.Fatalf("Rename /umoved/src.txt -> %q: %v", nfcDouble, st)
+			}
+			f.onInvalidateEntry = nil
+			invalidatedMu.Lock()
+			gotMovedMix := movedInv[mixedName]
+			invalidatedMu.Unlock()
+			if !gotMovedMix {
+				t.Fatalf("Rename-over inside renamed directory /umoved missed mixed spelling %q", mixedName)
+			}
+			_ = f.Unlink(nil, &gofuse.InHeader{NodeId: dirOut.NodeId}, nfcDouble)
+			_ = f.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "umoved")
+
 			// Sentinel-based client.ErrInvalidPath classification must return EINVAL
 			// even when the invalid path text contains words like "not found".
 			_, invalidErr := client.New("http://127.0.0.1:1", "").StatCtx(context.Background(), `/not found\bad`)

@@ -2372,7 +2372,8 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 	t.Run("concurrent-mark-unlinked-snapshot-no-deadlock", func(t *testing.T) {
 		b := testbackend.NewBackend()
 		b.Seed("/dir/a", []byte("alpha"))
-		b.Seed("/dir/b", []byte("bravo"))
+		b.Seed("/dir/sub/a", []byte("alpha"))
+		b.Seed("/dir/sub/b", []byte("bravo"))
 		ts := httptest.NewServer(b)
 		t.Cleanup(ts.Close)
 		cl := client.New(ts.URL, "")
@@ -2394,28 +2395,36 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		for round := 0; round < 20; round++ {
-			ha, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/dir/a", Flags: uint32(syscall.O_RDONLY)})
-			if err != nil {
-				t.Fatal(err)
-			}
-			hb, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/dir/b", Flags: uint32(syscall.O_RDONLY)})
-			if err != nil {
-				t.Fatal(err)
+		for round := 0; round < 30; round++ {
+			var openHandles []fs.Handle
+			for i := 0; i < 3; i++ {
+				ha, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/dir/sub/a", Flags: uint32(syscall.O_RDONLY)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				hb, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/dir/sub/b", Flags: uint32(syscall.O_RDONLY)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				openHandles = append(openHandles, ha.Handle, hb.Handle)
 			}
 			var wg sync.WaitGroup
-			wg.Add(3)
+			wg.Add(4)
 			go func() {
 				defer wg.Done()
 				_, _ = wb.markUnlinkedSnapshot("/dir", true)
 			}()
 			go func() {
 				defer wg.Done()
-				_, _ = wb.markUnlinkedSnapshot("/dir/a", false)
+				_, _ = wb.markUnlinkedSnapshot("/dir/sub", true)
 			}()
 			go func() {
 				defer wg.Done()
-				_, _ = wb.markUnlinkedSnapshot("/dir/b", false)
+				_, _ = wb.markUnlinkedSnapshot("/dir/sub/a", false)
+			}()
+			go func() {
+				defer wg.Done()
+				_, _ = wb.markUnlinkedSnapshot("/dir/sub/b", false)
 			}()
 			done := make(chan struct{})
 			go func() {
@@ -2427,8 +2436,9 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("deadlock in concurrent markUnlinkedSnapshot")
 			}
-			_ = ha.Handle.Release(ctx)
-			_ = hb.Handle.Release(ctx)
+			for _, oh := range openHandles {
+				_ = oh.Release(ctx)
+			}
 		}
 	})
 
@@ -2496,6 +2506,12 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 		}
 		if err := h2.Handle.Write(ctx, 16, []byte("PATCH1")); err != nil {
 			t.Fatalf("h2.Write(16): %v", err)
+		}
+		bh1.mu.Lock()
+		bh1MemAfterSnapshot := bh1.buf.MemoryUsage()
+		bh1.mu.Unlock()
+		if bh1MemAfterSnapshot > 16<<20 {
+			t.Fatalf("bh1.buf.MemoryUsage() after sibling snapshot + patch = %d, want <= %d (evicted parts must be re-evicted)", bh1MemAfterSnapshot, 16<<20)
 		}
 		gotHead := make([]byte, 32)
 		if n, rerr := h2.Handle.Read(ctx, 0, gotHead); rerr != nil || n != 32 {
@@ -2930,5 +2946,69 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 		bh.dirty = false
 		bh.mu.Unlock()
 		_ = ap.Handle.Release(ctx)
+	})
+
+	t.Run("landed-reopen-exceeding-budget-seeds-logical-size", func(t *testing.T) {
+		b := testbackend.NewBackend()
+		ts := httptest.NewServer(b)
+		t.Cleanup(ts.Close)
+		cl := client.New(ts.URL, "")
+		wb, err := New(Options{Policy: PolicyCloseSync, Client: cl})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+		terminal, err := core.New(cl, core.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ch, err := fs.NewChain(wb, terminal)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Create /lazy-landed, write 128 KiB, reopen h2 untouched while unlanded,
+		// close creator h1 so 128 KiB lands remotely, then tighten memory budget
+		// to 96 KiB so h2's lazy buffer initialization cannot preload 128 KiB in
+		// full and takes armRemoteRestoreLocked + SeedRemote(128 KiB).
+		h1, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/lazy-landed",
+			Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		orig128k := bytes.Repeat([]byte("Landed16Byte Blk"), 8<<10) // 128 KiB
+		if err := h1.Handle.Write(ctx, 0, orig128k); err != nil {
+			t.Fatal(err)
+		}
+		h2, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/lazy-landed", Flags: uint32(syscall.O_RDWR),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := h1.Handle.Flush(ctx); err != nil {
+			t.Fatalf("h1.Flush: %v", err)
+		}
+		if err := h1.Handle.Release(ctx); err != nil {
+			t.Fatalf("h1.Release: %v", err)
+		}
+
+		// Force h2 onto the lazy remote-restore branch by capping preload to 64 KiB.
+		wb.preload = 64 << 10
+		if err := h2.Handle.Write(ctx, 0, []byte("HEAD")); err != nil {
+			t.Fatalf("h2.Write(0, HEAD): %v", err)
+		}
+		if err := h2.Handle.Flush(ctx); err != nil {
+			t.Fatalf("h2.Flush: %v", err)
+		}
+		if err := h2.Handle.Release(ctx); err != nil {
+			t.Fatalf("h2.Release: %v", err)
+		}
+		want := append([]byte("HEAD"), orig128k[4:]...)
+		if n, ok := b.Node("/lazy-landed"); !ok || !bytes.Equal(n.Data, want) {
+			t.Fatalf("/lazy-landed after lazy-seeded 4B patch: ok=%v len=%d, want %d bytes", ok, len(n.Data), len(want))
+		}
 	})
 }
