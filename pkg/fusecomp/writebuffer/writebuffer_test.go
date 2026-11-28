@@ -366,3 +366,112 @@ func TestEvictedPartFallsBackToRemoteWhenShadowIsGone(t *testing.T) {
 		t.Fatal("an un-armed fallback silently replaced staged bytes with the stale remote image")
 	}
 }
+
+func TestCanMaterializeFullRejectsEvictedUploadedParts(t *testing.T) {
+	wb := partModeBuffer(4)
+	wb.SetSmallFileMax(1)
+	if _, err := wb.Write(0, []byte("abcd1234")); err != nil {
+		t.Fatal(err)
+	}
+	if !wb.CanMaterializeFull() {
+		t.Fatal("expected resident unseeded buffer to report CanMaterializeFull=true")
+	}
+	wb.RestorePart = func(partNum int) ([]byte, error) {
+		if partNum == 1 {
+			return []byte("abcd"), nil
+		}
+		return []byte("1234"), nil
+	}
+	wb.EvictPart(0)
+	if wb.CanMaterializeFull() {
+		t.Fatal("expected CanMaterializeFull=false when part 0 is evicted with remoteSize=0")
+	}
+	if err := wb.ForceEnsurePartsForWrite(0, wb.Size()); err != nil {
+		t.Fatalf("ForceEnsurePartsForWrite: %v", err)
+	}
+	if !wb.CanMaterializeFull() {
+		t.Fatal("expected CanMaterializeFull=true after restoring evicted part")
+	}
+	if got := string(wb.Bytes()); got != "abcd1234" {
+		t.Fatalf("Bytes after restore = %q, want abcd1234", got)
+	}
+}
+
+func TestCopyRangePreservesResidentCleanAndRestorableParts(t *testing.T) {
+	// Buffer 1: seeded in memory with no LoadPart and remoteSize == 0 (like
+	// seedBufferFromBytesLocked): part 0 dirty, part 1 resident clean, part 2
+	// evicted via RestorePart, part 3 sparse extended hole.
+	wb := partModeBuffer(4)
+	wb.SetSmallFileMax(1)
+	if _, err := wb.Write(0, []byte("aaaaRESCSPIL")); err != nil {
+		t.Fatal(err)
+	}
+	wb.ClearDirty()
+	if _, err := wb.Write(0, []byte("DIRT")); err != nil {
+		t.Fatal(err)
+	}
+	wb.RestorePart = func(partNum int) ([]byte, error) {
+		if partNum == 3 {
+			return []byte("SPIL"), nil
+		}
+		return nil, syscall.EIO
+	}
+	wb.EvictPart(2)
+	if err := wb.Truncate(16); err != nil {
+		t.Fatal(err)
+	}
+	memBefore := wb.MemoryUsage()
+
+	out := make([]byte, 16)
+	n, err := wb.CopyRange(0, out)
+	if err != nil || n != 16 {
+		t.Fatalf("CopyRange = (%d, %v), want (16, nil)", n, err)
+	}
+	if want := "DIRTRESCSPIL\x00\x00\x00\x00"; string(out) != want {
+		t.Fatalf("CopyRange bytes = %q, want %q", string(out), want)
+	}
+	if !wb.IsPartLoaded(0) || !wb.IsPartLoaded(1) {
+		t.Fatalf("resident parts lost: loaded(0)=%v loaded(1)=%v", wb.IsPartLoaded(0), wb.IsPartLoaded(1))
+	}
+	if wb.IsPartLoaded(2) || !wb.StreamedPartIndices()[2] {
+		t.Fatalf("evicted part 2 not re-evicted: loaded=%v streamed=%v", wb.IsPartLoaded(2), wb.StreamedPartIndices()[2])
+	}
+	if wb.IsPartLoaded(3) {
+		t.Fatal("sparse hole part 3 unexpectedly marked loaded")
+	}
+	if gotMem := wb.MemoryUsage(); gotMem != memBefore {
+		t.Fatalf("MemoryUsage after CopyRange = %d, want %d", gotMem, memBefore)
+	}
+	checkClean := make([]byte, 4)
+	if rn := wb.ReadAt(4, checkClean); rn != 4 || string(checkClean) != "RESC" {
+		t.Fatalf("resident clean part 1 after CopyRange = (%d, %q), want (4, RESC)", rn, string(checkClean))
+	}
+
+	// Buffer 2: lazy LoadPart-backed buffer where part 0 was pre-loaded (clean)
+	// and part 1 is unloaded; CopyRange must keep part 0 loaded and release
+	// part 1 back to unloaded.
+	wbLazy := partModeBuffer(4)
+	wbLazy.SetSmallFileMax(1)
+	wbLazy.SeedRemote(8)
+	wbLazy.LoadPart = func(partNum int) ([]byte, error) {
+		if partNum == 1 {
+			return []byte("LAZ0"), nil
+		}
+		return []byte("LAZ1"), nil
+	}
+	if err := wbLazy.EnsureLoaded(0); err != nil {
+		t.Fatal(err)
+	}
+	lazyMemBefore := wbLazy.MemoryUsage()
+	lazyOut := make([]byte, 8)
+	if ln, lerr := wbLazy.CopyRange(0, lazyOut); lerr != nil || ln != 8 || string(lazyOut) != "LAZ0LAZ1" {
+		t.Fatalf("wbLazy.CopyRange = (%d, %v, %q), want (8, nil, LAZ0LAZ1)", ln, lerr, string(lazyOut))
+	}
+	if !wbLazy.IsPartLoaded(0) || wbLazy.IsPartLoaded(1) {
+		t.Fatalf("wbLazy residency mismatch: loaded(0)=%v (want true) loaded(1)=%v (want false)",
+			wbLazy.IsPartLoaded(0), wbLazy.IsPartLoaded(1))
+	}
+	if wbLazy.MemoryUsage() != lazyMemBefore {
+		t.Fatalf("wbLazy.MemoryUsage = %d, want %d", wbLazy.MemoryUsage(), lazyMemBefore)
+	}
+}

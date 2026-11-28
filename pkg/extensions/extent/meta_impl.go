@@ -2575,11 +2575,78 @@ func (b *Bridge) DropDeletedOpen(sentinel string) {
 		return
 	}
 	delete(b.sentinels, sentinel)
+	if b.droppingSentinels == nil {
+		b.droppingSentinels = make(map[string]struct{})
+	}
+	b.droppingSentinels[sentinel] = struct{}{}
 	delete(b.replacements, b.fullPath(sentinel))
 	delete(b.moved, heldIno)
 	b.forgetInoLocked(heldIno)
 	b.mu.Unlock()
+
 	_ = b.cfg.Client.RemoveAllCtx(context.Background(), b.fullPath(sentinel))
+
+	b.mu.Lock()
+	delete(b.droppingSentinels, sentinel)
+	if b.sentinelWaitCh != nil {
+		close(b.sentinelWaitCh)
+		b.sentinelWaitCh = nil
+	}
+	b.mu.Unlock()
+}
+
+// IsSentinel reports whether local is a registered (or currently dropping)
+// internal .d9open-* keep-alive sentinel created by this bridge. User files
+// whose names happen to contain ".d9open-" are never registered and return
+// false.
+func (b *Bridge) IsSentinel(local string) bool {
+	if b == nil || !strings.Contains(local, ".d9open-") {
+		return false
+	}
+	b.mu.Lock()
+	_, active := b.sentinels[local]
+	_, dropping := b.droppingSentinels[local]
+	b.mu.Unlock()
+	return active || dropping
+}
+
+// SentinelsInDir returns the registered or currently dropping sentinel local
+// paths whose immediate parent directory is dir.
+func (b *Bridge) SentinelsInDir(dir string) (active []string, dropping []string) {
+	if b == nil {
+		return nil, nil
+	}
+	cleanDir := strings.TrimSuffix(dir, "/")
+	if cleanDir == "" {
+		cleanDir = "/"
+	}
+	b.mu.Lock()
+	for s := range b.sentinels {
+		p, _ := SplitParent(s)
+		if p == cleanDir {
+			active = append(active, s)
+		}
+	}
+	for s := range b.droppingSentinels {
+		p, _ := SplitParent(s)
+		if p == cleanDir {
+			dropping = append(dropping, s)
+		}
+	}
+	b.mu.Unlock()
+	return active, dropping
+}
+
+// SentinelChanged returns a channel closed the next time a sentinel finishes
+// its remote removal in DropDeletedOpen.
+func (b *Bridge) SentinelChanged() <-chan struct{} {
+	b.mu.Lock()
+	if b.sentinelWaitCh == nil {
+		b.sentinelWaitCh = make(chan struct{})
+	}
+	ch := b.sentinelWaitCh
+	b.mu.Unlock()
+	return ch
 }
 
 // heldInoForLocked reports the held (moved or sentinel-bound) path-hash

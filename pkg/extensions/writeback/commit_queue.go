@@ -187,14 +187,19 @@ type CommitQueue struct {
 	// shadow reclaimed: the staging handle refused certification (its
 	// buffer moved on), but the shadow is still the only restore source for
 	// the landing's unchanged evicted parts. Consumed by the cleanup pass.
-	retainedShadows   sync.Map
-	extentGlobs       []globMatcher
-	extentMatchCutoff int64
-	extentMinSize     int64
-	index             *staging.PendingIndex
-	journal           *staging.Journal
-	wg                sync.WaitGroup
-	stopped           bool
+	retainedShadows sync.Map
+	// retainedLiveShadows tracks shadow generations kept alive by
+	// retainedShadows after their PendingIndex entry was retired, so a
+	// subsequent non-shadow commit (wbCache), unlink, or final close can
+	// reclaim the orphaned shadow and release its quotaBytes.
+	retainedLiveShadows sync.Map
+	extentGlobs         []globMatcher
+	extentMatchCutoff   int64
+	extentMinSize       int64
+	index               *staging.PendingIndex
+	journal             *staging.Journal
+	wg                  sync.WaitGroup
+	stopped             bool
 	// abandoned is set by AbandonLayer when the mounted layer was rolled
 	// back. When true, Enqueue returns errLayerRolledBack and commitOne
 	// skips tryAutoResolveConflict, going straight to terminal failure so
@@ -238,6 +243,7 @@ type CommitQueue struct {
 	workCh chan *CommitEntry
 
 	zeroTruncateDelay time.Duration
+	testGate          func(string)
 	// extentTakeover arms the extent content-layout commit branch
 	// (SetExtentTakeover).
 	extentTakeover bool
@@ -373,6 +379,74 @@ func (cq *CommitQueue) RetainShadowForLanding(path string, gen staging.ContentGe
 		return
 	}
 	cq.retainedShadows.Store(path, gen)
+}
+
+// ReclaimRetainedShadow removes a shadow generation previously kept alive by
+// RetainShadowForLanding if it has not been replaced by a newer shadow write.
+func (cq *CommitQueue) ReclaimRetainedShadow(path string, gen staging.ContentGen) {
+	if cq == nil || cq.shadows == nil || path == "" {
+		return
+	}
+	if gen == 0 {
+		if stored, ok := cq.retainedLiveShadows.Load(path); ok {
+			gen, _ = stored.(staging.ContentGen)
+		}
+	}
+	if gen == 0 {
+		return
+	}
+	cq.retainedShadows.CompareAndDelete(path, gen)
+	cq.retainedLiveShadows.CompareAndDelete(path, gen)
+	cq.shadows.RemoveIfGeneration(path, gen)
+}
+
+// ReclaimOrphanRetainedShadow removes any shadow generation retained for an
+// open handle once the last handle at path has closed and no pending entry
+// owns path.
+func (cq *CommitQueue) ReclaimOrphanRetainedShadow(path string) {
+	if cq == nil || cq.shadows == nil || path == "" {
+		return
+	}
+	if stored, ok := cq.retainedLiveShadows.Load(path); ok {
+		if gen, gok := stored.(staging.ContentGen); gok && gen != 0 {
+			cq.retainedShadows.CompareAndDelete(path, gen)
+			cq.retainedLiveShadows.CompareAndDelete(path, gen)
+			cq.shadows.RemoveIfGeneration(path, gen)
+			return
+		}
+	}
+	if cur, ok := cq.retainedShadows.Load(path); ok {
+		if gen, gok := cur.(staging.ContentGen); gok && gen != 0 && !cq.HasPath(path) {
+			if cq.retainedShadows.CompareAndDelete(path, gen) {
+				cq.shadows.RemoveIfGeneration(path, gen)
+			}
+		}
+	}
+}
+
+// HasDrainableWork reports whether queued, in-flight, or immediate commits
+// exist that may release shadow byte quota upon completion.
+func (cq *CommitQueue) HasDrainableWork() bool {
+	if cq == nil {
+		return false
+	}
+	cq.mu.Lock()
+	busy := len(cq.queue) > 0 || len(cq.inFlight) > 0 || len(cq.immediate) > 0
+	cq.mu.Unlock()
+	return busy
+}
+
+// CommitClock returns the monotonic count of completed commits across all
+// paths, allowing callers to distinguish active queue drain progress from a
+// stalled backend.
+func (cq *CommitQueue) CommitClock() uint64 {
+	if cq == nil {
+		return 0
+	}
+	cq.mu.Lock()
+	c := cq.commitClock
+	cq.mu.Unlock()
+	return c
 }
 
 // ConfigureBatchWrite enables a small writeback-only direct-PUT batch window.
@@ -672,14 +746,42 @@ func (cq *CommitQueue) WaitPathTimeout(path string, pollInterval time.Duration) 
 // busy-path metadata ops (chmod/unlink/rename on just-written files) must
 // use this deadline loop instead.
 func (cq *CommitQueue) WaitPathDeadline(path string, timeout time.Duration) bool {
+	return cq.WaitPathContext(context.Background(), path, timeout)
+}
+
+// WaitPathContext waits until path is idle, respecting ctx cancellation and
+// timeout, and returns false if path remains busy when either expires.
+func (cq *CommitQueue) WaitPathContext(ctx context.Context, path string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for !cq.WaitPathTimeout(path, 0) {
-		if !time.Now().Before(deadline) {
+		if !time.Now().Before(deadline) || (ctx != nil && ctx.Err() != nil) {
 			return false
 		}
-		time.Sleep(50 * time.Millisecond)
+		timer := time.NewTimer(50 * time.Millisecond)
+		if ctx != nil {
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				return false
+			}
+		} else {
+			<-timer.C
+		}
+		timer.Stop()
 	}
 	return true
+}
+
+// InFlight reports whether a worker is actively committing path right now.
+func (cq *CommitQueue) InFlight(path string) bool {
+	if cq == nil {
+		return false
+	}
+	cq.mu.Lock()
+	_, ok := cq.inFlight[path]
+	cq.mu.Unlock()
+	return ok
 }
 
 // ClearPathCommitErr retires a remembered terminal failure for a pathname
@@ -966,14 +1068,46 @@ func (cq *CommitQueue) CancelQueuedZeroTruncatePreserveLocal(path string) bool {
 // removes queued entries, and cleans up their shadow/index state. Cancellation
 // is entry-scoped, so future entries under the same prefix are unaffected.
 func (cq *CommitQueue) CancelPrefix(prefix string) {
+	type cancelTarget struct {
+		path        string
+		retainedGen staging.ContentGen
+		failureSeq  uint64
+		hasFailure  bool
+		shadowGen   staging.ContentGen
+		hasShadow   bool
+		pendingGen  uint64
+		hasPending  bool
+	}
+
 	cq.mu.Lock()
+	var maxPendingAtCancel uint64
+	if cq.index != nil {
+		maxPendingAtCancel = cq.index.MaxGeneration()
+	}
+	var maxShadowAtCancel staging.ContentGen
+	if cq.shadows != nil {
+		maxShadowAtCancel = cq.shadows.MaxContentGeneration()
+	}
 	for path := range cq.landed {
 		if strings.HasPrefix(path, prefix) {
 			delete(cq.landed, path)
 		}
 	}
 	var remaining []*CommitEntry
-	var cancelled []string
+	targetsByPath := make(map[string]*cancelTarget)
+	var targetOrder []string
+	ensureTarget := func(p string) *cancelTarget {
+		if p == "" || !strings.HasPrefix(p, prefix) {
+			return nil
+		}
+		if t, exists := targetsByPath[p]; exists {
+			return t
+		}
+		t := &cancelTarget{path: p}
+		targetsByPath[p] = t
+		targetOrder = append(targetOrder, p)
+		return t
+	}
 	var cancels []context.CancelFunc
 	seen := make(map[*CommitEntry]struct{})
 	markCanceled := func(e *CommitEntry) {
@@ -996,19 +1130,19 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 	for p, e := range cq.inFlight {
 		if strings.HasPrefix(p, prefix) {
 			markCanceled(e)
-			cancelled = append(cancelled, p)
+			ensureTarget(p)
 		}
 	}
 	for e := range cq.immediate {
 		if e != nil && strings.HasPrefix(e.Path, prefix) {
 			markCanceled(e)
-			cancelled = append(cancelled, e.Path)
+			ensureTarget(e.Path)
 		}
 	}
 	for _, e := range cq.queue {
 		if strings.HasPrefix(e.Path, prefix) {
 			markCanceled(e)
-			cancelled = append(cancelled, e.Path)
+			ensureTarget(e.Path)
 		} else {
 			remaining = append(remaining, e)
 		}
@@ -1017,23 +1151,118 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 	if cq.queuedByPath != nil {
 		cq.rebuildQueuedIndexLocked()
 	}
+	for p, f := range cq.terminalFailures {
+		if strings.HasPrefix(p, prefix) {
+			if t := ensureTarget(p); t != nil {
+				t.failureSeq = f.seq
+				t.hasFailure = true
+			}
+			delete(cq.terminalFailures, p)
+		}
+	}
+	if cq.index != nil {
+		for p := range cq.index.ListPendingPaths() {
+			ensureTarget(p)
+		}
+	}
+	if cq.shadows != nil {
+		for _, p := range cq.shadows.PathsWithPrefix(prefix) {
+			ensureTarget(p)
+		}
+	}
+	cq.retainedShadows.Range(func(key, val any) bool {
+		if p, ok := key.(string); ok && strings.HasPrefix(p, prefix) {
+			if gen, gok := val.(staging.ContentGen); gok && gen != 0 && (maxShadowAtCancel == 0 || gen <= maxShadowAtCancel) {
+				cq.retainedShadows.CompareAndDelete(p, val)
+				if t := ensureTarget(p); t != nil && t.retainedGen == 0 {
+					t.retainedGen = gen
+				}
+			}
+		}
+		return true
+	})
+	cq.retainedLiveShadows.Range(func(key, val any) bool {
+		if p, ok := key.(string); ok && strings.HasPrefix(p, prefix) {
+			if gen, gok := val.(staging.ContentGen); gok && gen != 0 && (maxShadowAtCancel == 0 || gen <= maxShadowAtCancel) {
+				cq.retainedLiveShadows.CompareAndDelete(p, val)
+				if t := ensureTarget(p); t != nil && t.retainedGen == 0 {
+					t.retainedGen = gen
+				}
+			}
+		}
+		return true
+	})
 	cq.mu.Unlock()
+	if cq.testGate != nil {
+		cq.testGate("cancelPrefix:afterSnapshot")
+	}
 
 	for _, cancel := range cancels {
 		cancel()
 	}
+
+	// Lock candidate paths in deterministic lexicographic order AFTER releasing
+	// cq.mu (respecting pathLocks -> cq.mu lock order) so each path's pending
+	// metadata and active shadow generation are observed coherently from the
+	// exact same staged write, and any write staged after maxPendingAtCancel /
+	// maxShadowAtCancel is left completely untouched. targetOrder contains only
+	// unlanded pending/shadow entries under the removed/renamed prefix (bounded
+	// by active local staging, not total remote files in the directory).
+	sort.Strings(targetOrder)
+	var eligible []*cancelTarget
+	var heldUnlocks []func()
+	for _, p := range targetOrder {
+		t := targetsByPath[p]
+		unlockPath := cq.lockPath(p)
+		var meta *staging.WriteBackMeta
+		if cq.index != nil {
+			if m, ok := cq.index.GetMeta(p); ok && m != nil {
+				meta = m
+			}
+		}
+		var shadowGen staging.ContentGen
+		if cq.shadows != nil {
+			shadowGen = cq.shadows.ActiveGeneration(p)
+		}
+		if shadowGen == 0 && t.retainedGen != 0 {
+			shadowGen = t.retainedGen
+		}
+		if (meta != nil && meta.Generation > maxPendingAtCancel) ||
+			(shadowGen != 0 && shadowGen > maxShadowAtCancel) {
+			// A newer write staged after CancelPrefix's snapshot owns this path:
+			// keep both its pending metadata and its shadow intact.
+			unlockPath()
+			continue
+		}
+		if meta != nil && meta.Generation != 0 {
+			t.pendingGen = meta.Generation
+			t.hasPending = true
+		}
+		if shadowGen != 0 {
+			t.shadowGen = shadowGen
+			t.hasShadow = true
+		}
+		eligible = append(eligible, t)
+		heldUnlocks = append(heldUnlocks, unlockPath)
+	}
+	defer func() {
+		for i := len(heldUnlocks) - 1; i >= 0; i-- {
+			heldUnlocks[i]()
+		}
+	}()
+
 	// One fsync for the whole subtree: the markers are only a fence once they
 	// are on disk, and a cancel usually arrives as one rename/rmdir of a tree.
 	markerDurable := false
-	if cq.journal != nil && len(cancelled) > 0 {
+	if cq.journal != nil && len(eligible) > 0 {
 		appended := true
-		for _, p := range cancelled {
+		for _, t := range eligible {
 			if err := cq.journal.Append(staging.JournalEntry{
 				Op:   staging.JournalCommit,
-				Path: p,
+				Path: t.path,
 			}); err != nil {
 				appended = false
-				safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", p, err)
+				safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", t.path, err)
 			}
 		}
 		// Unconditional: one failed append must not leave the other subtree
@@ -1046,27 +1275,22 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 		}
 		markerDurable = appended
 	}
-	for _, p := range cancelled {
-		if cq.shadows != nil {
+	for _, t := range eligible {
+		if cq.shadows != nil && t.hasShadow && t.shadowGen != 0 {
 			if markerDurable {
-				// The fence is on disk: the page-cache unlink is enough (and the
-				// subtree pays no directory fsync for it).
-				cq.shadows.Remove(p)
+				cq.shadows.RemoveIfGeneration(t.path, t.shadowGen)
 			} else {
-				// No durable cancel marker, so the unlink itself is the only
-				// authority: a page-cache-only removal can revert on power loss
-				// and resurrect the cancelled subtree.
-				if _, err := cq.shadows.RemoveIfGenerationDurable(p, 0); err != nil {
-					safeLogPrintf("commit queue: subtree shadow removal for %s was not durable: %v", p, err)
+				if _, err := cq.shadows.RemoveIfGenerationDurable(t.path, t.shadowGen); err != nil {
+					safeLogPrintf("commit queue: subtree shadow removal for %s was not durable: %v", t.path, err)
 				}
 			}
 		}
-		if cq.index != nil {
-			cq.index.Remove(p)
+		if cq.index != nil && t.hasPending && t.pendingGen != 0 {
+			cq.index.RemoveIfGeneration(t.path, t.pendingGen)
 		}
-		// Same pathname-incarnation rule as cancelPath: the subtree's names
-		// are gone, so their terminal failures must not poison a recreator.
-		cq.clearTerminalFailure(p)
+		if t.hasFailure {
+			cq.ClearTerminalFailureIfSeq(t.path, t.failureSeq)
+		}
 	}
 }
 
@@ -2871,6 +3095,13 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 			// The staging handle kept newer local bytes: the shadow stays as
 			// the restore source for this landing's evicted parts.
 			retained = true
+			if entry.ShadowGen != 0 {
+				cq.retainedLiveShadows.Store(entry.Path, entry.ShadowGen)
+			}
+		} else if prev, pok := cq.retainedLiveShadows.LoadAndDelete(entry.Path); pok {
+			if prevGen, gok := prev.(staging.ContentGen); gok && prevGen != 0 && prevGen != entry.ShadowGen {
+				cq.shadows.RemoveIfGeneration(entry.Path, prevGen)
+			}
 		}
 		if !retained && entry.ShadowGen != 0 {
 			if markerErr != nil {

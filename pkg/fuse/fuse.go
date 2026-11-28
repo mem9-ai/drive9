@@ -22,9 +22,11 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"go.uber.org/zap"
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/mem9-ai/drive9/pkg/extensions/core"
 	"github.com/mem9-ai/drive9/pkg/fs"
@@ -139,9 +141,10 @@ type FS struct {
 
 	nextFh atomic.Uint64
 
-	mu       sync.Mutex
-	server   *gofuse.Server
-	startErr error
+	mu            sync.Mutex
+	releaseWaitCh chan struct{}
+	server        *gofuse.Server
+	startErr      error
 	// unmounted records that the go-fuse serve loop finished (OnUnmount
 	// fires unconditionally, clean or abnormal — the mount-exit
 	// classification uses the kernel mountinfo instead).
@@ -187,6 +190,18 @@ type FS struct {
 	// budget is the process-wide memory budget (nil when disabled). Retained
 	// for the drain/status snapshot.
 	budget *membudget.Budget
+
+	unicodeSpellingsMu sync.Mutex
+	unicodeSpellings   map[unicodeSpellingKey]map[string]struct{}
+	// onInvalidateEntry is a test-only seam (like CommitQueue.testGate) set by
+	// acceptance_facade_test.go to observe kernel dentry invalidation calls
+	// without mounting a kernel FUSE server; nil in production.
+	onInvalidateEntry func(parentIno uint64, name string)
+}
+
+type unicodeSpellingKey struct {
+	parentIno uint64
+	canonName string
 }
 
 // New assembles the facade: chain, Context, and identity tables. Register
@@ -1062,15 +1077,23 @@ func (f *FS) OnUnmount() {
 }
 
 func (f *FS) Forget(nodeid, nlookup uint64) {
+	entry, ok := f.inodes.GetEntry(nodeid)
+	lastLookup := ok && nodeid != 1 && entry.Nlookup <= int64(nlookup)
 	// v1 shouldPreserveForgottenInode: a forgotten inode with open handles
 	// or pending write-plane state keeps its path mapping, so fds of
 	// unlinked files keep resolving and the inode number stays stable until
 	// the state drains. Metadata-only specials are kept inside the table.
-	if entry, ok := f.inodes.GetEntry(nodeid); ok && !entry.IsDir && f.shouldPreserveForgotten(entry) {
+	if ok && !entry.IsDir && f.shouldPreserveForgotten(entry) {
 		f.inodes.ForgetKeepMapping(nodeid, nlookup)
+		if lastLookup {
+			f.reclaimForgottenUnicodeSpellings(entry)
+		}
 		return
 	}
 	f.inodes.Forget(nodeid, nlookup)
+	if lastLookup {
+		f.reclaimForgottenUnicodeSpellings(entry)
+	}
 }
 
 func (f *FS) shouldPreserveForgotten(entry *InodeEntry) bool {
@@ -1098,6 +1121,12 @@ type fileHandle struct {
 	// bypass the kernel page cache, so pages a KEEP_CACHE sibling of the
 	// inode holds must be dropped by the facade (see Write).
 	direct bool
+	// flushedAtNano records the UnixNano timestamp of the most recent
+	// FUSE_FLUSH on this descriptor; releasing records that FUSE_RELEASE has
+	// started. Keeping the two distinct lets Rmdir avoid stalling on a dup'd
+	// descriptor where one reference flushed/closed while another remains open.
+	flushedAtNano atomic.Int64
+	releasing     atomic.Bool
 }
 
 type handleTable struct {
@@ -1616,6 +1645,7 @@ func (f *FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string
 	}
 	isDir := res.Attr != nil && res.Attr.IsDir()
 	f.fillEntryOut(child, res.Attr, isDir, out)
+	f.recordUnicodeSpelling(header.NodeId, name, child)
 	return gofuse.OK
 }
 
@@ -1979,6 +2009,9 @@ func (f *FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name string, o
 	if st != gofuse.OK {
 		return st
 	}
+	if child, st = canonicalizeNamespaceTarget(child, false); st != gofuse.OK {
+		return st
+	}
 	if err := f.flushDeferredUnlink(child); err != nil {
 		return fs.StatusOf(err)
 	}
@@ -1992,6 +2025,7 @@ func (f *FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name string, o
 	}
 	f.mutated(fs.EventWrite, child)
 	f.fillEntryOut(child, res.Attr, false, out)
+	f.recordUnicodeSpelling(input.NodeId, name, child)
 	if res.Attr != nil && res.Attr.Mode&syscall.S_IFMT != 0 && res.Attr.Mode&syscall.S_IFMT != syscall.S_IFREG {
 		out.Mode = res.Attr.Mode // specials carry their own S_IFMT
 		// The device number rides the record (mknod/11 major,minor rows):
@@ -2013,6 +2047,9 @@ func (f *FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name string, o
 func (f *FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, out *gofuse.EntryOut) gofuse.Status {
 	child, st := f.childOf(input.NodeId, name)
 	if st != gofuse.OK {
+		return st
+	}
+	if child, st = canonicalizeNamespaceTarget(child, true); st != gofuse.OK {
 		return st
 	}
 	if err := f.flushDeferredUnlink(child); err != nil {
@@ -2039,6 +2076,7 @@ func (f *FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, o
 	}
 	f.mutated(fs.EventWrite, child)
 	f.fillEntryOut(child, &mode, true, out)
+	f.recordUnicodeSpelling(input.NodeId, name, child)
 	f.dirCacheUpsert(child, &mode)
 	caller := fs.CallerFrom(input.InHeader)
 	f.stampOwner(out.NodeId, caller)
@@ -2114,6 +2152,7 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 		f.touchParentMtime(header.NodeId)
 		f.mutated(fs.EventDelete, child)
 		f.markNameNegative(child)
+		f.invalidateAlternateUnicodeSpellings(header.NodeId, name, child)
 		pending.mu.Unlock()
 		// The last Release may have completed while MarkPathUnlinked was
 		// preparing the anonymous handle state, before registration existed.
@@ -2135,6 +2174,7 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 	f.touchParentMtime(header.NodeId)
 	f.mutated(fs.EventDelete, child)
 	f.markNameNegative(child)
+	f.invalidateAlternateUnicodeSpellings(header.NodeId, name, child)
 	return gofuse.OK
 }
 
@@ -2159,15 +2199,17 @@ func (f *FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name string)
 	if st != gofuse.OK {
 		return st
 	}
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+	f.waitFlushedDeferredUnlinksUnder(ctx, child)
 	if err := f.flushDeferredUnlinksUnder(child); err != nil {
 		return fs.StatusOf(err)
 	}
-	ctx, cf := fuseCtx(cancel)
-	defer cf()
 	if _, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpRmdir, Path: child, Ino: header.NodeId, Kernel: header, Caller: fs.CallerFrom(*header)}); st != gofuse.OK {
 		return st
 	}
 	f.inodes.AdjustLinkCount(header.NodeId, -1)
+	f.clearUnicodeSpellingsForSubtree(child)
 	// Detach the removed directory's NAME while keeping its inode for the
 	// references that outlive it (an open descriptor, a process cwd). Left
 	// mapped, the name would hand the removed object's nodeid to a later
@@ -2178,6 +2220,7 @@ func (f *FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name string)
 	f.touchParentMtime(header.NodeId)
 	f.mutated(fs.EventDelete, child)
 	f.markNameNegative(child)
+	f.invalidateAlternateUnicodeSpellings(header.NodeId, name, child)
 	return gofuse.OK
 }
 
@@ -2200,9 +2243,15 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 	if st != gofuse.OK {
 		return st
 	}
+	if newPath, st = canonicalizeNamespaceTarget(newPath, false); st != gofuse.OK {
+		return st
+	}
 	// v1: rename onto the same path is an immediate success — no remote
-	// round trip, no cache churn.
+	// round trip, no cache churn. Drop alternate Unicode dentries other than
+	// newName (which the kernel moves oldName onto) and record newName.
 	if oldPath == newPath {
+		f.invalidateAlternateUnicodeSpellings(input.Newdir, newName, newPath)
+		f.recordUnicodeSpelling(input.Newdir, newName, newPath)
 		return gofuse.OK
 	}
 	f.debugf("rename start old=%s new=%s", oldPath, newPath)
@@ -2224,6 +2273,11 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 	f.recordHandleOp(fs.OpRename, start, rerr, 0)
 	if rerr != nil {
 		return fs.StatusOf(rerr)
+	}
+	if dstIno, ok := f.inodes.GetInode(newPath); ok {
+		if de, eok := f.inodes.GetEntry(dstIno); eok && de.IsDir {
+			f.clearUnicodeSpellingsForSubtree(newPath)
+		}
 	}
 	f.inodes.Rename(oldPath, newPath)
 	f.openIdx.RenamePathPrefix(oldPath, newPath)
@@ -2253,12 +2307,14 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 	// v1 notifyRenameTarget: invalidate ONLY the rename TARGET — the kernel
 	// moves the old name's dentry natively, and dropping it from userspace
 	// disturbs the bookkeeping for the next create of the same name in
-	// rename-churn loops. The target notify forces the next stat of the
-	// replaced destination to re-LOOKUP instead of serving a type-mismatched
-	// cached dentry (the EIO class).
-	if pino2, ok := f.inodes.GetInode(parentDirOf(newPath)); ok {
-		f.InvalidateEntry(pino2, pathpkg.Base(newPath))
-	}
+	// rename-churn loops. Alternate Unicode spellings of oldPath (sp != oldName)
+	// were NOT moved by the kernel and must be invalidated so they cannot keep
+	// resolving oldPath. At the destination, invalidate both canonical and
+	// alternate Unicode spellings of the replaced entry, then record newName.
+	f.invalidateAlternateUnicodeSpellings(input.NodeId, oldName, oldPath)
+	f.InvalidateEntry(input.Newdir, pathpkg.Base(newPath))
+	f.invalidateAlternateUnicodeSpellings(input.Newdir, pathpkg.Base(newPath), newPath)
+	f.recordUnicodeSpelling(input.Newdir, newName, newPath)
 	// A rename that REPLACED a destination must also drop the destination
 	// inode's cached data: the kernel keeps the old name's pages and attrs
 	// under the still-live inode id, so a post-close read of the new name
@@ -2309,6 +2365,9 @@ func (f *FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, filename string,
 	if st != gofuse.OK {
 		return st
 	}
+	if newPath, st = canonicalizeNamespaceTarget(newPath, false); st != gofuse.OK {
+		return st
+	}
 	if err := f.flushDeferredUnlink(newPath); err != nil {
 		return fs.StatusOf(err)
 	}
@@ -2334,6 +2393,7 @@ func (f *FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, filename string,
 	// compare the survivor's ctime across link+unlink cycles.
 	f.inodes.UpdateCtime(input.Oldnodeid, time.Now())
 	f.fillEntryOut(newPath, res.Attr, false, out)
+	f.recordUnicodeSpelling(input.NodeId, filename, newPath)
 	if res.Attr != nil {
 		f.dirCacheUpsert(newPath, res.Attr)
 	}
@@ -2365,6 +2425,9 @@ func (f *FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, pointedTo 
 	if st != gofuse.OK {
 		return st
 	}
+	if child, st = canonicalizeNamespaceTarget(child, false); st != gofuse.OK {
+		return st
+	}
 	if err := f.flushDeferredUnlink(child); err != nil {
 		return fs.StatusOf(err)
 	}
@@ -2380,6 +2443,7 @@ func (f *FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, pointedTo 
 	// attr/dentry type mismatch).
 	attr := &fs.Attr{Kind: fs.KindSymlink, Mode: uint32(syscall.S_IFLNK) | 0o777, Size: int64(len(pointedTo))}
 	f.fillEntryOut(child, attr, false, out)
+	f.recordUnicodeSpelling(header.NodeId, linkName, child)
 	f.inodes.UpdateMode(out.NodeId, attr.Mode)
 	f.dirCacheUpsert(child, attr)
 	caller := fs.CallerFrom(*header)
@@ -2659,6 +2723,9 @@ func (f *FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name string,
 	if st != gofuse.OK {
 		return st
 	}
+	if child, st = canonicalizeNamespaceTarget(child, false); st != gofuse.OK {
+		return st
+	}
 	if err := f.flushDeferredUnlink(child); err != nil {
 		return fs.StatusOf(err)
 	}
@@ -2673,6 +2740,7 @@ func (f *FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name string,
 	f.mutated(fs.EventWrite, child)
 	isDir := res.Attr != nil && res.Attr.IsDir()
 	f.fillEntryOut(child, res.Attr, isDir, &out.EntryOut)
+	f.recordUnicodeSpelling(input.NodeId, name, child)
 	f.dirCacheUpsert(child, res.Attr)
 	// v1 Create records the create mode on the inode entry
 	// (inodes.UpdateMode): the entry's mode is what later Landed settles and
@@ -3001,13 +3069,15 @@ func (f *FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.Status 
 	if lockOwner := fuseLockOwner(input.LockOwner, input.Pid, input.Fh); lockOwner != 0 {
 		f.locks.release(input.NodeId, lockOwner)
 	}
-	if h := f.openHandle(input.Fh); h != nil {
+	if fhEntry, ok := f.handles.get(input.Fh); ok && fhEntry.h != nil {
+		h := fhEntry.h
 		unlock := f.pathLocks.HandleLock(input.Fh)
 		// The kernel's lock owner rides the context: close-time
 		// F_UNLCK must target exactly this owner (dup + close of one
 		// descriptor), not whoever opened the handle.
 		start := time.Now()
 		err := h.Flush(fs.WithFlushOwner(ctx, input.LockOwner))
+		fhEntry.flushedAtNano.Store(time.Now().UnixNano())
 		unlock()
 		f.recordHandleOp(fs.OpFlush, start, err, 0)
 		return fs.StatusOf(err)
@@ -3040,7 +3110,7 @@ func (f *FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		f.locks.release(input.NodeId, lockOwner)
 	}
 	if h, ok := f.handles.drop(input.Fh); ok {
-		f.openIdx.Remove(h)
+		h.releasing.Store(true)
 		var rerr error
 		start := time.Now()
 		if h.h != nil {
@@ -3048,8 +3118,10 @@ func (f *FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			rerr = h.h.Release(ctx)
 			unlock()
 		}
+		f.openIdx.Remove(h)
 		f.recordHandleOp(fs.OpRelease, start, rerr, 0)
 		f.maybeRunDeferredUnlink(h.ino)
+		f.notifyReleaseCompleted()
 		// The final descriptor may be the last live reference to an
 		// already-detached inode whose FORGET arrived before the detach.
 		f.inodes.CollectDetached(h.ino)
@@ -3645,6 +3717,17 @@ func (f *FS) childOf(parentIno uint64, name string) (string, gofuse.Status) {
 	if len(name) > posixNameMax {
 		return "", gofuse.Status(syscall.ENAMETOOLONG)
 	}
+	// Normalize valid UTF-8 names to NFC (matching drive9-server and
+	// pathutil.Canonicalize) across every FUSE operation so NFD spellings from
+	// macOS callers address the exact same inode, openIdx, and staging keys as
+	// Create/Rename; invalid UTF-8 bytes stay untouched so creation rejects them
+	// with EINVAL while Unlink/Rmdir can still clean up legacy local state.
+	if utf8.ValidString(name) && !norm.NFC.IsNormalString(name) {
+		name = norm.NFC.String(name)
+		if len(name) > posixNameMax {
+			return "", gofuse.Status(syscall.ENAMETOOLONG)
+		}
+	}
 	parent, ok := f.inodes.GetPath(parentIno)
 	if !ok {
 		return "", gofuse.ENOENT
@@ -3653,6 +3736,117 @@ func (f *FS) childOf(parentIno uint64, name string) (string, gofuse.Status) {
 		return "/" + name, gofuse.OK
 	}
 	return parent + "/" + name, gofuse.OK
+}
+
+// canonicalizeNamespaceTarget enforces drive9 path canonicalization rules
+// synchronously at namespace creation / destination entrypoints (Create,
+// Mkdir, Mknod, Symlink link path, Link destination, Rename destination),
+// returning the NFC-normalized mount path so inode and staging keys always use
+// canonical spellings and invalid paths fail immediately with EINVAL.
+func canonicalizeNamespaceTarget(path string, isDir bool) (string, gofuse.Status) {
+	if isDir {
+		canon, err := pathutil.CanonicalizeDir(path)
+		if err != nil {
+			return "", gofuse.Status(syscall.EINVAL)
+		}
+		if canon != "/" {
+			canon = strings.TrimSuffix(canon, "/")
+		}
+		return canon, gofuse.OK
+	}
+	canon, err := pathutil.Canonicalize(path)
+	if err != nil {
+		return "", gofuse.Status(syscall.EINVAL)
+	}
+	return canon, gofuse.OK
+}
+
+func (f *FS) notifyReleaseCompleted() {
+	f.mu.Lock()
+	if f.releaseWaitCh != nil {
+		close(f.releaseWaitCh)
+		f.releaseWaitCh = nil
+	}
+	f.mu.Unlock()
+}
+
+func (f *FS) releaseChanged() <-chan struct{} {
+	f.mu.Lock()
+	if f.releaseWaitCh == nil {
+		f.releaseWaitCh = make(chan struct{})
+	}
+	ch := f.releaseWaitCh
+	f.mu.Unlock()
+	return ch
+}
+
+const deferredUnlinkFlushDispatchGrace = 25 * time.Millisecond
+
+// waitFlushedDeferredUnlinksUnder waits before Rmdir when deferred unlinks
+// under dir/ belong to handles with an in-flight FUSE_RELEASE (up to 500ms) or
+// within the brief kernel dispatch grace after FUSE_FLUSH (up to 25ms). A
+// dup'd descriptor that flushed one reference while another reference stays
+// open exits after the short dispatch grace instead of stalling Rmdir.
+func (f *FS) waitFlushedDeferredUnlinksUnder(ctx context.Context, dir string) {
+	prefix := strings.TrimSuffix(dir, "/") + "/"
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		f.mu.Lock()
+		var inos []uint64
+		for path, entry := range f.deferredUnlinks {
+			if strings.HasPrefix(path, prefix) && entry.ino != 0 {
+				inos = append(inos, entry.ino)
+			}
+		}
+		f.mu.Unlock()
+		if len(inos) == 0 {
+			return
+		}
+		now := time.Now()
+		hasConfirmedRelease := false
+		hasFlushGraceOnly := false
+		for _, ino := range inos {
+			openHandles := f.openIdx.SnapshotInode(ino)
+			if len(openHandles) == 0 {
+				hasConfirmedRelease = true
+				continue
+			}
+			allClosingOrFlushed := true
+			inodeReleasing := false
+			for _, oh := range openHandles {
+				if oh.releasing.Load() {
+					inodeReleasing = true
+					continue
+				}
+				flushedAt := oh.flushedAtNano.Load()
+				if flushedAt != 0 && now.Sub(time.Unix(0, flushedAt)) <= deferredUnlinkFlushDispatchGrace {
+					continue
+				}
+				allClosingOrFlushed = false
+				break
+			}
+			if allClosingOrFlushed {
+				if inodeReleasing {
+					hasConfirmedRelease = true
+				} else {
+					hasFlushGraceOnly = true
+				}
+			}
+		}
+		if (!hasConfirmedRelease && !hasFlushGraceOnly) || now.After(deadline) || ctx.Err() != nil {
+			return
+		}
+		waitCh := f.releaseChanged()
+		timer := time.NewTimer(5 * time.Millisecond)
+		select {
+		case <-waitCh:
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		}
+		timer.Stop()
+	}
 }
 
 // InvalidateAll flushes kernel caches for every inode the facade knows.
@@ -3796,12 +3990,127 @@ func (f *FS) OwnerOf(path string) (uid, gid uint32, hasUID, hasGID bool) {
 
 // InvalidateEntry drops the kernel's cached dentry for parent/name.
 func (f *FS) InvalidateEntry(parentIno uint64, name string) {
+	if f.onInvalidateEntry != nil {
+		f.onInvalidateEntry(parentIno, name)
+	}
 	if s := f.currentServer(); s != nil {
 		f.notifyWg.Add(1)
 		go func() {
 			defer f.notifyWg.Done()
 			_ = s.EntryNotify(parentIno, name)
 		}()
+	}
+}
+
+func (f *FS) recordUnicodeSpelling(parentIno uint64, rawName, canonChild string) {
+	canonName := pathpkg.Base(canonChild)
+	if parentIno == 0 || rawName == "" || canonName == "" || canonName == "/" || canonName == "." || rawName == canonName {
+		return
+	}
+	key := unicodeSpellingKey{parentIno: parentIno, canonName: canonName}
+	f.unicodeSpellingsMu.Lock()
+	if f.unicodeSpellings == nil {
+		f.unicodeSpellings = make(map[unicodeSpellingKey]map[string]struct{})
+	}
+	set := f.unicodeSpellings[key]
+	if set == nil {
+		set = make(map[string]struct{})
+		f.unicodeSpellings[key] = set
+	}
+	set[rawName] = struct{}{}
+	f.unicodeSpellingsMu.Unlock()
+}
+
+func (f *FS) clearUnicodeSpellingsUnderDir(dirIno uint64) {
+	if dirIno == 0 {
+		return
+	}
+	f.unicodeSpellingsMu.Lock()
+	for k := range f.unicodeSpellings {
+		if k.parentIno == dirIno {
+			delete(f.unicodeSpellings, k)
+		}
+	}
+	f.unicodeSpellingsMu.Unlock()
+}
+
+func (f *FS) clearUnicodeSpellingsForSubtree(dirPath string) {
+	for _, dirIno := range f.inodes.DirInodesUnderPrefix(dirPath) {
+		f.clearUnicodeSpellingsUnderDir(dirIno)
+	}
+}
+
+// reclaimForgottenUnicodeSpellings drops recorded non-canonical spellings once
+// the kernel drops its last lookup reference to entry: with Nlookup == 0 no
+// positive dentry for this inode remains in the kernel dcache under any
+// spelling, so keeping the map entry would accumulate across the mount's life.
+func (f *FS) reclaimForgottenUnicodeSpellings(entry *InodeEntry) {
+	if entry == nil {
+		return
+	}
+	if entry.IsDir && (entry.Unlinked || entry.Path == "" || len(entry.Paths) == 0) {
+		f.clearUnicodeSpellingsUnderDir(entry.Ino)
+	}
+	reclaimPath := func(p string) {
+		if p == "" || p == "/" {
+			return
+		}
+		parentPath := parentDirOf(p)
+		var parentIno uint64
+		if parentPath == "/" {
+			parentIno = 1
+		} else if pino, ok := f.inodes.GetInode(parentPath); ok {
+			parentIno = pino
+		}
+		if parentIno == 0 {
+			return
+		}
+		key := unicodeSpellingKey{parentIno: parentIno, canonName: pathpkg.Base(p)}
+		f.unicodeSpellingsMu.Lock()
+		delete(f.unicodeSpellings, key)
+		f.unicodeSpellingsMu.Unlock()
+	}
+	reclaimPath(entry.Path)
+	for p := range entry.Paths {
+		if p != entry.Path {
+			reclaimPath(p)
+		}
+	}
+}
+
+// invalidateAlternateUnicodeSpellings drops cached kernel dentries for NFC,
+// NFD, and any previously recorded mixed Unicode spellings of an entry under
+// parentIno when they differ from rawName so an earlier Lookup/Create/Symlink/
+// Link/Mknod/Mkdir/Rename cannot stay positively cached (including across
+// ancestor directory renames, since parentIno stays stable).
+func (f *FS) invalidateAlternateUnicodeSpellings(parentIno uint64, rawName, canonChild string) {
+	canonName := pathpkg.Base(canonChild)
+	if parentIno == 0 || canonName == "" || canonName == "/" || canonName == "." {
+		return
+	}
+	notified := map[string]struct{}{rawName: {}}
+	notify := func(sp string) {
+		if sp == "" {
+			return
+		}
+		if _, dup := notified[sp]; dup {
+			return
+		}
+		notified[sp] = struct{}{}
+		f.InvalidateEntry(parentIno, sp)
+	}
+	key := unicodeSpellingKey{parentIno: parentIno, canonName: canonName}
+	f.unicodeSpellingsMu.Lock()
+	recorded := f.unicodeSpellings[key]
+	delete(f.unicodeSpellings, key)
+	f.unicodeSpellingsMu.Unlock()
+
+	notify(canonName)
+	if utf8.ValidString(canonName) {
+		notify(norm.NFD.String(canonName))
+	}
+	for sp := range recorded {
+		notify(sp)
 	}
 }
 

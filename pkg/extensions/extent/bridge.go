@@ -156,7 +156,9 @@ type Bridge struct {
 	// sentinels tracks the hidden keep-alive names THIS bridge created
 	// (silly-rename); only registered names may be deleted at last close —
 	// a user filename that merely contains ".d9open-" is never ours.
-	sentinels map[string]meta.Ino // sentinel LOCAL path -> held engine ino
+	sentinels         map[string]meta.Ino // sentinel LOCAL path -> held engine ino
+	droppingSentinels map[string]struct{} // sentinels whose remote RemoveAll is in flight
+	sentinelWaitCh    chan struct{}       // closed & replaced when a sentinel finishes dropping
 	// moved records engine inodes whose pathname changed (rename) or was
 	// unlinked (sentinel) while a descriptor still holds them; a NEW
 	// incarnation at the old path must not reuse the key. Keyed by the

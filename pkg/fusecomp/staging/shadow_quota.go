@@ -176,6 +176,10 @@ func (s *ShadowStore) recordWrite(remotePath string, sf *ShadowFile, offset int6
 // holes. Call after a successful truncate with s.mu held.
 func (s *ShadowStore) resizeWrittenLocked(sf *ShadowFile, size int64) {
 	written := sf.written.truncate(size)
-	s.quotaBytes.Add(written - sf.writtenBytes)
+	delta := written - sf.writtenBytes
+	s.quotaBytes.Add(delta)
 	sf.writtenBytes = written
+	if delta < 0 {
+		s.notifyQuotaReleased()
+	}
 }

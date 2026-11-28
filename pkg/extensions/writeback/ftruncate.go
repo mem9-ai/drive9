@@ -404,6 +404,7 @@ func (w *Writeback) admitFtruncate(ctx context.Context, owner *bufferingHandle, 
 			// flight) must not hit generation equality on completion and
 			// retire this truncate's dirty state (review P1).
 			if terr := sib.buf.Truncate(size); terr == nil {
+				sib.noteMinTruncLocked(size)
 				sib.buf.ResetSequentialState(size)
 				sib.dirty = true
 				sib.wgen++
@@ -457,6 +458,7 @@ func (w *Writeback) truncateOwnerUnderSiblings(ctx context.Context, owner *buffe
 	if err := owner.buf.Truncate(size); err != nil {
 		return err
 	}
+	owner.noteMinTruncLocked(size)
 	if owner.liveSpillFile != nil {
 		_ = owner.liveSpillFile.Truncate(size)
 	}

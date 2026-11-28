@@ -33,6 +33,9 @@ func HTTPStatusOf(err error) gofuse.Status {
 	if err == nil {
 		return gofuse.OK
 	}
+	if errors.Is(err, client.ErrInvalidPath) {
+		return gofuse.Status(syscall.EINVAL)
+	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return gofuse.Status(syscall.EAGAIN)
 	}
@@ -88,7 +91,7 @@ func HTTPStatusOf(err error) gofuse.Status {
 		return gofuse.Status(syscall.EFBIG)
 	case strings.Contains(msg, "HTTP 412"):
 		return gofuse.Status(syscall.ESTALE)
-	case strings.Contains(msg, "HTTP 400"):
+	case strings.Contains(msg, "HTTP 400") || strings.Contains(lowerMsg, "invalid drive9 path"):
 		return gofuse.Status(syscall.EINVAL)
 	case strings.Contains(msg, "HTTP 499") ||
 		strings.Contains(msg, "HTTP 500") ||

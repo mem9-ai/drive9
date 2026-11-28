@@ -370,6 +370,27 @@ func (m *InodeToPath) GetEntry(ino uint64) (*InodeEntry, bool) {
 	return copyInodeEntryLocked(entry), true
 }
 
+// DirInodesUnderPrefix returns the inode numbers of directories mapped at
+// dirPath or strictly beneath dirPath+"/".
+func (m *InodeToPath) DirInodesUnderPrefix(dirPath string) []uint64 {
+	if m == nil || dirPath == "" {
+		return nil
+	}
+	sub := strings.TrimSuffix(dirPath, "/") + "/"
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []uint64
+	for ino, e := range m.byInode {
+		if e == nil || !e.IsDir {
+			continue
+		}
+		if e.Path == dirPath || strings.HasPrefix(e.Path, sub) {
+			out = append(out, ino)
+		}
+	}
+	return out
+}
+
 // Forget decrements the Nlookup count for the given inode by nlookup. Some
 // visible mappings are retained after lookup refs drop so later lookups can
 // preserve POSIX inode identity and local owner metadata across rename.
