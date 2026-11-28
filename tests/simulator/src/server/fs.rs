@@ -220,12 +220,16 @@ fn set_extent_headers(h: &mut HeaderMap, n: &Node) {
     h.insert("x-dat9-extent-length", n.size.to_string().parse().unwrap());
 }
 
-// extent_read_is_current reports whether the file at `p` still carries the ETag
-// the response was assembled for. The ETag includes the inode, so a delete plus
-// same-size recreate (new inode, revision 1 again) is detected too.
-pub(crate) fn extent_read_is_current(t: &TenantDb, p: &str, etag: &str) -> Result<bool, StoreError> {
-    let after = t.get_node(p)?;
-    Ok(read_etag(&after.inode, after.revision, after.size) == etag)
+// extent_read_guard answers the read when the file at `p` no longer carries the
+// ETag the response was assembled for. The ETag includes the inode, so a delete
+// plus same-size recreate (new inode, revision 1 again) is rejected too.
+pub(crate) fn extent_read_guard(t: &TenantDb, p: &str, etag: &str) -> Result<(), Response> {
+    match t.get_node(p) {
+        Ok(after) if read_etag(&after.inode, after.revision, after.size) == etag => Ok(()),
+        Ok(_) => Err(err_resp(409, "file changed since it was opened")),
+        // The file is gone: the body is not a representation of anything.
+        Err(_) => Err(err_resp(404, "not found")),
+    }
 }
 
 async fn fs_read(state: Arc<AppState>, t: Arc<TenantDb>, req: FsReq) -> Response {
@@ -296,17 +300,14 @@ async fn fs_read(state: Arc<AppState>, t: Arc<TenantDb>, req: FsReq) -> Response
         Ok(d) => d,
         Err(r) => return r,
     };
-    if n.is_extent() {
-        // The node (and so the ETag, revision and extent length) was read
-        // before the mappings. A concurrent commit between those two store
-        // reads must not pair a newer body with this response's generation;
-        // comparing the full ETag also catches a delete plus same-size recreate.
-        match extent_read_is_current(&t, &p, &etag) {
-            Ok(true) => {}
-            Ok(false) => return err_resp(409, "file changed since it was opened"),
-            // The file is gone: the body is not a representation of anything.
-            Err(_) => return err_resp(404, "not found"),
-        }
+    // The node (and so the ETag, revision and extent length) was read before
+    // the mappings. A concurrent commit between those two store reads must not
+    // pair a newer body with this response's generation, so the extent read is
+    // only served while the node still carries the ETag it was assembled for.
+    if n.is_extent()
+        && let Err(r) = extent_read_guard(&t, &p, &etag)
+    {
+        return r;
     }
     let total = data.len() as i64;
     let effective_range = match (req.header("range"), req.header("if-range")) {

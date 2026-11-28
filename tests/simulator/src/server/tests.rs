@@ -453,6 +453,10 @@ fn uploads_v2_extent_contract() {
         header(&h, "x-dat9-extent-length").as_deref(),
         Some(data.len().to_string().as_str())
     );
+    // A resumable reader revalidates a partial body, so the 206 carries the
+    // same validators as the full read.
+    assert_eq!(header(&h, "etag").as_deref(), Some(etag.as_str()));
+    assert_eq!(header(&h, "accept-ranges").as_deref(), Some("bytes"));
 
     // An unsatisfiable range is still a 416 on the inline path.
     let (st, h, _) = http(
@@ -1364,8 +1368,15 @@ fn paused_gc_sweep_and_concurrent_reuse_are_mutually_serialized() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// guard_status reduces the guard's answer to the status the read would carry.
+fn guard_status(t: &TenantDb, path: &str, etag: &str) -> Option<u16> {
+    fs::extent_read_guard(t, path, etag)
+        .err()
+        .map(|resp| resp.status().as_u16())
+}
+
 #[test]
-fn extent_read_predicate_uses_the_full_etag() {
+fn extent_read_guard_answers_the_selected_generation() {
     let dir = tmpdir("extent-pred");
     let meta = Meta::open(&dir).unwrap();
     meta.create_tenant("tpred", "drive9_pred_key").unwrap();
@@ -1412,25 +1423,25 @@ fn extent_read_predicate_uses_the_full_etag() {
             .commit_extent(&state.s3, "/g.bin", len, -1, &slices)
             .unwrap();
         let selected = store::read_etag(&inode, rev, len);
-        assert!(fs::extent_read_is_current(&t, "/g.bin", &selected).unwrap());
+        assert_eq!(guard_status(&t, "/g.bin", &selected), None);
 
         // In-place commit: same inode, newer revision.
         let (rev2, inode2) = t.commit_extent(&state.s3, "/g.bin", len, rev, &slices).unwrap();
         assert_eq!((inode2.as_str(), rev2), (inode.as_str(), rev + 1));
-        assert!(!fs::extent_read_is_current(&t, "/g.bin", &selected).unwrap());
+        assert_eq!(guard_status(&t, "/g.bin", &selected), Some(409));
 
         // Truncate: same inode and revision move together.
         let (rev3, _) = t
             .commit_extent(&state.s3, "/g.bin", len - 4, rev2, &slices)
             .unwrap();
-        assert!(!fs::extent_read_is_current(&t, "/g.bin", &selected).unwrap());
+        assert_eq!(guard_status(&t, "/g.bin", &selected), Some(409));
         let truncated = store::read_etag(&inode, rev3, len - 4);
-        assert!(fs::extent_read_is_current(&t, "/g.bin", &truncated).unwrap());
+        assert_eq!(guard_status(&t, "/g.bin", &truncated), None);
 
         // Deleted: there is no generation to describe, so the caller cannot
         // answer 200 or 409 — the read is a 404.
         t.delete_tree("/g.bin").unwrap();
-        assert!(fs::extent_read_is_current(&t, "/g.bin", &truncated).is_err());
+        assert_eq!(guard_status(&t, "/g.bin", &truncated), Some(404));
 
         // Deleted and recreated at the same size: a new inode that starts at
         // revision 1 again, which is exactly the pair (revision, size) the
@@ -1440,8 +1451,8 @@ fn extent_read_predicate_uses_the_full_etag() {
             .unwrap();
         assert_eq!(rev4, 1);
         assert_ne!(inode4, inode);
-        assert!(!fs::extent_read_is_current(&t, "/g.bin", &selected).unwrap());
-        assert!(!fs::extent_read_is_current(&t, "/g.bin", &truncated).unwrap());
+        assert_eq!(guard_status(&t, "/g.bin", &selected), Some(409));
+        assert_eq!(guard_status(&t, "/g.bin", &truncated), Some(409));
     });
 
     let _ = std::fs::remove_dir_all(&dir);
