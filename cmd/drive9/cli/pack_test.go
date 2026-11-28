@@ -5,6 +5,10 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1596,5 +1600,395 @@ func TestPackPathWithinUsesFilesystemIdentity(t *testing.T) {
 	}
 	if !packPathUnder(filepath.Join(installed, "child"), installed) {
 		t.Fatal("descendant of a scope entry was not matched")
+	}
+}
+
+// packTarEntry is one decoded archive member, used by the format-version tests
+// to mutate an archive the way an incompatible or damaged writer would.
+type packTarEntry struct {
+	name     string
+	mode     int64
+	typeflag byte
+	linkname string
+	body     []byte
+}
+
+func decodePackTarEntries(t *testing.T, data []byte) []packTarEntry {
+	t.Helper()
+	gz, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("gzip reader: %v", err)
+	}
+	tr := tar.NewReader(gz)
+	var out []packTarEntry
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("tar next: %v", err)
+		}
+		body, err := io.ReadAll(tr)
+		if err != nil {
+			t.Fatalf("tar read %s: %v", hdr.Name, err)
+		}
+		out = append(out, packTarEntry{name: hdr.Name, mode: hdr.Mode, typeflag: hdr.Typeflag, linkname: hdr.Linkname, body: body})
+	}
+	return out
+}
+
+func encodePackTarEntries(t *testing.T, entries []packTarEntry) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	for _, entry := range entries {
+		hdr := &tar.Header{
+			Name:     entry.name,
+			Mode:     entry.mode,
+			Typeflag: entry.typeflag,
+			Linkname: entry.linkname,
+			ModTime:  time.Now().UTC(),
+		}
+		if entry.typeflag == tar.TypeReg || entry.typeflag == 0 {
+			hdr.Size = int64(len(entry.body))
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("write header %s: %v", entry.name, err)
+		}
+		if len(entry.body) > 0 {
+			if _, err := tw.Write(entry.body); err != nil {
+				t.Fatalf("write body %s: %v", entry.name, err)
+			}
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("tar close: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// mutatePackArchive rewrites manifest JSON with mutateManifest and drops the
+// trailing checksum entry so a test can build the write shapes older or newer
+// binaries produce.
+func mutatePackArchive(t *testing.T, data []byte, mutateManifest func(map[string]any), dropChecksums bool) []byte {
+	t.Helper()
+	entries := decodePackTarEntries(t, data)
+	var out []packTarEntry
+	for _, entry := range entries {
+		switch entry.name {
+		case packChecksumEntryName:
+			if dropChecksums {
+				continue
+			}
+		case packManifestEntryName:
+			var manifest map[string]any
+			if err := json.Unmarshal(entry.body, &manifest); err != nil {
+				t.Fatalf("decode manifest: %v", err)
+			}
+			if mutateManifest != nil {
+				mutateManifest(manifest)
+			}
+			body, err := json.Marshal(manifest)
+			if err != nil {
+				t.Fatalf("encode manifest: %v", err)
+			}
+			entry.body = body
+		}
+		out = append(out, entry)
+	}
+	return encodePackTarEntries(t, out)
+}
+
+func writeSmallPackArchive(t *testing.T) []byte {
+	t.Helper()
+	localRoot := t.TempDir()
+	repo := filepath.Join(localRoot, "overlay", "repo")
+	mustWriteFile(t, filepath.Join(repo, "a.txt"), []byte("alpha\n"), 0o644)
+	mustWriteFile(t, filepath.Join(repo, "nested", "b.txt"), []byte("bravo\n"), 0o644)
+	var buf bytes.Buffer
+	if _, err := writePackArchive(context.Background(), &buf, packOptions{
+		LocalRoot:        localRoot,
+		RemoteRoot:       "/",
+		LocalPrefix:      "repo",
+		ProfilePackPaths: []string{"/"},
+	}); err != nil {
+		t.Fatalf("writePackArchive: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestPackArchiveWritesFormatVersionAndChecksums(t *testing.T) {
+	archive := writeSmallPackArchive(t)
+	entries := decodePackTarEntries(t, archive)
+	var manifest packManifest
+	var sums *packChecksums
+	for _, entry := range entries {
+		switch entry.name {
+		case packManifestEntryName:
+			if err := json.Unmarshal(entry.body, &manifest); err != nil {
+				t.Fatalf("decode manifest: %v", err)
+			}
+		case packChecksumEntryName:
+			var decoded packChecksums
+			if err := json.Unmarshal(entry.body, &decoded); err != nil {
+				t.Fatalf("decode checksums: %v", err)
+			}
+			sums = &decoded
+		}
+	}
+	if manifest.Version != packFormatVersion {
+		t.Fatalf("archive version = %d, want %d", manifest.Version, packFormatVersion)
+	}
+	if sums == nil {
+		t.Fatalf("archive has no %s entry", packChecksumEntryName)
+	}
+	if sums.Version != packFormatVersion || sums.Format != packArchiveFormat {
+		t.Fatalf("checksum header = %+v, want format %q version %d", sums, packArchiveFormat, packFormatVersion)
+	}
+	if len(sums.Entries) != 2 {
+		t.Fatalf("checksum entries = %d, want 2 (%+v)", len(sums.Entries), sums.Entries)
+	}
+	want := sha256.Sum256([]byte("alpha\n"))
+	if got := sums.Entries["/repo/a.txt"]; got.SHA256 != hex.EncodeToString(want[:]) || got.Size != int64(len("alpha\n")) {
+		t.Fatalf("checksum for /repo/a.txt = %+v, want sha256 %x size %d", got, want, len("alpha\n"))
+	}
+}
+
+func TestExtractPackArchiveVerifiesChecksums(t *testing.T) {
+	archive := writeSmallPackArchive(t)
+	entries := decodePackTarEntries(t, archive)
+	corrupted := false
+	for i := range entries {
+		if entries[i].name == packArchiveEntryPrefix+"repo/a.txt" {
+			entries[i].body = []byte("alphx\n")
+			corrupted = true
+		}
+	}
+	if !corrupted {
+		t.Fatalf("archive has no %srepo/a.txt entry", packArchiveEntryPrefix)
+	}
+	_, err := extractPackArchive(context.Background(), bytes.NewReader(encodePackTarEntries(t, entries)), unpackOptions{
+		LocalRoot: t.TempDir(),
+		Replace:   true,
+	})
+	if err == nil {
+		t.Fatal("unpack accepted an archive whose content does not match its checksum")
+	}
+	if !strings.Contains(err.Error(), "pack content mismatch") {
+		t.Fatalf("unpack error = %v, want a checksum mismatch", err)
+	}
+}
+
+func TestExtractPackArchiveRejectsFutureFormatVersion(t *testing.T) {
+	archive := writeSmallPackArchive(t)
+	archive = mutatePackArchive(t, archive, func(manifest map[string]any) {
+		manifest["version"] = float64(packFormatVersion + 1)
+	}, false)
+	_, err := extractPackArchive(context.Background(), bytes.NewReader(archive), unpackOptions{
+		LocalRoot: t.TempDir(),
+		Replace:   true,
+	})
+	if err == nil {
+		t.Fatal("unpack accepted an archive written by a newer format version")
+	}
+	want := fmt.Sprintf("unsupported pack archive version %d", packFormatVersion+1)
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("unpack error = %v, want %q", err, want)
+	}
+}
+
+func TestExtractPackArchiveRequiresChecksumsForVersion2(t *testing.T) {
+	archive := mutatePackArchive(t, writeSmallPackArchive(t), nil, true)
+	_, err := extractPackArchive(context.Background(), bytes.NewReader(archive), unpackOptions{
+		LocalRoot: t.TempDir(),
+		Replace:   true,
+	})
+	if err == nil {
+		t.Fatal("unpack accepted a version 2 archive without its checksum entry")
+	}
+	if !strings.Contains(err.Error(), packChecksumEntryName) {
+		t.Fatalf("unpack error = %v, want it to name %s", err, packChecksumEntryName)
+	}
+}
+
+func TestExtractPackArchiveAcceptsLegacyVersion1Archive(t *testing.T) {
+	// Version 1 archives carry no checksum entry: the format predates it.
+	// They MUST still unpack, or an upgrade would strand every archive a
+	// customer packed with an older drive9.
+	archive := mutatePackArchive(t, writeSmallPackArchive(t), func(manifest map[string]any) {
+		manifest["version"] = 1.0
+	}, true)
+	localRoot := t.TempDir()
+	manifest, err := extractPackArchive(context.Background(), bytes.NewReader(archive), unpackOptions{
+		LocalRoot: localRoot,
+		Replace:   true,
+	})
+	if err != nil {
+		t.Fatalf("extract legacy archive: %v", err)
+	}
+	if manifest.Version != packMinFormatVersion {
+		t.Fatalf("legacy manifest version = %d, want %d", manifest.Version, packMinFormatVersion)
+	}
+	assertFileContent(t, filepath.Join(localRoot, "overlay", "repo", "a.txt"), "alpha\n")
+}
+
+func TestExtractPackArchiveRejectsMissingPerFileChecksum(t *testing.T) {
+	archive := writeSmallPackArchive(t)
+	entries := decodePackTarEntries(t, archive)
+	for i := range entries {
+		if entries[i].name != packChecksumEntryName {
+			continue
+		}
+		var sums packChecksums
+		if err := json.Unmarshal(entries[i].body, &sums); err != nil {
+			t.Fatalf("decode checksums: %v", err)
+		}
+		delete(sums.Entries, "/repo/nested/b.txt")
+		body, err := json.Marshal(sums)
+		if err != nil {
+			t.Fatalf("encode checksums: %v", err)
+		}
+		entries[i].body = body
+	}
+	_, err := extractPackArchive(context.Background(), bytes.NewReader(encodePackTarEntries(t, entries)), unpackOptions{
+		LocalRoot: t.TempDir(),
+		Replace:   true,
+	})
+	if err == nil {
+		t.Fatal("unpack accepted an archive missing a file's checksum")
+	}
+	if !strings.Contains(err.Error(), "/repo/nested/b.txt") {
+		t.Fatalf("unpack error = %v, want it to name the unchecked file", err)
+	}
+}
+
+func TestExtractPackArchiveRejectsDuplicateManifest(t *testing.T) {
+	// A second manifest could otherwise downgrade the declared version and skip
+	// verification for the bytes that came before it.
+	entries := decodePackTarEntries(t, writeSmallPackArchive(t))
+	var out []packTarEntry
+	for _, entry := range entries {
+		out = append(out, entry)
+		if entry.name == packManifestEntryName {
+			var manifest map[string]any
+			if err := json.Unmarshal(entry.body, &manifest); err != nil {
+				t.Fatalf("decode manifest: %v", err)
+			}
+			manifest["version"] = 1.0
+			body, err := json.Marshal(manifest)
+			if err != nil {
+				t.Fatalf("encode manifest: %v", err)
+			}
+			out = append(out, packTarEntry{name: packManifestEntryName, mode: 0o644, typeflag: tar.TypeReg, body: body})
+		}
+	}
+	_, err := extractPackArchive(context.Background(), bytes.NewReader(encodePackTarEntries(t, out)), unpackOptions{
+		LocalRoot: t.TempDir(),
+		Replace:   true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "duplicate "+packManifestEntryName) {
+		t.Fatalf("unpack error = %v, want a duplicate manifest rejection", err)
+	}
+}
+
+func TestExtractPackArchiveRejectsDuplicateChecksums(t *testing.T) {
+	entries := decodePackTarEntries(t, writeSmallPackArchive(t))
+	var out []packTarEntry
+	for _, entry := range entries {
+		out = append(out, entry)
+		if entry.name == packChecksumEntryName {
+			out = append(out, packTarEntry{name: packChecksumEntryName, mode: 0o644, typeflag: tar.TypeReg, body: []byte(`{"format":"drive9.pack.v1","version":2,"entries":{}}`)})
+		}
+	}
+	_, err := extractPackArchive(context.Background(), bytes.NewReader(encodePackTarEntries(t, out)), unpackOptions{
+		LocalRoot: t.TempDir(),
+		Replace:   true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "duplicate "+packChecksumEntryName) {
+		t.Fatalf("unpack error = %v, want a duplicate checksum rejection", err)
+	}
+}
+
+func TestExtractPackArchiveRejectsUnlistedStagedFile(t *testing.T) {
+	// An entry the manifest never names must not be installed unverified.
+	entries := decodePackTarEntries(t, writeSmallPackArchive(t))
+	entries = append(entries, packTarEntry{
+		name:     packArchiveEntryPrefix + "repo/nested/evil.txt",
+		mode:     0o644,
+		typeflag: tar.TypeReg,
+		body:     []byte("not in the manifest\n"),
+	})
+	_, err := extractPackArchive(context.Background(), bytes.NewReader(encodePackTarEntries(t, entries)), unpackOptions{
+		LocalRoot: t.TempDir(),
+		Replace:   true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "/repo/nested/evil.txt") {
+		t.Fatalf("unpack error = %v, want the unlisted file named", err)
+	}
+}
+
+func TestExtractPackArchiveAcceptsVersionZeroArchive(t *testing.T) {
+	// Archives written before the version field existed decode as 0; they are
+	// version 1 by definition and must still unpack.
+	entries := decodePackTarEntries(t, writeSmallPackArchive(t))
+	for i := range entries {
+		switch entries[i].name {
+		case packChecksumEntryName:
+			entries[i].body = nil
+		case packManifestEntryName:
+			var manifest map[string]any
+			if err := json.Unmarshal(entries[i].body, &manifest); err != nil {
+				t.Fatalf("decode manifest: %v", err)
+			}
+			delete(manifest, "version")
+			body, err := json.Marshal(manifest)
+			if err != nil {
+				t.Fatalf("encode manifest: %v", err)
+			}
+			entries[i].body = body
+		}
+	}
+	var kept []packTarEntry
+	for _, entry := range entries {
+		if entry.name == packChecksumEntryName {
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	localRoot := t.TempDir()
+	manifest, err := extractPackArchive(context.Background(), bytes.NewReader(encodePackTarEntries(t, kept)), unpackOptions{
+		LocalRoot: localRoot,
+		Replace:   true,
+	})
+	if err != nil {
+		t.Fatalf("extract version-zero archive: %v", err)
+	}
+	if manifest.Version != packMinFormatVersion {
+		t.Fatalf("version-zero manifest resolved to %d, want %d", manifest.Version, packMinFormatVersion)
+	}
+	assertFileContent(t, filepath.Join(localRoot, "overlay", "repo", "a.txt"), "alpha\n")
+}
+
+func TestExtractPackArchiveLeavesDestinationUntouchedOnChecksumFailure(t *testing.T) {
+	entries := decodePackTarEntries(t, writeSmallPackArchive(t))
+	for i := range entries {
+		if entries[i].name == packArchiveEntryPrefix+"repo/a.txt" {
+			entries[i].body = []byte("alphx\n")
+		}
+	}
+	localRoot := t.TempDir()
+	if _, err := extractPackArchive(context.Background(), bytes.NewReader(encodePackTarEntries(t, entries)), unpackOptions{
+		LocalRoot: localRoot,
+		Replace:   true,
+	}); err == nil {
+		t.Fatal("unpack accepted an archive whose content does not match its checksum")
+	}
+	if _, err := os.Stat(filepath.Join(localRoot, "overlay")); !os.IsNotExist(err) {
+		t.Fatalf("failed unpack installed content (overlay exists): err=%v", err)
 	}
 }
