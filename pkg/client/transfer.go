@@ -1786,7 +1786,8 @@ func newMultipartAbortContext(parent context.Context, timeout time.Duration) (co
 func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, error) {
 	// The extent read-plan representation is opt-in on the wire: declare
 	// support on every plain read too — a classic server ignores the
-	// header, an extent server answers the plan (without it, 422).
+	// header, an extent server answers the plan (without it, the bytes are
+	// served inline and cannot be parsed as a plan).
 	resp, err := c.readWithoutRedirectOptIn(ctx, path, "", true)
 	if err != nil {
 		return nil, err
@@ -1829,8 +1830,9 @@ func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, er
 }
 
 // readWithoutRedirectOptIn additionally declares support for the extent
-// block-plan representation (X-Dat9-Extent-Read-Plan): extent reads MUST
-// opt in or the server answers 422; classic reads leave it off.
+// block-plan representation (X-Dat9-Extent-Read-Plan): an extent read MUST
+// opt in to be answered with a plan rather than the bytes inline; classic
+// reads leave it off.
 func (c *Client) readWithoutRedirectOptIn(ctx context.Context, path, rangeHeader string, extentPlan bool) (*http.Response, error) {
 	// Disable redirect following so we can detect 302. The request carries the
 	// same credentials as any other read (doWith), including X-Dat9-Actor: the
@@ -1870,8 +1872,8 @@ func (c *Client) resolveReadTarget(ctx context.Context, path string) (*ReadTarge
 
 func (c *Client) resolveReadTargetOrExtentPlan(ctx context.Context, path string) (*ReadTarget, *ExtentReadPlan, error) {
 	// Opt in to the extent plan representation: without the header an
-	// extent file answers 422 here and the download would abort with the
-	// destination already created.
+	// extent file answers with its bytes inline and the download would abort
+	// with the destination already created.
 	resp, err := c.readWithoutRedirectOptIn(ctx, path, "", true)
 	if err != nil {
 		return nil, nil, err

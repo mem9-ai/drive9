@@ -1085,7 +1085,7 @@ func (c *Client) Read(path string) ([]byte, error) {
 func (c *Client) ReadCtx(ctx context.Context, path string) ([]byte, error) {
 	// ReadStream validates the path (newFSRequest), follows presigned
 	// redirects, and routes content_layout=extent reads to the JuiceFS data
-	// plane when the server answers 422 with the extent hint.
+	// plane when the server answers with an extent block plan.
 	rc, err := c.ReadStream(ctx, path)
 	if err != nil {
 		return nil, err

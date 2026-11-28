@@ -168,7 +168,7 @@ Because `resource_id` is the inode UUID/hex identity, the `ETag` changes on ever
       "next_offset": 67108864
     }
     ```
-  - Without `X-Dat9-Extent-Read-Plan`: returns `422 Unprocessable Entity` with headers `X-Dat9-Content-Layout: extent`, `X-Dat9-Storage-Type: extent`, `X-Dat9-Extent-Length: <size>` (so older clients never mistake a JSON block plan for file content).
+  - Without `X-Dat9-Extent-Read-Plan`: the content is streamed inline as bytes (`200`, or `206` for a `Range`, `application/octet-stream`) with headers `X-Dat9-Content-Layout: extent`, `X-Dat9-Storage-Type: extent`, `X-Dat9-Extent-Length: <size>`, `X-Dat9-Extent-Ino: <inode_id>`, and the same range/conditional semantics as a classic read. Extent layout is an internal storage choice: a client that cannot parse a plan still reads the file, and it never receives a JSON block plan as file bytes. If the file changes between selecting the generation and assembling the bytes, the server rejects the mixed read (`409`, or `404` when the file is gone) instead of returning a body its own validators do not describe.
 
 ### 4.4 `GET /v1/fs/{path}?stat`
 - Returns `200` JSON metadata (+ headers `X-Dat9-Mtime`, `X-Dat9-Btime`), or `404` if missing:
@@ -436,7 +436,7 @@ All batch endpoints accept `POST` only; any other HTTP method returns `405 Metho
 | `403` | Scoped token denied, tenant suspended/deleted, org not allowlisted |
 | `404` | Path, upload session, lease, journal, or route not found |
 | `405` | Disallowed HTTP method on route |
-| `409` | Path conflict (`?mkdir` / `?create` / `?symlink` / `?hardlink` on existing), CAS `expected_revision` mismatch, non-empty directory delete, layout mismatch, completing/resuming an aborted or completed upload |
+| `409` | Path conflict (`?mkdir` / `?create` / `?symlink` / `?hardlink` on existing), CAS `expected_revision` mismatch, non-empty directory delete, layout mismatch, completing/resuming an aborted or completed upload, or a read whose generation moved before its bytes were assembled (retry) |
 | `410` | Upload session expired |
 | `412` | `If-Match` precondition failed |
 | `413` | Payload / `total_size` exceeds `max_upload_bytes`, or batch item exceeds `inline_threshold` / batch byte cap |
