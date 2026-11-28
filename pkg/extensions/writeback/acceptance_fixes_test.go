@@ -3115,4 +3115,225 @@ func TestReviewEdgeCasesAndUploadCutConflictExcl(t *testing.T) {
 			t.Fatalf("/chained-16m final mismatch: ok=%v len=%d, want %d bytes", ok, len(n.Data), len(wantFinal))
 		}
 	})
+
+	t.Run("oversize-sibling-snapshot-accounts-shadow-quota-and-zero-base-clears-preserved-pending", func(t *testing.T) {
+		b := testbackend.NewBackend()
+		ts := httptest.NewServer(b)
+		t.Cleanup(ts.Close)
+		cl := client.New(ts.URL, "")
+
+		// Part A: close-sync with Staging configured charges oversize (>64 MiB)
+		// co-open sibling snapshots to ShadowStore.QuotaBytes() and releases to 0.
+		stCS, err := staging.NewStagingWithQuota(t.TempDir(), 0, 256)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(stCS.Close)
+		wbCS, err := New(Options{Policy: PolicyCloseSync, Client: cl, Staging: stCS})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = wbCS.Stop(context.Background()) })
+		termCS, err := core.New(cl, core.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		chCS, err := fs.NewChain(wbCS, termCS)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		h1, err := chCS.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/big-sib-quota",
+			Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		const bigSz = 68 << 20
+		chunk := bytes.Repeat([]byte("Q"), 4<<20)
+		for off := int64(0); off < bigSz; off += int64(len(chunk)) {
+			if err := h1.Handle.Write(ctx, off, chunk); err != nil {
+				t.Fatalf("h1.Write(%d): %v", off, err)
+			}
+		}
+		h2, err := chCS.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/big-sib-quota", Flags: uint32(syscall.O_RDWR),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := h2.Handle.Write(ctx, 0, []byte("SNAP")); err != nil {
+			t.Fatalf("h2.Write: %v", err)
+		}
+		if gotQuota := stCS.Shadow.QuotaBytes(); gotQuota != bigSz {
+			t.Fatalf("Shadow.QuotaBytes while oversize sibling snapshot open = %d, want %d", gotQuota, bigSz)
+		}
+		for _, h := range []fs.Result{h1, h2} {
+			if err := h.Handle.Flush(ctx); err != nil {
+				t.Fatalf("Flush: %v", err)
+			}
+			if err := h.Handle.Release(ctx); err != nil {
+				t.Fatalf("Release: %v", err)
+			}
+		}
+		if gotQuota := stCS.Shadow.QuotaBytes(); gotQuota != 0 {
+			t.Fatalf("Shadow.QuotaBytes after close = %d, want 0", gotQuota)
+		}
+
+		// Part B: writeback zero-base create over a leftover Pending + Shadow
+		// preserved by CancelPathPreserveLocal must truncate stale shadow bytes
+		// before skipping sparse hole parts.
+		wbcache, err := staging.NewWriteBackCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		stWB, err := staging.NewStagingWithQuota(t.TempDir(), 0, 128)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(stWB.Close)
+		wb, err := New(Options{
+			Policy:     PolicyWriteBack,
+			SyncMode:   "interactive",
+			Client:     cl,
+			WriteCache: wbcache,
+			Staging:    stWB,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		wb.wbCacheMaxBytes = 32 << 10
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+		termWB, err := core.New(cl, core.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		chWB, err := fs.NewChain(wb, termWB)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		oldPayload := bytes.Repeat([]byte("OLD!"), 3<<20) // 12 MiB
+		// 1) Verify OpUnlink with an unpinned anonymous marker pins+retires any
+		// active shadow via CancelPath instead of leaving a leftover Pending entry
+		// via CancelPathPreserveLocal.
+		rAnon, err := chWB.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/preserve-hole",
+			Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := stWB.Shadow.WriteFull("/preserve-hole", oldPayload, 0); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := stWB.Pending.Put("/preserve-hole", int64(len(oldPayload)), staging.PendingNew); err != nil {
+			t.Fatal(err)
+		}
+		wb.recordUnlinkedSnapshot("/preserve-hole", 0, 0)
+		if _, err := chWB.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/preserve-hole"}); err != nil && !fs.IsNotFound(err) {
+			t.Fatalf("OpUnlink /preserve-hole: %v", err)
+		}
+		if stWB.Pending.HasPending("/preserve-hole") {
+			t.Fatal("expected OpUnlink to clear Pending entry rather than leaving it via CancelPathPreserveLocal")
+		}
+		_ = rAnon.Handle.Release(ctx)
+
+		// 2) Verify spillToShadow's `zeroBase && buf.RemoteSize() == 0` guard:
+		// initialize cNew's sparse 16 MiB zero-base buffer (`isNew == true,
+		// h.trunc == false, RemoteSize() == 0`), then plant both a 12 MiB active
+		// shadow and a Pending entry before Flush so spillToShadow runs with
+		// `st.Pending.HasPending("/preserve-hole") == true`.
+		cNew, err := chWB.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/preserve-hole",
+			Flags: uint32(syscall.O_CREAT | syscall.O_WRONLY), Mode: 0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		const tailOff = 16 << 20
+		if err := cNew.Handle.Write(ctx, tailOff, []byte("TAIL")); err != nil {
+			t.Fatalf("cNew.Write sparse tail: %v", err)
+		}
+		if err := stWB.Shadow.WriteFull("/preserve-hole", oldPayload, 0); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := stWB.Pending.Put("/preserve-hole", int64(len(oldPayload)), staging.PendingNew); err != nil {
+			t.Fatal(err)
+		}
+		if err := cNew.Handle.Flush(ctx); err != nil {
+			t.Fatalf("cNew.Flush: %v", err)
+		}
+		if err := cNew.Handle.Release(ctx); err != nil {
+			t.Fatalf("cNew.Release: %v", err)
+		}
+		if err := wb.Drain(ctx); err != nil {
+			t.Fatalf("wb.Drain: %v", err)
+		}
+		n, ok := b.Node("/preserve-hole")
+		if !ok || len(n.Data) != tailOff+4 {
+			t.Fatalf("/preserve-hole landed ok=%v len=%d, want %d", ok, len(n.Data), tailOff+4)
+		}
+		for i := 0; i < tailOff; i++ {
+			if n.Data[i] != 0 {
+				t.Fatalf("/preserve-hole hole byte at %d = %#x (stale shadow leaked!), want 0", i, n.Data[i])
+			}
+		}
+		if string(n.Data[tailOff:]) != "TAIL" {
+			t.Fatalf("/preserve-hole tail = %q, want TAIL", string(n.Data[tailOff:]))
+		}
+	})
+
+	t.Run("mark-unlinked-snapshot-respects-timeout-bound", func(t *testing.T) {
+		b := testbackend.NewBackend()
+		ts := httptest.NewServer(b)
+		t.Cleanup(ts.Close)
+		cl := client.New(ts.URL, "")
+		wb, err := New(Options{Policy: PolicyCloseSync, Client: cl})
+		if err != nil {
+			t.Fatal(err)
+		}
+		wb.unlinkSnapTimeout = 40 * time.Millisecond
+		t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+		terminal, err := core.New(cl, core.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ch, err := fs.NewChain(wb, terminal)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		res, err := ch.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/stalled-read",
+			Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		bh := res.Handle.(*bufferingHandle)
+		idleCh := make(chan struct{})
+		bh.mu.Lock()
+		bh.linkedReadCount = 1
+		bh.linkedReadsIdle = idleCh
+		bh.mu.Unlock()
+
+		start := time.Now()
+		marked, serr := wb.markUnlinkedSnapshotCtx(ctx, "/stalled-read", false)
+		elapsed := time.Since(start)
+		if !errors.Is(serr, context.DeadlineExceeded) {
+			t.Fatalf("markUnlinkedSnapshotCtx err = %v, want DeadlineExceeded", serr)
+		}
+		if elapsed > 2*time.Second {
+			t.Fatalf("markUnlinkedSnapshotCtx took %v, expected ~40ms bound", elapsed)
+		}
+		restoreMarked(marked)
+		bh.mu.Lock()
+		bh.linkedReadCount = 0
+		bh.linkedReadsIdle = nil
+		bh.mu.Unlock()
+		close(idleCh)
+		_ = res.Handle.Release(ctx)
+	})
 }

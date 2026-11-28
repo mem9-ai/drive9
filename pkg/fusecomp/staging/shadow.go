@@ -258,6 +258,30 @@ func (s *ShadowStore) QuotaBytes() int64 {
 	return s.quotaBytes.Load()
 }
 
+// ReserveTempBytes checks write-back disk protection (byte quota and throttled
+// free-space ratio) for n bytes of transient local staging in s.Dir() (such as
+// an oversize co-open sibling snapshot file) and charges n against quotaBytes.
+func (s *ShadowStore) ReserveTempBytes(n int64) error {
+	if s == nil || n <= 0 {
+		return nil
+	}
+	if err := s.CheckWriteBackQuotaThrottled(n); err != nil {
+		return err
+	}
+	s.quotaBytes.Add(n)
+	return nil
+}
+
+// ReleaseTempBytes returns n bytes previously charged via ReserveTempBytes and
+// wakes any quota backpressure waiters.
+func (s *ShadowStore) ReleaseTempBytes(n int64) {
+	if s == nil || n <= 0 {
+		return
+	}
+	s.quotaBytes.Add(-n)
+	s.notifyQuotaReleased()
+}
+
 // MaxByteQuota returns the configured write-back byte quota (0 when disabled).
 func (s *ShadowStore) MaxByteQuota() int64 {
 	if s == nil {

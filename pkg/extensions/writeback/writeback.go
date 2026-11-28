@@ -256,9 +256,10 @@ type Writeback struct {
 	// snapshotUnlinkedRemoteToShadow). unlinkClaimMu linearizes Pass 1 batch
 	// claiming in markUnlinkedSnapshot so overlapping scans form a strict DAG
 	// without cyclic waits.
-	unlinkClaimMu  sync.Mutex
-	unlinkedMu     sync.Mutex
-	unlinkedShadow map[string]struct{}
+	unlinkClaimMu     sync.Mutex
+	unlinkSnapTimeout time.Duration // 0 uses defaultUnlinkSnapTimeout
+	unlinkedMu        sync.Mutex
+	unlinkedShadow    map[string]struct{}
 	// unlinkedShadowGen is the CONTENT generation the snapshot captured:
 	// `RemoveIfGeneration` compares write generations, so the drop must use
 	// this value (not the pin token).
@@ -456,7 +457,10 @@ type bufferingHandle struct {
 	pendingFileSize int64
 	// snapshotFile keeps a disk snapshot alive for the buffer's lazy part
 	// loader after the snapshot itself stopped serving reads directly.
-	snapshotFile *os.File
+	// snapshotQuotaBytes tracks any ShadowStore.ReserveTempBytes charge owned
+	// by snapshotFile so close/spill releases the exact byte quota.
+	snapshotFile       *os.File
+	snapshotQuotaBytes int64
 	// liveSpillFile backs evicted full parts during pre-close sequential writes
 	// past commitInlineStreamThreshold so multi-GiB files never accumulate in
 	// Go heap RAM before Flush/Release.
@@ -2203,14 +2207,18 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				w.dropOrphanUnlinkedShadowsPrefix(prefix)
 			}
 			if w.queue != nil {
-				var cancelErr error
-				if w.unlinkedShadowServed(op.Path) && w.unlinkedShadowPinFor(op.Path) == 0 {
-					// Legacy unpinned snapshot: keep the active shadow until
-					// the last anonymous handle drops it.
-					cancelErr = w.queue.CancelPathPreserveLocal(op.Path)
-				} else {
-					cancelErr = w.queue.CancelPath(op.Path)
+				if w.unlinkedShadowServed(op.Path) && w.unlinkedShadowPinFor(op.Path) == 0 &&
+					w.opts.Staging != nil && w.opts.Staging.Shadow != nil {
+					// Pin any active shadow in place before CancelPath retires it and
+					// clears Pending, so open anonymous fds retain their retired fd
+					// via ReadAtGen(pin) without leaving a leftover Pending entry at
+					// the unlinked pathname.
+					contentGen := w.opts.Staging.Shadow.ActiveGeneration(op.Path)
+					if pin, ok := w.opts.Staging.Shadow.PinIfExists(op.Path); ok && pin != 0 {
+						w.recordUnlinkedSnapshot(op.Path, contentGen, pin)
+					}
 				}
+				cancelErr := w.queue.CancelPath(op.Path)
 				if cancelErr != nil {
 					// The remote DELETE already succeeded, so the handles
 					// stay anonymous — but a replayable local image would
@@ -2239,7 +2247,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			}
 			return nil
 		}
-		w.markUnlinked(op.Path, under)
+		w.markUnlinkedCtx(ctx, op.Path, under)
 		w.waitUploaderPath(op.Path)
 		if under && w.wbCache != nil {
 			for _, entry := range w.wbCache.ListByPrefix(prefix) {
@@ -2579,7 +2587,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// were reading: mark them anonymous BEFORE the remote rename (their
 		// clean images are snapshotted for post-overwrite reads), or they
 		// keep reading /b and silently see the source's bytes.
-		marked, serr := w.markUnlinkedSnapshot(op.Path2, true)
+		marked, serr := w.markUnlinkedSnapshotCtx(ctx, op.Path2, true)
 		if serr != nil {
 			// The overwritten target's descriptors have no read source:
 			// abort instead of switching them to the source's bytes.
@@ -3333,13 +3341,12 @@ func (w *Writeback) adoptExtentHandle(h *bufferingHandle, e fs.Handle) bool {
 	}
 	pendingShadow := h.pendingShadowGen
 	pendingFile := h.pendingFile
-	snapshotFile := h.snapshotFile
+	snapshotFile, snapshotQuota := h.takeSnapshotFileLocked()
 	liveSpillFile := h.liveSpillFile
 	h.pendingShadowGen = 0
 	h.pendingImage = nil
 	h.pendingFile = nil
 	h.pendingFileSize = 0
-	h.snapshotFile = nil
 	h.liveSpillFile = nil
 	h.mu.Unlock()
 
@@ -3349,9 +3356,7 @@ func (w *Writeback) adoptExtentHandle(h *bufferingHandle, e fs.Handle) bool {
 	if pendingFile != nil {
 		_ = pendingFile.Close()
 	}
-	if snapshotFile != nil {
-		_ = snapshotFile.Close()
-	}
+	h.releaseSnapshotFile(snapshotFile, snapshotQuota)
 	if liveSpillFile != nil {
 		_ = liveSpillFile.Close()
 	}
@@ -3974,7 +3979,7 @@ func (h *bufferingHandle) Write(ctx context.Context, off int64, data []byte) err
 		// loads above the materialization cap) so evicted regions never turn
 		// into zeros.
 		h.mu.Unlock()
-		if serr := h.seedFromDirtySiblingForObj(coObjGen); serr != nil {
+		if serr := h.seedFromDirtySiblingForObj(ctx, coObjGen); serr != nil {
 			return serr
 		}
 		h.mu.Lock()
@@ -5254,8 +5259,7 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 		h.ledgerShadowGen = 0
 		lf := h.liveSpillFile
 		h.liveSpillFile = nil
-		sf := h.snapshotFile
-		h.snapshotFile = nil
+		sf, sq := h.takeSnapshotFileLocked()
 		// The descriptor is closed: the buffer's bytes are retained by nobody,
 		// so its memory-budget charge goes back (Discard resets it).
 		writebuffer.Discard(&h.buf)
@@ -5266,9 +5270,7 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 		if lf != nil {
 			_ = lf.Close()
 		}
-		if sf != nil {
-			_ = sf.Close()
-		}
+		h.releaseSnapshotFile(sf, sq)
 	}()
 	// One identity snapshot for the whole close (a concurrent retarget
 	// rewrites h.path under h.mu — bare reads were a data race and could
@@ -5511,8 +5513,7 @@ func (h *bufferingHandle) releaseMigrated(ctx context.Context, e fs.Handle) erro
 	pendingFile := h.pendingFile
 	h.pendingFile = nil
 	h.pendingFileSize = 0
-	snapshotFile := h.snapshotFile
-	h.snapshotFile = nil
+	snapshotFile, snapshotQuota := h.takeSnapshotFileLocked()
 	writebuffer.Discard(&h.buf)
 	inner := h.inner
 	h.mu.Unlock()
@@ -5526,9 +5527,7 @@ func (h *bufferingHandle) releaseMigrated(ctx context.Context, e fs.Handle) erro
 	if pendingFile != nil {
 		_ = pendingFile.Close()
 	}
-	if snapshotFile != nil {
-		_ = snapshotFile.Close()
-	}
+	h.releaseSnapshotFile(snapshotFile, snapshotQuota)
 	if h.w.debounce != nil {
 		h.w.debounce.Cancel(path)
 	}
@@ -6323,12 +6322,33 @@ func (w *Writeback) handleFor(path string) *bufferingHandle {
 // multi-gigabyte read-only fd must not OOM the mount at unlink).
 const unlinkedSnapshotMaxBytes = 64 << 20
 
+// defaultUnlinkSnapTimeout bounds how long markUnlinkedSnapshot waits on
+// in-flight reads, Release->Submit handoffs, overlapping unlink batches, and
+// remote clean-fd snapshot fetches so a slow backend or stalled reader cannot
+// wedge unlink/rename-over (and readers queued behind batchSnap.done) forever.
+const defaultUnlinkSnapTimeout = 30 * time.Second
+
+func (w *Writeback) withUnlinkSnapTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	d := defaultUnlinkSnapTimeout
+	if w != nil && w.unlinkSnapTimeout > 0 {
+		d = w.unlinkSnapTimeout
+	}
+	return context.WithTimeout(ctx, d)
+}
+
 // markUnlinked makes every live writer of p (or, under, its subtree)
 // anonymous: the buffer keeps serving the fd, but commits are discarded
 // so Release cannot resurrect the path. Per-handle, so a re-created p stays
 // committable by its new writer (fh.Unlinked).
 func (w *Writeback) markUnlinked(p string, under bool) {
-	marked, err := w.markUnlinkedSnapshot(p, under)
+	w.markUnlinkedCtx(context.Background(), p, under)
+}
+
+func (w *Writeback) markUnlinkedCtx(ctx context.Context, p string, under bool) {
+	marked, err := w.markUnlinkedSnapshotCtx(ctx, p, under)
 	if err != nil {
 		for _, h := range marked {
 			h.mu.Lock()
@@ -6358,6 +6378,13 @@ func restoreMarked(marked []*bufferingHandle) {
 // roll back: otherwise the descriptors silently switch to the replacement's
 // bytes.
 func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHandle, error) {
+	return w.markUnlinkedSnapshotCtx(context.Background(), p, under)
+}
+
+func (w *Writeback) markUnlinkedSnapshotCtx(ctx context.Context, p string, under bool) ([]*bufferingHandle, error) {
+	snapCtx, cancel := w.withUnlinkSnapTimeout(ctx)
+	defer cancel()
+
 	prefix := strings.TrimSuffix(p, "/") + "/"
 	batchSnap := &unlinkSnapState{done: make(chan struct{})}
 	var clean []*bufferingHandle
@@ -6400,31 +6427,62 @@ func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHand
 		return true
 	})
 	w.unlinkClaimMu.Unlock()
+
+	var firstErr error
 	for _, ch := range submitting {
-		<-ch
-	}
-	if len(readDrains) > 0 {
-		w.notifyTestGate("unlink:waitingLinkedReads")
-		for _, ch := range readDrains {
-			<-ch
+		select {
+		case <-ch:
+		case <-snapCtx.Done():
+			if firstErr == nil {
+				firstErr = snapCtx.Err()
+			}
+		}
+		if firstErr != nil {
+			break
 		}
 	}
-	var firstErr error
+	if firstErr == nil && len(readDrains) > 0 {
+		w.notifyTestGate("unlink:waitingLinkedReads")
+		for _, ch := range readDrains {
+			select {
+			case <-ch:
+			case <-snapCtx.Done():
+				if firstErr == nil {
+					firstErr = snapCtx.Err()
+				}
+			}
+			if firstErr != nil {
+				break
+			}
+		}
+	}
 	for _, ch := range clean {
+		if firstErr != nil {
+			break
+		}
 		var err error
 		if w.opts.Staging != nil {
-			err = w.snapshotUnlinkedClean(ch)
+			err = w.snapshotUnlinkedClean(snapCtx, ch)
 		} else {
-			err = w.snapshotUnlinkedImage(ch)
+			err = w.snapshotUnlinkedImage(snapCtx, ch)
 		}
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
 	for _, st := range otherSnapWaits {
-		<-st.done
-		if st.err != nil && firstErr == nil {
-			firstErr = st.err
+		select {
+		case <-st.done:
+			if st.err != nil && firstErr == nil {
+				firstErr = st.err
+			}
+		case <-snapCtx.Done():
+			if firstErr == nil {
+				firstErr = snapCtx.Err()
+			}
+		}
+		if firstErr != nil {
+			break
 		}
 	}
 	batchSnap.err = firstErr
@@ -6575,16 +6633,22 @@ func (w *Writeback) stagedImage(path string, size int64) ([]byte, bool) {
 // inner terminal still holds the OLD remote bytes, and reading size bytes
 // from it failed a legitimate rename with EIO). A read failure is returned
 // so the caller can ABORT the namespace operation.
-func (w *Writeback) captureSnapshot(h *bufferingHandle, size int64) ([]byte, *os.File, error) {
+func (w *Writeback) captureSnapshot(snapCtx context.Context, h *bufferingHandle, size int64) ([]byte, *os.File, error) {
 	if data, ok := w.stagedImage(h.path, size); ok {
 		return data, nil, nil
 	}
 	sibSrc, _ := w.newestBufferedSiblingByObj(h.objGen, h)
-	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+	if snapCtx == nil {
+		snapCtx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(snapCtx, uploadTimeout)
 	defer cancel()
 	readChunk := func(off int64, dst []byte) (int, error) {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 		if sibSrc != nil {
-			n, ok, serr := readFromSiblingHandle(sibSrc, off, dst)
+			n, ok, serr := readFromSiblingHandle(ctx, sibSrc, off, dst)
 			if serr != nil {
 				return n, serr
 			}
@@ -6653,7 +6717,7 @@ func (w *Writeback) captureSnapshot(h *bufferingHandle, size int64) ([]byte, *os
 
 // snapshotUnlinkedClean stages one clean handle's remote image into the
 // shadow for post-delete reads.
-func (w *Writeback) snapshotUnlinkedClean(h *bufferingHandle) error {
+func (w *Writeback) snapshotUnlinkedClean(ctx context.Context, h *bufferingHandle) error {
 	st := w.opts.Staging
 	if st.Pending.HasPending(h.path) {
 		return nil // a staged image already serves post-delete reads
@@ -6668,8 +6732,11 @@ func (w *Writeback) snapshotUnlinkedClean(h *bufferingHandle) error {
 	if h.inner == nil && (w.opts.Client == nil || isNew) {
 		return nil
 	}
-	size := w.liveObjectSize(context.Background(), h)
+	size := w.liveObjectSize(ctx, h)
 	if size < 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		return nil
 	}
 	h.mu.Lock()
@@ -6678,7 +6745,7 @@ func (w *Writeback) snapshotUnlinkedClean(h *bufferingHandle) error {
 	if !clean {
 		return nil
 	}
-	buf, file, err := w.captureSnapshot(h, size)
+	buf, file, err := w.captureSnapshot(ctx, h, size)
 	if err != nil {
 		return err
 	}
@@ -6723,7 +6790,7 @@ func (w *Writeback) snapshotUnlinkedClean(h *bufferingHandle) error {
 // snapshotUnlinkedClean: the clean fd's current image is captured into the
 // handle itself, so a rename-over or unlink keeps serving the OLD object's
 // bytes without a shadow plane.
-func (w *Writeback) snapshotUnlinkedImage(h *bufferingHandle) error {
+func (w *Writeback) snapshotUnlinkedImage(ctx context.Context, h *bufferingHandle) error {
 	h.mu.Lock()
 	alreadySnap := h.pendingImage != nil || h.pendingFile != nil
 	isNew := h.isNew
@@ -6734,11 +6801,14 @@ func (w *Writeback) snapshotUnlinkedImage(h *bufferingHandle) error {
 	if h.inner == nil && (w.opts.Client == nil || isNew) {
 		return nil
 	}
-	size := w.liveObjectSize(context.Background(), h)
+	size := w.liveObjectSize(ctx, h)
 	if size < 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		return nil
 	}
-	buf, file, err := w.captureSnapshot(h, size)
+	buf, file, err := w.captureSnapshot(ctx, h, size)
 	if err != nil {
 		return err
 	}
@@ -7781,7 +7851,28 @@ func readWriteBufferRangePreservingEviction(buf *writebuffer.WriteBuffer, off in
 	return buf.CopyRange(off, dst)
 }
 
-func readFromSiblingHandle(sib *bufferingHandle, off int64, dst []byte) (int, bool, error) {
+func (h *bufferingHandle) takeSnapshotFileLocked() (*os.File, int64) {
+	f, q := h.snapshotFile, h.snapshotQuotaBytes
+	h.snapshotFile = nil
+	h.snapshotQuotaBytes = 0
+	return f, q
+}
+
+func (h *bufferingHandle) releaseSnapshotFile(f *os.File, quota int64) {
+	if f != nil {
+		_ = f.Close()
+	}
+	if quota > 0 && h != nil && h.w != nil && h.w.opts.Staging != nil && h.w.opts.Staging.Shadow != nil {
+		h.w.opts.Staging.Shadow.ReleaseTempBytes(quota)
+	}
+}
+
+func readFromSiblingHandle(ctx context.Context, sib *bufferingHandle, off int64, dst []byte) (int, bool, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return 0, false, err
+		}
+	}
 	sib.mu.Lock()
 	defer sib.mu.Unlock()
 	if sib.closed || sib.buf == nil {
@@ -7835,6 +7926,11 @@ func (w *Writeback) readDirtySiblingByObj(ctx context.Context, objGen uint64, sk
 	if w == nil || objGen == 0 {
 		return 0, false, nil
 	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return 0, false, err
+		}
+	}
 	w.regMu.Lock()
 	handles := make([]*bufferingHandle, 0, len(w.liveByObj[objGen]))
 	for h := range w.liveByObj[objGen] {
@@ -7858,13 +7954,18 @@ func (w *Writeback) readDirtySiblingByObj(ctx context.Context, objGen uint64, sk
 	if best == nil {
 		return 0, false, nil
 	}
-	_ = ctx
-	return readFromSiblingHandle(best, off, dest)
+	return readFromSiblingHandle(ctx, best, off, dest)
 }
 
-func (h *bufferingHandle) seedFromDirtySiblingForObj(objGen uint64) error {
+func (h *bufferingHandle) seedFromDirtySiblingForObj(ctx context.Context, objGen uint64) error {
 	if h.w == nil || objGen == 0 {
 		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	h.w.regMu.Lock()
 	handles := make([]*bufferingHandle, 0, len(h.w.liveByObj[objGen]))
@@ -7921,49 +8022,69 @@ func (h *bufferingHandle) seedFromDirtySiblingForObj(objGen uint64) error {
 	}
 
 	// Oversize sibling buffer (> pendingServeMaterializeBytes, e.g. spilled to
-	// liveSpillFile): snapshot best's image into an unlinked temp file outside
-	// h.mu (under coOpenLocks) and wire LoadPart to ReadAt on that file. That
-	// keeps RAM bounded while ensuring LoadPart never acquires sibling handle
-	// mutexes (e.g. inside admitFtruncate while sibling locks are held) and
-	// stays isolated from sibling close or post-unlink pathname reuse.
-	tmp, err := os.CreateTemp("", "drive9-sib-*")
+	// liveSpillFile): snapshot best's image into an unlinked temp file rooted
+	// in Shadow.Dir() (when staging is configured) and charge its written bytes
+	// against ShadowStore's write-back quota so multi-GiB co-open snapshots
+	// stay on the configured cache filesystem and respect writeCacheMaxBytes.
+	var shadow *staging.ShadowStore
+	spillDir := ""
+	if h.w.opts.Staging != nil && h.w.opts.Staging.Shadow != nil {
+		shadow = h.w.opts.Staging.Shadow
+		spillDir = shadow.Dir()
+	}
+	tmp, err := os.CreateTemp(spillDir, "drive9-sib-*")
 	if err != nil {
 		return err
 	}
 	_ = os.Remove(tmp.Name())
+	var reservedQuota int64
+	abortSnapshot := func(retErr error) error {
+		h.releaseSnapshotFile(tmp, reservedQuota)
+		return retErr
+	}
 	chunkBuf := make([]byte, 8<<20)
 	var copied int64
 	for copied < bestSize {
+		if err := ctx.Err(); err != nil {
+			return abortSnapshot(err)
+		}
 		want := int64(len(chunkBuf))
 		if copied+want > bestSize {
 			want = bestSize - copied
 		}
-		n, ok, rerr := readFromSiblingHandle(best, copied, chunkBuf[:want])
+		n, ok, rerr := readFromSiblingHandle(ctx, best, copied, chunkBuf[:want])
 		if rerr != nil {
-			_ = tmp.Close()
-			return rerr
+			return abortSnapshot(rerr)
 		}
 		if !ok || int64(n) != want {
-			_ = tmp.Close()
-			return fmt.Errorf("co-open sibling snapshot at %d of %s unavailable", copied, h.path)
+			return abortSnapshot(fmt.Errorf("co-open sibling snapshot at %d of %s unavailable", copied, h.path))
+		}
+		if shadow != nil {
+			if qerr := shadow.ReserveTempBytes(int64(n)); qerr != nil {
+				if errors.Is(qerr, syscall.ENOSPC) && h.w.waitForShadowQuota(ctx, int64(n)) {
+					qerr = shadow.ReserveTempBytes(int64(n))
+				}
+				if qerr != nil {
+					return abortSnapshot(qerr)
+				}
+			}
+			reservedQuota += int64(n)
 		}
 		if _, werr := tmp.WriteAt(chunkBuf[:n], copied); werr != nil {
-			_ = tmp.Close()
-			return werr
+			return abortSnapshot(werr)
 		}
 		copied += int64(n)
 	}
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.buf != nil || h.trunc || h.unlinked || h.appendParticipant() {
-		_ = tmp.Close()
+		h.mu.Unlock()
+		h.releaseSnapshotFile(tmp, reservedQuota)
 		return nil
 	}
-	if h.snapshotFile != nil {
-		_ = h.snapshotFile.Close()
-	}
+	oldSF, oldSQ := h.takeSnapshotFileLocked()
 	h.snapshotFile = tmp
+	h.snapshotQuotaBytes = reservedQuota
 	buf := writebuffer.NewWriteBuffer(h.path, bufferedMaxTotal, 0)
 	buf.SetMemoryBudget(h.w.budget)
 	partSize := buf.PartSize()
@@ -7990,6 +8111,8 @@ func (h *bufferingHandle) seedFromDirtySiblingForObj(objGen uint64) error {
 	}
 	h.buf = buf
 	h.baseLoaded = true
+	h.mu.Unlock()
+	h.releaseSnapshotFile(oldSF, oldSQ)
 	return nil
 }
 
@@ -9745,11 +9868,20 @@ func (h *bufferingHandle) spillToShadow(st *staging.Staging, stagePath string, b
 	}
 	size := buf.Size()
 	hadShadowBefore := st.Shadow.Has(stagePath)
-	// Clear stale shadow bytes beyond any shrink watermark (or from a prior
-	// unspilled incarnation on a zero-base create/truncate) before skipping
-	// unloaded zero-extended parts below. Keep an active pending shadow intact
-	// when a co-open sibling is lazy-loading untouched parts from it.
-	if (h.trunc || (zeroBase && !st.Pending.HasPending(stagePath))) && buf.RestorePart == nil {
+	// Clear stale shadow bytes beyond any shrink watermark, or whenever this
+	// buffer has no lazy base (`h.trunc`, or `zeroBase && buf.RemoteSize() == 0`)
+	// and is not itself backed by the active shadow (`buf.RestorePart == nil`).
+	// Checking `buf.RemoteSize() == 0` rather than `!st.Pending.HasPending`:
+	//   - A co-open handle that lazy-loads untouched parts from an active pending
+	//     shadow has `buf.RemoteSize() > 0` (via SeedRemote) AND pins that shadow
+	//     (`ledgerShadowGen`), while ShadowStore.Truncate rotates any pinned
+	//     generation into retired storage before truncating the fresh active file.
+	//   - Conversely, if CancelPathPreserveLocal left a pending entry + shadow
+	//     from an unlinked prior incarnation at stagePath, a new zero-base create
+	//     has `buf.RemoteSize() == 0` and skips unloaded hole parts below, so it
+	//     MUST truncate the leftover active shadow to 0 instead of publishing the
+	//     previous incarnation's bytes inside sparse holes.
+	if (h.trunc || (zeroBase && buf.RemoteSize() == 0)) && buf.RestorePart == nil {
 		if st.Shadow.Size(stagePath) > 0 {
 			if err := st.Shadow.Truncate(stagePath, 0, baseRev); err != nil {
 				return err
@@ -9854,10 +9986,8 @@ func (h *bufferingHandle) spillToShadow(st *staging.Staging, stagePath string, b
 			_ = h.liveSpillFile.Close()
 			h.liveSpillFile = nil
 		}
-		if h.snapshotFile != nil {
-			_ = h.snapshotFile.Close()
-			h.snapshotFile = nil
-		}
+		sf, sq := h.takeSnapshotFileLocked()
+		h.releaseSnapshotFile(sf, sq)
 		buf.RestorePart = func(partNum int) ([]byte, error) {
 			if h.unlinked {
 				if pin := h.w.unlinkedShadowPinFor(h.path); pin != 0 {

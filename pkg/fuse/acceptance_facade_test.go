@@ -561,6 +561,41 @@ func TestFacadeRejectsInvalidNamespaceNamesWithoutPollutingDrain(t *testing.T) {
 			_ = f.Unlink(nil, &gofuse.InHeader{NodeId: dirOut.NodeId}, nfcDouble)
 			_ = f.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "umoved")
 
+			// FORGET dropping Nlookup to 0 reclaims recorded Unicode spellings so
+			// f.unicodeSpellings stays bounded by active kernel dentries.
+			const (
+				fgtMix = "fgt-\u00e9e\u0301"
+				fgtNFC = "fgt-\u00e9\u00e9"
+			)
+			var fgtCreate gofuse.CreateOut
+			if st := f.Create(nil, &gofuse.CreateIn{
+				InHeader: gofuse.InHeader{NodeId: 1},
+				Flags:    uint32(syscall.O_CREAT | syscall.O_RDWR),
+				Mode:     0o644,
+			}, fgtNFC, &fgtCreate); st != gofuse.OK {
+				t.Fatalf("Create %q: %v", fgtNFC, st)
+			}
+			_ = f.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: fgtCreate.NodeId}, Fh: fgtCreate.Fh})
+			f.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: fgtCreate.NodeId}, Fh: fgtCreate.Fh})
+			if st := f.Lookup(nil, &gofuse.InHeader{NodeId: 1}, fgtMix, &lo); st != gofuse.OK {
+				t.Fatalf("Lookup %q: %v", fgtMix, st)
+			}
+			fgtKey := unicodeSpellingKey{parentIno: 1, canonName: fgtNFC}
+			f.unicodeSpellingsMu.Lock()
+			_, recordedBeforeForget := f.unicodeSpellings[fgtKey]
+			f.unicodeSpellingsMu.Unlock()
+			if !recordedBeforeForget {
+				t.Fatalf("expected %v recorded before Forget", fgtKey)
+			}
+			f.Forget(fgtCreate.NodeId, 2)
+			f.unicodeSpellingsMu.Lock()
+			_, recordedAfterForget := f.unicodeSpellings[fgtKey]
+			f.unicodeSpellingsMu.Unlock()
+			if recordedAfterForget {
+				t.Fatalf("expected %v reclaimed when Forget dropped Nlookup to 0", fgtKey)
+			}
+			_ = f.Unlink(nil, &gofuse.InHeader{NodeId: 1}, fgtNFC)
+
 			// Sentinel-based client.ErrInvalidPath classification must return EINVAL
 			// even when the invalid path text contains words like "not found".
 			_, invalidErr := client.New("http://127.0.0.1:1", "").StatCtx(context.Background(), `/not found\bad`)

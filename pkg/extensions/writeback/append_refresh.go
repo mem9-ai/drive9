@@ -344,6 +344,11 @@ func (w *Writeback) fenceRefreshAppendBase(ctx context.Context, h *bufferingHand
 // a failed restore): if any sibling or remote revision advanced past h's base,
 // fail closed with EAGAIN so callers never adopt a foreign revision or
 // overwrite a concurrent append without its bytes.
+//
+// Expected cost: for spilled append buffers (> appendRefreshMaxBytes = 1 MiB),
+// each commit issues one remote StatCtx per candidate path (typically 1 path,
+// plus any hardlink aliases) at the staging boundary. Small/medium appends stay
+// materialized in RAM and take the local prefix-composition path instead.
 func (w *Writeback) fenceCheckUnmaterializableAppend(ctx context.Context, h *bufferingHandle, baseRev int64, ownTrunc bool, ownSeq uint64) ([]byte, int64, error) {
 	if ownTrunc {
 		return nil, 0, nil

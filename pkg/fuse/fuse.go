@@ -193,7 +193,10 @@ type FS struct {
 
 	unicodeSpellingsMu sync.Mutex
 	unicodeSpellings   map[unicodeSpellingKey]map[string]struct{}
-	onInvalidateEntry  func(parentIno uint64, name string)
+	// onInvalidateEntry is a test-only seam (like CommitQueue.testGate) set by
+	// acceptance_facade_test.go to observe kernel dentry invalidation calls
+	// without mounting a kernel FUSE server; nil in production.
+	onInvalidateEntry func(parentIno uint64, name string)
 }
 
 type unicodeSpellingKey struct {
@@ -1074,15 +1077,23 @@ func (f *FS) OnUnmount() {
 }
 
 func (f *FS) Forget(nodeid, nlookup uint64) {
+	entry, ok := f.inodes.GetEntry(nodeid)
+	lastLookup := ok && nodeid != 1 && entry.Nlookup <= int64(nlookup)
 	// v1 shouldPreserveForgottenInode: a forgotten inode with open handles
 	// or pending write-plane state keeps its path mapping, so fds of
 	// unlinked files keep resolving and the inode number stays stable until
 	// the state drains. Metadata-only specials are kept inside the table.
-	if entry, ok := f.inodes.GetEntry(nodeid); ok && !entry.IsDir && f.shouldPreserveForgotten(entry) {
+	if ok && !entry.IsDir && f.shouldPreserveForgotten(entry) {
 		f.inodes.ForgetKeepMapping(nodeid, nlookup)
+		if lastLookup {
+			f.reclaimForgottenUnicodeSpellings(entry)
+		}
 		return
 	}
 	f.inodes.Forget(nodeid, nlookup)
+	if lastLookup {
+		f.reclaimForgottenUnicodeSpellings(entry)
+	}
 }
 
 func (f *FS) shouldPreserveForgotten(entry *InodeEntry) bool {
@@ -2198,9 +2209,7 @@ func (f *FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name string)
 		return st
 	}
 	f.inodes.AdjustLinkCount(header.NodeId, -1)
-	if dirIno, ok := f.inodes.GetInode(child); ok {
-		f.clearUnicodeSpellingsUnderDir(dirIno)
-	}
+	f.clearUnicodeSpellingsForSubtree(child)
 	// Detach the removed directory's NAME while keeping its inode for the
 	// references that outlive it (an open descriptor, a process cwd). Left
 	// mapped, the name would hand the removed object's nodeid to a later
@@ -2264,6 +2273,11 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 	f.recordHandleOp(fs.OpRename, start, rerr, 0)
 	if rerr != nil {
 		return fs.StatusOf(rerr)
+	}
+	if dstIno, ok := f.inodes.GetInode(newPath); ok {
+		if de, eok := f.inodes.GetEntry(dstIno); eok && de.IsDir {
+			f.clearUnicodeSpellingsForSubtree(newPath)
+		}
 	}
 	f.inodes.Rename(oldPath, newPath)
 	f.openIdx.RenamePathPrefix(oldPath, newPath)
@@ -4018,6 +4032,50 @@ func (f *FS) clearUnicodeSpellingsUnderDir(dirIno uint64) {
 		}
 	}
 	f.unicodeSpellingsMu.Unlock()
+}
+
+func (f *FS) clearUnicodeSpellingsForSubtree(dirPath string) {
+	for _, dirIno := range f.inodes.DirInodesUnderPrefix(dirPath) {
+		f.clearUnicodeSpellingsUnderDir(dirIno)
+	}
+}
+
+// reclaimForgottenUnicodeSpellings drops recorded non-canonical spellings once
+// the kernel drops its last lookup reference to entry: with Nlookup == 0 no
+// positive dentry for this inode remains in the kernel dcache under any
+// spelling, so keeping the map entry would accumulate across the mount's life.
+func (f *FS) reclaimForgottenUnicodeSpellings(entry *InodeEntry) {
+	if entry == nil {
+		return
+	}
+	if entry.IsDir && (entry.Unlinked || entry.Path == "" || len(entry.Paths) == 0) {
+		f.clearUnicodeSpellingsUnderDir(entry.Ino)
+	}
+	reclaimPath := func(p string) {
+		if p == "" || p == "/" {
+			return
+		}
+		parentPath := parentDirOf(p)
+		var parentIno uint64
+		if parentPath == "/" {
+			parentIno = 1
+		} else if pino, ok := f.inodes.GetInode(parentPath); ok {
+			parentIno = pino
+		}
+		if parentIno == 0 {
+			return
+		}
+		key := unicodeSpellingKey{parentIno: parentIno, canonName: pathpkg.Base(p)}
+		f.unicodeSpellingsMu.Lock()
+		delete(f.unicodeSpellings, key)
+		f.unicodeSpellingsMu.Unlock()
+	}
+	reclaimPath(entry.Path)
+	for p := range entry.Paths {
+		if p != entry.Path {
+			reclaimPath(p)
+		}
+	}
 }
 
 // invalidateAlternateUnicodeSpellings drops cached kernel dentries for NFC,
