@@ -238,6 +238,36 @@ tier = "daily-fault"
 durability = "fsync"
 timeout = "15m"
 
+[[case]]
+name = "webdev/durability-interactive-crash"
+tier = "daily-fault"
+durability = "interactive"
+timeout = "10m"
+
+[[case]]
+name = "webdev/durability-close-sync-crash"
+tier = "daily-fault"
+durability = "close-sync"
+timeout = "10m"
+
+[[case]]
+name = "webdev/durability-write-sync-crash"
+tier = "daily-fault"
+durability = "write-sync"
+timeout = "10m"
+
+[[case]]
+name = "webdev/client-machine-loss"
+tier = "daily-fault"
+durability = "auto"
+timeout = "10m"
+
+[[case]]
+name = "webdev/client-power-cut"
+tier = "daily-fault"
+durability = "auto"
+timeout = "15m"
+
 # ---- Daily Deep FUSE Conformance, Stress & Multi-Client Suite (`daily-fuse`) ----
 [[case]]
 name = "drive9/fuse/concurrency"

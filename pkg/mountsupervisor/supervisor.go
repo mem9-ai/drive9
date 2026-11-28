@@ -85,6 +85,7 @@ type supervisor struct {
 	backoff        time.Duration
 	lockFile       *os.File
 	adopted        bool
+	autoAdopted    bool // adopted without an explicit Adopt request (prior supervisor died)
 	startedAt      time.Time
 
 	healthFails   int
@@ -128,14 +129,37 @@ func newSupervisor(cfg Config) (*supervisor, error) {
 	// (sticky tokens from SIGKILL-path umount). A token newer than startedAt
 	// is a concurrent intentional stop — honor it, do not clear.
 	clearStaleStopToken(cfg.MountPoint, startedAt)
+	// A previous supervisor may have died while its worker kept serving the
+	// FUSE endpoint. The worker still owns that endpoint, so this run must take
+	// it over instead of persisting a worker-less state: persisting first would
+	// erase the only evidence of the live owner, and the pre-start clean would
+	// then force-unmount a healthy mount while a second process shares its
+	// staging directory.
+	explicitAdopt := cfg.Adopt
+	if !explicitAdopt {
+		if pid, workerCreation, ok := liveWorkerIdentity(cfg.MountPoint); ok {
+			if workerCreation == 0 {
+				// Adopt validation requires a creation identity; without one the
+				// recorded pid may be a reused pid, so fail closed and let the
+				// clean path run instead of adopting a stranger.
+				ok = false
+			}
+			if ok {
+				cfg.Adopt = true
+				cfg.AdoptWorkerPID = pid
+				cfg.AdoptWorkerCreation = workerCreation
+			}
+		}
+	}
 	creation, _ := mountstate.ProcessCreationTime(os.Getpid())
 	now := cfg.Now()
 	s := &supervisor{
-		cfg:       cfg,
-		lockFile:  lock,
-		backoff:   time.Second,
-		startedAt: startedAt,
-		adopted:   cfg.Adopt && cfg.AdoptWorkerPID > 0,
+		cfg:         cfg,
+		lockFile:    lock,
+		backoff:     time.Second,
+		startedAt:   startedAt,
+		adopted:     cfg.Adopt && cfg.AdoptWorkerPID > 0,
+		autoAdopted: !explicitAdopt && cfg.Adopt && cfg.AdoptWorkerPID > 0,
 		state: mountstate.SupervisorState{
 			PID:          os.Getpid(),
 			CreationTime: creation,
@@ -241,7 +265,11 @@ func (s *supervisor) loop() error {
 		} else {
 			s.setState(mountstate.SupervisorStateRunning)
 			_ = s.writeAuthoritativeProcessState()
-			s.logf("adopt: monitoring existing worker pid=%d", s.state.WorkerPID)
+			if s.autoAdopted {
+				s.logf("adopt: taking over live worker pid=%d left by a previous supervisor", s.state.WorkerPID)
+			} else {
+				s.logf("adopt: monitoring existing worker pid=%d", s.state.WorkerPID)
+			}
 			notifyReady()
 			// Poll-based supervise (no waitpid on non-child).
 			res, stop := s.superviseAdopted(sigCh)
@@ -253,6 +281,13 @@ func (s *supervisor) loop() error {
 			code, reason := s.classifyExit(res.err)
 			s.recordExit(code, reason)
 			if s.isStopRequested() || mountstate.StopTokenPresent(s.cfg.MountPoint) {
+				return s.shutdownClean()
+			}
+			// The adopted worker is not our child, so its exit status is not
+			// observable. When the mount is already gone, treat it as a clean
+			// stop instead of restarting a mount the user ended on purpose.
+			if active, activeErr := drive9fuse.ActiveMountPointBounded(s.cfg.MountPoint); !active && !drive9fuse.IsTransportBroken(activeErr) {
+				s.logf("adopt: worker gone and mount inactive; stopping")
 				return s.shutdownClean()
 			}
 			// Fall through into normal restart/spawn path below.
@@ -1086,6 +1121,38 @@ func (s *supervisor) alert(event, detail string) {
 	if err == nil {
 		_ = resp.Body.Close()
 	}
+}
+
+// liveWorkerIdentity reports the recorded worker identity when that process is
+// still running. It mirrors the ownership test EnsureCleanMountpoint uses, but
+// must be evaluated BEFORE this run persists its own worker-less state: the
+// persisted state is the only record that a live worker owns the FUSE endpoint.
+func liveWorkerIdentity(mountPoint string) (pid int, creation uint64, ok bool) {
+	if st, _, err := mountstate.ReadSupervisorState(mountPoint); err == nil && st.WorkerPID > 0 {
+		if processAlive(st.WorkerPID, st.WorkerCreation) {
+			return st.WorkerPID, st.WorkerCreation, true
+		}
+		return 0, 0, false
+	}
+	ps, _, err := mountstate.ReadProcessState(mountPoint)
+	if err != nil {
+		return 0, 0, false
+	}
+	if ps.WorkerPID > 0 {
+		// Process state records the worker pid but not its creation identity.
+		if processIdentityAlive(ps.WorkerPID, 0, false) {
+			return ps.WorkerPID, 0, true
+		}
+		return 0, 0, false
+	}
+	if ps.Role == mountstate.RoleSupervisor || ps.Supervise {
+		// Supervised mount with no recorded worker identity: orphan.
+		return 0, 0, false
+	}
+	if ps.PID > 0 && processAlive(ps.PID, ps.CreationTime) {
+		return ps.PID, ps.CreationTime, true
+	}
+	return 0, 0, false
 }
 
 func processAlive(pid int, creation uint64) bool {
